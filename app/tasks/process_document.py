@@ -1,203 +1,281 @@
 import uuid
-from typing import Dict, Any, Optional
-import base64
-import json
-
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, status, Form, Header
+import asyncio
+from typing import Dict, Any, Optional, List, Type
+import tempfile
+import os
+from pathlib import Path
 import structlog
+import base64 # Keep for potential alternative data passing
+import io
 
-from app.api.v1 import schemas
+# --- Haystack Imports ---
+from haystack import Pipeline, Document
+from haystack.utils import Secret
+from haystack.components.converters import (
+    PyPDFToDocument,
+    TextFileToDocument,
+    MarkdownToDocument,
+    HTMLToDocument,
+    DOCXToDocument,
+    # Consider AzureOCRDocumentConverter or others if needed
+)
+from haystack.components.preprocessors import DocumentSplitter
+from haystack.components.embedders import OpenAITextEmbedder, OpenAIDocumentEmbedder # Use both for clarity
+from haystack_integrations.document_stores.milvus import MilvusDocumentStore # Assuming package structure
+from haystack.components.writers import DocumentWriter
+from haystack.dataclasses import ByteStream # For passing content directly
+
+# --- Local Imports ---
+from app.tasks.celery_app import celery_app
 from app.core.config import settings
 from app.db import postgres_client
-from app.tasks.process_document import process_document_task
-# Dependencia para obtener company_id (simulada aquí, debería venir de Auth Service/Gateway)
-from app.core.security import get_company_id_from_token # Implementar esta función
+from app.models.domain import DocumentStatus
+# Keep storage client for downloading if needed, or OCR client
+from app.services.storage_client import StorageServiceClient
+# from app.services.ocr_client import OcrServiceClient # Keep if used
 
 log = structlog.get_logger(__name__)
 
-router = APIRouter()
 
-# --- Dependencia Simulada ---
-# En un sistema real, el API Gateway validaría el JWT y pasaría el company_id
-# quizás en un header personalizado (ej. X-Company-ID)
-async def get_current_company_id(x_company_id: Optional[str] = Header(None)) -> uuid.UUID:
-    if not x_company_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing X-Company-ID header",
-        )
-    try:
-        return uuid.UUID(x_company_id)
-    except ValueError:
-         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid X-Company-ID header format (must be UUID)",
-        )
+# --- Haystack Component Initialization ---
+# It's often better to initialize components once if possible,
+# but within a Celery task, re-initializing might be safer,
+# especially for components holding external connections like DocumentStore.
 
-# --- Endpoints ---
-@router.post(
-    "/ingest",
-    response_model=schemas.IngestResponse,
-    status_code=status.HTTP_202_ACCEPTED, # 202 Accepted porque es asíncrono
-    summary="Ingest a new document",
-    description="Uploads a document file and its metadata, then queues it for processing.",
-)
-async def ingest_document(
-    metadata_json: str = Form(default="{}", description="JSON string of document metadata"),
-    file: UploadFile = File(..., description="The document file to ingest"),
-    company_id: uuid.UUID = Depends(get_current_company_id), # Obtener company_id
-):
-    """
-    Endpoint para iniciar la ingestión de un documento.
-    Recibe el archivo y metadatos, crea un registro inicial en la BD,
-    y encola la tarea de procesamiento en Celery.
-    """
-    request_log = log.bind(company_id=str(company_id), filename=file.filename, content_type=file.content_type)
-    request_log.info("Received document ingestion request")
-
-    # Validar tipo de contenido
-    if file.content_type not in settings.SUPPORTED_CONTENT_TYPES:
-        request_log.warning("Unsupported content type received")
-        raise HTTPException(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail=f"Unsupported file type: {file.content_type}. Supported types: {settings.SUPPORTED_CONTENT_TYPES}",
-        )
-
-    # Validar y parsear metadata JSON
-    try:
-        metadata = json.loads(metadata_json)
-        if not isinstance(metadata, dict):
-            raise ValueError("Metadata must be a JSON object")
-        # Validar con Pydantic si es necesario (requiere un modelo específico)
-        # schemas.DocumentMetadata(**metadata)
-    except json.JSONDecodeError:
-         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON format for metadata")
-    except ValueError as e:
-         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid metadata structure: {e}")
-
-    # Crear registro inicial en la base de datos
-    try:
-        document_id = await postgres_client.create_document(
-            company_id=company_id,
-            file_name=file.filename or "untitled",
-            file_type=file.content_type or "application/octet-stream",
-            metadata=metadata,
-        )
-        request_log = request_log.bind(document_id=str(document_id))
-        request_log.info("Initial document record created in DB")
-    except Exception as e:
-        request_log.error("Failed to create initial document record", error=e, exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to initiate document ingestion process.",
-        )
-
-    # Leer contenido del archivo y pasarlo a la tarea Celery
-    # Para archivos grandes, esto puede consumir mucha memoria.
-    # Alternativa: guardar temporalmente y pasar la ruta a Celery.
-    # Aquí usamos base64 para simplicidad, pero ¡cuidado con el tamaño!
-    try:
-        file_content = await file.read()
-        file_content_b64 = base64.b64encode(file_content).decode('utf-8')
-        request_log.info(f"Read file content ({len(file_content)} bytes), encoded to base64")
-    except Exception as e:
-        request_log.error("Failed to read uploaded file content", error=e, exc_info=True)
-        # Intentar marcar el documento como error si ya se creó
-        try:
-            await postgres_client.update_document_status(document_id, schemas.DocumentStatus.ERROR, error_message="Failed to read uploaded file")
-        except: pass # Ignorar error al actualizar estado
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Could not read uploaded file.",
-        )
-    finally:
-        await file.close()
-
-    # Encolar la tarea en Celery
-    try:
-        task = process_document_task.delay(
-            document_id_str=str(document_id),
-            company_id_str=str(company_id),
-            file_name=file.filename or "untitled",
-            content_type=file.content_type or "application/octet-stream",
-            file_content_b64=file_content_b64,
-        )
-        request_log.info("Document processing task queued", task_id=task.id)
-    except Exception as e:
-        request_log.error("Failed to queue document processing task", error=e, exc_info=True)
-         # Intentar marcar el documento como error si ya se creó
-        try:
-            await postgres_client.update_document_status(document_id, schemas.DocumentStatus.ERROR, error_message="Failed to queue processing task")
-        except: pass
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to queue document for processing.",
-        )
-
-    return schemas.IngestResponse(document_id=document_id)
-
-
-@router.get(
-    "/ingest/status/{document_id}",
-    response_model=schemas.StatusResponse,
-    status_code=status.HTTP_200_OK,
-    summary="Get document ingestion status",
-    description="Retrieves the current processing status and basic information of a document.",
-)
-async def get_ingestion_status(
-    document_id: uuid.UUID,
-    company_id: uuid.UUID = Depends(get_current_company_id), # Asegurar que el usuario pertenece a la compañía dueña
-):
-    """
-    Endpoint para consultar el estado de procesamiento de un documento.
-    """
-    status_log = log.bind(document_id=str(document_id), company_id=str(company_id))
-    status_log.info("Received request for document status")
-
-    try:
-        doc_data = await postgres_client.get_document_status(document_id)
-    except Exception as e:
-        status_log.error("Failed to retrieve document status from DB", error=e, exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Could not retrieve document status.",
-        )
-
-    if not doc_data:
-        status_log.warning("Document ID not found")
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Document not found.",
-        )
-
-    # Aquí deberíamos verificar si el company_id del token coincide con el del documento
-    # doc_company_id = doc_data.get("company_id") # Asumiendo que get_document_status lo devuelve
-    # if doc_company_id != company_id:
-    #     status_log.warning("Company ID mismatch for document status request")
-    #     raise HTTPException(
-    #         status_code=status.HTTP_403_FORBIDDEN,
-    #         detail="You do not have permission to view this document's status.",
-    #     )
-
-    response_data = schemas.StatusResponse(
-        document_id=doc_data["id"],
-        status=doc_data["status"],
-        file_name=doc_data.get("file_name"),
-        file_type=doc_data.get("file_type"),
-        chunk_count=doc_data.get("chunk_count"),
-        error_message=doc_data.get("error_message"),
-        last_updated=str(doc_data.get("updated_at")) if doc_data.get("updated_at") else None,
+def get_haystack_document_store() -> MilvusDocumentStore:
+    """Initializes the MilvusDocumentStore."""
+    # Ensure Milvus schema matches Haystack expectations or configure mappings
+    return MilvusDocumentStore(
+        uri=settings.MILVUS_URI,
+        collection_name=settings.MILVUS_COLLECTION_NAME,
+        dim=settings.EMBEDDING_DIMENSION,
+        embedding_field=settings.MILVUS_EMBEDDING_FIELD,
+        content_field=settings.MILVUS_CONTENT_FIELD,
+        metadata_fields=settings.MILVUS_METADATA_FIELDS, # Ensure company_id etc. are listed
+        index_params=settings.MILVUS_INDEX_PARAMS,
+        search_params=settings.MILVUS_SEARCH_PARAMS,
+        consistency_level="Strong", # Or other level as needed
+        # auto_id=True, # Let Milvus generate IDs if needed, but Haystack might prefer its own
     )
 
-    # Añadir un mensaje más descriptivo
-    if response_data.status == schemas.DocumentStatus.ERROR:
-        response_data.message = f"Processing failed: {response_data.error_message or 'Unknown error'}"
-    elif response_data.status == schemas.DocumentStatus.PROCESSED:
-         response_data.message = f"Document processed successfully with {response_data.chunk_count or 0} chunks."
-    elif response_data.status == schemas.DocumentStatus.PROCESSING:
-         response_data.message = "Document is currently being processed."
-    elif response_data.status == schemas.DocumentStatus.UPLOADED:
-         response_data.message = "Document uploaded, awaiting processing."
+def get_haystack_embedder() -> OpenAIDocumentEmbedder:
+    """Initializes the OpenAI Embedder for documents."""
+    # Use Secret.from_env_var() which is serializable for pipelines
+    return OpenAIDocumentEmbedder(
+        api_key=Secret.from_env_var("OPENAI_API_KEY"),
+        model=settings.OPENAI_EMBEDDING_MODEL,
+        # Consider adding prefix/suffix if needed by the model
+        meta_fields_to_embed=["file_name"] # Example: embed filename with content
+    )
 
-    status_log.info("Returning document status", status=response_data.status)
-    return response_data
+def get_haystack_splitter() -> DocumentSplitter:
+    """Initializes the DocumentSplitter."""
+    return DocumentSplitter(
+        split_by=settings.SPLITTER_SPLIT_BY,
+        split_length=settings.SPLITTER_CHUNK_SIZE,
+        split_overlap=settings.SPLITTER_CHUNK_OVERLAP
+    )
+
+def get_converter_for_content_type(content_type: str) -> Optional[Type]:
+     """Returns the appropriate Haystack Converter class."""
+     # Add more mappings as needed
+     if content_type == "application/pdf":
+         return PyPDFToDocument
+     elif content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+         return DOCXToDocument
+     elif content_type == "text/plain":
+         return TextFileToDocument
+     elif content_type == "text/markdown":
+         return MarkdownToDocument
+     elif content_type == "text/html":
+         return HTMLToDocument
+     # Add other converters like CSV, JSON etc. if supported
+     else:
+         return None
+
+
+# --- Celery Task ---
+@celery_app.task(
+    bind=True,
+    autoretry_for=(Exception,), # Consider more specific retry exceptions
+    retry_kwargs={'max_retries': 3, 'countdown': 15}, # Increased countdown
+    acks_late=True,
+    name="tasks.process_document_haystack"
+)
+def process_document_haystack_task(
+    self, # Task instance
+    document_id_str: str,
+    company_id_str: str,
+    file_path: str, # Path from Storage Service
+    file_name: str,
+    content_type: str,
+    original_metadata: Dict[str, Any], # Metadata provided during upload
+):
+    """
+    Processes a document using a Haystack pipeline:
+    1. Select appropriate Converter. Handle OCR case.
+    2. Build pipeline: Converter -> Splitter -> Embedder -> Writer (Milvus).
+    3. Run pipeline.
+    4. Update document status in PostgreSQL.
+    """
+    document_id = uuid.UUID(document_id_str)
+    company_id = uuid.UUID(company_id_str)
+    task_log = log.bind(document_id=str(document_id), company_id=str(company_id), task_id=self.request.id, file_name=file_name, file_path=file_path)
+    task_log.info("Starting Haystack document processing task")
+
+    async def async_process():
+        haystack_pipeline = Pipeline()
+        processed_docs_count = 0
+        # Initialize clients needed (Storage for download, OCR if used)
+        storage_client = StorageServiceClient()
+        # ocr_client = OcrServiceClient() if settings.OCR_SERVICE_URL else None
+
+        try:
+            # 0. Mark as processing
+            await postgres_client.update_document_status(document_id, DocumentStatus.PROCESSING)
+            task_log.info("Document status set to PROCESSING")
+
+            # 1. Prepare Haystack Document Input
+            #    We need the file content as ByteStream for most converters
+            #    Download from Storage Service (alternative: stream if possible)
+            task_log.info("Downloading file from storage...")
+            # This part needs the Storage Service to have a download endpoint
+            # file_content_bytes = await storage_client.download_file(file_path) # Implement download_file
+            # For now, simulate reading from local path if StorageService download isn't ready
+            # In K8s, this path needs to be accessible by the worker (e.g., mounted volume)
+            local_file_path = Path(file_path) # Assuming file_path is somehow accessible locally/mounted
+            if not local_file_path.is_file():
+                 task_log.error("File not found at accessible path", path=file_path)
+                 raise FileNotFoundError(f"File not found at path: {file_path}")
+
+            # Create ByteStream for Haystack
+            # Combine original metadata with system metadata
+            doc_meta = {
+                "company_id": str(company_id), # Ensure it's a string for Haystack meta
+                "document_id": str(document_id),
+                "file_name": file_name,
+                "file_type": content_type,
+                **original_metadata # Add user-provided metadata
+            }
+            # Read file content into ByteStream
+            with open(local_file_path, "rb") as f:
+                file_bytes = f.read()
+
+            source_stream = ByteStream(data=file_bytes, meta=doc_meta)
+            task_log.info(f"File read into ByteStream ({len(file_bytes)} bytes)")
+
+
+            # 2. Select Converter or Handle OCR
+            ConverterClass = get_converter_for_content_type(content_type)
+
+            if content_type in settings.EXTERNAL_OCR_REQUIRED_CONTENT_TYPES and settings.OCR_SERVICE_URL:
+                # --- External OCR Path ---
+                task_log.info("External OCR required, calling OCR service...")
+                # ocr_client = OcrServiceClient() # Initialize if needed
+                # extracted_text = await ocr_client.extract_text(company_id, file_path)
+                # await ocr_client.close()
+                # task_log.info(f"Text extracted via external OCR ({len(extracted_text)} chars)")
+                # if not extracted_text or extracted_text.isspace():
+                #     raise ValueError("External OCR returned no text.")
+                # # Create a single Haystack Document from the OCR text
+                # initial_doc = Document(content=extracted_text, meta=doc_meta)
+                # # Build pipeline starting from Splitter
+                # haystack_pipeline.add_component("splitter", get_haystack_splitter())
+                # haystack_pipeline.add_component("embedder", get_haystack_embedder())
+                # haystack_pipeline.add_component("writer", DocumentWriter(document_store=get_haystack_document_store()))
+                # # Connect: Splitter -> Embedder -> Writer
+                # haystack_pipeline.connect("splitter.documents", "embedder.documents")
+                # haystack_pipeline.connect("embedder.documents", "writer.documents")
+                # pipeline_input = {"splitter": {"documents": [initial_doc]}}
+                # # We skip the converter in this path
+                task_log.error("External OCR path not fully implemented in this example.")
+                raise NotImplementedError("External OCR path needs implementation.")
+
+
+            elif ConverterClass:
+                # --- Haystack Converter Path ---
+                task_log.info(f"Using Haystack converter: {ConverterClass.__name__}")
+                haystack_pipeline.add_component("converter", ConverterClass())
+                haystack_pipeline.add_component("splitter", get_haystack_splitter())
+                haystack_pipeline.add_component("embedder", get_haystack_embedder())
+                haystack_pipeline.add_component("writer", DocumentWriter(document_store=get_haystack_document_store()))
+
+                # Connect: Converter -> Splitter -> Embedder -> Writer
+                haystack_pipeline.connect("converter.documents", "splitter.documents")
+                haystack_pipeline.connect("splitter.documents", "embedder.documents")
+                haystack_pipeline.connect("embedder.documents", "writer.documents")
+
+                # Input for the pipeline run
+                pipeline_input = {"converter": {"sources": [source_stream]}}
+
+            else:
+                task_log.error("No suitable Haystack converter found and not an OCR type.", content_type=content_type)
+                raise ValueError(f"Unsupported content type for Haystack processing: {content_type}")
+
+
+            # 3. Run the Haystack Pipeline
+            task_log.info("Running Haystack indexing pipeline...")
+            # pipeline.show() # Useful for debugging pipeline structure
+            pipeline_result = haystack_pipeline.run(pipeline_input)
+            task_log.info("Haystack pipeline finished.")
+
+            # Check pipeline result (structure depends on Haystack version and components)
+            if "writer" in pipeline_result and "documents_written" in pipeline_result["writer"]:
+                processed_docs_count = pipeline_result["writer"]["documents_written"]
+                task_log.info(f"Documents written to Milvus: {processed_docs_count}")
+            else:
+                # Fallback or alternative check if the output structure is different
+                # Maybe check logs or document store count difference if possible
+                task_log.warning("Could not determine exact number of documents written from pipeline output.", output_keys=pipeline_result.keys())
+                # Assume success if no error, but count might be inaccurate
+                # We need the count for the postgres update. If splitter output is available, use that length.
+                if "splitter" in pipeline_result and "documents" in pipeline_result["splitter"]:
+                     processed_docs_count = len(pipeline_result["splitter"]["documents"])
+                     task_log.info(f"Inferring processed count from splitter output: {processed_docs_count}")
+                elif processed_docs_count == 0: # If still 0, mark as potentially failed or 0 chunks
+                     # Decide if 0 chunks is an error or valid state
+                     task_log.warning("Pipeline ran but no documents seem to have been written/counted.")
+                     # Let's consider 0 chunks a valid processed state for now
+                     processed_docs_count = 0
+
+
+            # 4. Update Final Status in PostgreSQL
+            await postgres_client.update_document_status(
+                document_id,
+                DocumentStatus.PROCESSED, # Or INDEXED
+                chunk_count=processed_docs_count
+            )
+            task_log.info("Document status set to PROCESSED in PostgreSQL", chunk_count=processed_docs_count)
+
+        except Exception as e:
+            task_log.error("Error during Haystack document processing", error=str(e), exc_info=True)
+            # Mark document as error in DB
+            try:
+                await postgres_client.update_document_status(
+                    document_id,
+                    DocumentStatus.ERROR,
+                    error_message=f"Haystack Pipeline Error: {type(e).__name__}: {str(e)[:250]}"
+                )
+                task_log.info("Document status set to ERROR in PostgreSQL")
+            except Exception as db_update_err:
+                task_log.error("Failed to update document status to ERROR after processing failure", nested_error=str(db_update_err), exc_info=True)
+            # Re-raise the exception for Celery retry mechanism
+            raise e
+        finally:
+            # Close any clients initialized within the task
+            await storage_client.close()
+            # if ocr_client: await ocr_client.close()
+            task_log.info("Cleaned up resources for task.")
+
+    # --- Run the async part ---
+    try:
+        # Ensure DB connections are ready for the async task run
+        # get_db_pool needs to handle re-connection if worker restarts
+        # Milvus connection is handled internally by Haystack DocumentStore now
+        asyncio.run(async_process())
+        log.info("Haystack document processing task finished successfully", document_id=str(document_id))
+    except Exception as e:
+        # Exception already logged and status updated in async_process
+        # Celery's autoretry mechanism will handle this if configured
+        log.error("Async processing wrapper caught exception, letting Celery handle retry/failure", document_id=str(document_id), error=str(e))
+        raise e

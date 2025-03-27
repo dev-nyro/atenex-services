@@ -3,13 +3,14 @@ from typing import Any, Optional, Dict, List
 import asyncpg
 from pydantic import BaseModel, Field
 import structlog
+import json # Import json for metadata serialization
 
 from app.core.config import settings
 from app.models.domain import DocumentStatus
 
 log = structlog.get_logger(__name__)
 
-# --- Pydantic models for DB records (optional but helpful) ---
+# --- Pydantic models remain useful for clarity ---
 class DocumentRecord(BaseModel):
     id: uuid.UUID
     company_id: uuid.UUID
@@ -20,40 +21,43 @@ class DocumentRecord(BaseModel):
     chunk_count: Optional[int] = None
     status: DocumentStatus
     error_message: Optional[str] = None
-    # Add created_at, updated_at if needed
 
-class DocumentChunkRecord(BaseModel):
-    id: uuid.UUID
-    document_id: uuid.UUID
-    chunk_index: int
-    content: str
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-    embedding_id: Optional[str] = None # ID from Milvus
-    # Add created_at if needed
+# DocumentChunkRecord might not be needed if all info is in Milvus + Haystack Document
+# class DocumentChunkRecord(BaseModel): ...
 
 # --- Database Interaction Logic ---
 _pool: Optional[asyncpg.Pool] = None
 
 async def get_db_pool() -> asyncpg.Pool:
-    """Obtiene el pool de conexiones a la base de datos."""
+    """Obtiene o crea el pool de conexiones a la base de datos."""
     global _pool
-    if _pool is None:
+    if _pool is None or _pool._closed: # Check if pool is closed
         try:
+            log.info("Creating database connection pool...")
             _pool = await asyncpg.create_pool(
                 dsn=str(settings.POSTGRES_DSN),
                 min_size=5,
-                max_size=20
+                max_size=20,
+                # Setup to automatically encode/decode JSONB
+                init=lambda conn: conn.set_type_codec(
+                    'jsonb',
+                    encoder=lambda d: json.dumps(d),
+                    decoder=lambda s: json.loads(s),
+                    schema='pg_catalog',
+                    format='text' # Use text format for JSONB with asyncpg
+                )
             )
             log.info("Database connection pool created successfully.")
         except Exception as e:
-            log.error("Failed to create database connection pool", error=e, exc_info=True)
+            log.error("Failed to create database connection pool", error=str(e), dsn=str(settings.POSTGRES_DSN), exc_info=True)
             raise
     return _pool
 
 async def close_db_pool():
     """Cierra el pool de conexiones."""
     global _pool
-    if _pool:
+    if _pool and not _pool._closed:
+        log.info("Closing database connection pool...")
         await _pool.close()
         _pool = None
         log.info("Database connection pool closed.")
@@ -67,23 +71,35 @@ async def create_document(
     """Crea un registro inicial para el documento."""
     pool = await get_db_pool()
     doc_id = uuid.uuid4()
+    # Ensure metadata is serializable (Pydantic model would handle this better)
+    try:
+        serialized_metadata = json.dumps(metadata)
+    except TypeError as e:
+        log.error("Metadata is not JSON serializable", metadata=metadata, error=e)
+        raise ValueError("Provided metadata cannot be serialized to JSON") from e
+
     query = """
-        INSERT INTO DOCUMENTS (id, company_id, file_name, file_type, metadata, status, file_path)
-        VALUES ($1, $2, $3, $4, $5, $6, '')
+        INSERT INTO DOCUMENTS (id, company_id, file_name, file_type, metadata, status, file_path, uploaded_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5::jsonb, $6, '', NOW(), NOW())
         RETURNING id;
     """
     try:
-        result = await pool.fetchval(
-            query,
-            doc_id,
-            company_id,
-            file_name,
-            file_type,
-            metadata, # Asegúrate de que metadata sea serializable a JSON
-            DocumentStatus.UPLOADED.value
-        )
-        log.info("Document record created", document_id=doc_id, company_id=company_id)
-        return result # type: ignore
+        # Use acquire() for potentially better connection handling within a request/task
+        async with pool.acquire() as connection:
+            result = await connection.fetchval(
+                query,
+                doc_id,
+                company_id,
+                file_name,
+                file_type,
+                serialized_metadata, # Pass the serialized string
+                DocumentStatus.UPLOADED.value
+            )
+        if result:
+            log.info("Document record created", document_id=doc_id, company_id=company_id)
+            return result
+        else:
+             raise RuntimeError("Failed to create document record, no ID returned.")
     except Exception as e:
         log.error("Failed to create document record", error=e, company_id=company_id, file_name=file_name, exc_info=True)
         raise
@@ -95,10 +111,10 @@ async def update_document_status(
     chunk_count: Optional[int] = None,
     error_message: Optional[str] = None,
 ) -> bool:
-    """Actualiza el estado, file_path, chunk_count o mensaje de error de un documento."""
+    """Actualiza el estado y otros campos de un documento."""
     pool = await get_db_pool()
     fields_to_update = ["status = $2", "updated_at = NOW()"]
-    params = [document_id, status.value]
+    params: List[Any] = [document_id, status.value]
     current_param_index = 3
 
     if file_path is not None:
@@ -109,12 +125,15 @@ async def update_document_status(
         fields_to_update.append(f"chunk_count = ${current_param_index}")
         params.append(chunk_count)
         current_param_index += 1
-    if error_message is not None:
+    # Handle error message update carefully
+    if status == DocumentStatus.ERROR:
         fields_to_update.append(f"error_message = ${current_param_index}")
-        params.append(error_message)
-    else: # Clear previous error if status is not ERROR
-        if status != DocumentStatus.ERROR:
-             fields_to_update.append("error_message = NULL")
+        # Truncate error message if too long for DB column
+        params.append(error_message[:1000] if error_message else "Unknown processing error")
+    else:
+        # Clear error message if status is not ERROR
+        fields_to_update.append("error_message = NULL")
+
 
     query = f"""
         UPDATE DOCUMENTS
@@ -122,28 +141,33 @@ async def update_document_status(
         WHERE id = $1;
     """
     try:
-        result = await pool.execute(query, *params)
+        async with pool.acquire() as connection:
+             result = await connection.execute(query, *params)
         success = result == "UPDATE 1"
         if success:
-            log.info("Document status updated", document_id=document_id, status=status.value, file_path=file_path, chunk_count=chunk_count, error=error_message)
+            log.info("Document status updated", document_id=document_id, status=status.value, file_path=file_path, chunk_count=chunk_count, has_error=error_message is not None)
         else:
-            log.warning("Document status update did not affect any rows", document_id=document_id, status=status.value)
+            # This might happen if the document was deleted between checks
+            log.warning("Document status update did not affect any rows (document might not exist)", document_id=document_id, status=status.value)
         return success
     except Exception as e:
         log.error("Failed to update document status", error=e, document_id=document_id, status=status.value, exc_info=True)
         raise
 
 async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]]:
-    """Obtiene el estado actual y otra información relevante de un documento."""
+    """Obtiene el estado y otros datos de un documento."""
     pool = await get_db_pool()
+    # Include company_id for potential authorization checks
     query = """
-        SELECT id, status, file_name, file_type, chunk_count, error_message, updated_at
+        SELECT id, company_id, status, file_name, file_type, chunk_count, error_message, updated_at
         FROM DOCUMENTS
         WHERE id = $1;
     """
     try:
-        record = await pool.fetchrow(query, document_id)
+        async with pool.acquire() as connection:
+            record = await connection.fetchrow(query, document_id)
         if record:
+            # Convert asyncpg Record to dict
             return dict(record)
         log.warning("Document status requested for non-existent ID", document_id=document_id)
         return None
@@ -151,33 +175,4 @@ async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]
         log.error("Failed to get document status", error=e, document_id=document_id, exc_info=True)
         raise
 
-async def save_chunks(document_id: uuid.UUID, chunks: List[Dict[str, Any]]):
-    """Guarda los chunks procesados en la base de datos."""
-    pool = await get_db_pool()
-    query = """
-        INSERT INTO DOCUMENT_CHUNKS (id, document_id, chunk_index, content, metadata, embedding_id)
-        VALUES ($1, $2, $3, $4, $5, $6);
-    """
-    records_to_insert = []
-    for i, chunk_data in enumerate(chunks):
-        chunk_id = uuid.uuid4()
-        # Asignar el ID generado aquí para poder usarlo al insertar en Milvus
-        chunk_data['db_id'] = chunk_id
-        records_to_insert.append((
-            chunk_id,
-            document_id,
-            chunk_data.get('chunk_index', i), # Usar índice si viene, sino el de la lista
-            chunk_data['content'],
-            chunk_data.get('metadata', {}), # Asegurar que metadata exista
-            chunk_data.get('embedding_id') # Puede ser None inicialmente
-        ))
-
-    try:
-        # Usar transaction para asegurar atomicidad
-        async with pool.acquire() as connection:
-            async with connection.transaction():
-                await connection.executemany(query, records_to_insert)
-        log.info(f"Saved {len(records_to_insert)} chunks for document", document_id=document_id)
-    except Exception as e:
-        log.error("Failed to save document chunks", error=e, document_id=document_id, num_chunks=len(records_to_insert), exc_info=True)
-        raise
+# Removed save_chunks function as Haystack DocumentWriter handles persistence to Milvus
