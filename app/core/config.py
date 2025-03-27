@@ -2,47 +2,60 @@ import logging
 import os
 from typing import Optional, List
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import RedisDsn, PostgresDsn, AnyHttpUrl, SecretStr, Field
+from pydantic import RedisDsn, PostgresDsn, AnyHttpUrl, SecretStr, Field, validator
 
 # Define niveles de log para que Pydantic los reconozca
 LogLevel = logging.getLevelName # type: ignore
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file='.env',
+        env_file='.env',        # Still useful for local dev, K8s uses env vars
+        env_prefix='INGEST_',   # Optional: Add prefix to env vars
         env_file_encoding='utf-8',
         case_sensitive=False,
         extra='ignore'
     )
 
     # --- General ---
-    PROJECT_NAME: str = "Ingest Service (Haystack)"
+    PROJECT_NAME: str = "Ingest Service (Haystack/K8s)"
     API_V1_STR: str = "/api/v1"
     LOG_LEVEL: LogLevel = logging.INFO # type: ignore
 
-    # --- Celery ---
-    CELERY_BROKER_URL: RedisDsn = RedisDsn("redis://localhost:6379/0") # type: ignore
-    CELERY_RESULT_BACKEND: RedisDsn = RedisDsn("redis://localhost:6379/1") # type: ignore
+    # --- Celery (using K8s service names) ---
+    CELERY_BROKER_URL: RedisDsn = RedisDsn("redis://redis-service:6379/0") # type: ignore
+    CELERY_RESULT_BACKEND: RedisDsn = RedisDsn("redis://redis-service:6379/1") # type: ignore
 
-    # --- Databases ---
-    POSTGRES_DSN: PostgresDsn = PostgresDsn("postgresql+asyncpg://user:pass@host:port/db") # type: ignore
-    MILVUS_URI: str = "http://localhost:19530"
-    MILVUS_COLLECTION_NAME: str = "document_chunks_haystack" # Consider renaming
-    MILVUS_INDEX_PARAMS: dict = Field(default={ # Default index params
-        "metric_type": "COSINE", # OpenAI embeddings often use cosine similarity
+    # --- Databases (using K8s service names) ---
+    # Format: postgresql+asyncpg://<user>:<password>@<host>:<port>/<dbname>
+    POSTGRES_USER: str = "user"
+    POSTGRES_PASSWORD: SecretStr = SecretStr("password") # Load from Secret
+    POSTGRES_SERVER: str = "postgres-service"
+    POSTGRES_PORT: str = "5432"
+    POSTGRES_DB: str = "mydatabase"
+    POSTGRES_DSN: Optional[PostgresDsn] = None # Will be constructed
+
+    MILVUS_URI: str = "http://milvus-service:19530" # K8s service name
+    MILVUS_COLLECTION_NAME: str = "document_chunks_haystack"
+    MILVUS_INDEX_PARAMS: dict = Field(default={
+        "metric_type": "COSINE",
         "index_type": "HNSW",
         "params": {"M": 16, "efConstruction": 256}
     })
     MILVUS_SEARCH_PARAMS: dict = Field(default={"metric_type": "COSINE", "params": {"ef": 128}})
 
+    # --- MinIO Storage (using K8s service name) ---
+    MINIO_ENDPOINT: str = "minio-service:9000" # K8s service name and port
+    MINIO_ACCESS_KEY: SecretStr = SecretStr("minioadmin") # Load from Secret
+    MINIO_SECRET_KEY: SecretStr = SecretStr("minioadmin") # Load from Secret
+    MINIO_BUCKET_NAME: str = "ingested-documents"
+    MINIO_USE_SECURE: bool = False # Use HTTP within cluster by default
 
-    # --- External Services (Only Storage and potentially OCR remain) ---
-    STORAGE_SERVICE_URL: AnyHttpUrl = AnyHttpUrl("http://localhost:8001/api/v1/storage") # type: ignore
+    # --- External Services (Only OCR if needed) ---
     # Optional: Keep OCR service if needed for images/scanned PDFs
-    OCR_SERVICE_URL: Optional[AnyHttpUrl] = None # type: ignore # Example: "http://localhost:8002/api/v1/ocr"
+    OCR_SERVICE_URL: Optional[AnyHttpUrl] = None # type: ignore # Example: "http://ocr-service:8002/api/v1/ocr"
 
     # --- Service Client Config ---
-    HTTP_CLIENT_TIMEOUT: int = 60 # Increased timeout for potentially longer calls
+    HTTP_CLIENT_TIMEOUT: int = 60
     HTTP_CLIENT_MAX_RETRIES: int = 2
     HTTP_CLIENT_BACKOFF_FACTOR: float = 1.0
 
@@ -50,47 +63,51 @@ class Settings(BaseSettings):
     SUPPORTED_CONTENT_TYPES: List[str] = Field(default=[
         "application/pdf",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document", # docx
-        "text/plain",
-        "text/markdown",
-        "text/html",
-        "image/jpeg", # Keep if OCR service is used
-        "image/png",  # Keep if OCR service is used
+        "text/plain", "text/markdown", "text/html",
+        "image/jpeg", "image/png", # Keep if OCR service is used
     ])
-    # Content types definitely needing the external OCR service
-    EXTERNAL_OCR_REQUIRED_CONTENT_TYPES: List[str] = Field(default=[
-        "image/jpeg",
-        "image/png",
-    ])
-    # Haystack DocumentSplitter settings
+    EXTERNAL_OCR_REQUIRED_CONTENT_TYPES: List[str] = Field(default=["image/jpeg", "image/png"])
     SPLITTER_CHUNK_SIZE: int = 500
     SPLITTER_CHUNK_OVERLAP: int = 50
-    SPLITTER_SPLIT_BY: str = "word" # or "sentence", "passage"
+    SPLITTER_SPLIT_BY: str = "word"
 
     # --- OpenAI ---
-    OPENAI_API_KEY: SecretStr = SecretStr("sk-...") # Loaded from env var OPENAI_API_KEY
-    OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small" # Or "text-embedding-ada-002", "text-embedding-3-large"
-    # Dimension needs to match the model
-    # text-embedding-3-small: 1536
-    # text-embedding-ada-002: 1536
-    # text-embedding-3-large: 3072
-    EMBEDDING_DIMENSION: int = 1536 # Adjust based on OPENAI_EMBEDDING_MODEL
+    OPENAI_API_KEY: SecretStr = SecretStr("sk-...") # Loaded from Secret
+    OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
+    EMBEDDING_DIMENSION: int = 1536
 
     # --- MilvusDocumentStore Fields ---
-    # Ensure these match your Milvus schema and needs
     MILVUS_CONTENT_FIELD: str = "content"
     MILVUS_EMBEDDING_FIELD: str = "embedding"
-    MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name", "file_type"]) # Fields from Haystack Doc.meta to store
+    MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name", "file_type"])
 
+    # --- Validators ---
+    @validator("POSTGRES_DSN", pre=True, always=True)
+    def assemble_postgres_dsn(cls, v: Optional[str], values: dict[str, Any]) -> Any:
+        if isinstance(v, str):
+            return v
+        return PostgresDsn.build(
+            scheme="postgresql+asyncpg",
+            username=values.get("POSTGRES_USER"),
+            password=values.get("POSTGRES_PASSWORD").get_secret_value() if values.get("POSTGRES_PASSWORD") else None, # type: ignore
+            host=values.get("POSTGRES_SERVER"),
+            port=int(values.get("POSTGRES_PORT", 5432)), # type: ignore
+            path=f"{values.get('POSTGRES_DB') or ''}",
+        )
+
+    @validator("EMBEDDING_DIMENSION", pre=True, always=True)
+    def set_embedding_dimension(cls, v: int, values: dict[str, Any]) -> int:
+        model = values.get("OPENAI_EMBEDDING_MODEL")
+        if model == "text-embedding-3-large":
+            return 3072
+        elif model in ["text-embedding-3-small", "text-embedding-ada-002"]:
+            return 1536
+        # Add other models if needed
+        return v # Return existing or default if model not matched
 
 settings = Settings()
 
-# Override Milvus dimension based on selected model if needed (simple example)
-if settings.OPENAI_EMBEDDING_MODEL == "text-embedding-3-large":
-    settings.EMBEDDING_DIMENSION = 3072
-elif settings.OPENAI_EMBEDDING_MODEL in ["text-embedding-3-small", "text-embedding-ada-002"]:
-    settings.EMBEDDING_DIMENSION = 1536
-
-# Add OPENAI_API_KEY to environment if not set, for Haystack Secret loading
-# In production, this should absolutely be set externally (k8s secret, etc.)
-if "OPENAI_API_KEY" not in os.environ and settings.OPENAI_API_KEY:
-     os.environ["OPENAI_API_KEY"] = settings.OPENAI_API_KEY.get_secret_value()
+# Ensure OpenAI key is in env for Haystack Secret (should be set via K8s Secret)
+# if "OPENAI_API_KEY" not in os.environ and settings.OPENAI_API_KEY:
+#     os.environ["OPENAI_API_KEY"] = settings.OPENAI_API_KEY.get_secret_value()
+# --> Remove this block. Rely solely on K8s secrets for production.

@@ -2,6 +2,7 @@ import uuid
 from typing import Dict, Any, Optional
 import json
 import structlog
+import io
 
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, status, Form, Header
 
@@ -9,7 +10,7 @@ from app.api.v1 import schemas
 from app.core.config import settings
 from app.db import postgres_client
 from app.tasks.process_document import process_document_haystack_task # Use the new task
-from app.services.storage_client import StorageServiceClient # Need this client
+from app.services.minio_client import MinioStorageClient
 
 log = structlog.get_logger(__name__)
 
@@ -54,68 +55,77 @@ async def ingest_document_haystack(
     request_log = log.bind(company_id=str(company_id), filename=file.filename, content_type=file.content_type)
     request_log.info("Received document ingestion request (Haystack)")
 
-    # 1. Validate Content Type
-    if file.content_type not in settings.SUPPORTED_CONTENT_TYPES:
-        request_log.warning("Unsupported content type received")
+     # 1. Validate Content Type
+    if not file.content_type or file.content_type not in settings.SUPPORTED_CONTENT_TYPES:
+        request_log.warning("Unsupported or missing content type received", received_type=file.content_type)
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail=f"Unsupported file type: {file.content_type}. Supported types: {settings.SUPPORTED_CONTENT_TYPES}",
+            detail=f"Unsupported file type: {file.content_type or 'Unknown'}. Supported types: {settings.SUPPORTED_CONTENT_TYPES}",
         )
+    content_type = file.content_type # Use validated type
 
     # 2. Validate Metadata
     try:
         metadata = json.loads(metadata_json)
         if not isinstance(metadata, dict):
             raise ValueError("Metadata must be a JSON object")
-        # Optional: Validate metadata against a Pydantic schema here
-        # schemas.DocumentMetadata(**metadata)
     except json.JSONDecodeError:
          raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON format for metadata")
-    except Exception as e: # Catch validation errors too
+    except Exception as e:
          raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid metadata: {e}")
 
-    # --- Refactored Flow: Store first, then queue ---
-    storage_client = StorageServiceClient()
-    file_path: Optional[str] = None
+
+    minio_client = MinioStorageClient() # Initialize MinIO client
+    minio_object_name: Optional[str] = None
     document_id: Optional[uuid.UUID] = None
     task_id: Optional[str] = None
 
     try:
-        # 3. Upload to Storage Service
-        request_log.info("Uploading file to storage service...")
-        # Read content once
-        file_content = await file.read()
-        if not file_content:
-             raise ValueError("Uploaded file is empty.")
-
-        # Use BytesIO to pass content to the client
-        file_stream = io.BytesIO(file_content)
-        file_path = await storage_client.upload_file(
-            company_id=company_id,
-            file_name=file.filename or "untitled",
-            file_content=file_stream, # Pass the stream
-            content_type=file.content_type or "application/octet-stream"
-        )
-        request_log.info("File uploaded successfully", file_path=file_path)
-
-        # 4. Create initial record in PostgreSQL AFTER successful upload
+        # 3. Create initial DB record FIRST to get document_id
         document_id = await postgres_client.create_document(
             company_id=company_id,
             file_name=file.filename or "untitled",
-            file_type=file.content_type or "application/octet-stream",
+            file_type=content_type,
             metadata=metadata,
-            # file_path is now set via update_document_status in the task
         )
         request_log = request_log.bind(document_id=str(document_id))
         request_log.info("Initial document record created in DB")
 
-        # 5. Enqueue Celery Task with file_path
+        # 4. Upload to MinIO using document_id in the object name
+        request_log.info("Uploading file to MinIO...")
+        file_content = await file.read() # Read content
+        content_length = len(file_content)
+        if content_length == 0:
+            raise ValueError("Uploaded file is empty.")
+
+        file_stream = io.BytesIO(file_content) # Create stream
+        minio_object_name = await minio_client.upload_file(
+            company_id=company_id,
+            document_id=document_id, # Use the generated ID
+            file_name=file.filename or "untitled",
+            file_content_stream=file_stream,
+            content_type=content_type,
+            content_length=content_length
+        )
+        request_log.info("File uploaded successfully to MinIO", object_name=minio_object_name)
+
+        # 5. Update DB record with MinIO path (object name)
+        #    This could also be done in the Celery task, but doing it here confirms upload
+        await postgres_client.update_document_status(
+            document_id=document_id,
+            status=DocumentStatus.UPLOADED, # Keep as UPLOADED until task starts
+            file_path=minio_object_name # Store the object name
+        )
+        request_log.info("Document record updated with MinIO object name")
+
+
+        # 6. Enqueue Celery Task with MinIO object name
         task = process_document_haystack_task.delay(
             document_id_str=str(document_id),
             company_id_str=str(company_id),
-            file_path=file_path, # Pass the path from storage
+            minio_object_name=minio_object_name, # Pass object name instead of local path
             file_name=file.filename or "untitled",
-            content_type=file.content_type or "application/octet-stream",
+            content_type=content_type,
             original_metadata=metadata,
         )
         task_id = task.id
@@ -125,9 +135,9 @@ async def ingest_document_haystack(
 
     except Exception as e:
         request_log.error("Error during ingestion trigger", error=str(e), exc_info=True)
-        # Attempt to mark as error if DB record was created
         if document_id:
             try:
+                # Attempt to mark as error, don't overwrite file_path if it was set
                 await postgres_client.update_document_status(
                     document_id,
                     schemas.DocumentStatus.ERROR,
@@ -135,21 +145,20 @@ async def ingest_document_haystack(
                 )
             except Exception as db_err:
                  request_log.error("Failed to mark document as error after API failure", nested_error=str(db_err))
-        # Determine appropriate status code
+
         status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
         detail = "Failed to process ingestion request."
-        if isinstance(e, ValueError): # e.g., empty file
+        if isinstance(e, ValueError):
              status_code = status.HTTP_400_BAD_REQUEST
              detail = str(e)
-        elif isinstance(e, FileNotFoundError): # Should not happen if storage upload succeeded
-             status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
-             detail = "Storage inconsistency detected."
+        elif isinstance(e, S3Error): # Catch MinIO errors specifically
+             status_code = status.HTTP_503_SERVICE_UNAVAILABLE # Indicate storage issue
+             detail = f"Storage service error: {e.code}"
 
         raise HTTPException(status_code=status_code, detail=detail)
 
     finally:
         await file.close()
-        await storage_client.close()
 
 
 @router.get(

@@ -18,9 +18,10 @@ python-jose = {extras = ["cryptography"], version = "^3.3.0"} # Para JWT (aunque
 tenacity = "^8.2.3" # Para retries
 python-multipart = "^0.0.9" # Para file uploads
 structlog = "^24.1.0" # Para logging estructurado
+minio = "^7.1.17" # Add minio client
 # Opcional: Haystack (si se usan componentes directamente)
 # haystack-ai = "^2.0.0"
-# sentence-transformers = "..." # Si se usa embedder localmente
+
 
 [tool.poetry.dev-dependencies]
 pytest = "^7.4.4"
