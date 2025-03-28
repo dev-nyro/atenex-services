@@ -1,6 +1,7 @@
 import logging
 import os
-from typing import Optional, List
+# Add 'Any' to this import
+from typing import Optional, List, Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import RedisDsn, PostgresDsn, AnyHttpUrl, SecretStr, Field, validator
 
@@ -82,17 +83,21 @@ class Settings(BaseSettings):
     MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name", "file_type"])
 
     # --- Validators ---
+    # Make sure 'Any' comes from typing import above
     @validator("POSTGRES_DSN", pre=True, always=True)
     def assemble_postgres_dsn(cls, v: Optional[str], values: dict[str, Any]) -> Any:
         if isinstance(v, str):
             return v
+        # Ensure password handling is correct
+        password = values.get("POSTGRES_PASSWORD")
+        password_value = password.get_secret_value() if password else None
         return PostgresDsn.build(
             scheme="postgresql+asyncpg",
             username=values.get("POSTGRES_USER"),
-            password=values.get("POSTGRES_PASSWORD").get_secret_value() if values.get("POSTGRES_PASSWORD") else None, # type: ignore
+            password=password_value,
             host=values.get("POSTGRES_SERVER"),
             port=int(values.get("POSTGRES_PORT", 5432)), # type: ignore
-            path=f"{values.get('POSTGRES_DB') or ''}",
+            path=f"/{values.get('POSTGRES_DB') or ''}", # Add leading slash for path
         )
 
     @validator("EMBEDDING_DIMENSION", pre=True, always=True)
@@ -106,8 +111,3 @@ class Settings(BaseSettings):
         return v # Return existing or default if model not matched
 
 settings = Settings()
-
-# Ensure OpenAI key is in env for Haystack Secret (should be set via K8s Secret)
-# if "OPENAI_API_KEY" not in os.environ and settings.OPENAI_API_KEY:
-#     os.environ["OPENAI_API_KEY"] = settings.OPENAI_API_KEY.get_secret_value()
-# --> Remove this block. Rely solely on K8s secrets for production.
