@@ -1,55 +1,43 @@
+# ./app/db/postgres_client.py
+# MINOR IMPROVEMENT APPLIED
 import uuid
 from typing import Any, Optional, Dict, List
 import asyncpg
-from pydantic import BaseModel, Field
+# from pydantic import BaseModel, Field # Not strictly needed here anymore
 import structlog
-import json # Import json for metadata serialization
+import json
 
 from app.core.config import settings
 from app.models.domain import DocumentStatus
 
 log = structlog.get_logger(__name__)
 
-# --- Pydantic models remain useful for clarity ---
-class DocumentRecord(BaseModel):
-    id: uuid.UUID
-    company_id: uuid.UUID
-    file_name: str
-    file_type: str
-    file_path: str
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-    chunk_count: Optional[int] = None
-    status: DocumentStatus
-    error_message: Optional[str] = None
-
-# DocumentChunkRecord might not be needed if all info is in Milvus + Haystack Document
-# class DocumentChunkRecord(BaseModel): ...
-
 # --- Database Interaction Logic ---
 _pool: Optional[asyncpg.Pool] = None
 
 async def get_db_pool() -> asyncpg.Pool:
-    """Obtiene o crea el pool de conexiones a la base de datos."""
+    """Obtiene o crea el pool de conexiones a la base de datos (Supabase)."""
     global _pool
-    if _pool is None or _pool._closed: # Check if pool is closed
+    if _pool is None or _pool._closed:
         try:
-            log.info("Creating database connection pool...")
+            if not settings.POSTGRES_DSN:
+                 raise ValueError("PostgreSQL DSN is not configured.")
+            log.info("Creating Supabase/PostgreSQL connection pool...", dsn_host=settings.POSTGRES_SERVER)
             _pool = await asyncpg.create_pool(
                 dsn=str(settings.POSTGRES_DSN),
                 min_size=5,
                 max_size=20,
-                # Setup to automatically encode/decode JSONB
                 init=lambda conn: conn.set_type_codec(
                     'jsonb',
-                    encoder=lambda d: json.dumps(d),
-                    decoder=lambda s: json.loads(s),
+                    encoder=json.dumps, # Use standard json.dumps
+                    decoder=json.loads, # Use standard json.loads
                     schema='pg_catalog',
-                    format='text' # Use text format for JSONB with asyncpg
+                    format='text'
                 )
             )
-            log.info("Database connection pool created successfully.")
+            log.info("Supabase/PostgreSQL connection pool created successfully.")
         except Exception as e:
-            log.error("Failed to create database connection pool", error=str(e), dsn=str(settings.POSTGRES_DSN), exc_info=True)
+            log.error("Failed to create Supabase/PostgreSQL connection pool", error=str(e), host=settings.POSTGRES_SERVER, db=settings.POSTGRES_DB, user=settings.POSTGRES_USER, dsn_set=bool(settings.POSTGRES_DSN), exc_info=True)
             raise
     return _pool
 
@@ -57,34 +45,36 @@ async def close_db_pool():
     """Cierra el pool de conexiones."""
     global _pool
     if _pool and not _pool._closed:
-        log.info("Closing database connection pool...")
+        log.info("Closing Supabase/PostgreSQL connection pool...")
         await _pool.close()
         _pool = None
-        log.info("Database connection pool closed.")
+        log.info("Supabase/PostgreSQL connection pool closed.")
 
 async def create_document(
     company_id: uuid.UUID,
     file_name: str,
     file_type: str,
-    metadata: Dict[str, Any]
+    metadata: Dict[str, Any] # Pass the original dictionary
 ) -> uuid.UUID:
-    """Crea un registro inicial para el documento."""
+    """Crea un registro inicial para el documento en la tabla DOCUMENTS."""
     pool = await get_db_pool()
     doc_id = uuid.uuid4()
-    # Ensure metadata is serializable (Pydantic model would handle this better)
-    try:
-        serialized_metadata = json.dumps(metadata)
-    except TypeError as e:
-        log.error("Metadata is not JSON serializable", metadata=metadata, error=e)
-        raise ValueError("Provided metadata cannot be serialized to JSON") from e
+
+    # No need to manually serialize metadata if pool init handles jsonb codec
+    # try:
+    #     serialized_metadata = json.dumps(metadata)
+    # except TypeError as e:
+    #     log.error("Metadata is not JSON serializable", metadata=metadata, error=e)
+    #     raise ValueError("Provided metadata cannot be serialized to JSON") from e
 
     query = """
-        INSERT INTO DOCUMENTS (id, company_id, file_name, file_type, metadata, status, file_path, uploaded_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5::jsonb, $6, '', NOW(), NOW())
+        INSERT INTO documents (id, company_id, file_name, file_type, metadata, status, file_path, uploaded_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, '', NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC')
         RETURNING id;
     """
+    # Note: $5 is now directly the metadata dict, asyncpg's codec handles it.
+
     try:
-        # Use acquire() for potentially better connection handling within a request/task
         async with pool.acquire() as connection:
             result = await connection.fetchval(
                 query,
@@ -92,17 +82,22 @@ async def create_document(
                 company_id,
                 file_name,
                 file_type,
-                serialized_metadata, # Pass the serialized string
+                metadata, # Pass the dictionary directly
                 DocumentStatus.UPLOADED.value
             )
         if result:
-            log.info("Document record created", document_id=doc_id, company_id=company_id)
+            log.info("Document record created in Supabase", document_id=doc_id, company_id=company_id)
             return result
         else:
+             log.error("Failed to create document record, no ID returned.", document_id=doc_id)
              raise RuntimeError("Failed to create document record, no ID returned.")
+    except asyncpg.exceptions.UniqueViolationError as e:
+        log.error("Failed to create document record due to unique constraint violation.", error=str(e), document_id=doc_id, company_id=company_id, exc_info=True)
+        raise ValueError(f"Document creation failed: {e}") from e
     except Exception as e:
-        log.error("Failed to create document record", error=e, company_id=company_id, file_name=file_name, exc_info=True)
+        log.error("Failed to create document record in Supabase", error=str(e), document_id=doc_id, company_id=company_id, file_name=file_name, exc_info=True)
         raise
+
 
 async def update_document_status(
     document_id: uuid.UUID,
@@ -111,9 +106,10 @@ async def update_document_status(
     chunk_count: Optional[int] = None,
     error_message: Optional[str] = None,
 ) -> bool:
-    """Actualiza el estado y otros campos de un documento."""
+    """Actualiza el estado y otros campos de un documento en la tabla DOCUMENTS."""
+    # This function remains logically the same as before.
     pool = await get_db_pool()
-    fields_to_update = ["status = $2", "updated_at = NOW()"]
+    fields_to_update = ["status = $2", "updated_at = NOW() AT TIME ZONE 'UTC'"]
     params: List[Any] = [document_id, status.value]
     current_param_index = 3
 
@@ -125,54 +121,50 @@ async def update_document_status(
         fields_to_update.append(f"chunk_count = ${current_param_index}")
         params.append(chunk_count)
         current_param_index += 1
-    # Handle error message update carefully
     if status == DocumentStatus.ERROR:
         fields_to_update.append(f"error_message = ${current_param_index}")
-        # Truncate error message if too long for DB column
         params.append(error_message[:1000] if error_message else "Unknown processing error")
+        current_param_index += 1
     else:
-        # Clear error message if status is not ERROR
         fields_to_update.append("error_message = NULL")
 
-
     query = f"""
-        UPDATE DOCUMENTS
+        UPDATE documents
         SET {', '.join(fields_to_update)}
         WHERE id = $1;
     """
     try:
         async with pool.acquire() as connection:
              result = await connection.execute(query, *params)
-        success = result == "UPDATE 1"
+        success = result.startswith("UPDATE ") and int(result.split(" ")[1]) > 0
         if success:
-            log.info("Document status updated", document_id=document_id, status=status.value, file_path=file_path, chunk_count=chunk_count, has_error=error_message is not None)
+            log.info("Document status updated in Supabase", document_id=document_id, new_status=status.value, file_path=file_path, chunk_count=chunk_count, has_error=(status == DocumentStatus.ERROR))
         else:
-            # This might happen if the document was deleted between checks
-            log.warning("Document status update did not affect any rows (document might not exist)", document_id=document_id, status=status.value)
+            log.warning("Document status update did not affect any rows (document might not exist?)", document_id=document_id, new_status=status.value)
         return success
     except Exception as e:
-        log.error("Failed to update document status", error=e, document_id=document_id, status=status.value, exc_info=True)
+        log.error("Failed to update document status in Supabase", error=str(e), document_id=document_id, new_status=status.value, exc_info=True)
         raise
 
+
 async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]]:
-    """Obtiene el estado y otros datos de un documento."""
+    """Obtiene el estado y otros datos de un documento de la tabla DOCUMENTS."""
+    # This function remains logically the same as before.
     pool = await get_db_pool()
-    # Include company_id for potential authorization checks
     query = """
         SELECT id, company_id, status, file_name, file_type, chunk_count, error_message, updated_at
-        FROM DOCUMENTS
+        FROM documents
         WHERE id = $1;
     """
     try:
         async with pool.acquire() as connection:
             record = await connection.fetchrow(query, document_id)
         if record:
-            # Convert asyncpg Record to dict
-            return dict(record)
-        log.warning("Document status requested for non-existent ID", document_id=document_id)
-        return None
+            log.debug("Document status retrieved from Supabase", document_id=document_id)
+            return dict(record) # Convert Record to dict
+        else:
+            log.warning("Document status requested for non-existent ID", document_id=document_id)
+            return None
     except Exception as e:
-        log.error("Failed to get document status", error=e, document_id=document_id, exc_info=True)
+        log.error("Failed to get document status from Supabase", error=str(e), document_id=document_id, exc_info=True)
         raise
-
-# Removed save_chunks function as Haystack DocumentWriter handles persistence to Milvus
