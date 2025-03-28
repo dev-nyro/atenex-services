@@ -1,4 +1,4 @@
-# ./app/core/config.py (CORREGIDO - Defaults restaurados, prints eliminados)
+# ./app/core/config.py (CORREGIDO - POSTGRES_PORT como string)
 import logging
 import os
 from typing import Optional, List, Any
@@ -8,7 +8,7 @@ import sys
 
 # --- Supabase Connection Defaults ---
 SUPABASE_DEFAULT_HOST = "db.ymsilkrhstwxikjiqqog.supabase.co"
-SUPABASE_DEFAULT_PORT = 5432
+SUPABASE_DEFAULT_PORT_STR = "5432" # Default como string
 SUPABASE_DEFAULT_DB = "postgres"
 SUPABASE_DEFAULT_USER = "postgres"
 
@@ -34,35 +34,32 @@ class Settings(BaseSettings):
     POSTGRES_USER: str = SUPABASE_DEFAULT_USER
     POSTGRES_PASSWORD: SecretStr
     POSTGRES_SERVER: str = SUPABASE_DEFAULT_HOST
-    POSTGRES_PORT: int = SUPABASE_DEFAULT_PORT
+    # *** CORREGIDO: Definir como string ***
+    POSTGRES_PORT: str = SUPABASE_DEFAULT_PORT_STR # Leer/esperar como string
     POSTGRES_DB: str = SUPABASE_DEFAULT_DB
     POSTGRES_DSN: Optional[PostgresDsn] = None
 
     # --- Milvus ---
     MILVUS_URI: str = "http://milvus-service:19530"
     MILVUS_COLLECTION_NAME: str = "document_chunks_haystack"
-    # *** CORREGIDO: Default completo ***
     MILVUS_INDEX_PARAMS: dict = Field(default={
         "metric_type": "COSINE",
         "index_type": "HNSW",
         "params": {"M": 16, "efConstruction": 256}
     })
-    # *** CORREGIDO: Default completo ***
     MILVUS_SEARCH_PARAMS: dict = Field(default={
         "metric_type": "COSINE",
         "params": {"ef": 128}
     })
     MILVUS_CONTENT_FIELD: str = "content"
     MILVUS_EMBEDDING_FIELD: str = "embedding"
-    # *** CORREGIDO: Default completo ***
-    # Ajusta esta lista según los metadatos REALES que necesites en Milvus
     MILVUS_METADATA_FIELDS: List[str] = Field(default=[
         "company_id",
         "document_id",
         "file_name",
         "file_type",
-        # "category", # Ejemplo
-        # "source",   # Ejemplo
+        # "category",
+        # "source",
     ])
 
     # --- MinIO Storage ---
@@ -81,7 +78,6 @@ class Settings(BaseSettings):
     HTTP_CLIENT_BACKOFF_FACTOR: float = 1.0
 
     # --- File Processing & Haystack ---
-    # *** CORREGIDO: Default completo ***
     SUPPORTED_CONTENT_TYPES: List[str] = Field(default=[
         "application/pdf",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document", # docx
@@ -91,7 +87,6 @@ class Settings(BaseSettings):
         "image/jpeg",
         "image/png",
     ])
-    # *** CORREGIDO: Default completo ***
     EXTERNAL_OCR_REQUIRED_CONTENT_TYPES: List[str] = Field(default=[
         "image/jpeg",
         "image/png"
@@ -108,11 +103,6 @@ class Settings(BaseSettings):
     # --- Validators ---
     @validator("POSTGRES_DSN", pre=True, always=True)
     def assemble_postgres_dsn(cls, v: Optional[str], values: dict[str, Any]) -> Any:
-        """
-        Constructs the DSN string for asyncpg if not provided explicitly.
-        Ensures the format is correct for Supabase Direct Connection.
-        (Lógica corregida en respuesta anterior, sin prints ahora)
-        """
         if isinstance(v, str):
             try:
                 dsn = PostgresDsn(v)
@@ -128,19 +118,24 @@ class Settings(BaseSettings):
         password_value = password_obj.get_secret_value()
         user = values.get("POSTGRES_USER")
         server = values.get("POSTGRES_SERVER")
-        port = values.get("POSTGRES_PORT")
+        # *** CORREGIDO: 'port' ahora es string ***
+        port = values.get("POSTGRES_PORT") # Ahora es un string "5432"
         db_name = values.get("POSTGRES_DB")
+
         if not all([user, server, port, db_name]):
              missing = [k for k, val in {"user": user, "server": server, "port": port, "db": db_name}.items() if not val]
              raise ValueError(f"Missing required PostgreSQL connection parts: {missing}")
+
         try:
+            # Pydantic.build debe manejar el puerto como string correctamente
             dsn = PostgresDsn.build(
                 scheme="postgresql+asyncpg",
                 username=user,
                 password=password_value,
                 host=server,
+                # *** CORREGIDO: Pasar el puerto (que ahora es string) directamente ***
                 port=port,
-                path=db_name or None, # Correct path logic
+                path=db_name or None,
             )
             return str(dsn)
         except ValidationError as e:
@@ -164,10 +159,9 @@ class Settings(BaseSettings):
 # Create the settings instance globally
 try:
     settings = Settings()
-except (ValidationError, ValueError) as e: # Catch both Pydantic and our ValueErrors
-    # Log critical error clearly
+except (ValidationError, ValueError) as e:
     print(f"FATAL: Configuration validation failed:\n{e}")
-    sys.exit(1) # Ensure exit on any validation failure
-except Exception as e: # Catch any other unexpected error
+    sys.exit(1)
+except Exception as e:
     print(f"FATAL: Unexpected error during Settings instantiation:\n{e}")
     sys.exit(1)
