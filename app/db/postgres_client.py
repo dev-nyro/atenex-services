@@ -1,3 +1,4 @@
+# ./app/db/postgres_client.py (CORREGIDO)
 import uuid
 from typing import Any, Optional, Dict, List
 import asyncpg
@@ -16,10 +17,10 @@ async def get_db_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None or _pool._closed:
         try:
-            # *** CORRECCIÓN: Usar argumentos nombrados en lugar de DSN string ***
+            # *** CORREGIDO: Loguear los parámetros que SÍ se usan para conectar ***
             log.info("Creating Supabase/PostgreSQL connection pool using arguments...",
                      host=settings.POSTGRES_SERVER,
-                     port=settings.POSTGRES_PORT,
+                     port=settings.POSTGRES_PORT, # Usará el puerto del Pooler (6543) desde config
                      user=settings.POSTGRES_USER,
                      database=settings.POSTGRES_DB)
 
@@ -28,9 +29,12 @@ async def get_db_pool() -> asyncpg.Pool:
                 password=settings.POSTGRES_PASSWORD.get_secret_value(),
                 database=settings.POSTGRES_DB,
                 host=settings.POSTGRES_SERVER,
-                port=settings.POSTGRES_PORT,
-                min_size=5,
-                max_size=20,
+                port=settings.POSTGRES_PORT, # Tomará el valor de settings (6543 por defecto o de ConfigMap)
+                min_size=5,  # Ajustar según necesidad
+                max_size=20, # Ajustar según necesidad
+                # Añadir configuraciones de timeout si es necesario
+                # command_timeout=60, # Timeout para comandos individuales
+                # timeout=300, # Timeout general? Revisar docs de asyncpg
                 # El init para jsonb sigue siendo útil
                 init=lambda conn: conn.set_type_codec(
                     'jsonb',
@@ -41,11 +45,27 @@ async def get_db_pool() -> asyncpg.Pool:
                 )
             )
             log.info("Supabase/PostgreSQL connection pool created successfully.")
+        except OSError as e:
+             # Capturar específicamente errores de red/OS como 'Network unreachable'
+             log.error("Network/OS error creating Supabase/PostgreSQL connection pool",
+                      error=str(e),
+                      errno=e.errno if hasattr(e, 'errno') else None,
+                      host=settings.POSTGRES_SERVER,
+                      port=settings.POSTGRES_PORT,
+                      db=settings.POSTGRES_DB,
+                      user=settings.POSTGRES_USER,
+                      exc_info=True) # Incluir traceback
+             raise # Re-lanzar para que falle el startup
+        except asyncpg.exceptions.InvalidPasswordError:
+             log.error("Invalid password for Supabase/PostgreSQL connection",
+                       host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT, user=settings.POSTGRES_USER)
+             raise
         except Exception as e:
             # Loguear el error específico
             log.error("Failed to create Supabase/PostgreSQL connection pool",
                       error=str(e),
                       host=settings.POSTGRES_SERVER,
+                      port=settings.POSTGRES_PORT,
                       db=settings.POSTGRES_DB,
                       user=settings.POSTGRES_USER,
                       exc_info=True) # Incluir traceback
@@ -61,6 +81,10 @@ async def close_db_pool():
         _pool = None
         log.info("Supabase/PostgreSQL connection pool closed.")
 
+# --- Funciones create_document, update_document_status, get_document_status ---
+# (Sin cambios necesarios en la lógica interna, ya usan los parámetros individuales
+# y el pool correctamente. Se mantienen como estaban en tu versión original)
+
 async def create_document(
     company_id: uuid.UUID,
     file_name: str,
@@ -71,13 +95,6 @@ async def create_document(
     pool = await get_db_pool()
     doc_id = uuid.uuid4()
 
-    # No need to manually serialize metadata if pool init handles jsonb codec
-    # try:
-    #     serialized_metadata = json.dumps(metadata)
-    # except TypeError as e:
-    #     log.error("Metadata is not JSON serializable", metadata=metadata, error=e)
-    #     raise ValueError("Provided metadata cannot be serialized to JSON") from e
-
     query = """
         INSERT INTO documents (id, company_id, file_name, file_type, metadata, status, file_path, uploaded_at, updated_at)
         VALUES ($1, $2, $3, $4, $5, $6, '', NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC')
@@ -87,15 +104,16 @@ async def create_document(
 
     try:
         async with pool.acquire() as connection:
-            result = await connection.fetchval(
-                query,
-                doc_id,
-                company_id,
-                file_name,
-                file_type,
-                metadata, # Pass the dictionary directly
-                DocumentStatus.UPLOADED.value
-            )
+            # async with connection.transaction(): # Consider transaction if needed
+                result = await connection.fetchval(
+                    query,
+                    doc_id,
+                    company_id,
+                    file_name,
+                    file_type,
+                    metadata, # Pass the dictionary directly
+                    DocumentStatus.UPLOADED.value
+                )
         if result:
             log.info("Document record created in Supabase", document_id=doc_id, company_id=company_id)
             return result
@@ -103,11 +121,12 @@ async def create_document(
              log.error("Failed to create document record, no ID returned.", document_id=doc_id)
              raise RuntimeError("Failed to create document record, no ID returned.")
     except asyncpg.exceptions.UniqueViolationError as e:
-        log.error("Failed to create document record due to unique constraint violation.", error=str(e), document_id=doc_id, company_id=company_id, exc_info=True)
-        raise ValueError(f"Document creation failed: {e}") from e
+        log.error("Failed to create document record due to unique constraint violation.", error=str(e), document_id=doc_id, company_id=company_id, exc_info=False) # No need for full traceback usually
+        # Decide how to handle this - raise a specific error?
+        raise ValueError(f"Document creation failed: unique constraint violated ({e.constraint_name})") from e
     except Exception as e:
         log.error("Failed to create document record in Supabase", error=str(e), document_id=doc_id, company_id=company_id, file_name=file_name, exc_info=True)
-        raise
+        raise # Re-raise generic exceptions
 
 
 async def update_document_status(
@@ -118,7 +137,6 @@ async def update_document_status(
     error_message: Optional[str] = None,
 ) -> bool:
     """Actualiza el estado y otros campos de un documento en la tabla DOCUMENTS."""
-    # This function remains logically the same as before.
     pool = await get_db_pool()
     fields_to_update = ["status = $2", "updated_at = NOW() AT TIME ZONE 'UTC'"]
     params: List[Any] = [document_id, status.value]
@@ -133,10 +151,13 @@ async def update_document_status(
         params.append(chunk_count)
         current_param_index += 1
     if status == DocumentStatus.ERROR:
+        # Limitar longitud del mensaje de error
+        safe_error_message = (error_message or "Unknown processing error")[:1000]
         fields_to_update.append(f"error_message = ${current_param_index}")
-        params.append(error_message[:1000] if error_message else "Unknown processing error")
+        params.append(safe_error_message)
         current_param_index += 1
     else:
+        # Limpiar mensaje de error si el estado no es ERROR
         fields_to_update.append("error_message = NULL")
 
     query = f"""
@@ -146,8 +167,17 @@ async def update_document_status(
     """
     try:
         async with pool.acquire() as connection:
-             result = await connection.execute(query, *params)
-        success = result.startswith("UPDATE ") and int(result.split(" ")[1]) > 0
+             # async with connection.transaction(): # Consider transaction
+                result = await connection.execute(query, *params)
+        # Parse result string like 'UPDATE 1'
+        affected_rows = 0
+        if isinstance(result, str) and result.startswith("UPDATE "):
+            try:
+                affected_rows = int(result.split(" ")[1])
+            except (IndexError, ValueError):
+                log.warning("Could not parse affected rows from DB result", result_string=result)
+
+        success = affected_rows > 0
         if success:
             log.info("Document status updated in Supabase", document_id=document_id, new_status=status.value, file_path=file_path, chunk_count=chunk_count, has_error=(status == DocumentStatus.ERROR))
         else:
@@ -155,12 +185,11 @@ async def update_document_status(
         return success
     except Exception as e:
         log.error("Failed to update document status in Supabase", error=str(e), document_id=document_id, new_status=status.value, exc_info=True)
-        raise
+        raise # Re-raise generic exceptions
 
 
 async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]]:
     """Obtiene el estado y otros datos de un documento de la tabla DOCUMENTS."""
-    # This function remains logically the same as before.
     pool = await get_db_pool()
     query = """
         SELECT id, company_id, status, file_name, file_type, chunk_count, error_message, updated_at
@@ -172,10 +201,11 @@ async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]
             record = await connection.fetchrow(query, document_id)
         if record:
             log.debug("Document status retrieved from Supabase", document_id=document_id)
-            return dict(record) # Convert Record to dict
+            # Convert asyncpg.Record to dict for easier handling
+            return dict(record)
         else:
             log.warning("Document status requested for non-existent ID", document_id=document_id)
             return None
     except Exception as e:
         log.error("Failed to get document status from Supabase", error=str(e), document_id=document_id, exc_info=True)
-        raise
+        raise # Re-raise generic exceptions
