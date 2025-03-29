@@ -2,123 +2,156 @@ name: CI/CD Pipeline Docker -> Manifest Update
 
 on:
   push:
-    branches: [ "develop" ] # Dispara en push a la rama main
-  # Opcional: Descomenta si quieres que corra también en Pull Requests a main (sin hacer push/update)
-  # pull_request:
-  #   branches: [ "main" ]
+    branches: [ "develop" ] # Dispara en push a la rama develop
 
 env:
   # --- AJUSTA ESTAS VARIABLES ---
-  REGISTRY: ghcr.io                             # Usaremos GitHub Container Registry
-  # Reemplaza 'dev-nyro' con tu usuario u organización de GitHub
-  # Reemplaza 'ingest-service' con el nombre deseado para tu imagen
+  REGISTRY: ghcr.io
   IMAGE_NAME: ghcr.io/dev-nyro/ingest-service
-  MANIFEST_REPO_OWNER: dev-nyro                 # Dueño del repo de manifiestos
-  MANIFEST_REPO_NAME: manifests-nyro            # Nombre del repo de manifiestos
-  MANIFEST_REPO_BRANCH: develop                    # Rama a actualizar en el repo de manifiestos
-  MANIFEST_PATH_API: ingest-service/deployment-api.yaml    # Ruta al deployment API en el repo de manifiestos
-  MANIFEST_PATH_WORKER: ingest-service/deployment-worker.yaml # Ruta al deployment Worker en el repo de manifiestos
+  MANIFEST_REPO_OWNER: dev-nyro
+  MANIFEST_REPO_NAME: manifests-nyro
+  MANIFEST_REPO_BRANCH: develop
+  MANIFEST_PATH_API: ingest-service/deployment-api.yaml
+  MANIFEST_PATH_WORKER: ingest-service/deployment-worker.yaml
   # --- FIN DE VARIABLES AJUSTABLES ---
 
 jobs:
   build-push-update:
-    runs-on: ubuntu-latest # Usamos un runner estándar hospedado por GitHub
+    runs-on: ubuntu-latest
 
-    # Permisos necesarios:
-    # contents: read - para hacer checkout del código de la app
-    # packages: write - para hacer push de la imagen a GHCR
-    # id-token: write - (Opcional, para autenticación OIDC si se usa en lugar de PAT/GITHUB_TOKEN)
     permissions:
       contents: read
       packages: write
-      # Descomenta si usas OIDC en lugar de GITHUB_TOKEN para Docker login
-      # id-token: write
 
     steps:
       # 1. Checkout del código de la aplicación
       - name: Checkout Application Code
         uses: actions/checkout@v4
 
-      # 2. Configurar Docker Buildx (recomendado para build-push-action)
+      # 2. Configurar Docker Buildx
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       # 3. Login a GitHub Container Registry (GHCR)
-      #    Usa GITHUB_TOKEN que se provee automáticamente para autenticar.
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}       # Usuario de GitHub que ejecuta la acción
-          password: ${{ secrets.GITHUB_TOKEN }} # Token automático de la acción
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 4. Generar etiqueta para la imagen (similar a Tekton: branch-commitsha)
+      # 4. Generar etiqueta para la imagen
       - name: Generate Image Tag
         id: image_tag
         run: |
+          echo "::group::Generating Image Tag"
           # Usar el nombre de la rama (ref_name) y el hash corto del commit
           TAG="${{ github.ref_name }}-$(echo $GITHUB_SHA | cut -c1-7)"
-          # Asegurarse que la etiqueta sea válida para Docker (ej: reemplazar / en feature/branch)
+          # Asegurarse que la etiqueta sea válida para Docker
           TAG=$(echo $TAG | sed 's/[^a-zA-Z0-9.-]/-/g')
+          echo "Branch/Ref Name: ${{ github.ref_name }}"
+          echo "Commit SHA (short): $(echo $GITHUB_SHA | cut -c1-7)"
           echo "Generated Tag: $TAG"
-          # Guardar la etiqueta completa de la imagen para usarla después
+          FULL_IMAGE_NAME="${{ env.IMAGE_NAME }}:$TAG"
+          echo "Full Image Name: $FULL_IMAGE_NAME"
+          # Guardar para usar en pasos posteriores
           echo "image_tag=$TAG" >> $GITHUB_OUTPUT
-          echo "full_image_name=${{ env.IMAGE_NAME }}:$TAG" >> $GITHUB_OUTPUT
+          echo "full_image_name=$FULL_IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "::endgroup::"
 
       # 5. Construir y Empujar la imagen Docker a GHCR
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
-          context: . # Directorio que contiene el Dockerfile (raíz del repo)
-          file: ./Dockerfile # Ruta al Dockerfile
-          push: ${{ github.event_name == 'push' }} # Solo hacer push si el evento es un 'push' (no en PRs)
-          tags: ${{ steps.image_tag.outputs.full_image_name }} # Usa la etiqueta generada
-          cache-from: type=gha # Habilitar caché de build de GitHub Actions
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.image_tag.outputs.full_image_name }}
+          cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Añadido para obtener el digest de la imagen empujada
+          outputs: type=registry,push=true
 
       # --- Actualización del Repositorio de Manifests ---
-      # Solo ejecutar si el evento fue un push a la rama 'main'
       - name: Checkout Manifests Repository
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        # Condición CORREGIDA: Solo ejecutar en eventos 'push' (ya filtrado a develop por 'on:')
+        if: github.event_name == 'push'
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.MANIFEST_REPO_OWNER }}/${{ env.MANIFEST_REPO_NAME }} # Repo de manifests
-          ref: ${{ env.MANIFEST_REPO_BRANCH }}         # Rama a actualizar
-          token: ${{ secrets.MANIFEST_PAT }}           # PAT para poder hacer push
-          path: manifests-repo                       # Clonar en un directorio específico
+          repository: ${{ env.MANIFEST_REPO_OWNER }}/${{ env.MANIFEST_REPO_NAME }}
+          ref: ${{ env.MANIFEST_REPO_BRANCH }}
+          token: ${{ secrets.MANIFEST_PAT }} # PAT con permisos de escritura en el repo de manifests
+          path: manifests-repo # Clonar en un subdirectorio
 
       - name: Update Manifest Files
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push'
         run: |
-          echo "Updating manifests with image: ${{ steps.image_tag.outputs.full_image_name }}"
+          echo "::group::Updating Manifest Files"
+          echo "Target Manifest Directory: manifests-repo"
           cd manifests-repo
+          echo "Current directory: $(pwd)"
+          echo "Listing files in ingest-service:"
+          ls -la ingest-service/ || echo "Directory ingest-service not found or empty."
 
-          # Usar sed para reemplazar la línea 'image:'. Usamos '|' como delimitador
-          # porque el nombre de la imagen contiene '/'
-          sed -i "s|image: .*|image: ${{ steps.image_tag.outputs.full_image_name }}|" "${{ env.MANIFEST_PATH_API }}"
-          sed -i "s|image: .*|image: ${{ steps.image_tag.outputs.full_image_name }}|" "${{ env.MANIFEST_PATH_WORKER }}"
+          TARGET_IMAGE="${{ steps.image_tag.outputs.full_image_name }}"
+          echo "Updating image to: $TARGET_IMAGE"
 
-          echo "Manifest files updated."
-          # Mostrar cambios (opcional)
+          API_FILE="${{ env.MANIFEST_PATH_API }}"
+          WORKER_FILE="${{ env.MANIFEST_PATH_WORKER }}"
+
+          echo "--- Updating API Deployment ($API_FILE) ---"
+          echo "Before update:"
+          grep 'image:' "$API_FILE" || echo "Image line not found in $API_FILE"
+          sed -i "s|image: .*|image: $TARGET_IMAGE|" "$API_FILE"
+          echo "After update:"
+          grep 'image:' "$API_FILE"
+
+          echo "--- Updating Worker Deployment ($WORKER_FILE) ---"
+          echo "Before update:"
+          grep 'image:' "$WORKER_FILE" || echo "Image line not found in $WORKER_FILE"
+          sed -i "s|image: .*|image: $TARGET_IMAGE|" "$WORKER_FILE"
+          echo "After update:"
+          grep 'image:' "$WORKER_FILE"
+
+          echo "--- Checking Git Status ---"
           git status
-          git diff
+          echo "--- Checking Git Diff ---"
+          # Usar --exit-code para que falle si no hay cambios (opcional, útil para debug)
+          git diff # || echo "No differences found by git diff."
+
+          echo "Manifest files update process finished."
+          echo "::endgroup::"
 
       - name: Commit and Push Manifest Changes
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push'
         run: |
+          echo "::group::Committing and Pushing Manifest Changes"
           cd manifests-repo
+          echo "Current directory: $(pwd)"
+
+          echo "Configuring Git user..."
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          echo "Git user configured."
 
-          # Añadir los archivos modificados
-          git add "${{ env.MANIFEST_PATH_API }}" "${{ env.MANIFEST_PATH_WORKER }}"
+          API_FILE="${{ env.MANIFEST_PATH_API }}"
+          WORKER_FILE="${{ env.MANIFEST_PATH_WORKER }}"
 
-          # Verificar si hay cambios para commitear
+          echo "Adding files to staging: $API_FILE, $WORKER_FILE"
+          git add "$API_FILE" "$WORKER_FILE"
+
+          echo "Checking for staged changes..."
           if git diff --staged --quiet; then
-            echo "No changes detected in manifests. Nothing to commit."
+            echo "No changes staged. Nothing to commit."
           else
-            echo "Committing changes..."
-            git commit -m "Update image to ${{ steps.image_tag.outputs.full_image_name }} [CI]"
-            echo "Pushing changes to ${{ env.MANIFEST_REPO_BRANCH }} branch..."
+            echo "Changes detected. Committing..."
+            COMMIT_MSG="Update image to ${{ steps.image_tag.outputs.full_image_name }} [CI]"
+            echo "Commit message: $COMMIT_MSG"
+            git commit -m "$COMMIT_MSG"
+
+            echo "Pushing changes to origin/${{ env.MANIFEST_REPO_BRANCH }}..."
+            # Asegúrate que la URL remota incluya el token si es necesario (checkout action suele configurarlo bien)
             git push origin ${{ env.MANIFEST_REPO_BRANCH }}
+            echo "Push successful."
           fi
+          echo "::endgroup::"
