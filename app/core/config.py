@@ -103,77 +103,91 @@ class Settings(BaseSettings):
     OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
     EMBEDDING_DIMENSION: int = 1536
 
-            # --- Validators ---
+        # --- Validators ---
     # Usando @validator (estilo Pydantic v1 como en tu original)
     @validator("POSTGRES_DSN", pre=True, always=True)
     def assemble_postgres_dsn(cls, v: Optional[str], values: dict[str, Any]) -> Any:
-        if isinstance(v, str):
-            # Si se proporciona un DSN completo, intentar usarlo directamente
-            try:
-                dsn = PostgresDsn(v)
-                # Asegurarse de que usa asyncpg
-                if dsn.scheme != "postgresql+asyncpg":
-                     # Intentar construir con el esquema correcto usando build (Pydantic v1)
-                     built_dsn = dsn.build(
-                         scheme="postgresql+asyncpg",
-                         user=dsn.user or '',
-                         password=dsn.password or '',
-                         host=dsn.host or '',
-                         # Pasar puerto como int si existe, build debería manejarlo
-                         port=dsn.port if dsn.port is not None else None,
-                         path=dsn.path or ''
-                     )
-                     validated_built_dsn = PostgresDsn(built_dsn)
-                     return str(validated_built_dsn)
+        final_dsn_str: Optional[str] = None
 
-                validated_dsn = PostgresDsn(str(dsn))
-                return str(validated_dsn)
-            except ValidationError as e:
-                raise ValueError(f"Invalid INGEST_POSTGRES_DSN provided or failed to rebuild: {e}") from e
-            except Exception as e:
+        if isinstance(v, str) and v.startswith("postgres"): # Verificar si se pasó un DSN válido
+             # Si se proporciona un DSN completo, intentar usarlo directamente pero asegurar esquema
+             print(f"DEBUG: Attempting to use provided DSN: {v!r}")
+             try:
+                 dsn = PostgresDsn(v)
+                 # Asegurarse de que usa asyncpg
+                 if dsn.scheme == "postgresql+asyncpg":
+                      final_dsn_str = str(dsn)
+                 elif dsn.scheme == "postgresql":
+                      # Reconstruir la cadena con el esquema correcto
+                      # Nota: Acceder a los atributos puede dar None si no están en el DSN original
+                      user_part = f"{dsn.user}:{dsn.password}@" if dsn.user and dsn.password else (f"{dsn.user}@" if dsn.user else "")
+                      host_part = dsn.host or ""
+                      port_part = f":{dsn.port}" if dsn.port is not None else ""
+                      db_part = dsn.path or "/postgres" # Default a /postgres si no hay path
+                      final_dsn_str = f"postgresql+asyncpg://{user_part}{host_part}{port_part}{db_part}"
+                      print(f"DEBUG: Rebuilt DSN with asyncpg scheme: {final_dsn_str!r}")
+                 else:
+                      raise ValueError(f"Unsupported scheme in provided DSN: {dsn.scheme}")
+
+                 # Validar el DSN final (ya sea el original o el reconstruido)
+                 validated_dsn = PostgresDsn(final_dsn_str)
+                 print(f"DEBUG: Successfully validated provided/rebuilt DSN: {str(validated_dsn)!r}")
+                 return str(validated_dsn)
+
+             except ValidationError as e:
+                 print(f"ERROR: Validation failed for provided DSN {v!r}: {e}")
+                 raise ValueError(f"Invalid INGEST_POSTGRES_DSN provided: {e}") from e
+             except Exception as e:
+                 print(f"ERROR: Unexpected error processing provided DSN {v!r}: {e}")
+                 # Mostrar traceback para errores inesperados
+                 import traceback
+                 traceback.print_exc()
                  raise ValueError(f"Unexpected error processing provided DSN: {e}") from e
 
-        # --- Construir DSN desde las partes si no se proporcionó uno completo ---
+        # --- Construir DSN desde las partes si no se proporcionó uno completo o si 'v' no era DSN ---
+        print("DEBUG: Provided value 'v' is not a DSN string or check failed. Building DSN from parts.")
         password_obj = values.get("POSTGRES_PASSWORD")
         if not password_obj:
              raise ValueError("INGEST_POSTGRES_PASSWORD environment variable is required.")
-        password_value = password_obj.get_secret_value()
+        # Asegurarse de que get_secret_value() no falle si password_obj no es SecretStr (aunque debería serlo)
+        password_value = password_obj.get_secret_value() if hasattr(password_obj, 'get_secret_value') else str(password_obj)
+
         user = values.get("POSTGRES_USER")
         server = values.get("POSTGRES_SERVER")
         # 'port' ya es un entero gracias a la definición del campo
         port_int = values.get("POSTGRES_PORT")
         db_name = values.get("POSTGRES_DB")
 
+        # Verificar que todas las partes necesarias están presentes
         if not all([user, server, port_int is not None, db_name]):
-             missing = [k for k, val in {"user": user, "server": server, "port": port_int, "db": db_name}.items() if val is None or val == '']
+             missing = [k for k, val in {"user": user, "server": server, "port": port_int, "db": db_name}.items() if val is None or str(val).strip() == '']
+             # Asegurarse de añadir 'port' si es None
              if port_int is None: missing.append("port")
+             # Imprimir valores para depuración
+             print(f"DEBUG: Missing parts check failed. Values: user={user!r}, server={server!r}, port={port_int!r}, db={db_name!r}, password_present={bool(password_obj)}")
              raise ValueError(f"Missing required PostgreSQL connection parts: {missing}")
 
+        print(f"DEBUG: Assembling DSN string from parts: user={user!r}, server={server!r}, port={port_int!r}, db={db_name!r}")
         try:
-            # *** USAR PostgresDsn.build PASANDO EL ENTERO DIRECTAMENTE ***
-            dsn_built = PostgresDsn.build(
-                scheme="postgresql+asyncpg",
-                username=user,
-                password=password_value,
-                host=server,
-                port=port_int, # <--- PASAR EL ENTERO DIRECTAMENTE
-                path=f"/{db_name}"
-            )
-            # Validar el DSN construido
-            validated_dsn = PostgresDsn(dsn_built)
-            return str(validated_dsn)
+            # *** CONSTRUIR LA CADENA DSN MANUALMENTE ***
+            dsn_str = f"postgresql+asyncpg://{user}:{password_value}@{server}:{port_int}/{db_name}"
+            print(f"DEBUG: Assembled DSN string: {dsn_str!r}") # Log importante
+
+            # *** VALIDAR LA CADENA CONSTRUIDA CON PostgresDsn() ***
+            validated_dsn = PostgresDsn(dsn_str)
+            print(f"DEBUG: Successfully validated assembled DSN: {str(validated_dsn)!r}")
+            return str(validated_dsn) # Devolver como string
 
         except ValidationError as e:
-            print(f"DEBUG: Failed DSN build/validation. Parts used: user={user!r}, server={server!r}, port={port_int!r}, db={db_name!r}")
-            raise ValueError(f"Failed to assemble or validate Postgres DSN from parts using build: {e}") from e
+            # Error durante la validación de la cadena construida
+            print(f"ERROR: Validation failed for assembled DSN string {dsn_str!r}: {e}")
+            raise ValueError(f"Failed to validate assembled Postgres DSN string: {e}") from e
         except Exception as e:
-             print(f"DEBUG: Unexpected error during DSN build. Parts used: user={user!r}, server={server!r}, port={port_int!r}, db={db_name!r}")
-             # Mostrar el traceback específico de este error puede ser útil
+             # Otros errores inesperados durante la construcción o validación
+             print(f"ERROR: Unexpected error assembling/validating DSN from parts. String was: {'Not assembled'}. Error: {e}")
              import traceback
-             print("Traceback for unexpected error during build:")
              traceback.print_exc()
-             # El error original ya indica str vs int, pero mantenemos la estructura por si cambia
-             raise ValueError(f"Unexpected error assembling Postgres DSN using build: {e}") from e
+             raise ValueError(f"Unexpected error assembling/validating Postgres DSN from parts: {e}") from e
 
     # --- set_embedding_dimension validator (sin cambios) ---
     @validator("EMBEDDING_DIMENSION", pre=True, always=True)
