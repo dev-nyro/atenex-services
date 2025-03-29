@@ -103,7 +103,7 @@ class Settings(BaseSettings):
     OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
     EMBEDDING_DIMENSION: int = 1536
 
-        # --- Validators ---
+            # --- Validators ---
     # Usando @validator (estilo Pydantic v1 como en tu original)
     @validator("POSTGRES_DSN", pre=True, always=True)
     def assemble_postgres_dsn(cls, v: Optional[str], values: dict[str, Any]) -> Any:
@@ -114,27 +114,24 @@ class Settings(BaseSettings):
                 # Asegurarse de que usa asyncpg
                 if dsn.scheme != "postgresql+asyncpg":
                      # Intentar construir con el esquema correcto usando build (Pydantic v1)
-                     # Nota: build en v1 requiere todos los argumentos relevantes.
                      built_dsn = dsn.build(
                          scheme="postgresql+asyncpg",
-                         user=dsn.user or '', # Proporcionar defaults vacíos si son None
+                         user=dsn.user or '',
                          password=dsn.password or '',
                          host=dsn.host or '',
-                         port=str(dsn.port) if dsn.port is not None else None, # Pasar puerto como string si existe
-                         path=dsn.path or '' # El path ya debería tener el '/' inicial si existe
+                         # Pasar puerto como int si existe, build debería manejarlo
+                         port=dsn.port if dsn.port is not None else None,
+                         path=dsn.path or ''
                      )
-                     # Validar el DSN reconstruido
                      validated_built_dsn = PostgresDsn(built_dsn)
                      return str(validated_built_dsn)
 
-                # Si ya tiene el esquema correcto, validar y devolver
-                validated_dsn = PostgresDsn(str(dsn)) # Validar por si acaso
+                validated_dsn = PostgresDsn(str(dsn))
                 return str(validated_dsn)
             except ValidationError as e:
                 raise ValueError(f"Invalid INGEST_POSTGRES_DSN provided or failed to rebuild: {e}") from e
-            except Exception as e: # Capturar otros errores inesperados durante build
+            except Exception as e:
                  raise ValueError(f"Unexpected error processing provided DSN: {e}") from e
-
 
         # --- Construir DSN desde las partes si no se proporcionó uno completo ---
         password_obj = values.get("POSTGRES_PASSWORD")
@@ -147,36 +144,35 @@ class Settings(BaseSettings):
         port_int = values.get("POSTGRES_PORT")
         db_name = values.get("POSTGRES_DB")
 
-        # Verificar que todas las partes necesarias están presentes
         if not all([user, server, port_int is not None, db_name]):
              missing = [k for k, val in {"user": user, "server": server, "port": port_int, "db": db_name}.items() if val is None or val == '']
              if port_int is None: missing.append("port")
              raise ValueError(f"Missing required PostgreSQL connection parts: {missing}")
 
         try:
-            # *** USAR PostgresDsn.build (Pydantic v1 style) ***
-            # Pasar el puerto como STRING a build, aunque sea int en el modelo.
-            # Asegurarse de que el path tenga el '/' inicial.
+            # *** USAR PostgresDsn.build PASANDO EL ENTERO DIRECTAMENTE ***
             dsn_built = PostgresDsn.build(
                 scheme="postgresql+asyncpg",
                 username=user,
                 password=password_value,
                 host=server,
-                port=str(port_int), # <--- Convertir a string para el método build
-                path=f"/{db_name}"  # <--- Añadir '/' inicial al nombre de la BD para el path
+                port=port_int, # <--- PASAR EL ENTERO DIRECTAMENTE
+                path=f"/{db_name}"
             )
-            # Validar el DSN construido (build no siempre valida todo)
+            # Validar el DSN construido
             validated_dsn = PostgresDsn(dsn_built)
-            return str(validated_dsn) # Devolver como string
+            return str(validated_dsn)
 
         except ValidationError as e:
-            # Error durante la construcción o validación final
-            # Imprimir las partes usadas puede ayudar a depurar
             print(f"DEBUG: Failed DSN build/validation. Parts used: user={user!r}, server={server!r}, port={port_int!r}, db={db_name!r}")
             raise ValueError(f"Failed to assemble or validate Postgres DSN from parts using build: {e}") from e
         except Exception as e:
-             # Otros errores inesperados durante la construcción
              print(f"DEBUG: Unexpected error during DSN build. Parts used: user={user!r}, server={server!r}, port={port_int!r}, db={db_name!r}")
+             # Mostrar el traceback específico de este error puede ser útil
+             import traceback
+             print("Traceback for unexpected error during build:")
+             traceback.print_exc()
+             # El error original ya indica str vs int, pero mantenemos la estructura por si cambia
              raise ValueError(f"Unexpected error assembling Postgres DSN using build: {e}") from e
 
     # --- set_embedding_dimension validator (sin cambios) ---
