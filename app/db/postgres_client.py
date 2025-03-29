@@ -1,9 +1,6 @@
-# ./app/db/postgres_client.py
-# MINOR IMPROVEMENT APPLIED
 import uuid
 from typing import Any, Optional, Dict, List
 import asyncpg
-# from pydantic import BaseModel, Field # Not strictly needed here anymore
 import structlog
 import json
 
@@ -12,7 +9,6 @@ from app.models.domain import DocumentStatus
 
 log = structlog.get_logger(__name__)
 
-# --- Database Interaction Logic ---
 _pool: Optional[asyncpg.Pool] = None
 
 async def get_db_pool() -> asyncpg.Pool:
@@ -20,25 +16,40 @@ async def get_db_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None or _pool._closed:
         try:
-            if not settings.POSTGRES_DSN:
-                 raise ValueError("PostgreSQL DSN is not configured.")
-            log.info("Creating Supabase/PostgreSQL connection pool...", dsn_host=settings.POSTGRES_SERVER)
+            # *** CORRECCIÓN: Usar argumentos nombrados en lugar de DSN string ***
+            log.info("Creating Supabase/PostgreSQL connection pool using arguments...",
+                     host=settings.POSTGRES_SERVER,
+                     port=settings.POSTGRES_PORT,
+                     user=settings.POSTGRES_USER,
+                     database=settings.POSTGRES_DB)
+
             _pool = await asyncpg.create_pool(
-                dsn=str(settings.POSTGRES_DSN),
+                user=settings.POSTGRES_USER,
+                password=settings.POSTGRES_PASSWORD.get_secret_value(),
+                database=settings.POSTGRES_DB,
+                host=settings.POSTGRES_SERVER,
+                port=settings.POSTGRES_PORT,
                 min_size=5,
                 max_size=20,
+                # El init para jsonb sigue siendo útil
                 init=lambda conn: conn.set_type_codec(
                     'jsonb',
-                    encoder=json.dumps, # Use standard json.dumps
-                    decoder=json.loads, # Use standard json.loads
+                    encoder=json.dumps,
+                    decoder=json.loads,
                     schema='pg_catalog',
                     format='text'
                 )
             )
             log.info("Supabase/PostgreSQL connection pool created successfully.")
         except Exception as e:
-            log.error("Failed to create Supabase/PostgreSQL connection pool", error=str(e), host=settings.POSTGRES_SERVER, db=settings.POSTGRES_DB, user=settings.POSTGRES_USER, dsn_set=bool(settings.POSTGRES_DSN), exc_info=True)
-            raise
+            # Loguear el error específico
+            log.error("Failed to create Supabase/PostgreSQL connection pool",
+                      error=str(e),
+                      host=settings.POSTGRES_SERVER,
+                      db=settings.POSTGRES_DB,
+                      user=settings.POSTGRES_USER,
+                      exc_info=True) # Incluir traceback
+            raise # Re-lanzar la excepción para que falle el startup si no conecta
     return _pool
 
 async def close_db_pool():
