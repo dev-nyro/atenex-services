@@ -1,9 +1,11 @@
+# ./app/services/minio_client.py (CORREGIDO - download_file_stream ahora es sync)
 import io
 import uuid
-from typing import IO
+from typing import IO, BinaryIO # Usar BinaryIO para type hint
 from minio import Minio
 from minio.error import S3Error
 import structlog
+import asyncio # Import asyncio para run_in_executor
 
 from app.core.config import settings
 
@@ -13,6 +15,7 @@ class MinioStorageClient:
     """Cliente para interactuar con MinIO."""
 
     def __init__(self):
+        # La inicialización sigue siendo síncrona
         try:
             self.client = Minio(
                 settings.MINIO_ENDPOINT,
@@ -24,11 +27,10 @@ class MinioStorageClient:
             log.info("MinIO client initialized", endpoint=settings.MINIO_ENDPOINT, bucket=settings.MINIO_BUCKET_NAME)
         except Exception as e:
             log.error("Failed to initialize MinIO client", error=str(e), exc_info=True)
-            # Decide if this should be a fatal error during startup
             raise
 
     def _ensure_bucket_exists(self):
-        """Crea el bucket si no existe."""
+        """Crea el bucket si no existe (síncrono)."""
         try:
             found = self.client.bucket_exists(settings.MINIO_BUCKET_NAME)
             if not found:
@@ -40,66 +42,111 @@ class MinioStorageClient:
             log.error(f"Error checking/creating MinIO bucket '{settings.MINIO_BUCKET_NAME}'", error=str(e), exc_info=True)
             raise
 
+    # upload_file puede permanecer async si la llamada a put_object se hace en executor
+    # o si se usa un cliente MinIO asíncrono en el futuro. Por ahora, lo dejamos async
+    # asumiendo que la tarea Celery lo llamará desde run_in_executor si es necesario.
     async def upload_file(
         self,
         company_id: uuid.UUID,
-        document_id: uuid.UUID, # Use doc_id for a more unique object name structure
+        document_id: uuid.UUID,
         file_name: str,
-        file_content_stream: IO[bytes],
+        file_content_stream: IO[bytes], # Acepta cualquier stream de bytes
         content_type: str,
         content_length: int
     ) -> str:
         """
-        Sube un archivo a MinIO.
+        Sube un archivo a MinIO de forma asíncrona (ejecutando la operación síncrona en un executor).
         Retorna el nombre del objeto en MinIO (object_name).
         """
-        # Crear un nombre de objeto único y estructurado
         object_name = f"{str(company_id)}/{str(document_id)}/{file_name}"
         upload_log = log.bind(bucket=settings.MINIO_BUCKET_NAME, object_name=object_name, content_type=content_type, length=content_length)
-        upload_log.info("Uploading file to MinIO...")
+        upload_log.info("Queueing file upload to MinIO executor...")
 
+        loop = asyncio.get_running_loop()
         try:
-            result = self.client.put_object(
-                settings.MINIO_BUCKET_NAME,
-                object_name,
-                file_content_stream,
-                length=content_length, # Important for progress and efficiency
-                content_type=content_type,
-                # metadata={"company-id": str(company_id), "document-id": str(document_id)} # Optional S3 metadata
+            # Ejecutar la operación síncrona de MinIO en un executor
+            result = await loop.run_in_executor(
+                None, # Usa el ThreadPoolExecutor por defecto
+                lambda: self.client.put_object(
+                    settings.MINIO_BUCKET_NAME,
+                    object_name,
+                    file_content_stream, # Pasar el stream directamente
+                    length=content_length,
+                    content_type=content_type,
+                )
             )
-            upload_log.info("File uploaded successfully to MinIO", etag=result.etag, version_id=result.version_id)
-            return object_name # Return the object name used
+            upload_log.info("File uploaded successfully to MinIO via executor", etag=result.etag, version_id=result.version_id)
+            return object_name
         except S3Error as e:
-            upload_log.error("Failed to upload file to MinIO", error=str(e), exc_info=True)
-            raise # Re-raise the exception
+            upload_log.error("Failed to upload file to MinIO via executor", error=str(e), exc_info=True)
+            raise # Re-raise the specific S3Error
+        except Exception as e:
+            upload_log.error("Unexpected error during file upload via executor", error=str(e), exc_info=True)
+            raise # Re-raise generic exceptions
 
-    async def download_file_stream(
+
+    # *** CORREGIDO: Hacerla síncrona para llamarla desde run_in_executor ***
+    def download_file_stream_sync(
         self,
         object_name: str
     ) -> io.BytesIO:
         """
         Descarga un archivo de MinIO como un stream en memoria (BytesIO).
+        Esta es una operación SÍNCRONA.
         """
         download_log = log.bind(bucket=settings.MINIO_BUCKET_NAME, object_name=object_name)
-        download_log.info("Downloading file from MinIO...")
+        download_log.info("Downloading file from MinIO (sync)...")
+        response = None
         try:
-            response = None
-            try:
-                response = self.client.get_object(settings.MINIO_BUCKET_NAME, object_name)
-                file_stream = io.BytesIO(response.read())
-                download_log.info("File downloaded successfully from MinIO")
-                file_stream.seek(0) # Reset stream position
-                return file_stream
-            except S3Error as e:
-                download_log.error("Failed to download file from MinIO", error=str(e), exc_info=True)
-                raise FileNotFoundError(f"Object not found or error downloading: {object_name}") from e
-            finally:
-                if response:
-                    response.close()
-                    response.release_conn()
+            # Operación bloqueante de red/IO
+            response = self.client.get_object(settings.MINIO_BUCKET_NAME, object_name)
+            file_data = response.read() # Leer todo el contenido (bloqueante)
+            file_stream = io.BytesIO(file_data)
+            download_log.info(f"File downloaded successfully from MinIO (sync, {len(file_data)} bytes)")
+            file_stream.seek(0) # Reset stream position
+            return file_stream
+        except S3Error as e:
+            download_log.error("Failed to download file from MinIO (sync)", error=str(e), exc_info=True)
+            # Es importante lanzar una excepción clara si el archivo no se encuentra
+            if e.code == 'NoSuchKey':
+                 raise FileNotFoundError(f"Object not found in MinIO: {object_name}") from e
+            else:
+                 # Otro error de S3
+                 raise IOError(f"S3 error downloading file {object_name}: {e.code}") from e
         except Exception as e:
-             # Catch potential errors outside S3Error during stream handling
-             download_log.error("Unexpected error during file download", error=str(e), exc_info=True)
-             raise
+             # Capturar otros posibles errores
+             download_log.error("Unexpected error during sync file download", error=str(e), exc_info=True)
+             raise IOError(f"Unexpected error downloading file {object_name}") from e
+        finally:
+            # Asegurar que la conexión se libera siempre
+            if response:
+                response.close()
+                response.release_conn()
 
-    # No async close needed for the minio client itself
+    # Mantenemos la versión async como wrapper por si se necesita en otros lados,
+    # pero ahora llama a la versión síncrona en el executor.
+    async def download_file_stream(
+        self,
+        object_name: str
+    ) -> io.BytesIO:
+        """
+        Descarga un archivo de MinIO como un stream en memoria (BytesIO) de forma asíncrona.
+        Ejecuta la descarga síncrona en un executor.
+        """
+        download_log = log.bind(bucket=settings.MINIO_BUCKET_NAME, object_name=object_name)
+        download_log.info("Queueing file download from MinIO executor...")
+        loop = asyncio.get_running_loop()
+        try:
+            file_stream = await loop.run_in_executor(
+                None, # Usa el ThreadPoolExecutor por defecto
+                self.download_file_stream_sync, # Llama a la función síncrona
+                object_name
+            )
+            download_log.info("File download successful via executor")
+            return file_stream
+        except FileNotFoundError: # Capturar el error específico de archivo no encontrado
+            download_log.error("File not found in MinIO via executor", object_name=object_name)
+            raise # Relanzar FileNotFoundError
+        except Exception as e:
+            download_log.error("Error downloading file via executor", error=str(e), exc_info=True)
+            raise # Relanzar otras excepciones

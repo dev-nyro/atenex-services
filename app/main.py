@@ -1,4 +1,4 @@
-# ./app/main.py (CORREGIDO - Manejo de error DB en startup)
+# ./app/main.py (CORREGIDO - Manejo de error DB en startup y health check)
 from fastapi import FastAPI, HTTPException, status as fastapi_status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -18,7 +18,7 @@ from app.db import postgres_client
 setup_logging()
 log = structlog.get_logger(__name__)
 
-# Estado global simple para verificar dependencias críticas
+# Estado global simple para verificar dependencias críticas al inicio
 SERVICE_READY = False
 
 app = FastAPI(
@@ -33,24 +33,36 @@ app = FastAPI(
 async def startup_event():
     global SERVICE_READY
     log.info("Starting up Ingest Service (Haystack)...")
+    db_pool_initialized = False
     try:
-        # Intentar establecer el pool de PG. Si falla, lanzará excepción.
+        # Intentar obtener/crear el pool de PG.
+        # get_db_pool ahora lanza excepción si falla la creación inicial.
         await postgres_client.get_db_pool()
-        log.info("PostgreSQL connection pool initialization attempt successful (pool might be created on first use).")
+        # Si la línea anterior no lanzó excepción, el pool está listo (o será creado en primer uso).
+        # Para verificar la conectividad real, hacemos un ping simple.
+        pool = await postgres_client.get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("SELECT 1") # Ping a la base de datos
+        log.info("PostgreSQL connection pool initialized and connection verified.")
+        db_pool_initialized = True
         # Milvus connection handled by Haystack DocumentStore on demand within tasks
 
-        # *** CORREGIDO: Marcar como listo SÓLO si la conexión a BD es exitosa ***
-        SERVICE_READY = True
-        log.info("Ingest Service startup complete and marked as READY.")
-
     except Exception as e:
-        # *** CORREGIDO: Loguear como crítico y SALIR para que K8s marque el pod como fallido ***
-        log.critical("CRITICAL: Failed to establish essential PostgreSQL connection pool on startup. Service will exit.", error=str(e), exc_info=True)
-        # Esto evitará que el pod se marque como listo si la BD no está accesible al inicio.
-        # K8s intentará reiniciar el pod.
-        # Nota: Si el error de red es persistente, el pod entrará en CrashLoopBackOff,
-        # lo cual es el comportamiento deseado para indicar un problema grave.
-        sys.exit(f"Could not connect to PostgreSQL on startup: {e}") # Salir con mensaje de error
+        # *** CORREGIDO: Loguear como crítico si falla la inicialización/ping ***
+        log.critical("CRITICAL: Failed to establish essential PostgreSQL connection pool or verify connection on startup.", error=str(e), exc_info=True)
+        # No salimos inmediatamente aquí para permitir que Gunicorn inicie,
+        # pero el health check fallará. SERVICE_READY permanecerá False.
+        # Si el timeout de Gunicorn es suficientemente alto, el pod iniciará pero reportará no estar sano.
+        # Si el timeout es bajo, Gunicorn podría matar al worker aquí de todas formas.
+
+    # *** CORREGIDO: Marcar como listo SÓLO si la conexión a BD fue exitosa ***
+    if db_pool_initialized:
+        SERVICE_READY = True
+        log.info("Ingest Service startup sequence completed and service marked as READY.")
+    else:
+        SERVICE_READY = False
+        log.warning("Ingest Service startup sequence completed but essential DB connection failed. Service marked as NOT READY.")
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -60,7 +72,7 @@ async def shutdown_event():
     log.info("PostgreSQL connection pool closed.")
     log.info("Ingest Service shutdown complete.")
 
-# --- Exception Handlers (Keep as is - logging ya es bueno) ---
+# --- Exception Handlers (Mantener como estaban) ---
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc):
     log.warning("HTTP Exception caught", status_code=exc.status_code, detail=exc.detail, path=str(request.url))
@@ -95,50 +107,62 @@ async def generic_exception_handler(request, exc):
 app.include_router(ingest.router, prefix=settings.API_V1_STR, tags=["Ingestion"])
 
 # --- Root Endpoint / Health Check ---
+# *** CORREGIDO: Health check más robusto ***
 @app.get("/", tags=["Health Check"], status_code=fastapi_status.HTTP_200_OK)
 async def read_root():
     """
-    Health check endpoint. Checks critical dependencies initialized during startup.
-    Returns 503 Service Unavailable if critical dependencies (like DB) failed.
+    Health check endpoint. Checks if the service started successfully
+    and can still connect to the database.
+    Returns 503 Service Unavailable if startup failed or DB connection is lost.
     """
     log.debug("Root endpoint accessed (health check)")
+
     if not SERVICE_READY:
-         # *** CORREGIDO: Retornar 503 si el startup no completó correctamente ***
-         log.warning("Health check failed: Service not ready (DB connection likely failed on startup).")
+         # Si el startup ya indicó fallo, reportar inmediatamente.
+         log.warning("Health check failed: Service did not start successfully (SERVICE_READY is False).")
          raise HTTPException(
              status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE,
-             detail="Service is not ready, essential connections might be down."
+             detail="Service is not ready, essential connections likely failed during startup."
          )
-    # Podrías añadir chequeos más activos aquí si es necesario,
-    # como un ping rápido a la base de datos.
-    # try:
-    #     pool = await postgres_client.get_db_pool()
-    #     async with pool.acquire() as conn:
-    #         await conn.execute("SELECT 1")
-    #     log.debug("Health check: DB ping successful.")
-    # except Exception as db_ping_err:
-    #     log.error("Health check failed: DB ping error.", error=str(db_ping_err))
-    #     raise HTTPException(
-    #         status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE,
-    #         detail="Service is unhealthy, cannot connect to database."
-    #     )
 
-    return {"status": "ok", "service": settings.PROJECT_NAME}
+    # Chequeo activo de la base de datos en cada llamada al health check
+    try:
+        pool = await postgres_client.get_db_pool()
+        async with pool.acquire() as conn:
+            # Usar un timeout bajo para el ping para no bloquear el health check
+            await asyncio.wait_for(conn.execute("SELECT 1"), timeout=5.0)
+        log.debug("Health check: DB ping successful.")
+    except asyncio.TimeoutError:
+        log.error("Health check failed: DB ping timed out (> 5 seconds).")
+        raise HTTPException(
+            status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Service is unhealthy, database connection check timed out."
+        )
+    except Exception as db_ping_err:
+        log.error("Health check failed: DB ping error.", error=str(db_ping_err))
+        # Si falla el ping, marcar el servicio como no listo para futuras comprobaciones rápidas
+        global SERVICE_READY
+        SERVICE_READY = False
+        raise HTTPException(
+            status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Service is unhealthy, cannot connect to database: {db_ping_err}"
+        )
+
+    # Si todo está bien
+    return {"status": "ok", "service": settings.PROJECT_NAME, "ready": SERVICE_READY}
 
 # --- Main execution (for local development) ---
 if __name__ == "__main__":
     log.info("Starting Uvicorn server for local development...")
-    # Use standard logging levels for uvicorn
-    log_level_str = settings.LOG_LEVEL.lower() # Nombres estándar: debug, info, warning, error
-    # Validar que sea un nivel conocido por logging
+    log_level_str = settings.LOG_LEVEL.lower()
     if log_level_str not in logging._nameToLevel:
-        log_warning(f"Invalid LOG_LEVEL '{settings.LOG_LEVEL}', defaulting Uvicorn log level to 'info'.")
+        log.warning(f"Invalid LOG_LEVEL '{settings.LOG_LEVEL}', defaulting Uvicorn log level to 'info'.")
         log_level_str = "info"
 
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
-        port=8000, # Opcionalmente desde settings: settings.APP_PORT or 8000
-        reload=True, # Reload solo para desarrollo local
-        log_level=log_level_str # Usar nivel estándar
+        port=8000,
+        reload=True,
+        log_level=log_level_str
     )
