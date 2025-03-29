@@ -1,4 +1,4 @@
-# ./app/main.py (CORREGIDO - Manejo de error DB en startup y health check)
+# ./app/main.py (CORREGIDO - Posición de 'global SERVICE_READY')
 from fastapi import FastAPI, HTTPException, status as fastapi_status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -6,12 +6,13 @@ import structlog
 import uvicorn
 import logging # Import logging
 import sys # Import sys for SystemExit
+import asyncio # Import asyncio for health check timeout
 
 from app.api.v1.endpoints import ingest
 from app.core.config import settings
 from app.core.logging_config import setup_logging
 from app.db import postgres_client
-# Remove milvus_client import (confirmado que no se usa directamente aquí)
+# Remove milvus_client import
 # from app.db import milvus_client
 
 # Configurar logging ANTES de importar cualquier otra cosa que loguee
@@ -24,38 +25,29 @@ SERVICE_READY = False
 app = FastAPI(
     title=settings.PROJECT_NAME,
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
-    version="0.1.0", # Considerar obtener de variable de entorno o archivo
+    version="0.1.0",
     description="Microservice for document ingestion and preprocessing using Haystack.",
 )
 
 # --- Event Handlers ---
 @app.on_event("startup")
 async def startup_event():
-    global SERVICE_READY
+    global SERVICE_READY # Declarar global al inicio si se modifica
     log.info("Starting up Ingest Service (Haystack)...")
     db_pool_initialized = False
     try:
-        # Intentar obtener/crear el pool de PG.
-        # get_db_pool ahora lanza excepción si falla la creación inicial.
         await postgres_client.get_db_pool()
-        # Si la línea anterior no lanzó excepción, el pool está listo (o será creado en primer uso).
-        # Para verificar la conectividad real, hacemos un ping simple.
         pool = await postgres_client.get_db_pool()
         async with pool.acquire() as conn:
-            await conn.execute("SELECT 1") # Ping a la base de datos
+            # Verificar conexión con timeout corto
+            await asyncio.wait_for(conn.execute("SELECT 1"), timeout=10.0)
         log.info("PostgreSQL connection pool initialized and connection verified.")
         db_pool_initialized = True
-        # Milvus connection handled by Haystack DocumentStore on demand within tasks
-
+    except asyncio.TimeoutError:
+        log.critical("CRITICAL: Timed out (>10s) verifying PostgreSQL connection on startup.", exc_info=False)
     except Exception as e:
-        # *** CORREGIDO: Loguear como crítico si falla la inicialización/ping ***
-        log.critical("CRITICAL: Failed to establish essential PostgreSQL connection pool or verify connection on startup.", error=str(e), exc_info=True)
-        # No salimos inmediatamente aquí para permitir que Gunicorn inicie,
-        # pero el health check fallará. SERVICE_READY permanecerá False.
-        # Si el timeout de Gunicorn es suficientemente alto, el pod iniciará pero reportará no estar sano.
-        # Si el timeout es bajo, Gunicorn podría matar al worker aquí de todas formas.
+        log.critical("CRITICAL: Failed to establish/verify essential PostgreSQL connection pool on startup.", error=str(e), exc_info=True)
 
-    # *** CORREGIDO: Marcar como listo SÓLO si la conexión a BD fue exitosa ***
     if db_pool_initialized:
         SERVICE_READY = True
         log.info("Ingest Service startup sequence completed and service marked as READY.")
@@ -68,7 +60,6 @@ async def startup_event():
 async def shutdown_event():
     log.info("Shutting down Ingest Service (Haystack)...")
     await postgres_client.close_db_pool()
-    # No explicit Milvus disconnect needed here if managed by Haystack Store
     log.info("PostgreSQL connection pool closed.")
     log.info("Ingest Service shutdown complete.")
 
@@ -85,7 +76,6 @@ async def http_exception_handler(request, exc):
 async def validation_exception_handler(request, exc):
     log.warning("Request Validation Error", errors=exc.errors(), path=str(request.url))
     error_details = []
-    # Pydantic v2 usa 'loc' como tupla, v1 como lista. Convertir a string siempre.
     for error in exc.errors():
         field = " -> ".join(map(str, error.get("loc", [])))
         error_details.append({"field": field, "message": error.get("msg", ""), "type": error.get("type", "")})
@@ -107,7 +97,6 @@ async def generic_exception_handler(request, exc):
 app.include_router(ingest.router, prefix=settings.API_V1_STR, tags=["Ingestion"])
 
 # --- Root Endpoint / Health Check ---
-# *** CORREGIDO: Health check más robusto ***
 @app.get("/", tags=["Health Check"], status_code=fastapi_status.HTTP_200_OK)
 async def read_root():
     """
@@ -115,33 +104,38 @@ async def read_root():
     and can still connect to the database.
     Returns 503 Service Unavailable if startup failed or DB connection is lost.
     """
+    # *** CORREGIDO: Mover la declaración 'global' al inicio de la función ***
+    global SERVICE_READY
     log.debug("Root endpoint accessed (health check)")
 
     if not SERVICE_READY:
-         # Si el startup ya indicó fallo, reportar inmediatamente.
          log.warning("Health check failed: Service did not start successfully (SERVICE_READY is False).")
          raise HTTPException(
              status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE,
              detail="Service is not ready, essential connections likely failed during startup."
          )
 
-    # Chequeo activo de la base de datos en cada llamada al health check
+    # Chequeo activo de la base de datos
     try:
         pool = await postgres_client.get_db_pool()
         async with pool.acquire() as conn:
-            # Usar un timeout bajo para el ping para no bloquear el health check
-            await asyncio.wait_for(conn.execute("SELECT 1"), timeout=5.0)
+            await asyncio.wait_for(conn.execute("SELECT 1"), timeout=5.0) # Timeout bajo para ping
         log.debug("Health check: DB ping successful.")
+        # Si el ping tiene éxito pero SERVICE_READY era False (raro, pero posible si hubo un error temporal), lo corregimos.
+        if not SERVICE_READY:
+             log.warning("DB Ping successful, but service was marked as not ready. Setting SERVICE_READY=True now.")
+             SERVICE_READY = True
     except asyncio.TimeoutError:
         log.error("Health check failed: DB ping timed out (> 5 seconds).")
+        # Marcar como no listo si falla el ping
+        SERVICE_READY = False
         raise HTTPException(
             status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Service is unhealthy, database connection check timed out."
         )
     except Exception as db_ping_err:
         log.error("Health check failed: DB ping error.", error=str(db_ping_err))
-        # Si falla el ping, marcar el servicio como no listo para futuras comprobaciones rápidas
-        global SERVICE_READY
+        # Marcar como no listo si falla el ping
         SERVICE_READY = False
         raise HTTPException(
             status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE,
