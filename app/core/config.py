@@ -6,6 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # from pydantic import RedisDsn, PostgresDsn, AnyHttpUrl, SecretStr, Field, validator, ValidationError, ValidationInfo # Pydantic v2
 from pydantic import RedisDsn, PostgresDsn, AnyHttpUrl, SecretStr, Field, validator, ValidationError # Pydantic v1 style
 import sys
+import traceback # Importar traceback para logs más detallados
 
 # --- Supabase Connection Defaults ---
 SUPABASE_DEFAULT_HOST = "db.ymsilkrhstwxikjiqqog.supabase.co"
@@ -14,8 +15,14 @@ SUPABASE_DEFAULT_DB = "postgres"
 SUPABASE_DEFAULT_USER = "postgres"
 
 # --- Milvus Kubernetes Defaults ---
-MILVUS_K8S_HOST = "milvus-milvus.default.svc.cluster.local"
+MILVUS_K8S_HOST = "milvus-milvus.default.svc.cluster.local" # Asume que Milvus está en el namespace 'default', ajustar si es necesario
 MILVUS_K8S_PORT = 19530
+
+# --- Redis Kubernetes Defaults ---
+# *** CORRECCIÓN: Usar el nombre de servicio probable dentro del mismo namespace ***
+# Asume que el servicio se llama 'redis-service-master' y está en el mismo namespace que el worker/api
+REDIS_K8S_SERVICE = "redis-service-master"
+REDIS_K8S_PORT = 6379
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -32,9 +39,9 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
 
     # --- Celery ---
-    # *** CORREGIDO: Apuntar al nombre de servicio correcto creado por Helm ***
-    CELERY_BROKER_URL: RedisDsn = RedisDsn("redis://redis-service-master:6379/0")
-    CELERY_RESULT_BACKEND: RedisDsn = RedisDsn("redis://redis-service-master:6379/1")
+    # *** CORREGIDO: Apuntar al nombre de servicio correcto (sin namespace si está en el mismo) ***
+    CELERY_BROKER_URL: RedisDsn = RedisDsn(f"redis://{REDIS_K8S_SERVICE}:{REDIS_K8S_PORT}/0")
+    CELERY_RESULT_BACKEND: RedisDsn = RedisDsn(f"redis://{REDIS_K8S_SERVICE}:{REDIS_K8S_PORT}/1")
 
     # --- Database (Supabase Direct Connection Settings) ---
     POSTGRES_USER: str = SUPABASE_DEFAULT_USER
@@ -64,10 +71,11 @@ class Settings(BaseSettings):
         "document_id",
         "file_name",
         "file_type",
+        # Añadir aquí CUALQUIER otro campo de metadata que quieras almacenar en Milvus
     ])
 
     # --- MinIO Storage ---
-    MINIO_ENDPOINT: str = "minio-service:9000"
+    MINIO_ENDPOINT: str = "minio-service:9000" # Asume que minio-service está en el mismo namespace
     MINIO_ACCESS_KEY: SecretStr
     MINIO_SECRET_KEY: SecretStr
     MINIO_BUCKET_NAME: str = "ingested-documents"
@@ -88,8 +96,8 @@ class Settings(BaseSettings):
         "text/plain",
         "text/markdown",
         "text/html",
-        "image/jpeg",
-        "image/png",
+        "image/jpeg", # Requiere OCR
+        "image/png",  # Requiere OCR
     ])
     EXTERNAL_OCR_REQUIRED_CONTENT_TYPES: List[str] = Field(default=[
         "image/jpeg",
@@ -108,7 +116,11 @@ class Settings(BaseSettings):
     # Validador de DSN de Postgres (mantener como estaba)
     @validator("POSTGRES_DSN", pre=True, always=True)
     def assemble_postgres_dsn(cls, v: Optional[str], values: dict[str, Any]) -> Any:
-        # ... (lógica de validación/ensamblaje existente, SIN CAMBIOS aquí) ...
+        # La lógica existente aquí es para validar/ensamblar si se *proporciona* un DSN
+        # o para construir uno a partir de las partes. Dado que postgres_client.py
+        # usa los argumentos directamente, esta validación principalmente asegura
+        # que las variables de entorno individuales están presentes si no se da un DSN.
+        # Mantenemos la lógica original para esa validación y los logs de debug.
         final_dsn_str: Optional[str] = None
         if isinstance(v, str) and v.startswith("postgres"):
              print(f"DEBUG: Attempting to use provided DSN: {v!r}")
@@ -131,7 +143,7 @@ class Settings(BaseSettings):
                  raise ValueError(f"Invalid INGEST_POSTGRES_DSN provided: {e}") from e
              except Exception as e:
                  print(f"ERROR: Unexpected error processing provided DSN {v!r}: {e}")
-                 import traceback; traceback.print_exc()
+                 traceback.print_exc()
                  raise ValueError(f"Unexpected error processing provided DSN: {e}") from e
         print("DEBUG: Provided value 'v' is not a DSN string or check failed. Building DSN from parts.")
         password_obj = values.get("POSTGRES_PASSWORD")
@@ -148,31 +160,35 @@ class Settings(BaseSettings):
              raise ValueError(f"Missing required PostgreSQL connection parts: {missing}")
         print(f"DEBUG: Assembling DSN string from parts: user={user!r}, server={server!r}, port={port_int!r}, db={db_name!r}")
         try:
+            # Construye un DSN sólo para validación interna y debug logging
             dsn_str = f"postgresql+asyncpg://{user}:{password_value}@{server}:{port_int}/{db_name}"
             print(f"DEBUG: Assembled DSN string: {dsn_str!r}")
             validated_dsn = PostgresDsn(dsn_str)
             print(f"DEBUG: Successfully validated assembled DSN: {str(validated_dsn)!r}")
+            # Devolvemos el DSN validado, aunque no se use directamente en create_pool
             return str(validated_dsn)
         except ValidationError as e:
             print(f"ERROR: Validation failed for assembled DSN string {dsn_str!r}: {e}")
             raise ValueError(f"Failed to validate assembled Postgres DSN string: {e}") from e
         except Exception as e:
-             print(f"ERROR: Unexpected error assembling/validating DSN from parts. String was: {'Not assembled'}. Error: {e}")
-             import traceback; traceback.print_exc()
+             print(f"ERROR: Unexpected error assembling/validating DSN from parts. Error: {e}")
+             traceback.print_exc()
              raise ValueError(f"Unexpected error assembling/validating Postgres DSN from parts: {e}") from e
+
 
     # Validador de dimensión de embedding (sin cambios necesarios)
     @validator("EMBEDDING_DIMENSION", pre=True, always=True)
     def set_embedding_dimension(cls, v: Optional[int], values: dict[str, Any]) -> int:
-        # ... (lógica existente sin cambios) ...
+        # La lógica existente aquí es correcta
         model = values.get("OPENAI_EMBEDDING_MODEL")
         if model == "text-embedding-3-large": return 3072
         elif model in ["text-embedding-3-small", "text-embedding-ada-002"]: return 1536
-        if v is None or v == 0:
-            if model:
-                if model == "text-embedding-3-large": return 3072
-                if model in ["text-embedding-3-small", "text-embedding-ada-002"]: return 1536
-            return 1536
+        # Fallback si v no está o es 0, o si el modelo no coincide
+        if v is None or v <= 0:
+             print(f"WARN: INGEST_EMBEDDING_DIMENSION not set or invalid ({v}), defaulting based on model ({model}) or to 1536.")
+             if model == "text-embedding-3-large": return 3072
+             # Para small, ada, u otros no reconocidos, usar 1536 por defecto
+             return 1536
         return v
 
 # --- Instancia Global ---
@@ -187,5 +203,5 @@ except (ValidationError, ValueError) as e:
     sys.exit(1)
 except Exception as e:
     print(f"FATAL: Unexpected error during Settings instantiation:\n{e}")
-    import traceback; traceback.print_exc()
+    traceback.print_exc()
     sys.exit(1)
