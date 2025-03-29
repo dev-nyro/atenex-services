@@ -1,14 +1,17 @@
-# ./app/core/config.py (CORREGIDO - POSTGRES_PORT como string)
+# ./app/core/config.py (CORREGIDO - POSTGRES_PORT como int)
 import logging
 import os
 from typing import Optional, List, Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
+# Asegúrate de importar ValidationInfo si usas Pydantic v2 y @field_validator
+# from pydantic import RedisDsn, PostgresDsn, AnyHttpUrl, SecretStr, Field, validator, ValidationError, ValidationInfo
 from pydantic import RedisDsn, PostgresDsn, AnyHttpUrl, SecretStr, Field, validator, ValidationError
 import sys
 
 # --- Supabase Connection Defaults ---
 SUPABASE_DEFAULT_HOST = "db.ymsilkrhstwxikjiqqog.supabase.co"
-SUPABASE_DEFAULT_PORT_STR = "5432" # Default como string
+# SUPABASE_DEFAULT_PORT_STR = "5432" # Ya no se necesita como string por defecto
+SUPABASE_DEFAULT_PORT_INT = 5432 # <--- Usar entero por defecto
 SUPABASE_DEFAULT_DB = "postgres"
 SUPABASE_DEFAULT_USER = "postgres"
 
@@ -34,10 +37,10 @@ class Settings(BaseSettings):
     POSTGRES_USER: str = SUPABASE_DEFAULT_USER
     POSTGRES_PASSWORD: SecretStr
     POSTGRES_SERVER: str = SUPABASE_DEFAULT_HOST
-    # *** CORREGIDO: Definir como string ***
-    POSTGRES_PORT: str = SUPABASE_DEFAULT_PORT_STR # Leer/esperar como string
+    # *** CORREGIDO: Definir como entero ***
+    POSTGRES_PORT: int = SUPABASE_DEFAULT_PORT_INT # <--- TIPO CAMBIADO A INT y default a entero
     POSTGRES_DB: str = SUPABASE_DEFAULT_DB
-    POSTGRES_DSN: Optional[PostgresDsn] = None
+    POSTGRES_DSN: Optional[PostgresDsn] = None # Se ensamblará en el validador
 
     # --- Milvus ---
     MILVUS_URI: str = "http://milvus-service:19530"
@@ -101,67 +104,114 @@ class Settings(BaseSettings):
     EMBEDDING_DIMENSION: int = 1536
 
     # --- Validators ---
+    # Usando @validator (estilo Pydantic v1 como en tu original)
     @validator("POSTGRES_DSN", pre=True, always=True)
     def assemble_postgres_dsn(cls, v: Optional[str], values: dict[str, Any]) -> Any:
         if isinstance(v, str):
+            # Si se proporciona un DSN completo, usarlo directamente (tras validar)
             try:
                 dsn = PostgresDsn(v)
+                # Asegurarse de que usa asyncpg
                 if dsn.scheme != "postgresql+asyncpg":
-                     return dsn.build(scheme="postgresql+asyncpg")
+                     # Pydantic v1 build
+                     built_dsn = dsn.build(scheme="postgresql+asyncpg", host=dsn.host or '', # build necesita todos los args en v1
+                                            user=dsn.user or '', password=dsn.password or '',
+                                            port=str(dsn.port) if dsn.port else None, path=dsn.path or '')
+                     return built_dsn
                 return str(dsn)
             except ValidationError as e:
                 raise ValueError(f"Invalid INGEST_POSTGRES_DSN provided: {e}") from e
+            except TypeError as e: # Capturar error si build falla por args faltantes
+                 raise ValueError(f"Error building DSN from provided string parts (potentially incomplete DSN): {e}") from e
 
+
+        # Si no se proporcionó DSN completo, construirlo desde las partes
         password_obj = values.get("POSTGRES_PASSWORD")
         if not password_obj:
              raise ValueError("INGEST_POSTGRES_PASSWORD environment variable is required.")
         password_value = password_obj.get_secret_value()
         user = values.get("POSTGRES_USER")
         server = values.get("POSTGRES_SERVER")
-        # *** CORREGIDO: 'port' ahora es string ***
-        port = values.get("POSTGRES_PORT") # Ahora es un string "5432"
+        # *** CORREGIDO: 'port' ahora es un entero porque Pydantic lo convirtió ***
+        port = values.get("POSTGRES_PORT") # Ya es int gracias a la definición del campo
         db_name = values.get("POSTGRES_DB")
 
-        if not all([user, server, port, db_name]):
-             missing = [k for k, val in {"user": user, "server": server, "port": port, "db": db_name}.items() if not val]
+        # Verificar que todas las partes necesarias están presentes
+        # El puerto 0 es válido, así que verificamos que no sea None
+        if not all([user, server, port is not None, db_name]):
+             missing = [k for k, val in {"user": user, "server": server, "port": port, "db": db_name}.items() if val is None or val == '']
+             # Ajustar mensaje de error si es necesario para 'port'
+             if port is None: missing.append("port")
              raise ValueError(f"Missing required PostgreSQL connection parts: {missing}")
 
         try:
-            # Pydantic.build debe manejar el puerto como string correctamente
-            dsn = PostgresDsn.build(
-                scheme="postgresql+asyncpg",
-                username=user,
-                password=password_value,
-                host=server,
-                # *** CORREGIDO: Pasar el puerto (que ahora es string) directamente ***
-                port=port,
-                path=db_name or None,
-            )
-            return str(dsn)
+            # Construir la cadena DSN manualmente usando las partes
+            # El puerto ya es un entero y se formateará correctamente en la f-string
+            dsn_str = f"postgresql+asyncpg://{user}:{password_value}@{server}:{port}/{db_name}"
+
+            # Validar la cadena DSN construida usando Pydantic
+            validated_dsn = PostgresDsn(dsn_str)
+            return str(validated_dsn) # Devolver el DSN validado como string
+
+            # El método build en Pydantic v1 puede ser más estricto con los argumentos
+            # por lo que construir la cadena manualmente suele ser más robusto.
+            # Si prefieres usar build:
+            # dsn = PostgresDsn.build(
+            #     scheme="postgresql+asyncpg",
+            #     username=user,
+            #     password=password_value,
+            #     host=server,
+            #     port=str(port), # build probablemente necesita el puerto como string
+            #     path=f"/{db_name}" # path necesita el / inicial
+            # )
+            # return str(dsn)
+
         except ValidationError as e:
-            raise ValueError(f"Failed to assemble Postgres DSN from parts: {e}") from e
+            # Error durante la validación del DSN construido
+            raise ValueError(f"Failed to assemble or validate Postgres DSN from parts: {e}") from e
+        except Exception as e:
+             # Otros errores inesperados durante la construcción
+             raise ValueError(f"Unexpected error assembling Postgres DSN: {e}") from e
+
 
     # --- set_embedding_dimension validator (sin cambios) ---
     @validator("EMBEDDING_DIMENSION", pre=True, always=True)
     def set_embedding_dimension(cls, v: Optional[int], values: dict[str, Any]) -> int:
         model = values.get("OPENAI_EMBEDDING_MODEL")
+        # Lógica existente para determinar la dimensión basada en el modelo
         if model == "text-embedding-3-large":
             return 3072
         elif model in ["text-embedding-3-small", "text-embedding-ada-002"]:
             return 1536
+        # Fallback si no hay modelo o si se proporciona un valor explícito
         if v is None or v == 0:
+            # Si no hay valor explícito, intentar inferir de nuevo (redundante pero seguro)
             if model:
                 if model == "text-embedding-3-large": return 3072
                 if model in ["text-embedding-3-small", "text-embedding-ada-002"]: return 1536
-            return 1536
+            # Default final si no se puede inferir y no se proporcionó valor
+            return 1536 # O el default que consideres más apropiado
+        # Si se proporcionó un valor explícito (v), usarlo
         return v
 
 # Create the settings instance globally
 try:
     settings = Settings()
 except (ValidationError, ValueError) as e:
-    print(f"FATAL: Configuration validation failed:\n{e}")
+    # Mejorar el mensaje de error para incluir detalles de validación si están disponibles
+    error_details = ""
+    if isinstance(e, ValidationError):
+        try:
+            # Intentar formatear los errores de Pydantic para mayor claridad
+            error_details = f"\nValidation Errors:\n{e.json(indent=2)}"
+        except Exception: # Por si json() falla
+             error_details = f"\nRaw Errors: {e.errors()}"
+
+    print(f"FATAL: Configuration validation failed:{error_details}\nOriginal Error: {e}")
     sys.exit(1)
 except Exception as e:
     print(f"FATAL: Unexpected error during Settings instantiation:\n{e}")
+    # Considerar imprimir el traceback completo en caso de errores inesperados
+    import traceback
+    traceback.print_exc()
     sys.exit(1)
