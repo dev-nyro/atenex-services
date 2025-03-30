@@ -8,7 +8,7 @@ import logging
 import sys
 import asyncio
 
-from app.api.v1.endpoints import ingest
+from app.api.v1.endpoints import query
 from app.core.config import settings
 from app.core.logging_config import setup_logging
 from app.db import postgres_client
