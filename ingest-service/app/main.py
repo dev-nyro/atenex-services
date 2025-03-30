@@ -165,3 +165,5 @@ if __name__ == "__main__":
         reload=True, # Activa reload para desarrollo local
         log_level=log_level_str
     )
+
+#V 0.0.1
