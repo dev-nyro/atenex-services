@@ -11,18 +11,12 @@ env:
   MANIFEST_REPO_NAME: manifests-nyro
   MANIFEST_REPO_BRANCH: develop
 
-  # --- Configuración Ingest Service ---
-  INGEST_SERVICE_DIR: ingest-service # Directorio del servicio
+  # --- SOLO Directorios y Nombres Base ---
+  INGEST_SERVICE_DIR: ingest-service
   INGEST_IMAGE_NAME: ghcr.io/dev-nyro/ingest-service
-  # INGEST_CONTEXT_PATH: Se construirá directamente en el step 'with'
-  INGEST_MANIFEST_PATH_API: ${{ GITHUB.ENV.INGEST_SERVICE_DIR }}/deployment-api.yaml
-  INGEST_MANIFEST_PATH_WORKER: ${{ GITHUB.ENV.INGEST_SERVICE_DIR }}/deployment-worker.yaml
-
-  # --- Configuración Query Service ---
-  QUERY_SERVICE_DIR: query-service # Directorio del servicio
+  QUERY_SERVICE_DIR: query-service
   QUERY_IMAGE_NAME: ghcr.io/dev-nyro/query-service
-  # QUERY_CONTEXT_PATH: Se construirá directamente en el step 'with'
-  QUERY_MANIFEST_PATH: ${{ GITHUB.ENV.QUERY_SERVICE_DIR }}/deployment.yaml
+  # !! Se eliminan las definiciones de INGEST_MANIFEST_PATH_* y QUERY_MANIFEST_PATH de aquí !!
 
 jobs:
   build-push-update:
@@ -34,8 +28,8 @@ jobs:
       pull-requests: read
 
     outputs:
-      ingest_built: ${{ steps.build_ingest.outputs.digest != '' && steps.build_ingest.outcome == 'success' }} # Añadir chequeo de éxito
-      query_built: ${{ steps.build_query.outputs.digest != '' && steps.build_query.outcome == 'success' }} # Añadir chequeo de éxito
+      ingest_built: ${{ steps.build_ingest.outputs.digest != '' && steps.build_ingest.outcome == 'success' }}
+      query_built: ${{ steps.build_query.outputs.digest != '' && steps.build_query.outcome == 'success' }}
 
     steps:
       # 1. Checkout del código fuente
@@ -85,7 +79,6 @@ jobs:
         if: steps.changed_files.outputs.ingest_any_changed == 'true'
         uses: docker/build-push-action@v5
         with:
-          # *** CORRECCIÓN: Construir context y file directamente aquí ***
           context: ./${{ env.INGEST_SERVICE_DIR }}
           file: ./${{ env.INGEST_SERVICE_DIR }}/Dockerfile
           push: ${{ github.event_name == 'push' }}
@@ -100,7 +93,6 @@ jobs:
         if: steps.changed_files.outputs.query_any_changed == 'true'
         uses: docker/build-push-action@v5
         with:
-          # *** CORRECCIÓN: Construir context y file directamente aquí ***
           context: ./${{ env.QUERY_SERVICE_DIR }}
           file: ./${{ env.QUERY_SERVICE_DIR }}/Dockerfile
           push: ${{ github.event_name == 'push' }}
@@ -113,7 +105,6 @@ jobs:
   update-manifests:
     needs: build-push-update
     runs-on: ubuntu-latest
-    # Condición if mejorada: Ejecutar si es push Y (ingest se construyó O query se construyó)
     if: github.event_name == 'push' && (needs.build-push-update.outputs.ingest_built == 'true' || needs.build-push-update.outputs.query_built == 'true')
 
     steps:
@@ -138,14 +129,14 @@ jobs:
       # 3. Actualizar archivos de Manifest (Condicionalmente dentro del script)
       - name: Update Manifest Files Conditionally
         env:
-          # Usar el contexto 'needs' para acceder a los outputs del job anterior
+          # Pasar outputs del job anterior
           INGEST_BUILT: ${{ needs.build-push-update.outputs.ingest_built }}
           QUERY_BUILT: ${{ needs.build-push-update.outputs.query_built }}
           COMMON_TAG: ${{ steps.image_tag_common.outputs.image_tag }}
-          # Pasar los paths de los manifests como env vars también
-          INGEST_MANIFEST_PATH_API_REL: ${{ env.INGEST_MANIFEST_PATH_API }}
-          INGEST_MANIFEST_PATH_WORKER_REL: ${{ env.INGEST_MANIFEST_PATH_WORKER }}
-          QUERY_MANIFEST_PATH_REL: ${{ env.QUERY_MANIFEST_PATH }}
+          # *** CORRECCIÓN: Construir los paths relativos aquí usando las variables base ***
+          INGEST_MANIFEST_PATH_API_REL: ${{ env.INGEST_SERVICE_DIR }}/deployment-api.yaml
+          INGEST_MANIFEST_PATH_WORKER_REL: ${{ env.INGEST_SERVICE_DIR }}/deployment-worker.yaml
+          QUERY_MANIFEST_PATH_REL: ${{ env.QUERY_SERVICE_DIR }}/deployment.yaml
         run: |
           echo "::group::Updating Manifest Files Conditionally"
           cd manifests-repo
@@ -153,14 +144,18 @@ jobs:
           echo "Ingest Built: $INGEST_BUILT"
           echo "Query Built: $QUERY_BUILT"
           echo "Common Tag: $COMMON_TAG"
+          echo "Ingest API Path: $INGEST_MANIFEST_PATH_API_REL"
+          echo "Ingest Worker Path: $INGEST_MANIFEST_PATH_WORKER_REL"
+          echo "Query Path: $QUERY_MANIFEST_PATH_REL"
 
           MANIFEST_UPDATED=false
 
           # --- Update Ingest Service ---
           if [ "$INGEST_BUILT" = "true" ]; then
             INGEST_TARGET_IMAGE="${{ env.INGEST_IMAGE_NAME }}:$COMMON_TAG"
-            echo "Updating Ingest Service image to: $INGEST_TARGET_IMAGE"
+            echo "Attempting to update Ingest Service image to: $INGEST_TARGET_IMAGE"
 
+            # Usar las variables _REL que ahora tienen el path correcto
             if [ -f "$INGEST_MANIFEST_PATH_API_REL" ]; then
               sed -i "s|image: .*|image: $INGEST_TARGET_IMAGE|" "$INGEST_MANIFEST_PATH_API_REL"
               echo "Updated $INGEST_MANIFEST_PATH_API_REL"
@@ -182,14 +177,14 @@ jobs:
           # --- Update Query Service ---
           if [ "$QUERY_BUILT" = "true" ]; then
             QUERY_TARGET_IMAGE="${{ env.QUERY_IMAGE_NAME }}:$COMMON_TAG"
-            echo "Updating Query Service image to: $QUERY_TARGET_IMAGE"
+            echo "Attempting to update Query Service image to: $QUERY_TARGET_IMAGE"
 
+            # Usar la variable _REL que ahora tiene el path correcto
             if [ -f "$QUERY_MANIFEST_PATH_REL" ]; then
               sed -i "s|image: .*|image: $QUERY_TARGET_IMAGE|" "$QUERY_MANIFEST_PATH_REL"
               echo "Updated $QUERY_MANIFEST_PATH_REL"
               MANIFEST_UPDATED=true
             else
-              # Si el manifest no existe, podría ser un error grave
               echo "ERROR: Query manifest file $QUERY_MANIFEST_PATH_REL not found!"
               exit 1
             fi
@@ -212,7 +207,7 @@ jobs:
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
 
-          # Añadir todos los archivos modificados (más simple si confías en que solo se modificaron manifests)
+          # Añadir todos los cambios detectados por git
           git add .
 
           if git diff --staged --quiet; then
