@@ -1,4 +1,5 @@
 # Fase 1: Construir el entorno virtual con Poetry
+# Usar 'as' en minúsculas para consistencia
 FROM python:3.10-slim as builder
 
 # Argumentos para versiones y UID/GID
@@ -12,24 +13,29 @@ ARG APP_GID=1001
 
 # Instalar Poetry
 ENV POETRY_VERSION=${POETRY_VERSION}
+# Actualizar pip y luego instalar poetry
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir poetry==${POETRY_VERSION}
 
 # Configurar Poetry para no crear venvs dentro del proyecto
 RUN poetry config virtualenvs.create false
 
+# Establecer directorio de trabajo
 WORKDIR /app
 
-# Crear usuario y grupo no root
+# Crear usuario y grupo no root ANTES de copiar archivos
 RUN groupadd -g ${APP_GID} ${APP_USER} && \
     useradd -u ${APP_UID} -g ${APP_GID} -ms /bin/sh ${APP_USER}
 
 # Copiar solo los archivos de dependencias primero para aprovechar el cache de Docker
+# Asegurar que los permisos son para el usuario no root
+# !! ESTE PASO REQUIERE QUE poetry.lock EXISTA EN EL REPOSITORIO !!
 COPY --chown=${APP_USER}:${APP_USER} pyproject.toml poetry.lock ./
 
-# Instalar dependencias (sin dev) usando Poetry
-# Ejecutar como el usuario de la app para que los permisos sean correctos
+# Cambiar al usuario no root ANTES de instalar dependencias
 USER ${APP_USER}
+
+# Instalar dependencias (sin dev) usando Poetry
 RUN poetry install --no-dev --no-interaction --no-ansi --sync
 
 # Fase 2: Crear la imagen final de producción
@@ -41,31 +47,27 @@ ARG APP_UID=1001
 ARG APP_GID=1001
 
 # Recrear usuario y grupo no root en la imagen final
-# (necesario porque no se copian de la fase builder)
 RUN groupadd -g ${APP_GID} ${APP_USER} && \
     useradd -u ${APP_UID} -g ${APP_GID} -ms /bin/sh ${APP_USER}
 
+# Establecer directorio de trabajo
 WORKDIR /app
 
 # Establecer variables de entorno
 ENV PYTHONUNBUFFERED=1 \
     PYTHONFAULTHANDLER=1 \
-    # Añadir el path de los paquetes instalados por Poetry
-    # (El path puede variar ligeramente dependiendo de cómo poetry install lo maneje sin venv create)
-    # Ajustar si es necesario inspeccionando la imagen builder
-    PYTHONPATH=/app/.venv/lib/python3.10/site-packages:$PYTHONPATH \
-    # Puerto por defecto (puede ser sobreescrito)
+    # Definir PYTHONPATH explícitamente (corregido)
+    PYTHONPATH=/app/.venv/lib/python3.10/site-packages \
+    # Puerto por defecto (puede ser sobreescrito por K8s env var si se define)
     PORT=8001
 
 # Copiar el entorno virtual instalado desde la fase builder
-# Asegurar que los permisos sean correctos
 COPY --from=builder --chown=${APP_USER}:${APP_USER} /app/.venv /app/.venv
 
 # Copiar el código de la aplicación
-# Asegurar que los permisos sean correctos
 COPY --chown=${APP_USER}:${APP_USER} app ./app
 
-# Cambiar al usuario no root
+# Cambiar al usuario no root para la ejecución
 USER ${APP_USER}
 
 # Exponer el puerto en el que correrá la aplicación

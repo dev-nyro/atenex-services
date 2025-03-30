@@ -34,6 +34,9 @@ jobs:
       # 1. Checkout del código fuente (ambos microservicios)
       - name: Checkout Application Code
         uses: actions/checkout@v4
+        # Fetch all history for accurate short SHA generation if needed (usually not necessary)
+        # with:
+        #   fetch-depth: 0
 
       # 2. Configurar Docker Buildx
       - name: Set up Docker Buildx
@@ -51,8 +54,12 @@ jobs:
       - name: Generate Common Image Tag
         id: image_tag_common
         run: |
+          # Usar ref_name para la rama/tag y hash corto del commit
           TAG="${{ github.ref_name }}-$(echo $GITHUB_SHA | cut -c1-7)"
+          # Reemplazar caracteres no válidos para Docker (excepto . y -)
           TAG=$(echo $TAG | sed 's/[^a-zA-Z0-9.-]/-/g')
+          # Asegurarse de que no empiece o termine con . o - (simplificado)
+          TAG=$(echo $TAG | sed 's/^[.-]*//;s/[.-]*$//')
           echo "Generated Common Tag: $TAG"
           echo "image_tag=$TAG" >> $GITHUB_OUTPUT
 
@@ -67,8 +74,11 @@ jobs:
           tags: ${{ env.INGEST_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Añadido para obtener digest/metadata si se necesita en el futuro
+          outputs: type=registry,push=${{ github.event_name == 'push' }}
 
       # 6. Construir y Empujar Imagen Docker - Query Service
+      # !! ESTE PASO FALLARÁ SI poetry.lock NO ESTÁ EN query-service !!
       - name: Build and push Query Service Docker image
         id: build_query
         uses: docker/build-push-action@v5
@@ -79,9 +89,11 @@ jobs:
           tags: ${{ env.QUERY_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Añadido para obtener digest/metadata si se necesita en el futuro
+          outputs: type=registry,push=${{ github.event_name == 'push' }}
 
       # --- Actualización del Repositorio de Manifests ---
-      # Solo ejecutar en push a develop
+      # Solo ejecutar en push a develop Y si los builds fueron exitosos (implícito por defecto)
       - name: Checkout Manifests Repository
         if: github.event_name == 'push'
         uses: actions/checkout@v4
@@ -107,6 +119,7 @@ jobs:
           INGEST_API_FILE="${{ env.INGEST_MANIFEST_PATH_API }}"
           INGEST_WORKER_FILE="${{ env.INGEST_MANIFEST_PATH_WORKER }}"
 
+          # Usar -i'' en macOS, -i en Linux para sed in-place sin backup
           echo "Updating $INGEST_API_FILE..."
           sed -i "s|image: .*|image: $INGEST_TARGET_IMAGE|" "$INGEST_API_FILE"
           grep 'image:' "$INGEST_API_FILE"
@@ -120,10 +133,14 @@ jobs:
           QUERY_FILE="${{ env.QUERY_MANIFEST_PATH }}"
 
           echo "Updating $QUERY_FILE..."
-          # Asegurarse que el path es correcto relativo a 'manifests-repo'
-          ls -la query-service/ # Verificar que el archivo existe
-          sed -i "s|image: .*|image: $QUERY_TARGET_IMAGE|" "$QUERY_FILE"
-          grep 'image:' "$QUERY_FILE"
+          # Verificar que el archivo existe antes de modificar
+          if [ -f "$QUERY_FILE" ]; then
+            sed -i "s|image: .*|image: $QUERY_TARGET_IMAGE|" "$QUERY_FILE"
+            grep 'image:' "$QUERY_FILE"
+          else
+            echo "ERROR: Manifest file $QUERY_FILE not found!"
+            exit 1
+          fi
 
           echo "--- Checking Git Status ---"
           git status
@@ -137,16 +154,17 @@ jobs:
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
 
-          # Añadir todos los archivos modificados
-          git add .
+          # Añadir todos los archivos modificados en los directorios relevantes
+          git add ${{ env.INGEST_MANIFEST_PATH_API }} ${{ env.INGEST_MANIFEST_PATH_WORKER }} ${{ env.QUERY_MANIFEST_PATH }}
 
           if git diff --staged --quiet; then
-            echo "No changes staged. Nothing to commit."
+            echo "No manifest changes detected. Nothing to commit."
           else
-            echo "Changes detected. Committing..."
-            COMMIT_MSG="Update images for ingest & query to tag ${{ steps.image_tag_common.outputs.image_tag }} [CI]"
+            echo "Manifest changes detected. Committing..."
+            COMMIT_MSG="Update ingest & query images to tag ${{ steps.image_tag_common.outputs.image_tag }} [CI]"
             git commit -m "$COMMIT_MSG"
             echo "Pushing changes to origin/${{ env.MANIFEST_REPO_BRANCH }}..."
+            # El token PAT ya debería estar configurado por la action checkout
             git push origin ${{ env.MANIFEST_REPO_BRANCH }}
             echo "Push successful."
           fi
