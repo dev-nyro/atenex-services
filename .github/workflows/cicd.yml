@@ -63,8 +63,8 @@ jobs:
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
-          context: .
-          file: ./Dockerfile
+          context: ./ingest-service
+          file: ./ingest-service/Dockerfile
           push: ${{ github.event_name == 'push' }}
           tags: ${{ steps.image_tag.outputs.full_image_name }}
           cache-from: type=gha
