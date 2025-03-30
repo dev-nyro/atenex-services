@@ -1,6 +1,7 @@
 # ./app/services/base_client.py
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+# Importar los objetos necesarios de tenacity
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, retry_if_exception
 import structlog
 from typing import Any, Dict, Optional
 
@@ -28,22 +29,31 @@ class BaseServiceClient:
         log.info(f"{self.service_name} client closed.")
 
     # Decorador de reintentos usando tenacity
+    # *** SECCIÓN CORREGIDA ***
     @retry(
         stop=stop_after_attempt(settings.HTTP_CLIENT_MAX_RETRIES + 1), # +1 porque el primer intento cuenta
         wait=wait_exponential(multiplier=1, min=settings.HTTP_CLIENT_BACKOFF_FACTOR, max=10),
-        # Reintentar en errores de red, timeout, y errores 5xx del servidor
-        retry=retry_if_exception_type((httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError)) \
-              | (lambda e: isinstance(e, httpx.HTTPStatusError) and e.response.status_code >= 500),
+        # CORRECCIÓN: Combinar las condiciones de reintento correctamente
+        retry=(
+            # Reintentar en errores básicos de red/timeout
+            retry_if_exception_type((httpx.TimeoutException, httpx.NetworkError)) |
+            # Reintentar SI la excepción es HTTPStatusError Y el código es >= 500
+            retry_if_exception(
+                lambda e: isinstance(e, httpx.HTTPStatusError) and e.response.status_code >= 500
+            )
+        ),
         reraise=True, # Vuelve a lanzar la excepción después de los reintentos si todos fallan
         before_sleep=lambda retry_state: log.warning(
             f"Retrying {self.service_name} request",
-            method=retry_state.args[1] if len(retry_state.args) > 1 else 'N/A', # Intentar obtener método
-            endpoint=retry_state.args[2] if len(retry_state.args) > 2 else 'N/A', # Intentar obtener endpoint
+            # Intentar obtener detalles del request si están disponibles en args
+            method=getattr(retry_state.args[0], 'method', 'N/A') if retry_state.args else 'N/A',
+            endpoint=getattr(retry_state.args[0], 'url', 'N/A') if retry_state.args else 'N/A',
             attempt=retry_state.attempt_number,
             wait_time=f"{retry_state.next_action.sleep:.2f}s",
             error=str(retry_state.outcome.exception()) # Mostrar el error
         )
     )
+    # *** FIN SECCIÓN CORREGIDA ***
     async def _request(
         self,
         method: str,
@@ -73,7 +83,8 @@ class BaseServiceClient:
             return response
         except httpx.HTTPStatusError as e:
             # Loguear error pero permitir que Tenacity decida si reintentar (para 5xx) o fallar (para 4xx)
-            request_log.error(
+            log_level = log.warning if e.response.status_code < 500 else log.error
+            log_level(
                 "Request failed with HTTP status code",
                 status_code=e.response.status_code,
                 response_text=e.response.text[:500], # Limitar longitud del texto de respuesta
