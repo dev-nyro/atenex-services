@@ -61,9 +61,10 @@ async def get_db_pool() -> asyncpg.Pool:
                        host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT, user=settings.POSTGRES_USER)
              raise
         except Exception as e:
-            # Loguear el error específico
+            # Loguear el error específico, incluyendo TimeoutError
             log.error("Failed to create Supabase/PostgreSQL connection pool",
                       error=str(e),
+                      error_type=type(e).__name__, # Añadir tipo de error
                       host=settings.POSTGRES_SERVER,
                       port=settings.POSTGRES_PORT,
                       db=settings.POSTGRES_DB,

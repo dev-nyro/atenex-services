@@ -38,25 +38,30 @@ async def startup_event():
     db_pool_initialized = False
     try:
         # Intenta obtener el pool (lo crea si no existe)
+        # get_db_pool ahora lanza excepción si falla, así que no necesitamos asignarlo aquí
         await postgres_client.get_db_pool()
         # Verifica la conexión activa
-        pool = await postgres_client.get_db_pool()
+        pool = await postgres_client.get_db_pool() # Obtener el pool ya existente
         async with pool.acquire() as conn:
             # Verificar conexión con timeout corto
+            log.info("Verifying PostgreSQL connection...")
             await asyncio.wait_for(conn.execute("SELECT 1"), timeout=10.0)
         log.info("PostgreSQL connection pool initialized and connection verified.")
         db_pool_initialized = True
     except asyncio.TimeoutError:
         log.critical("CRITICAL: Timed out (>10s) verifying PostgreSQL connection on startup.", exc_info=False)
+        # SERVICE_READY permanece False
     except Exception as e:
-        log.critical("CRITICAL: Failed to establish/verify essential PostgreSQL connection pool on startup.", error=str(e), exc_info=True)
+        # get_db_pool ya loguea el error detallado
+        log.critical("CRITICAL: Failed to establish/verify essential PostgreSQL connection pool on startup.", error=str(e), exc_info=False) # No duplicar traceback si ya se logueó
+        # SERVICE_READY permanece False
 
-    # Marca el servicio como listo SOLO si la BD conectó
+    # Marca el servicio como listo SOLO si la BD conectó y verificó
     if db_pool_initialized:
         SERVICE_READY = True
         log.info("Ingest Service startup sequence completed and service marked as READY.")
     else:
-        SERVICE_READY = False
+        SERVICE_READY = False # Asegurarse que es False
         log.warning("Ingest Service startup sequence completed but essential DB connection failed. Service marked as NOT READY.")
 
 
@@ -64,7 +69,7 @@ async def startup_event():
 async def shutdown_event():
     log.info("Shutting down Ingest Service (Haystack)...")
     await postgres_client.close_db_pool()
-    log.info("PostgreSQL connection pool closed.")
+    # log.info("PostgreSQL connection pool closed.") # close_db_pool ya loguea esto
     log.info("Ingest Service shutdown complete.")
 
 # --- Exception Handlers (Mantener como estaban) ---
@@ -105,15 +110,16 @@ app.include_router(ingest.router, prefix=settings.API_V1_STR, tags=["Ingestion"]
 async def read_root():
     """
     Health check endpoint. Checks if the service started successfully
-    and can still connect to the database.
-    Returns 503 Service Unavailable if startup failed or DB connection is lost.
+    (SERVICE_READY flag) and performs an active database ping.
+    Returns 503 Service Unavailable if startup failed or DB ping fails.
     """
     # *** CORREGIDO: Mover la declaración 'global' al inicio de la función ***
     global SERVICE_READY
-    log.debug("Root endpoint accessed (health check)")
+    health_log = log.bind(check="liveness/readiness")
+    health_log.debug("Root endpoint accessed (health check)")
 
     if not SERVICE_READY:
-         log.warning("Health check failed: Service did not start successfully (SERVICE_READY is False).")
+         health_log.warning("Health check failed: Service is marked as NOT READY (startup issue).")
          raise HTTPException(
              status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE,
              detail="Service is not ready, essential connections likely failed during startup."
@@ -121,33 +127,34 @@ async def read_root():
 
     # Chequeo activo de la base de datos (ping)
     try:
-        pool = await postgres_client.get_db_pool()
+        pool = await postgres_client.get_db_pool() # Reutilizar el pool existente
         async with pool.acquire() as conn:
             # Usa un timeout bajo para el ping
             await asyncio.wait_for(conn.execute("SELECT 1"), timeout=5.0)
-        log.debug("Health check: DB ping successful.")
+        health_log.debug("Health check: DB ping successful.")
         # Si el ping tiene éxito pero SERVICE_READY era False (raro, pero posible si hubo un error temporal), lo corregimos.
+        # Esto es una autocorrección leve, pero si el startup falló gravemente, el pod debería reiniciarse.
         if not SERVICE_READY:
-             log.warning("DB Ping successful, but service was marked as not ready. Setting SERVICE_READY=True now.")
+             health_log.warning("DB Ping successful, but service was marked as not ready. Setting SERVICE_READY=True now (potential recovery).")
              SERVICE_READY = True # Marcar como listo si el ping funciona ahora
     except asyncio.TimeoutError:
-        log.error("Health check failed: DB ping timed out (> 5 seconds).")
-        # Marcar como no listo si falla el ping
+        health_log.error("Health check failed: DB ping timed out (> 5 seconds). Marking service as NOT READY.")
+        # Marcar como no listo si falla el ping activo
         SERVICE_READY = False
         raise HTTPException(
             status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Service is unhealthy, database connection check timed out."
         )
     except Exception as db_ping_err:
-        log.error("Health check failed: DB ping error.", error=str(db_ping_err))
-        # Marcar como no listo si falla el ping
+        health_log.error("Health check failed: DB ping error. Marking service as NOT READY.", error=str(db_ping_err))
+        # Marcar como no listo si falla el ping activo
         SERVICE_READY = False
         raise HTTPException(
             status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Service is unhealthy, cannot connect to database: {db_ping_err}"
+            detail=f"Service is unhealthy, cannot connect to database: {type(db_ping_err).__name__}"
         )
 
-    # Si todo está bien
+    # Si todo está bien (SERVICE_READY era True y el ping funcionó)
     return {"status": "ok", "service": settings.PROJECT_NAME, "ready": SERVICE_READY}
 
 # --- Main execution (for local development) ---

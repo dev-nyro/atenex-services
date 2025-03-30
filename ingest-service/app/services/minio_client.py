@@ -63,6 +63,8 @@ class MinioStorageClient:
         loop = asyncio.get_running_loop()
         try:
             # Ejecutar la operación síncrona de MinIO en un executor
+            # Asegurarse que el stream está al inicio antes de pasarlo al thread
+            file_content_stream.seek(0)
             result = await loop.run_in_executor(
                 None, # Usa el ThreadPoolExecutor por defecto
                 lambda: self.client.put_object(
@@ -76,7 +78,7 @@ class MinioStorageClient:
             upload_log.info("File uploaded successfully to MinIO via executor", etag=result.etag, version_id=result.version_id)
             return object_name
         except S3Error as e:
-            upload_log.error("Failed to upload file to MinIO via executor", error=str(e), exc_info=True)
+            upload_log.error("Failed to upload file to MinIO via executor", error=str(e), code=e.code, exc_info=True)
             raise # Re-raise the specific S3Error
         except Exception as e:
             upload_log.error("Unexpected error during file upload via executor", error=str(e), exc_info=True)
@@ -104,7 +106,7 @@ class MinioStorageClient:
             file_stream.seek(0) # Reset stream position
             return file_stream
         except S3Error as e:
-            download_log.error("Failed to download file from MinIO (sync)", error=str(e), code=e.code, exc_info=False)
+            download_log.error("Failed to download file from MinIO (sync)", error=str(e), code=e.code, exc_info=False) # No need for full trace on known errors like NoSuchKey
             # Es importante lanzar una excepción clara si el archivo no se encuentra
             if e.code == 'NoSuchKey':
                  raise FileNotFoundError(f"Object not found in MinIO: {object_name}") from e
@@ -144,6 +146,6 @@ class MinioStorageClient:
         except FileNotFoundError: # Capturar el error específico de archivo no encontrado
             download_log.error("File not found in MinIO via executor", object_name=object_name)
             raise # Relanzar FileNotFoundError para que la tarea Celery lo maneje
-        except Exception as e:
-            download_log.error("Error downloading file via executor", error=str(e), exc_info=True)
+        except Exception as e: # Captura IOError u otros errores del sync helper
+            download_log.error("Error downloading file via executor", error=str(e), error_type=type(e).__name__, exc_info=True)
             raise # Relanzar otras excepciones

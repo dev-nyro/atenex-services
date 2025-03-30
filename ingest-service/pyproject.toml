@@ -33,8 +33,8 @@ milvus-haystack = "^0.0.6" # Paquete correcto para la integración Haystack 2.x
 pypdf = "^4.0.1"
 python-docx = "^1.1.0"
 # Añadir 'markdown' y 'beautifulsoup4' si usas MarkdownToDocument y HTMLToDocument
-# markdown = "^3.5"
-# beautifulsoup4 = "^4.12.3"
+markdown = "^3.5" # Añadido para MarkdownToDocument
+beautifulsoup4 = "^4.12.3" # Añadido para HTMLToDocument
 
 
 [tool.poetry.dev-dependencies]
