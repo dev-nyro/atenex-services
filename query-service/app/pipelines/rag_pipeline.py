@@ -1,7 +1,9 @@
 # ./app/pipelines/rag_pipeline.py
 import structlog
 import asyncio
-from typing import Dict, Any, List, Tuple
+import uuid # Importar uuid que se usa en run_rag_pipeline
+# *** CORRECCIÓN: Añadir Optional y otros tipos necesarios de 'typing' ***
+from typing import Dict, Any, List, Tuple, Optional
 
 from haystack import Pipeline, Document
 from haystack.components.embedders import OpenAITextEmbedder
@@ -9,7 +11,10 @@ from haystack.components.builders.prompt_builder import PromptBuilder
 from milvus_haystack import MilvusDocumentStore, MilvusEmbeddingRetriever
 from haystack.utils import Secret
 
+# Importar desde la app local
 from app.core.config import settings
+# Importar db.postgres_client directamente para loguear la interacción
+from app.db import postgres_client
 from app.services.gemini_client import gemini_client # Importar instancia del cliente
 
 log = structlog.get_logger(__name__)
@@ -25,23 +30,21 @@ def get_milvus_document_store() -> MilvusDocumentStore:
              embedding_field=settings.MILVUS_EMBEDDING_FIELD,
              content_field=settings.MILVUS_CONTENT_FIELD,
              metadata_fields=settings.MILVUS_METADATA_FIELDS,
-             company_id_field=settings.MILVUS_COMPANY_ID_FIELD,
+             # Corregido: company_id_field no es un parámetro de MilvusDocumentStore
+             # Se usa en los filtros del retriever.
+             # company_id_field=settings.MILVUS_COMPANY_ID_FIELD,
              search_params=settings.MILVUS_SEARCH_PARAMS)
     try:
         store = MilvusDocumentStore(
             uri=str(settings.MILVUS_URI),
             collection_name=settings.MILVUS_COLLECTION_NAME,
-            dim=settings.EMBEDDING_DIMENSION, # Asegurar que la dimensión es correcta
+            dim=settings.EMBEDDING_DIMENSION,
             embedding_field=settings.MILVUS_EMBEDDING_FIELD,
             content_field=settings.MILVUS_CONTENT_FIELD,
-            metadata_fields=settings.MILVUS_METADATA_FIELDS, # Campos a recuperar
-             # Parámetros específicos de búsqueda (ajustar según sea necesario)
+            metadata_fields=settings.MILVUS_METADATA_FIELDS,
             search_params=settings.MILVUS_SEARCH_PARAMS,
-            # Consistency level fuerte para asegurar leer escrituras recientes si es necesario
-            # Podría relajarse a 'Bounded' o 'Eventually' para rendimiento si la consistencia inmediata no es crítica
             consistency_level="Strong",
         )
-        # Podríamos añadir un ping o verificación aquí si MilvusDocumentStore lo soporta
         log.info("MilvusDocumentStore initialized")
         return store
     except Exception as e:
@@ -52,10 +55,8 @@ def get_milvus_document_store() -> MilvusDocumentStore:
 def get_openai_text_embedder() -> OpenAITextEmbedder:
     """Initializes the OpenAI Embedder for text (queries)."""
     log.debug("Initializing OpenAITextEmbedder", model=settings.OPENAI_EMBEDDING_MODEL)
-    # Haystack usa OPENAI_API_KEY de env vars por defecto si Secret no se pasa explícitamente
-    # pero es mejor ser explícito usando Secret.from_env o Secret.from_token
-    api_key_secret = Secret.from_env_var("QUERY_OPENAI_API_KEY") # Leer desde la variable correcta
-    if not api_key_secret.resolve_value(): # Verificar si la clave se pudo resolver
+    api_key_secret = Secret.from_env_var("QUERY_OPENAI_API_KEY")
+    if not api_key_secret.resolve_value():
          log.warning("QUERY_OPENAI_API_KEY environment variable not found or empty for OpenAI Embedder.")
          # Considerar lanzar un error si la clave es estrictamente necesaria
          # raise ValueError("Missing OpenAI API Key for text embedder")
@@ -63,8 +64,6 @@ def get_openai_text_embedder() -> OpenAITextEmbedder:
     return OpenAITextEmbedder(
         api_key=api_key_secret,
         model=settings.OPENAI_EMBEDDING_MODEL,
-        # Podríamos añadir prefijo/sufijo si es necesario para el modelo
-        # prefix="query: ",
     )
 
 def get_milvus_retriever(document_store: MilvusDocumentStore) -> MilvusEmbeddingRetriever:
@@ -72,8 +71,6 @@ def get_milvus_retriever(document_store: MilvusDocumentStore) -> MilvusEmbedding
     log.debug("Initializing MilvusEmbeddingRetriever")
     return MilvusEmbeddingRetriever(
         document_store=document_store,
-        # top_k se pasará dinámicamente en pipeline.run()
-        # filters también se pasarán dinámicamente
     )
 
 def get_prompt_builder() -> PromptBuilder:
@@ -83,8 +80,8 @@ def get_prompt_builder() -> PromptBuilder:
 
 # --- Pipeline Construction ---
 
-# Almacenar pipeline construido globalmente para reutilizar (si es seguro y deseado)
-# Esto evita reconstruirlo en cada request, pero asume que los componentes son reutilizables
+# Almacenar pipeline construido globalmente para reutilizar
+# *** CORRECCIÓN: Se añadió Optional a la importación de typing arriba ***
 _rag_pipeline_instance: Optional[Pipeline] = None
 
 def build_rag_pipeline() -> Pipeline:
@@ -115,7 +112,6 @@ def build_rag_pipeline() -> Pipeline:
         # 3. Connect components
         rag_pipeline.connect("text_embedder.embedding", "retriever.query_embedding")
         rag_pipeline.connect("retriever.documents", "prompt_builder.documents")
-        # La salida del prompt_builder se usará para llamar a Gemini externamente
 
         log.info("Haystack RAG pipeline built successfully.")
         _rag_pipeline_instance = rag_pipeline # Guardar instancia global
@@ -159,15 +155,23 @@ async def run_rag_pipeline(
 
     # Determine retriever parameters
     retriever_top_k = top_k if top_k is not None else settings.RETRIEVER_TOP_K
-    retriever_filters = {
-        "bool": {
-             "filter": [
-                 {"term": {"company_id": company_id}}
-                 # Puedes añadir más filtros aquí si es necesario, usando la sintaxis de Milvus/Haystack
-                 # Ejemplo: {"range": {"created_at": {"gte": "2023-01-01"}}}
-             ]
-         }
-     }
+    # Construir el filtro de Milvus correctamente usando el campo definido en config
+    # La estructura exacta puede depender de milvus-haystack, pero usualmente es un dict
+    # Milvus/Haystack esperan filtros en formato específico. Ver doc de MilvusEmbeddingRetriever.
+    # Usualmente es una lista de condiciones o un diccionario complejo.
+    # Probemos con un filtro simple de término:
+    retriever_filters = {"company_id": company_id}
+    # Si se necesitan filtros más complejos (AND/OR), la estructura sería diferente:
+    # retriever_filters = {
+    #     "bool": {
+    #         "filter": [
+    #             {"term": {settings.MILVUS_COMPANY_ID_FIELD: company_id}}
+    #             # Ejemplo: {"range": {"created_at": {"gte": "2023-01-01"}}}
+    #         ]
+    #         # "must": [...], "should": [...] # Para condiciones AND/OR
+    #     }
+    # }
+    run_log.debug("Retriever filters prepared", filters=retriever_filters, top_k=retriever_top_k)
 
 
     # Prepare inputs for the Haystack pipeline run
@@ -180,11 +184,10 @@ async def run_rag_pipeline(
 
     try:
         # Execute the Haystack pipeline (embedding, retrieval, prompt building)
-        # Pipeline.run is synchronous, run it in a thread to avoid blocking async event loop
         loop = asyncio.get_running_loop()
         pipeline_result = await loop.run_in_executor(
             None, # Use default ThreadPoolExecutor
-            lambda: pipeline.run(pipeline_input, include_outputs_from=["retriever", "prompt_builder"]) # Incluir outputs específicos
+            lambda: pipeline.run(pipeline_input, include_outputs_from=["retriever", "prompt_builder"])
         )
         run_log.info("Haystack pipeline (embed, retrieve, prompt) executed successfully.")
 
@@ -193,27 +196,34 @@ async def run_rag_pipeline(
         prompt_builder_output = pipeline_result.get("prompt_builder", {})
         generated_prompt: Optional[str] = None
 
-        # El prompt puede estar en diferentes formatos dependiendo del builder/output
+        # El prompt puede estar en diferentes formatos
         if "prompt" in prompt_builder_output:
-             # Si es una lista de ChatMessage (común con ChatPromptBuilder), unir contenido
-             if isinstance(prompt_builder_output["prompt"], list):
-                 generated_prompt = "\n".join([msg.content for msg in prompt_builder_output["prompt"] if hasattr(msg, 'content')])
-             elif isinstance(prompt_builder_output["prompt"], str):
-                  generated_prompt = prompt_builder_output["prompt"]
+             prompt_data = prompt_builder_output["prompt"]
+             if isinstance(prompt_data, list): # Común con ChatPromptBuilder (lista de ChatMessage)
+                 # Extraer contenido textual de los mensajes
+                 text_parts = []
+                 for msg in prompt_data:
+                     if hasattr(msg, 'content') and isinstance(msg.content, str):
+                          text_parts.append(msg.content)
+                     # Podrías necesitar manejar otros tipos de contenido si usas roles/funciones
+                 generated_prompt = "\n".join(text_parts)
+             elif isinstance(prompt_data, str): # Si el builder devuelve un string simple
+                  generated_prompt = prompt_data
+             else:
+                  run_log.warning("Unexpected prompt format from prompt_builder", prompt_type=type(prompt_data))
+                  # Intentar convertir a string como fallback
+                  generated_prompt = str(prompt_data)
 
 
         if not retrieved_docs:
             run_log.warning("No relevant documents found by retriever.")
-            # Decidir qué hacer: ¿Intentar responder sin contexto? ¿Devolver mensaje específico?
-            # Por ahora, intentaremos responder indicando la falta de contexto.
-            # Podríamos crear un prompt alternativo o dejar que Gemini diga "No sé".
-            # Ajustamos el prompt para reflejar esto si es necesario, o confiamos en la plantilla por defecto.
-            if not generated_prompt: # Si el prompt builder no generó nada (raro)
+            # Ajustar prompt si no hay documentos y no se generó un prompt alternativo
+            if not generated_prompt:
                  generated_prompt = f"Pregunta: {query}\n\nNo se encontraron documentos relevantes. Intenta responder brevemente si es posible, o indica que no tienes información."
 
 
         if not generated_prompt:
-             run_log.error("Failed to extract generated prompt from pipeline output", output=prompt_builder_output)
+             run_log.error("Failed to extract or generate prompt from pipeline output", output=prompt_builder_output)
              raise ValueError("Could not construct prompt for LLM.")
 
         run_log.debug("Generated prompt for LLM", prompt_preview=generated_prompt[:200] + "...")
@@ -225,43 +235,44 @@ async def run_rag_pipeline(
         # Log the interaction (asynchronously)
         log_id: Optional[uuid.UUID] = None
         try:
-            # Preparar datos para logging
             doc_ids = [doc.id for doc in retrieved_docs]
-            doc_scores = [doc.score for doc in retrieved_docs if doc.score is not None] # Asegurarse de que score no es None
-            # Convertir user_id a UUID si existe
+            doc_scores = [doc.score for doc in retrieved_docs if doc.score is not None]
             user_uuid = uuid.UUID(user_id) if user_id else None
+
+            # Llamar a la función de logging del cliente postgres
             log_id = await postgres_client.log_query_interaction(
-                company_id=uuid.UUID(company_id), # Convertir a UUID
+                company_id=uuid.UUID(company_id),
                 user_id=user_uuid,
                 query=query,
                 response=answer,
                 retrieved_doc_ids=doc_ids,
                 retrieved_doc_scores=doc_scores,
-                metadata={"retriever_top_k": retriever_top_k} # Ejemplo de metadata adicional
+                metadata={"retriever_top_k": retriever_top_k}
             )
         except Exception as log_err:
              run_log.error("Failed to log query interaction to database", error=str(log_err), exc_info=True)
-             # No fallar la respuesta al usuario, pero loguear el error. log_id será None.
 
         return answer, retrieved_docs, log_id
 
     except Exception as e:
         run_log.exception("Error occurred during RAG pipeline execution")
-        raise # Re-lanzar para que el endpoint lo maneje
+        raise
 
 # Función para verificar dependencias (llamada desde health check)
 async def check_pipeline_dependencies() -> Dict[str, str]:
+    """Checks critical dependencies for the pipeline (e.g., Milvus)."""
     results = {"milvus_connection": "pending"}
     try:
+        # Intentar obtener el DocumentStore como prueba de conexión/configuración
         store = get_milvus_document_store()
-        # Intentar una operación simple, como contar documentos (si existe y es rápida)
-        # o simplemente verificar la conexión si el store lo permite.
-        # MilvusDocumentStore no tiene un método 'ping' directo expuesto.
-        # Podríamos intentar contar documentos con un límite muy bajo.
-        count = await asyncio.to_thread(store.count_documents) # Ejecutar sync en thread
+        # Realizar una operación ligera para confirmar la conexión, como contar documentos
+        # Ejecutar la operación síncrona en un thread para no bloquear
+        count = await asyncio.to_thread(store.count_documents)
         results["milvus_connection"] = "ok"
-        log.debug("Milvus dependency check successful (count documents)")
+        log.debug("Milvus dependency check successful (count documents)", count=count)
     except Exception as e:
-        results["milvus_connection"] = f"error: {type(e).__name__}"
-        log.warning("Milvus dependency check failed", error=str(e))
+        # Capturar cualquier excepción durante la inicialización o la operación
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        results["milvus_connection"] = f"error: {error_msg[:100]}" # Limitar longitud del error
+        log.warning("Milvus dependency check failed", error=error_msg, exc_info=False) # No loguear traceback completo aquí
     return results
