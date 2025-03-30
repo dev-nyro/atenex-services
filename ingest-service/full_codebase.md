@@ -622,9 +622,10 @@ async def get_db_pool() -> asyncpg.Pool:
                        host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT, user=settings.POSTGRES_USER)
              raise
         except Exception as e:
-            # Loguear el error específico
+            # Loguear el error específico, incluyendo TimeoutError
             log.error("Failed to create Supabase/PostgreSQL connection pool",
                       error=str(e),
+                      error_type=type(e).__name__, # Añadir tipo de error
                       host=settings.POSTGRES_SERVER,
                       port=settings.POSTGRES_PORT,
                       db=settings.POSTGRES_DB,
@@ -814,25 +815,30 @@ async def startup_event():
     db_pool_initialized = False
     try:
         # Intenta obtener el pool (lo crea si no existe)
+        # get_db_pool ahora lanza excepción si falla, así que no necesitamos asignarlo aquí
         await postgres_client.get_db_pool()
         # Verifica la conexión activa
-        pool = await postgres_client.get_db_pool()
+        pool = await postgres_client.get_db_pool() # Obtener el pool ya existente
         async with pool.acquire() as conn:
             # Verificar conexión con timeout corto
+            log.info("Verifying PostgreSQL connection...")
             await asyncio.wait_for(conn.execute("SELECT 1"), timeout=10.0)
         log.info("PostgreSQL connection pool initialized and connection verified.")
         db_pool_initialized = True
     except asyncio.TimeoutError:
         log.critical("CRITICAL: Timed out (>10s) verifying PostgreSQL connection on startup.", exc_info=False)
+        # SERVICE_READY permanece False
     except Exception as e:
-        log.critical("CRITICAL: Failed to establish/verify essential PostgreSQL connection pool on startup.", error=str(e), exc_info=True)
+        # get_db_pool ya loguea el error detallado
+        log.critical("CRITICAL: Failed to establish/verify essential PostgreSQL connection pool on startup.", error=str(e), exc_info=False) # No duplicar traceback si ya se logueó
+        # SERVICE_READY permanece False
 
-    # Marca el servicio como listo SOLO si la BD conectó
+    # Marca el servicio como listo SOLO si la BD conectó y verificó
     if db_pool_initialized:
         SERVICE_READY = True
         log.info("Ingest Service startup sequence completed and service marked as READY.")
     else:
-        SERVICE_READY = False
+        SERVICE_READY = False # Asegurarse que es False
         log.warning("Ingest Service startup sequence completed but essential DB connection failed. Service marked as NOT READY.")
 
 
@@ -840,7 +846,7 @@ async def startup_event():
 async def shutdown_event():
     log.info("Shutting down Ingest Service (Haystack)...")
     await postgres_client.close_db_pool()
-    log.info("PostgreSQL connection pool closed.")
+    # log.info("PostgreSQL connection pool closed.") # close_db_pool ya loguea esto
     log.info("Ingest Service shutdown complete.")
 
 # --- Exception Handlers (Mantener como estaban) ---
@@ -881,15 +887,16 @@ app.include_router(ingest.router, prefix=settings.API_V1_STR, tags=["Ingestion"]
 async def read_root():
     """
     Health check endpoint. Checks if the service started successfully
-    and can still connect to the database.
-    Returns 503 Service Unavailable if startup failed or DB connection is lost.
+    (SERVICE_READY flag) and performs an active database ping.
+    Returns 503 Service Unavailable if startup failed or DB ping fails.
     """
     # *** CORREGIDO: Mover la declaración 'global' al inicio de la función ***
     global SERVICE_READY
-    log.debug("Root endpoint accessed (health check)")
+    health_log = log.bind(check="liveness/readiness")
+    health_log.debug("Root endpoint accessed (health check)")
 
     if not SERVICE_READY:
-         log.warning("Health check failed: Service did not start successfully (SERVICE_READY is False).")
+         health_log.warning("Health check failed: Service is marked as NOT READY (startup issue).")
          raise HTTPException(
              status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE,
              detail="Service is not ready, essential connections likely failed during startup."
@@ -897,33 +904,34 @@ async def read_root():
 
     # Chequeo activo de la base de datos (ping)
     try:
-        pool = await postgres_client.get_db_pool()
+        pool = await postgres_client.get_db_pool() # Reutilizar el pool existente
         async with pool.acquire() as conn:
             # Usa un timeout bajo para el ping
             await asyncio.wait_for(conn.execute("SELECT 1"), timeout=5.0)
-        log.debug("Health check: DB ping successful.")
+        health_log.debug("Health check: DB ping successful.")
         # Si el ping tiene éxito pero SERVICE_READY era False (raro, pero posible si hubo un error temporal), lo corregimos.
+        # Esto es una autocorrección leve, pero si el startup falló gravemente, el pod debería reiniciarse.
         if not SERVICE_READY:
-             log.warning("DB Ping successful, but service was marked as not ready. Setting SERVICE_READY=True now.")
+             health_log.warning("DB Ping successful, but service was marked as not ready. Setting SERVICE_READY=True now (potential recovery).")
              SERVICE_READY = True # Marcar como listo si el ping funciona ahora
     except asyncio.TimeoutError:
-        log.error("Health check failed: DB ping timed out (> 5 seconds).")
-        # Marcar como no listo si falla el ping
+        health_log.error("Health check failed: DB ping timed out (> 5 seconds). Marking service as NOT READY.")
+        # Marcar como no listo si falla el ping activo
         SERVICE_READY = False
         raise HTTPException(
             status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Service is unhealthy, database connection check timed out."
         )
     except Exception as db_ping_err:
-        log.error("Health check failed: DB ping error.", error=str(db_ping_err))
-        # Marcar como no listo si falla el ping
+        health_log.error("Health check failed: DB ping error. Marking service as NOT READY.", error=str(db_ping_err))
+        # Marcar como no listo si falla el ping activo
         SERVICE_READY = False
         raise HTTPException(
             status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Service is unhealthy, cannot connect to database: {db_ping_err}"
+            detail=f"Service is unhealthy, cannot connect to database: {type(db_ping_err).__name__}"
         )
 
-    # Si todo está bien
+    # Si todo está bien (SERVICE_READY era True y el ping funcionó)
     return {"status": "ok", "service": settings.PROJECT_NAME, "ready": SERVICE_READY}
 
 # --- Main execution (for local development) ---
@@ -1121,6 +1129,8 @@ class MinioStorageClient:
         loop = asyncio.get_running_loop()
         try:
             # Ejecutar la operación síncrona de MinIO en un executor
+            # Asegurarse que el stream está al inicio antes de pasarlo al thread
+            file_content_stream.seek(0)
             result = await loop.run_in_executor(
                 None, # Usa el ThreadPoolExecutor por defecto
                 lambda: self.client.put_object(
@@ -1134,7 +1144,7 @@ class MinioStorageClient:
             upload_log.info("File uploaded successfully to MinIO via executor", etag=result.etag, version_id=result.version_id)
             return object_name
         except S3Error as e:
-            upload_log.error("Failed to upload file to MinIO via executor", error=str(e), exc_info=True)
+            upload_log.error("Failed to upload file to MinIO via executor", error=str(e), code=e.code, exc_info=True)
             raise # Re-raise the specific S3Error
         except Exception as e:
             upload_log.error("Unexpected error during file upload via executor", error=str(e), exc_info=True)
@@ -1162,7 +1172,7 @@ class MinioStorageClient:
             file_stream.seek(0) # Reset stream position
             return file_stream
         except S3Error as e:
-            download_log.error("Failed to download file from MinIO (sync)", error=str(e), code=e.code, exc_info=False)
+            download_log.error("Failed to download file from MinIO (sync)", error=str(e), code=e.code, exc_info=False) # No need for full trace on known errors like NoSuchKey
             # Es importante lanzar una excepción clara si el archivo no se encuentra
             if e.code == 'NoSuchKey':
                  raise FileNotFoundError(f"Object not found in MinIO: {object_name}") from e
@@ -1202,8 +1212,8 @@ class MinioStorageClient:
         except FileNotFoundError: # Capturar el error específico de archivo no encontrado
             download_log.error("File not found in MinIO via executor", object_name=object_name)
             raise # Relanzar FileNotFoundError para que la tarea Celery lo maneje
-        except Exception as e:
-            download_log.error("Error downloading file via executor", error=str(e), exc_info=True)
+        except Exception as e: # Captura IOError u otros errores del sync helper
+            download_log.error("Error downloading file via executor", error=str(e), error_type=type(e).__name__, exc_info=True)
             raise # Relanzar otras excepciones
 ```
 
@@ -1247,7 +1257,7 @@ log.info("Celery app configured", broker=settings.CELERY_BROKER_URL)
 
 ## File: `app\tasks\process_document.py`
 ```py
-# ./app/tasks/process_document.py (CORREGIDO - Llamada a MinIO en executor)
+# ./app/tasks/process_document.py (CORREGIDO - Llamada a MinIO/Haystack en executor y manejo async)
 import uuid
 import asyncio
 from typing import Dict, Any, Optional, List, Type
@@ -1257,6 +1267,7 @@ from pathlib import Path
 import structlog
 import base64
 import io
+import time # Para medir tiempos si es necesario
 
 # --- Haystack Imports ---
 from haystack import Pipeline, Document
@@ -1277,13 +1288,14 @@ from haystack.dataclasses import ByteStream
 # --- Local Imports ---
 from app.tasks.celery_app import celery_app
 from app.core.config import settings
-from app.db import postgres_client
+from app.db import postgres_client # Importar funciones async del cliente DB
 from app.models.domain import DocumentStatus
-from app.services.minio_client import MinioStorageClient # Importar cliente corregido
+from app.services.minio_client import MinioStorageClient # Importar cliente MinIO corregido
 
 log = structlog.get_logger(__name__)
 
 # --- Funciones de inicialización de Haystack (sin cambios necesarios) ---
+# (Se asume que estas funciones son síncronas y seguras para llamarse desde el executor o antes)
 def get_haystack_document_store() -> MilvusDocumentStore:
     """Initializes the MilvusDocumentStore."""
     log.debug("Initializing MilvusDocumentStore",
@@ -1307,10 +1319,14 @@ def get_haystack_document_store() -> MilvusDocumentStore:
 def get_haystack_embedder() -> OpenAIDocumentEmbedder:
     """Initializes the OpenAI Embedder for documents."""
     api_key_env_var = "INGEST_OPENAI_API_KEY" # La variable de entorno real según tu config
-    if not settings.OPENAI_API_KEY.get_secret_value():
+    api_key = settings.OPENAI_API_KEY.get_secret_value()
+    if not api_key:
          log.warning(f"OpenAI API Key not found in settings. Haystack embedding might fail.")
+         # Considerar lanzar un error si la clave es esencial
+         # raise ValueError("OpenAI API Key is missing in configuration")
     return OpenAIDocumentEmbedder(
-        api_key=Secret.from_env_var(api_key_env_var) if os.getenv(api_key_env_var) else Secret.from_token(settings.OPENAI_API_KEY.get_secret_value()),
+        # Usar Secret.from_env_var si la clave viene de env var, sino from_token
+        api_key=Secret.from_env_var(api_key_env_var) if os.getenv(api_key_env_var) else Secret.from_token(api_key),
         model=settings.OPENAI_EMBEDDING_MODEL,
         meta_fields_to_embed=[] # Ajusta si necesitas embeber metadatos
     )
@@ -1339,8 +1355,14 @@ def get_converter_for_content_type(content_type: str) -> Optional[Type]:
 # --- Celery Task ---
 @celery_app.task(
     bind=True,
-    autoretry_for=(Exception,), # Reintenta en cualquier excepción (ajusta si es necesario)
-    retry_kwargs={'max_retries': 2, 'countdown': 60}, # 2 reintentos con 60s de espera
+    # *** CORREGIDO: Reintentar solo en excepciones recuperables, NO en FileNotFoundError o ValueError ***
+    autoretry_for=(IOError, ConnectionError, TimeoutError, Exception), # Excepciones genéricas/red/IO
+    retry_kwargs={'max_retries': 2, 'countdown': 60},
+    # No reintentar en errores de lógica/datos como:
+    # FileNotFoundError (archivo no existe)
+    # ValueError (tipo de contenido no soportado, metadata inválida)
+    # NotImplementedError (OCR no implementado)
+    reject_on_worker_lost=True, # Re-encolar si el worker muere
     acks_late=True, # Reconoce el mensaje solo después de completar o fallar definitivamente
     name="tasks.process_document_haystack"
 )
@@ -1355,6 +1377,7 @@ def process_document_haystack_task(
 ):
     """
     Procesa un documento usando un pipeline Haystack (MinIO -> Haystack -> Milvus -> Supabase Status).
+    Utiliza asyncio.run para manejar operaciones async y run_in_executor para operaciones bloqueantes.
     """
     document_id = uuid.UUID(document_id_str)
     company_id = uuid.UUID(company_id_str)
@@ -1362,7 +1385,7 @@ def process_document_haystack_task(
                       task_id=self.request.id, file_name=file_name, object_name=minio_object_name, content_type=content_type)
     task_log.info("Starting Haystack document processing task")
 
-    # Usar una función async interna para poder usar await con postgres_client y run_in_executor
+    # *** CORREGIDO: Usar una función async interna para la lógica principal ***
     async def async_process():
         haystack_pipeline = Pipeline()
         processed_docs_count = 0
@@ -1372,30 +1395,25 @@ def process_document_haystack_task(
         document_store: Optional[MilvusDocumentStore] = None
 
         try:
-            # 0. Marcar como procesando en Supabase
+            # 0. Marcar como procesando en Supabase (usando await)
             await postgres_client.update_document_status(document_id, DocumentStatus.PROCESSING)
             task_log.info("Document status set to PROCESSING")
 
-            # 1. Descargar archivo de MinIO (usando executor para la llamada síncrona)
-            task_log.info("Downloading file from MinIO via executor...")
-            loop = asyncio.get_running_loop()
+            # 1. Descargar archivo de MinIO (usando await en el wrapper async de Minio)
+            task_log.info("Downloading file from MinIO via async wrapper...")
             try:
-                # *** CORREGIDO: Llamar a la función síncrona en el executor ***
-                downloaded_file_stream = await loop.run_in_executor(
-                    None, # Usa el default ThreadPoolExecutor
-                    minio_client.download_file_stream_sync, # Llama a la función sync corregida
-                    minio_object_name
-                )
+                # *** CORREGIDO: Llamar al método async download_file_stream que usa executor internamente ***
+                downloaded_file_stream = await minio_client.download_file_stream(minio_object_name)
             except FileNotFoundError as fnf_err:
                  # Si el archivo no existe, no tiene sentido reintentar. Marcar como error y salir.
                  task_log.error("File not found in MinIO storage. Cannot process.", object_name=minio_object_name, error=str(fnf_err))
                  await postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message="File not found in storage")
-                 # No relanzamos la excepción aquí para que Celery no intente reintentar por FileNotFoundError
+                 # No relanzamos la excepción aquí para que Celery NO intente reintentar por FileNotFoundError
                  return # Salir de la función async_process
-            except Exception as download_err:
-                 # Otros errores de descarga sí podrían beneficiarse de un reintento
-                 task_log.error("Failed to download file from MinIO.", error=str(download_err), exc_info=True)
-                 raise download_err # Relanzar para que Celery reintente
+            # Capturar otros errores de descarga (IOError, etc.) que SÍ podrían reintentarse
+            except (IOError, Exception) as download_err:
+                 task_log.error("Failed to download file from MinIO.", error=str(download_err), error_type=type(download_err).__name__, exc_info=True)
+                 raise download_err # Relanzar para que Celery reintente si está configurado
 
             file_bytes = downloaded_file_stream.getvalue()
             if not file_bytes:
@@ -1403,7 +1421,7 @@ def process_document_haystack_task(
                 task_log.error("Downloaded file from MinIO is empty.")
                 await postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message="Downloaded file is empty")
                 return # Salir de la función async_process
-            task_log.info(f"File downloaded successfully via executor ({len(file_bytes)} bytes)")
+            task_log.info(f"File downloaded successfully ({len(file_bytes)} bytes)")
 
             # 2. Preparar Input Haystack (ByteStream) con metadatos FILTRADOS
             # (Sin cambios en esta lógica, parece correcta)
@@ -1428,42 +1446,52 @@ def process_document_haystack_task(
             task_log.debug("Filtered metadata for Haystack/Milvus", final_meta=doc_meta, original_allowed_added=filtered_original_meta_count)
             source_stream = ByteStream(data=file_bytes, meta=doc_meta)
 
-            # 3. Seleccionar Conversor o Manejar OCR
+            # 3. Seleccionar Conversor o Manejar OCR / Construir Pipeline
             # (Sin cambios en esta lógica)
             ConverterClass = get_converter_for_content_type(content_type)
             if content_type in settings.EXTERNAL_OCR_REQUIRED_CONTENT_TYPES:
-                # Aquí iría la lógica para llamar a un servicio OCR externo si estuviera implementado
                 task_log.error("OCR processing required but not implemented.", content_type=content_type)
+                # Lanzar NotImplementedError para que Celery NO reintente
                 raise NotImplementedError(f"OCR processing for {content_type} not implemented.")
             elif ConverterClass:
                  task_log.info(f"Using Haystack converter: {ConverterClass.__name__}")
-                 document_store = get_haystack_document_store() # Inicializar store
-                 haystack_pipeline.add_component("converter", ConverterClass())
-                 haystack_pipeline.add_component("splitter", get_haystack_splitter())
-                 haystack_pipeline.add_component("embedder", get_haystack_embedder())
-                 haystack_pipeline.add_component("writer", DocumentWriter(document_store=document_store))
-                 # Conectar los componentes en orden
+                 # Inicializar componentes (síncrono)
+                 document_store = get_haystack_document_store()
+                 converter = ConverterClass()
+                 splitter = get_haystack_splitter()
+                 embedder = get_haystack_embedder()
+                 writer = DocumentWriter(document_store=document_store)
+
+                 # Construir pipeline (síncrono)
+                 haystack_pipeline.add_component("converter", converter)
+                 haystack_pipeline.add_component("splitter", splitter)
+                 haystack_pipeline.add_component("embedder", embedder)
+                 haystack_pipeline.add_component("writer", writer)
                  haystack_pipeline.connect("converter.documents", "splitter.documents")
                  haystack_pipeline.connect("splitter.documents", "embedder.documents")
                  haystack_pipeline.connect("embedder.documents", "writer.documents")
+
                  pipeline_input = {"converter": {"sources": [source_stream]}}
             else:
                  # Si no hay conversor y no es OCR, es un tipo no soportado
                  task_log.error("Unsupported content type for Haystack processing", content_type=content_type)
+                 # Lanzar ValueError para que Celery NO reintente
                  raise ValueError(f"Unsupported content type for processing: {content_type}")
 
-            # 4. Ejecutar el Pipeline Haystack (usando executor porque puede ser bloqueante)
+            # 4. Ejecutar el Pipeline Haystack (usando executor porque es bloqueante)
             if not haystack_pipeline.inputs: # Verificar si la pipeline se construyó
                  raise RuntimeError("Haystack pipeline construction failed or is empty.")
 
             task_log.info("Running Haystack indexing pipeline via executor...", pipeline_input_keys=list(pipeline_input.keys()))
+            start_time = time.monotonic()
             loop = asyncio.get_running_loop()
-            # Ejecutar el pipeline síncrono en el executor
+            # *** CORREGIDO: Ejecutar el pipeline síncrono en el executor ***
             pipeline_result = await loop.run_in_executor(
                 None, # Default executor
                 lambda: haystack_pipeline.run(pipeline_input)
             )
-            task_log.info("Haystack pipeline finished via executor.")
+            duration = time.monotonic() - start_time
+            task_log.info(f"Haystack pipeline finished via executor in {duration:.2f} seconds.")
 
             # 5. Verificar resultado y obtener contador de chunks/documentos procesados
             # (Sin cambios en esta lógica)
@@ -1489,19 +1517,34 @@ def process_document_haystack_task(
             )
             task_log.info("Document status set to PROCESSED/INDEXED in Supabase", chunk_count=processed_docs_count)
 
+        # *** CORREGIDO: Manejo de excepciones específicas para evitar reintentos innecesarios ***
+        except (ValueError, NotImplementedError, TypeError) as logical_error:
+             # Errores de lógica/datos (tipo no soportado, OCR no implementado, etc.) - NO REINTENTAR
+             task_log.error("Logical/Data error during processing, will not retry.", error=str(logical_error), error_type=type(logical_error).__name__, exc_info=True)
+             try:
+                 await postgres_client.update_document_status(
+                     document_id, DocumentStatus.ERROR, error_message=f"Task Error (No Retry): {type(logical_error).__name__}: {str(logical_error)[:500]}"
+                 )
+                 task_log.info("Document status set to ERROR in Supabase due to logical/data failure.")
+             except Exception as db_update_err:
+                 task_log.error("CRITICAL: Failed to update document status to ERROR after logical/data failure", nested_error=str(db_update_err), exc_info=True)
+             # NO relanzar la excepción para que Celery no la vea como un fallo reintentable
+             # La tarea se marcará como SUCCESSFUL en Celery, pero el estado en la BD será ERROR.
+             # Si prefieres que Celery la marque como FAILED, puedes relanzarla, pero asegúrate que no está en `autoretry_for`.
+             # raise logical_error # Descomentar si quieres que Celery marque como FAILED
         except Exception as e:
-            # Captura cualquier excepción durante el proceso
-            task_log.error("Error during Haystack document processing", error=str(e), exc_info=True)
+            # Captura cualquier OTRA excepción (IOError, TimeoutError, errores inesperados) que SÍ podría reintentarse
+            task_log.error("Potentially recoverable error during Haystack processing", error=str(e), error_type=type(e).__name__, exc_info=True)
             try:
-                # Intenta marcar como error en la BD
+                # Intenta marcar como error en la BD (puede que se revierta si hay reintento exitoso)
                 await postgres_client.update_document_status(
-                    document_id, DocumentStatus.ERROR, error_message=f"Task Error: {type(e).__name__}: {str(e)[:500]}" # Limita longitud del error
+                    document_id, DocumentStatus.ERROR, error_message=f"Task Error (Retry Pending): {type(e).__name__}: {str(e)[:500]}" # Limita longitud del error
                 )
-                task_log.info("Document status set to ERROR in Supabase due to processing failure.")
+                task_log.info("Document status set to ERROR in Supabase due to potentially recoverable failure.")
             except Exception as db_update_err:
                 # Loguea si falla la actualización de estado a ERROR
-                task_log.error("CRITICAL: Failed to update document status to ERROR after processing failure", nested_error=str(db_update_err), exc_info=True)
-            # Re-lanza la excepción original para que Celery la vea y maneje reintentos/fallo
+                task_log.error("CRITICAL: Failed to update document status to ERROR after potentially recoverable failure", nested_error=str(db_update_err), exc_info=True)
+            # Re-lanza la excepción original para que Celery la vea y maneje reintentos/fallo según `autoretry_for`
             raise e
         finally:
             # Asegurar limpieza de recursos
@@ -1513,17 +1556,18 @@ def process_document_haystack_task(
 
     # --- Ejecutar la lógica async dentro de la tarea síncrona de Celery ---
     try:
-        # Ejecuta la función async_process hasta que complete
+        # *** CORREGIDO: Ejecuta la función async_process hasta que complete ***
         asyncio.run(async_process())
-        task_log.info("Haystack document processing task finished successfully.")
+        task_log.info("Haystack document processing task finished.")
     except Exception as task_exception:
-        # Si async_process lanzó una excepción (y no fue FileNotFoundError o archivo vacío manejados internamente)
-        # Celery necesita ver la excepción para marcar la tarea como fallida y potencialmente reintentar.
-        task_log.exception("Haystack processing task failed at top level after potential retries.")
-        # La excepción ya fue relanzada desde async_process, Celery la capturará.
+        # Si async_process lanzó una excepción (y fue una de las reintentables O una que no se capturó explícitamente arriba),
+        # Celery necesita verla para marcar la tarea como fallida y potencialmente reintentar.
+        # Las excepciones FileNotFoundError, ValueError, NotImplementedError, etc., ya se manejaron dentro de async_process y no deberían llegar aquí si no se relanzaron.
+        task_log.exception("Haystack processing task failed at top level after potential retries or due to unhandled exception.")
+        # La excepción ya fue relanzada desde async_process si era reintentable.
         # No es necesario relanzar explícitamente aquí si ya se hizo en async_process.
-        # Si quieres asegurarte, puedes añadir: raise task_exception
-        pass # La excepción ya se propagó y Celery la manejará
+        # Si quieres asegurarte que Celery la vea, puedes añadir: raise task_exception
+        pass # La excepción ya se propagó (si era reintentable) y Celery la manejará
 ```
 
 ## File: `app\utils\__init__.py`
@@ -1573,8 +1617,8 @@ milvus-haystack = "^0.0.6" # Paquete correcto para la integración Haystack 2.x
 pypdf = "^4.0.1"
 python-docx = "^1.1.0"
 # Añadir 'markdown' y 'beautifulsoup4' si usas MarkdownToDocument y HTMLToDocument
-# markdown = "^3.5"
-# beautifulsoup4 = "^4.12.3"
+markdown = "^3.5" # Añadido para MarkdownToDocument
+beautifulsoup4 = "^4.12.3" # Añadido para HTMLToDocument
 
 
 [tool.poetry.dev-dependencies]
