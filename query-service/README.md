@@ -1,26 +1,26 @@
-# Query Service (Microservicio de Consulta) - Plan de Desarrollo
+# Query Service (Microservicio de Consulta)
 
 ## 1. Visión General
 
-El **Query Service** es el microservicio responsable de manejar las consultas en lenguaje natural de los usuarios dentro de la plataforma SaaS B2B. Su función principal es recibir una pregunta, utilizar un **pipeline de Retrieval-Augmented Generation (RAG) construido con [Haystack](https://haystack.deepset.ai/)** para encontrar información relevante en los documentos previamente ingeridos (y almacenados en Milvus), generar una respuesta coherente utilizando un Large Language Model (LLM) como Gemini, y registrar la interacción.
+El **Query Service** es el microservicio responsable de manejar las consultas en lenguaje natural de los usuarios dentro de la plataforma SaaS B2B. Su función principal es recibir una pregunta del usuario (`query`), utilizar un **pipeline de Retrieval-Augmented Generation (RAG) construido con [Haystack](https://haystack.deepset.ai/)** para encontrar información relevante en los documentos previamente ingeridos por el `ingest-service` (indexados en Milvus), generar una respuesta coherente utilizando un Large Language Model (LLM) externo (configurado para usar Google Gemini), y registrar la interacción para auditoría y análisis futuros.
 
 **Flujo principal:**
 
-1.  **Recepción:** La API recibe la consulta del usuario y el `X-Company-ID` (`POST /api/v1/query`).
-2.  **Validación:** Verifica la consulta y el header `X-Company-ID`.
-3.  **Procesamiento RAG (Pipeline Haystack):**
-    *   **Embedding de Consulta:** Convierte la pregunta del usuario en un vector de embedding usando un modelo compatible (ej: `text-embedding-3-small` de **OpenAI**) a través de `OpenAITextEmbedder`.
-    *   **Recuperación (Retrieval):** Busca en la base de datos vectorial **Milvus** los chunks de documentos más relevantes semánticamente para el embedding de la consulta, **filtrando estrictamente por el `company_id`** del usuario. Utiliza `MilvusEmbeddingRetriever` (o `MilvusHybridRetriever` si se implementa la ingesta híbrida).
-    *   **Construcción del Prompt:** Combina la consulta original y el contenido de los documentos recuperados en un prompt estructurado para el LLM, usando `ChatPromptBuilder`.
-    *   **Generación de Respuesta:** Envía el prompt al LLM configurado (ej: **Gemini API**) para generar la respuesta. Esto se puede hacer mediante una llamada directa a la API del LLM o encapsulándolo en un componente Haystack `Generator` (ej: un `GeminiGenerator` personalizado o adaptado).
-4.  **Persistencia del Log:** Registra la consulta, la respuesta generada, los IDs de los documentos recuperados y metadatos relevantes en la tabla `QUERY_LOGS` de **Supabase (PostgreSQL)**.
-5.  **Respuesta:** Devuelve la respuesta generada al usuario.
+1.  **Recepción:** La API (`POST /api/v1/query`) recibe la consulta del usuario (`query`) y el identificador de la empresa (`X-Company-ID` en headers). Se asume que la autenticación (JWT) es manejada por un API Gateway o servicio previo.
+2.  **Validación:** Verifica la presencia y formato de `query` y `X-Company-ID`.
+3.  **Ejecución del Pipeline RAG (Orquestado en `app.pipelines.rag_pipeline.py`):**
+    *   **Embedding de Consulta:** Convierte la `query` en un vector usando `OpenAITextEmbedder` (modelo definido en config, ej: `text-embedding-3-small`).
+    *   **Recuperación (Retrieval):** `MilvusEmbeddingRetriever` busca en la colección Milvus (definida en config) los chunks de documentos más relevantes para el vector de la consulta. **Crucialmente, aplica un filtro estricto para devolver solo documentos pertenecientes al `company_id` proporcionado.** El número de documentos (`top_k`) es configurable.
+    *   **Construcción del Prompt:** `PromptBuilder` toma la `query` original y el contenido de los `documents` recuperados, y los inserta en una plantilla predefinida (configurable) diseñada para instruir al LLM.
+    *   **Generación de Respuesta (Llamada Externa):** Se utiliza el cliente `app.services.gemini_client.py` para enviar el prompt generado a la API de Google Gemini (modelo definido en config, ej: `gemini-1.5-flash-latest`).
+4.  **Persistencia del Log:** La función `app.db.postgres_client.log_query_interaction` registra la consulta, la respuesta generada, los IDs y scores de los documentos recuperados, y metadatos relevantes (como modelos usados) en la tabla `query_logs` de Supabase (PostgreSQL).
+5.  **Respuesta:** Devuelve la respuesta generada por Gemini y la información sobre los documentos recuperados al cliente (`QueryResponse`).
 
-Este servicio se centra en la recuperación eficiente y la generación de respuestas contextualizadas, asegurando el aislamiento de datos entre empresas (multi-tenancy).
+Este servicio se centra en la recuperación eficiente y filtrada por tenant, y en la generación de respuestas contextualizadas, manteniendo la coherencia con la arquitectura y tecnologías del `ingest-service`.
 
 ## 2. Arquitectura General del Proyecto (Posición del Query Service)
 
-El `Query Service` (G1) interactúa principalmente con el API Gateway, Milvus, el LLM (Gemini) y Supabase.
+El `Query Service` (G1) se sitúa detrás del API Gateway y es invocado por este tras validar el JWT. Interactúa con Supabase (para logging), Milvus (para retrieval), OpenAI (para embedding de consulta) y Google Gemini (para generación de respuesta).
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#d3ffd4', 'edgeLabelBackground':'#fff', 'tertiaryColor': '#dcd0ff'}}}%%
@@ -39,20 +39,20 @@ flowchart TD
 
         C -->|Pregunta + JWT + X-Company-ID| G1["<strong>Query Service</strong><br/>(API + Pipeline Haystack RAG)"]
         %% Query Service Internals %%
-        subgraph QueryServiceInternals ["Query Service Pipeline"]
+        subgraph QueryServiceInternals ["Query Service Pipeline (Conceptual)"]
             direction LR
-            QS_In[Input: Query, CompanyID] --> QS_Embed["OpenAITextEmbedder"]
-            QS_Embed -->|Query Vector| QS_Retrieve["MilvusEmbeddingRetriever<br/>(Filtro por CompanyID)"]
-            QS_Retrieve -->|Relevant Docs| QS_Prompt["ChatPromptBuilder"]
-            QS_Prompt -->|Formatted Prompt| QS_Generate["Gemini Generator<br/>(Llamada a API Externa)"]
-            QS_Generate -->|Generated Answer| QS_Out[Output: Answer]
+            QS_In[Input: Query, CompanyID] --> QS_Embed["Haystack: OpenAITextEmbedder"]
+            QS_Embed -->|Query Vector| QS_Retrieve["Haystack: MilvusEmbeddingRetriever<br/>(Filtro por CompanyID)"]
+            QS_Retrieve -->|Relevant Docs| QS_Prompt["Haystack: PromptBuilder"]
+            QS_Prompt -->|Formatted Prompt| QS_ExtCall["Llamada Externa:<br/>GeminiClient"]
+            QS_ExtCall -->|Generated Answer| QS_Out[Output: Answer]
         end
         G1 --> QS_In
         QS_Retrieve -->|Búsqueda Semántica| F2
+        QS_ExtCall --> |API Call| I[Google Gemini API]
         QS_Out --> G1
 
         G1 -->|Log Query/Response| F3
-        G1 -->|API Call| I[Gemini Cloud API]
 
 
         E1 -->|Logs| H1["Monitoring Service"]
@@ -62,34 +62,33 @@ flowchart TD
     end
 
 ```
-
-*Nota: El pipeline RAG de Haystack se ejecuta **dentro** del `Query Service` (G1).*
+*Nota: El pipeline de Haystack maneja el embedding y retrieval. La generación se realiza mediante una llamada directa a la API de Gemini desde el servicio.*
 
 ## 3. Características Clave
 
-*   **API RESTful:** Endpoint para recibir consultas y devolver respuestas.
-*   **Pipeline RAG con Haystack:** Orquesta el embedding de la consulta, la recuperación filtrada de documentos relevantes desde Milvus y la generación de respuestas con un LLM.
-*   **Integración con LLM:** Diseñado para interactuar con la API de Gemini (u otro LLM configurado).
-*   **Multi-tenancy Estricto:** Asegura que las búsquedas y respuestas se basen únicamente en documentos pertenecientes a la empresa del usuario (`X-Company-ID`).
-*   **Logging de Consultas:** Persistencia de interacciones en Supabase (PostgreSQL) para auditoría y análisis.
-*   **Configuración Centralizada:** Uso de ConfigMaps y Secrets en Kubernetes.
+*   **API RESTful:** Endpoint `POST /api/v1/query` para consultas.
+*   **Pipeline RAG con Haystack:** Orquesta embedding (OpenAI), retrieval filtrado (Milvus) y construcción de prompt.
+*   **Integración con Google Gemini:** Utiliza la API de Gemini para la generación final de respuestas.
+*   **Multi-tenancy Estricto:** Filtra documentos por `company_id` en Milvus durante el retrieval.
+*   **Logging de Consultas:** Persistencia detallada en Supabase (`query_logs`).
+*   **Configuración Centralizada:** Uso de ConfigMaps (`query-service-config`) y Secrets (`query-service-secrets`) en Kubernetes.
 *   **Logging Estructurado:** Logs en JSON con `structlog`.
-*   **Basado en Estructura Existente:** Sigue el patrón de diseño y estructura del `ingest-service`.
+*   **Health Check Robusto:** Endpoint `/` optimizado para Kubernetes probes.
+*   **Manejo de Errores:** Captura y loguea errores de dependencias y del pipeline.
 
 ## 4. Pila Tecnológica Principal
 
 *   **Lenguaje:** Python 3.10+
 *   **Framework API:** FastAPI
-*   **Orquestación RAG:** Haystack AI 2.x
+*   **Orquestación RAG:** Haystack AI 2.x (`haystack-ai`)
 *   **Base de Datos Relacional (Logging):** Supabase (PostgreSQL) vía `asyncpg`.
 *   **Base de Datos Vectorial (Retrieval):** Milvus vía `milvus-haystack`.
-*   **Modelo de Embeddings (Query):** OpenAI (`text-embedding-3-small` por defecto) vía `haystack-ai`.
-*   **Modelo de Lenguaje Grande (Generación):** Google Gemini (acceso vía API externa, ej: `google-generativeai`).
+*   **Modelo de Embeddings (Query):** OpenAI (`text-embedding-3-small` por defecto) vía `openai`.
+*   **Modelo de Lenguaje Grande (Generación):** Google Gemini vía `google-generativeai`.
 *   **Despliegue:** Docker, Kubernetes (GKE / local en K8s de Docker Desktop).
+*   **Servidor ASGI:** Gunicorn + Uvicorn workers.
 
-## 5. Estructura de la Codebase Propuesta.
-
-Siguiendo el patrón del `ingest-service`:
+## 5. Estructura de la Codebase
 
 ```
 query-service/
@@ -101,65 +100,70 @@ query-service/
 │   │       ├── __init__.py
 │   │       ├── endpoints/
 │   │       │   ├── __init__.py
-│   │       │   └── query.py      # Define el endpoint POST /query
-│   │       └── schemas.py        # Define QueryRequest, QueryResponse, etc.
+│   │       │   └── query.py      # Define POST /query
+│   │       └── schemas.py        # Define Pydantic models (Request/Response)
 │   ├── core/
 │   │   ├── __init__.py
-│   │   ├── config.py         # Carga y valida la configuración (variables de entorno)
-│   │   └── logging_config.py # Configura el logging (puede ser compartido/adaptado)
+│   │   ├── config.py         # Carga configuración (Pydantic BaseSettings)
+│   │   └── logging_config.py # Configura structlog
 │   ├── db/
 │   │   ├── __init__.py
-│   │   └── postgres_client.py # Cliente para Supabase (logging) (puede ser compartido/adaptado)
-│   ├── main.py               # Punto de entrada de la aplicación FastAPI
-│   ├── models/               # (Opcional si no hay modelos de dominio específicos aquí)
+│   │   └── postgres_client.py # Cliente asyncpg para Supabase (logging)
+│   ├── main.py               # Entrypoint FastAPI, startup/shutdown, health check
+│   ├── models/               # Vacío por ahora
 │   │   └── __init__.py
-│   ├── pipelines/            # Directorio para la lógica del pipeline Haystack
+│   ├── pipelines/            # Lógica del pipeline Haystack
 │   │   ├── __init__.py
-│   │   └── rag_pipeline.py   # Define y construye el pipeline RAG de Haystack
-│   ├── services/             # Para clientes de servicios externos
+│   │   └── rag_pipeline.py   # Construye y ejecuta el pipeline RAG
+│   ├── services/             # Clientes para APIs externas
 │   │   ├── __init__.py
-│   │   ├── base_client.py    # (Reutilizable)
-│   │   └── gemini_client.py  # (Opcional) Cliente específico para Gemini si no se usa un Generator Haystack
+│   │   ├── base_client.py    # Cliente HTTP base (reutilizable)
+│   │   └── gemini_client.py  # Cliente específico para Google Gemini API
 │   └── utils/
 │       ├── __init__.py
 │       └── helpers.py        # Funciones de utilidad
-├── Dockerfile
-├── pyproject.toml
-├── README.md
-└── .env.example
+├── Dockerfile                # Define cómo construir la imagen Docker
+├── pyproject.toml            # Define dependencias (Poetry)
+├── README.md                 # Este archivo
+└── .env.example              # Ejemplo de variables de entorno locales
 ```
 
 ## 6. Configuración (Kubernetes)
 
-Se necesitará un ConfigMap `query-service-config` y un Secret `query-service-secrets` en el namespace `nyro-develop`.
+Gestionada mediante ConfigMap `query-service-config` y Secret `query-service-secrets` en el namespace `nyro-develop`.
 
 ### ConfigMap (`query-service-config`)
 
-| Clave                           | Descripción                                                          | Ejemplo (Valor Esperado)                        | Origen/Notas                                     |
-| :------------------------------ | :------------------------------------------------------------------- | :---------------------------------------------- | :----------------------------------------------- |
-| `QUERY_LOG_LEVEL`               | Nivel de logging.                                                    | `INFO`                                          | Similar a Ingest                                 |
-| `QUERY_POSTGRES_SERVER`         | Host del **Supabase Session Pooler**.                                | `aws-0-sa-east-1.pooler.supabase.com`           | Igual que Ingest                                 |
-| `QUERY_POSTGRES_PORT`           | Puerto del **Supabase Session Pooler**.                              | `5432`                                          | Igual que Ingest                                 |
-| `QUERY_POSTGRES_USER`           | Usuario del **Supabase Session Pooler**.                             | `postgres.ymsilkrhstwxikjiqqog`                 | Igual que Ingest                                 |
-| `QUERY_POSTGRES_DB`             | Base de datos en Supabase.                                           | `postgres`                                      | Igual que Ingest                                 |
-| `QUERY_MILVUS_URI`              | URI del servicio Milvus dentro de K8s.                               | `http://milvus-service...:19530`                | Igual que Ingest                                 |
-| `QUERY_MILVUS_COLLECTION_NAME`  | Nombre de la colección Milvus donde están los chunks.                | `document_chunks_haystack`                      | Igual que Ingest                                 |
-| `QUERY_MILVUS_EMBEDDING_FIELD`  | Nombre del campo de embedding en Milvus.                             | `embedding`                                     | Igual que Ingest (Settings.MILVUS\_EMBEDDING\_FIELD) |
-| `QUERY_MILVUS_CONTENT_FIELD`    | Nombre del campo de contenido en Milvus.                             | `content`                                       | Igual que Ingest (Settings.MILVUS\_CONTENT\_FIELD)   |
-| `QUERY_OPENAI_EMBEDDING_MODEL`  | Modelo de embedding OpenAI para la *consulta*.                       | `text-embedding-3-small`                        | **Debe coincidir** con el usado en Ingest        |
-| `QUERY_EMBEDDING_DIMENSION`     | Dimensión del vector de embedding.                                   | `1536`                                          | **Debe coincidir** con el usado en Ingest        |
-| `QUERY_RETRIEVER_TOP_K`         | Número de documentos a recuperar de Milvus.                          | `5`                                             | Ajustable según rendimiento/precisión            |
-| `QUERY_GEMINI_MODEL_NAME`       | Nombre del modelo Gemini a usar.                                     | `gemini-1.5-flash-latest`                       | (o el modelo específico de Gemini elegido)       |
-| `QUERY_RAG_PROMPT_TEMPLATE`     | (Opcional) Plantilla Jinja2 para el prompt RAG (si no hardcodeada). | `"Responde a la pregunta '{{query}}' basándote únicamente en estos documentos:\n{% for doc in documents %}\n{{ doc.content }}\n{% endfor %}"` | Puede definirse en código o aquí                |
-| `QUERY_MAX_PROMPT_TOKENS`       | (Opcional) Límite de tokens para el prompt enviado a Gemini.         | `7000`                                          | Para evitar exceder límites de Gemini            |
+| Clave                           | Descripción                                                          | Ejemplo (Valor Esperado)                               | Notas                                                       |
+| :------------------------------ | :------------------------------------------------------------------- | :----------------------------------------------------- | :---------------------------------------------------------- |
+| `QUERY_LOG_LEVEL`               | Nivel de logging (DEBUG, INFO, WARNING, ERROR).                      | `INFO`                                                 |                                                             |
+| `QUERY_POSTGRES_SERVER`         | Host del Supabase Session Pooler.                                    | `aws-0-sa-east-1.pooler.supabase.com`                  |                                                             |
+| `QUERY_POSTGRES_PORT`           | Puerto del Supabase Session Pooler.                                  | `5432` (*Corregido*)                                   | Puerto estándar de PG, Pooler usa este por defecto ahora. |
+| `SUPABASE_PROJECT_REF`          | Referencia del proyecto Supabase (usada para construir user).         | `ymsilkrhstwxikjiqqog`                                 | **¡Ajustar a tu proyecto!**                               |
+| `QUERY_POSTGRES_USER`           | Usuario del Supabase Session Pooler (`postgres.<project-ref>`).      | `postgres.ymsilkrhstwxikjiqqog`                        | Construido a partir de `SUPABASE_PROJECT_REF` en `config.py` |
+| `QUERY_POSTGRES_DB`             | Base de datos en Supabase.                                           | `postgres`                                             |                                                             |
+| `QUERY_MILVUS_URI`              | URI del servicio Milvus (DNS interno de K8s).                        | `http://milvus-milvus.default.svc.cluster.local:19530` | **Corregido: apunta a `default` ns**                      |
+| `QUERY_MILVUS_COLLECTION_NAME`  | Nombre de la colección Milvus.                                       | `document_chunks_haystack`                             | Debe coincidir con `ingest-service`                         |
+| `QUERY_MILVUS_EMBEDDING_FIELD`  | Nombre del campo vectorial en Milvus.                                | `embedding`                                            | Usado por el Retriever. Default `milvus-haystack`.        |
+| `QUERY_MILVUS_CONTENT_FIELD`    | Nombre del campo de contenido textual en Milvus.                     | `content`                                              | Usado por el Retriever. Default `milvus-haystack`.        |
+| `QUERY_MILVUS_COMPANY_ID_FIELD` | Nombre del campo de metadatos para filtrar por empresa.               | `company_id`                                           | **CRUCIAL** para multi-tenancy                            |
+| `QUERY_OPENAI_EMBEDDING_MODEL`  | Modelo de embedding OpenAI para la consulta.                         | `text-embedding-3-small`                               | **Debe coincidir** con `ingest-service`                   |
+| `QUERY_EMBEDDING_DIMENSION`     | Dimensión del vector de embedding (auto-ajustado en config).         | `1536`                                                 |                                                             |
+| `QUERY_RETRIEVER_TOP_K`         | Número de documentos a recuperar de Milvus por defecto.              | `5`                                                    | Puede sobreescribirse por request.                        |
+| `QUERY_GEMINI_MODEL_NAME`       | Nombre del modelo Gemini a usar para generación.                     | `gemini-1.5-flash-latest`                              |                                                             |
+| `QUERY_RAG_PROMPT_TEMPLATE`     | (Opcional) Plantilla Jinja2 para el prompt RAG.                      | *(Ver default en `config.py`)*                         | Se usa el default si no se especifica aquí.               |
+| `QUERY_MAX_PROMPT_TOKENS`       | (Opcional) Límite *aproximado* de tokens para el prompt a Gemini.    | `7000`                                                 | No implementado activamente (truncamiento/etc.).          |
+| `QUERY_HTTP_CLIENT_TIMEOUT`     | Timeout para clientes HTTP (ej: Gemini).                             | `60`                                                   | En segundos.                                                |
+| `QUERY_HTTP_CLIENT_MAX_RETRIES` | Máximo de reintentos para clientes HTTP.                             | `2`                                                    |                                                             |
+| `QUERY_HTTP_CLIENT_BACKOFF_FACTOR`| Factor de backoff exponencial para reintentos.                     | `1.0`                                                  |                                                             |
 
 ### Secret (`query-service-secrets`)
 
-| Clave del Secreto     | Variable de Entorno Correspondiente | Descripción                                   | Origen/Notas       |
-| :-------------------- | :---------------------------------- | :-------------------------------------------- | :----------------- |
-| `postgres-password`   | `QUERY_POSTGRES_PASSWORD`           | Contraseña de Supabase (Pooler).              | Misma que Ingest   |
-| `openai-api-key`      | `QUERY_OPENAI_API_KEY`              | Clave API de OpenAI (para embedding consulta). | Misma que Ingest   |
-| `gemini-api-key`      | `QUERY_GEMINI_API_KEY`              | Clave API para Google Gemini.                 | Nueva credencial   |
+| Clave del Secreto     | Variable de Entorno Correspondiente | Descripción                                   |
+| :-------------------- | :---------------------------------- | :-------------------------------------------- |
+| `postgres-password`   | `QUERY_POSTGRES_PASSWORD`           | Contraseña de Supabase (Pooler).              |
+| `openai-api-key`      | `QUERY_OPENAI_API_KEY`              | Clave API de OpenAI (para embedding consulta). |
+| `gemini-api-key`      | `QUERY_GEMINI_API_KEY`              | Clave API para Google Gemini.                 |
 
 ## 7. API Endpoints
 
@@ -170,22 +174,14 @@ Prefijo base: `/api/v1`
 ### Health Check
 
 *   **Endpoint:** `GET /`
-*   **Descripción:** Verifica la disponibilidad del servicio y la conexión a dependencias críticas (Supabase, Milvus - opcionalmente un ping). Usado por Kubernetes Probes.
-*   **Respuesta Exitosa (`200 OK`):**
-    ```json
-    {
-      "status": "ok",
-      "service": "Query Service",
-      "ready": true,
-      "dependencies": {
-          "supabase_connection": "ok",
-          "milvus_connection": "ok" // o "pending" / "error"
-      }
-    }
+*   **Descripción:** Chequeo básico de Liveness/Readiness para Kubernetes. Verifica si el servicio se inició correctamente (variable interna `SERVICE_READY`). **No realiza chequeos activos de dependencias externas** para mayor estabilidad de los probes.
+*   **Respuesta Exitosa (`200 OK`):** Indica que el servicio arrancó y está aceptando conexiones.
+    ```plain
+    OK
     ```
-*   **Respuesta No Listo (`503 Service Unavailable`):** Indica fallo en el arranque o pérdida de conexión a dependencias.
+*   **Respuesta No Listo (`503 Service Unavailable`):** Indica que el flag `SERVICE_READY` es `False` (fallo crítico durante el startup).
     ```json
-    { "detail": "Service is not ready or dependencies unavailable." }
+    { "detail": "Service is not ready or failed during startup." }
     ```
 
 ---
@@ -193,144 +189,71 @@ Prefijo base: `/api/v1`
 ### Realizar Consulta (RAG)
 
 *   **Endpoint:** `POST /query`
-*   **Descripción:** Recibe una consulta, ejecuta el pipeline RAG y devuelve la respuesta generada por el LLM.
+*   **Descripción:** Recibe una consulta, ejecuta el pipeline RAG (embedding, retrieval filtrado, prompt, generación con Gemini), loguea la interacción y devuelve la respuesta.
 *   **Headers Requeridos:**
     *   `X-Company-ID`: (String UUID) Identificador de la empresa para filtrar documentos.
-    *   `Authorization`: (String) `Bearer <JWT_TOKEN>` (Validado por API Gateway/Auth Service).
-*   **Request Body:** (JSON)
+    *   `Authorization`: (String) `Bearer <JWT_TOKEN>` (Se asume validado previamente).
+*   **Request Body:** (`application/json`)
     ```json
     {
-      "query": "string" // La pregunta del usuario
-      // "chat_history": [ { "role": "user/assistant", "content": "..." } ] // Opcional para conversaciones
-      // "retriever_top_k": int // Opcional para sobreescribir el default
+      "query": "string",
+      "retriever_top_k": int | null // Opcional
     }
     ```
-    *   **Schema Pydantic:** `QueryRequest`
+    *   **Schema Pydantic:** `schemas.QueryRequest`
 *   **Respuesta Exitosa (`200 OK`):**
     ```json
     {
-      "answer": "string", // La respuesta generada por el LLM
-      "retrieved_documents": [ // Lista de documentos usados como contexto
+      "answer": "string",
+      "retrieved_documents": [
         {
-          "id": "chunk_id_from_milvus_or_doc_id", // ID del chunk o documento
-          "score": 0.85, // Score de relevancia del retriever
-          "content_preview": "string" // (Opcional) Primeras N palabras/caracteres del chunk
-          // "metadata": { ... } // (Opcional) Metadatos relevantes del chunk
+          "id": "string",
+          "score": float | null,
+          "content_preview": "string" | null,
+          "metadata": { ... } | null,
+          "document_id": "string" | null,
+          "file_name": "string" | null
         }
       ],
-      "query_log_id": "uuid" // ID del registro en la tabla QUERY_LOGS
+      "query_log_id": "uuid" | null
     }
     ```
-    *   **Schema Pydantic:** `QueryResponse`
-*   **Respuestas de Error:**
-    *   `400 Bad Request`: Falta `query` o formato inválido.
-    *   `401 Unauthorized`: Falta `X-Company-ID` o token inválido (detectado antes usualmente).
-    *   `403 Forbidden`: El `X-Company-ID` no es válido o no tiene permisos.
-    *   `404 Not Found`: (Potencialmente) Si no se encuentran documentos relevantes *y* el LLM no puede responder sin contexto (configurable).
-    *   `500 Internal Server Error`: Fallo inesperado en el pipeline, LLM, o base de datos.
-    *   `503 Service Unavailable`: Milvus, Supabase o Gemini no están disponibles.
+    *   **Schema Pydantic:** `schemas.QueryResponse`
+*   **Respuestas de Error Comunes:**
+    *   `400 Bad Request`: `query` vacío o formato inválido.
+    *   `401 Unauthorized`: Falta `X-Company-ID`.
+    *   `500 Internal Server Error`: Error inesperado durante la ejecución del pipeline o llamada a Gemini.
+    *   `503 Service Unavailable`: Fallo al conectar con dependencias críticas (Milvus, Gemini API) durante el procesamiento de la query, o si el pipeline no pudo construirse en startup.
 
-## 8. Dependencias Externas Clave (Desde la perspectiva del Query Service)
+## 8. Dependencias Externas Clave
 
-*   **Supabase (PostgreSQL):** Almacenamiento de logs de consulta (`QUERY_LOGS`). Conectado vía **Session Pooler**.
-*   **Milvus:** Base de datos vectorial para la recuperación de chunks de documentos relevantes. Conectado vía URI del servicio K8s (`http://milvus-service...`).
-*   **OpenAI API:** Generación de embeddings para la consulta del usuario. Acceso vía Internet.
-*   **Google Gemini API:** Generación de la respuesta final basada en el prompt RAG. Acceso vía Internet.
-*   **API Gateway:** Recibe las peticiones del frontend/usuario.
-*   **Auth Service (Implícito):** Valida el JWT antes de que la petición llegue al Query Service.
+*   **Supabase (PostgreSQL):** Almacenamiento de `query_logs`. Conectado vía Session Pooler.
+*   **Milvus:** Base de datos vectorial para retrieval. Conectado vía DNS interno de Kubernetes.
+*   **OpenAI API:** Para generar embeddings de consulta. Acceso vía Internet.
+*   **Google Gemini API:** Para generar respuestas. Acceso vía Internet.
+*   **API Gateway:** Punto de entrada para las peticiones.
+*   **Auth Service:** (Implícito) Valida JWT.
 
-## 9. Pipeline Haystack Propuesto (`rag_pipeline.py`)
+## 9. Pipeline Haystack (`app/pipelines/rag_pipeline.py`)
 
-El pipeline RAG se construirá usando Haystack 2.x y componentes específicos:
-
-1.  **Input:** Recibe `query` (string) y `company_id` (string UUID).
-2.  **`OpenAITextEmbedder`:**
-    *   Configurado con `settings.QUERY_OPENAI_EMBEDDING_MODEL`.
-    *   Input: `text` (la consulta del usuario).
-    *   Output: `embedding` (el vector de la consulta).
-3.  **`MilvusEmbeddingRetriever`:**
-    *   Configurado con `MilvusDocumentStore` apuntando a `settings.QUERY_MILVUS_URI`, `settings.QUERY_MILVUS_COLLECTION_NAME`, etc.
-    *   Input: `query_embedding` (del `OpenAITextEmbedder`).
-    *   Input (Dinámico): `filters` (diccionario para filtrar metadatos en Milvus). **Es CRUCIAL pasar aquí `{"company_id": company_id}`**.
-    *   Input (Dinámico/Config): `top_k` (de `settings.QUERY_RETRIEVER_TOP_K` o request).
-    *   Output: `documents` (lista de objetos `Document` de Haystack recuperados de Milvus).
-4.  **`ChatPromptBuilder`:**
-    *   Configurado con una plantilla Jinja2 (desde `settings.QUERY_RAG_PROMPT_TEMPLATE` o hardcodeada). La plantilla debe iterar sobre `documents` y usar `query`.
-    *   Input: `query` (la consulta original).
-    *   Input: `documents` (la lista de documentos del `MilvusEmbeddingRetriever`).
-    *   Output: `prompt` (una lista de `ChatMessage` o un string formateado, dependiendo de cómo se integre Gemini).
-5.  **Componente Generador (Gemini):**
-    *   **Opción A (Recomendada si existe/es fácil crear):** Un componente `GeminiGenerator` personalizado de Haystack.
-        *   Input: `prompt` (del `ChatPromptBuilder`).
-        *   Lógica interna: Llama a la API de Gemini con el prompt, maneja la respuesta.
-        *   Output: `replies` (lista de strings con las respuestas generadas).
-    *   **Opción B (Alternativa):** Un componente `PythonFunction` de Haystack que encapsule la lógica de llamar a la API de Gemini.
-        *   Input: `prompt`.
-        *   Lógica: Usa la librería `google-generativeai` para enviar el prompt y obtener la respuesta.
-        *   Output: `replies`.
-    *   **Opción C (Menos Haystack-native):** El endpoint FastAPI llama directamente a un `GeminiClient` después de recibir los documentos del retriever y construir el prompt manualmente (sin `ChatPromptBuilder` ni `Generator` de Haystack para este paso). Menos elegante pero funcional.
-6.  **Output:** La respuesta final (`replies`) del componente Generador.
-
-**Conexiones del Pipeline (Ejemplo):**
-
-```python
-# En app/pipelines/rag_pipeline.py
-
-from haystack import Pipeline
-from haystack.components.embedders import OpenAITextEmbedder
-from milvus_haystack import MilvusDocumentStore, MilvusEmbeddingRetriever
-from haystack.components.builders.chat_prompt_builder import ChatPromptBuilder
-# from app.components.generators import GeminiGenerator # Si se crea un componente custom
-# from haystack.components.generators.chat import OpenAIChatGenerator # Ejemplo, reemplazar con Gemini
-# from app.services.gemini_client import call_gemini_api # Si se usa opción B/C
-
-# ... inicializar componentes (store, embedder, retriever, builder, generator/client) ...
-
-rag_pipeline = Pipeline()
-
-rag_pipeline.add_component("text_embedder", ...) # OpenAITextEmbedder instance
-rag_pipeline.add_component("retriever", ...)     # MilvusEmbeddingRetriever instance
-rag_pipeline.add_component("prompt_builder", ...) # ChatPromptBuilder instance
-rag_pipeline.add_component("llm_generator", ...) # GeminiGenerator or similar
-
-# Conectar los componentes
-rag_pipeline.connect("text_embedder.embedding", "retriever.query_embedding")
-rag_pipeline.connect("retriever.documents", "prompt_builder.documents")
-rag_pipeline.connect("prompt_builder.prompt", "llm_generator.prompt") # Ajustar según output/input
-
-# Inputs esperados por pipeline.run():
-# {
-#   "text_embedder": {"text": user_query},
-#   "retriever": {"filters": {"company_id": company_id_str}, "top_k": 5},
-#   "prompt_builder": {"query": user_query}
-# }
-# Output de pipeline.run():
-# {
-#   "llm_generator": {"replies": ["Generated answer..."]}
-# }
-```
+1.  **`OpenAITextEmbedder`:** Genera el embedding para la `query`.
+2.  **`MilvusEmbeddingRetriever`:** Busca en Milvus usando el embedding y el filtro `{ "company_id": <ID> }`.
+3.  **`PromptBuilder`:** Construye el prompt final usando la plantilla y los documentos recuperados.
+4.  **(Fuera del pipeline Haystack)** `GeminiClient`: Llama a la API de Google Gemini con el prompt generado.
 
 ## 10. Consideraciones Adicionales
 
-*   **Manejo de Errores:** Implementar manejo robusto para fallos en Milvus, Supabase, OpenAI, Gemini API. Devolver códigos de estado y mensajes claros.
-*   **Gestión de Contexto Largo:** Si los `top_k` documentos recuperados exceden el límite de tokens del prompt de Gemini, se necesita una estrategia (truncar, resumir, seleccionar los más relevantes por score).
-*   **Prompt Engineering:** La calidad de la plantilla del `ChatPromptBuilder` es crucial para obtener buenas respuestas del LLM. Debe instruir claramente al modelo para que use *solo* la información proporcionada.
-*   **Seguridad:** Validar estrictamente el `X-Company-ID`. Asegurar que las API keys (OpenAI, Gemini) se manejen como Secrets.
-*   **Rendimiento:** Optimizar la configuración de Milvus (índices), ajustar `top_k`, y considerar `AsyncPipeline` de Haystack si hay cuellos de botella paralelizables (aunque el flujo RAG es bastante secuencial). Monitorear latencias.
-*   **Logging Detallado:** Además del log de `QUERY_LOGS`, usar `structlog` para trazar el flujo de la petición a través del pipeline Haystack, incluyendo scores de retriever, prompt final, etc., para depuración.
-*   **Integración con Gemini:** Investigar la mejor forma de integrar Gemini: SDK directo, un `Generator` de Haystack existente (si es compatible con llamadas genéricas a APIs) o crear un componente `GeminiGenerator` personalizado.
+*   **Placeholder User ID:** La función `get_current_user_id` necesita ser implementada con la lógica real de extracción del ID de usuario desde el JWT.
+*   **Gestión de Contexto Largo:** No implementado activamente. Si el contexto recuperado es muy largo, la llamada a Gemini podría fallar o truncarse. Se requeriría lógica adicional (chunking, summarization, etc.) si esto es un problema.
+*   **Prompt Engineering:** La plantilla por defecto es básica. Podría necesitar ajustes finos para mejorar la calidad y el seguimiento de instrucciones por parte de Gemini.
+*   **Errores de API Externas:** El manejo de errores para OpenAI y Gemini se basa en reintentos (`tenacity`) y la captura de excepciones genéricas. Podría refinarse para manejar códigos de error específicos (rate limits, errores de autenticación, etc.).
 
 ## 11. TODO / Mejoras Futuras
 
-*   **Implementar Logging:** Escribir la lógica para insertar en la tabla `QUERY_LOGS` de Supabase.
-*   **Integración Gemini:** Finalizar la implementación de la llamada a la API de Gemini (Opción A, B o C).
-*   **Tests:** Añadir tests unitarios (para lógica de componentes, formateo) y de integración (simulando llamadas a Milvus/Gemini, verificando el flujo completo).
-*   **Observabilidad:** Integrar tracing distribuido (OpenTelemetry) para seguir las peticiones a través de los servicios.
-*   **Manejo de Chat History:** Implementar la recepción y uso del historial de chat en el `QueryRequest` para mantener conversaciones contextualizadas. El `ChatPromptBuilder` puede manejar esto.
-*   **Evaluación de Calidad RAG:** Implementar mecanismos para evaluar la calidad de las respuestas (precisión, relevancia, ausencia de alucinaciones).
-*   **Soporte Híbrido/Sparse:** Si `ingest-service` añade embeddings sparse/híbridos, actualizar el retriever aquí (`MilvusHybridRetriever`, `MilvusSparseEmbeddingRetriever`).
-*   **Mecanismo de Feedback:** Añadir endpoints para que los usuarios puedan calificar las respuestas (útil para mejorar el sistema).
-
----
-
-Este documento proporciona una base sólida para comenzar el desarrollo del `query-service`. Si necesitas detalles más específicos sobre alguna sección (por ejemplo, la implementación exacta de la llamada a Gemini o la estructura de `QUERY_LOGS`), por favor, solicítalo.
+*   **Implementar Extracción User ID:** Reemplazar el placeholder `get_current_user_id`.
+*   **Tests:** Añadir tests unitarios y de integración.
+*   **Observabilidad:** Integrar tracing distribuido (OpenTelemetry).
+*   **Manejo de Chat History:** Implementar la lógica para usar `chat_history` en el `PromptBuilder`.
+*   **Gestión de Contexto Largo:** Añadir estrategia si es necesario.
+*   **Evaluación RAG / Feedback:** Implementar mecanismos de evaluación y feedback.
+*   **Soporte Híbrido/Sparse:** Alinear con `ingest-service` si implementa otros tipos de retrieval.
