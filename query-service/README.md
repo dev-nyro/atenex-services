@@ -87,7 +87,7 @@ flowchart TD
 *   **Modelo de Lenguaje Grande (Generación):** Google Gemini (acceso vía API externa, ej: `google-generativeai`).
 *   **Despliegue:** Docker, Kubernetes (GKE / local en K8s de Docker Desktop).
 
-## 5. Estructura de la Codebase Propuesta
+## 5. Estructura de la Codebase Propuesta.
 
 Siguiendo el patrón del `ingest-service`:
 
