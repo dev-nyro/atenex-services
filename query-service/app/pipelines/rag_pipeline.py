@@ -4,6 +4,9 @@ import asyncio
 import uuid
 from typing import Dict, Any, List, Tuple, Optional
 
+# Importar excepciones específicas si es necesario
+from pymilvus.exceptions import MilvusException
+
 from haystack import Pipeline, Document
 from haystack.components.embedders import OpenAITextEmbedder
 from haystack.components.builders.prompt_builder import PromptBuilder
@@ -20,30 +23,58 @@ log = structlog.get_logger(__name__)
 
 def get_milvus_document_store() -> MilvusDocumentStore:
     """Initializes the MilvusDocumentStore connection."""
+    connection_uri = str(settings.MILVUS_URI)
+    # Definir un timeout explícito para la conexión (en segundos)
+    connection_timeout = 30.0 # Ajustable, 30 segundos es un valor generoso para la conexión inicial
+
     log.debug("Initializing MilvusDocumentStore for Query Service",
-             connection_uri=str(settings.MILVUS_URI),
+             connection_uri=connection_uri,
              collection=settings.MILVUS_COLLECTION_NAME,
-             # Ya no se loguean los campos aquí porque no se pasan al constructor
-             search_params=settings.MILVUS_SEARCH_PARAMS)
+             search_params=settings.MILVUS_SEARCH_PARAMS,
+             connection_timeout=connection_timeout)
     try:
-        # *** CORRECCIÓN: Eliminar embedding_field, content_field, metadata_fields ***
+        # *** CORRECCIÓN: Añadir timeout a connection_args ***
         store = MilvusDocumentStore(
-            connection_args={"uri": str(settings.MILVUS_URI)},
+            connection_args={
+                "uri": connection_uri,
+                "timeout": connection_timeout # Añadir timeout explícito
+                # Si Milvus requiere auth, añadir aquí:
+                # "user": "your_milvus_user",
+                # "password": "your_milvus_password",
+                # "token": "your_milvus_token",
+            },
             collection_name=settings.MILVUS_COLLECTION_NAME,
-            # Los siguientes campos NO son argumentos válidos para el constructor:
-            # embedding_field=settings.MILVUS_EMBEDDING_FIELD,
-            # content_field=settings.MILVUS_CONTENT_FIELD,
-            # metadata_fields=settings.MILVUS_METADATA_FIELDS,
-            search_params=settings.MILVUS_SEARCH_PARAMS, # Parámetros de búsqueda sí son válidos
-            consistency_level="Strong",                 # Nivel de consistencia sí es válido
+            search_params=settings.MILVUS_SEARCH_PARAMS,
+            consistency_level="Strong",
         )
-        log.info("MilvusDocumentStore initialized successfully")
+        # Intentar una operación simple para forzar la conexión real y validarla
+        log.debug("Attempting to verify connection by counting documents...")
+        store.count_documents() # Esta llamada forzará la conexión si no se hizo ya
+        log.info("MilvusDocumentStore initialized and connection verified successfully")
         return store
+    except MilvusException as e:
+        # Capturar específicamente errores de Milvus
+        log.error(
+            "Failed to initialize or connect to MilvusDocumentStore",
+            error_code=e.code,
+            error_message=e.message,
+            connection_uri=connection_uri,
+            collection=settings.MILVUS_COLLECTION_NAME,
+            exc_info=True # Incluir traceback completo para MilvusException
+        )
+        # Lanzar un error más descriptivo
+        raise RuntimeError(
+            f"Could not connect to Milvus at {connection_uri}. "
+            f"Error code {e.code}: {e.message}. "
+            "Check Milvus service status, network connectivity/policies between namespaces, and credentials."
+        ) from e
     except Exception as e:
-        log.error("Failed to initialize MilvusDocumentStore", error=str(e), exc_info=True)
-        raise RuntimeError(f"Could not initialize Milvus Document Store: {e}") from e
+        # Capturar otros errores inesperados
+        log.error("Unexpected error during MilvusDocumentStore initialization", error=str(e), exc_info=True)
+        raise RuntimeError(f"Unexpected error initializing Milvus Document Store: {e}") from e
 
 
+# --- get_openai_text_embedder, get_milvus_retriever, get_prompt_builder (Sin cambios respecto a la versión funcional anterior) ---
 def get_openai_text_embedder() -> OpenAITextEmbedder:
     """Initializes the OpenAI Embedder for text (queries)."""
     log.debug("Initializing OpenAITextEmbedder", model=settings.OPENAI_EMBEDDING_MODEL)
@@ -59,12 +90,8 @@ def get_openai_text_embedder() -> OpenAITextEmbedder:
 def get_milvus_retriever(document_store: MilvusDocumentStore) -> MilvusEmbeddingRetriever:
     """Initializes the MilvusEmbeddingRetriever."""
     log.debug("Initializing MilvusEmbeddingRetriever")
-    # El retriever usará los nombres de campo por defecto ('embedding', 'content')
-    # o los configurados en la colección Milvus. No necesita pasarlos explícitamente aquí
-    # a menos que quieras sobreescribir los defaults del store/colección.
     return MilvusEmbeddingRetriever(
         document_store=document_store,
-        # top_k y filters se pasarán dinámicamente
     )
 
 def get_prompt_builder() -> PromptBuilder:
@@ -73,7 +100,7 @@ def get_prompt_builder() -> PromptBuilder:
     return PromptBuilder(template=settings.RAG_PROMPT_TEMPLATE)
 
 # --- Pipeline Construction ---
-
+# (Sin cambios respecto a la versión funcional anterior)
 _rag_pipeline_instance: Optional[Pipeline] = None
 
 def build_rag_pipeline() -> Pipeline:
@@ -90,18 +117,15 @@ def build_rag_pipeline() -> Pipeline:
     rag_pipeline = Pipeline()
 
     try:
-        # 1. Initialize components (get_milvus_document_store ya corregido)
-        doc_store = get_milvus_document_store()
+        doc_store = get_milvus_document_store() # Ahora debería fallar aquí si hay problemas
         text_embedder = get_openai_text_embedder()
         retriever = get_milvus_retriever(document_store=doc_store)
         prompt_builder = get_prompt_builder()
 
-        # 2. Add components
         rag_pipeline.add_component("text_embedder", text_embedder)
         rag_pipeline.add_component("retriever", retriever)
         rag_pipeline.add_component("prompt_builder", prompt_builder)
 
-        # 3. Connect components
         rag_pipeline.connect("text_embedder.embedding", "retriever.query_embedding")
         rag_pipeline.connect("retriever.documents", "prompt_builder.documents")
 
@@ -115,8 +139,7 @@ def build_rag_pipeline() -> Pipeline:
 
 
 # --- Pipeline Execution ---
-# (El resto de la función run_rag_pipeline y check_pipeline_dependencies no necesita cambios
-#  respecto a la versión anterior, ya que el error estaba en get_milvus_document_store)
+# (Sin cambios respecto a la versión funcional anterior)
 async def run_rag_pipeline(
     query: str,
     company_id: str,
@@ -208,6 +231,7 @@ async def run_rag_pipeline(
         raise HTTPException(status_code=500, detail=f"Error processing query: {type(e).__name__}")
 
 
+# --- check_pipeline_dependencies (Sin cambios respecto a la versión funcional anterior) ---
 async def check_pipeline_dependencies() -> Dict[str, str]:
     """Checks critical dependencies for the pipeline (e.g., Milvus)."""
     results = {"milvus_connection": "pending"}
@@ -218,6 +242,6 @@ async def check_pipeline_dependencies() -> Dict[str, str]:
         log.debug("Milvus dependency check successful (count documents)", count=count)
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
-        results["milvus_connection"] = f"error: {error_msg[:100]}"
+        results["milvus_connection"] = f"error: {error_msg[:100]}" # Limitar longitud
         log.warning("Milvus dependency check failed", error=error_msg, exc_info=False)
     return results
