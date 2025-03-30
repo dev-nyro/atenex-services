@@ -140,7 +140,7 @@ Define las conexiones a servicios internos de K8s y parámetros no sensibles.
 | `INGEST_CELERY_BROKER_URL`     | URL del servicio Redis master para Celery.                       | `redis://redis-service-master...:6379/0`        |
 | `INGEST_CELERY_RESULT_BACKEND` | URL del servicio Redis master para resultados Celery.            | `redis://redis-service-master...:6379/1`        |
 | `INGEST_POSTGRES_SERVER`       | Host del **Supabase Session Pooler**.                            | `aws-0-sa-east-1.pooler.supabase.com`           |
-| `INGEST_POSTGRES_PORT`         | Puerto del **Supabase Session Pooler**.                          | `5432`                                          |
+| `INGEST_POSTGRES_PORT`         | Puerto del **Supabase Session Pooler**.                          | **`6543`** (*Corregido*)                         |
 | `INGEST_POSTGRES_USER`         | Usuario del **Supabase Session Pooler** (`postgres.<project-ref>`). | `postgres.ymsilkrhstwxikjiqqog`                 |
 | `INGEST_POSTGRES_DB`           | Base de datos en Supabase.                                       | `postgres`                                      |
 | `INGEST_MILVUS_URI`            | URI del servicio Milvus dentro de K8s.                           | `http://milvus-service...:19530`                |
@@ -174,7 +174,7 @@ Prefijo base: `/api/v1` (definido por `settings.API_V1_STR`)
 ### Health Check
 
 *   **Endpoint:** `GET /`
-*   **Descripción:** Verifica la disponibilidad del servicio y la conexión a la base de datos. Usado por Kubernetes Probes.
+*   **Descripción:** Verifica la disponibilidad del servicio (si completó el arranque). Usado por Kubernetes Probes.
 *   **Respuesta Exitosa (`200 OK`):** Indica que el servicio está listo.
     ```json
     {
@@ -183,7 +183,7 @@ Prefijo base: `/api/v1` (definido por `settings.API_V1_STR`)
       "ready": true
     }
     ```
-*   **Respuesta No Listo (`503 Service Unavailable`):** Indica fallo en el arranque o pérdida de conexión a la BD.
+*   **Respuesta No Listo (`503 Service Unavailable`):** Indica fallo en el arranque.
     ```json
     { "detail": "Service is not ready..." }
     ```

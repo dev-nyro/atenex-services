@@ -641,14 +641,16 @@ log = structlog.get_logger(__name__)
 # Importar routers y otros módulos después de configurar logging
 from app.api.v1.endpoints import query
 from app.db import postgres_client
-# *** CORRECCIÓN: Importar explícitamente desde rag_pipeline ***
+# Importar solo build_rag_pipeline aquí, check_pipeline_dependencies se usará solo en startup
 from app.pipelines.rag_pipeline import build_rag_pipeline, check_pipeline_dependencies
-from app.api.v1 import schemas # Importar schemas para health check
+from app.api.v1 import schemas
 
 # Estado global para verificar dependencias críticas al inicio
 SERVICE_READY = False
 # Almacenar el pipeline construido globalmente si se decide inicializar en startup
 GLOBAL_RAG_PIPELINE = None
+# Variable para almacenar el estado de Milvus verificado en startup
+MILVUS_STARTUP_OK = False
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -660,10 +662,11 @@ app = FastAPI(
 # --- Event Handlers ---
 @app.on_event("startup")
 async def startup_event():
-    global SERVICE_READY, GLOBAL_RAG_PIPELINE
+    global SERVICE_READY, GLOBAL_RAG_PIPELINE, MILVUS_STARTUP_OK
     log.info(f"Starting up {settings.PROJECT_NAME}...")
     db_pool_initialized = False
     pipeline_built = False
+    milvus_ok = False
 
     # 1. Inicializar Pool de Base de Datos (Supabase)
     try:
@@ -677,33 +680,43 @@ async def startup_event():
     except Exception as e:
         log.critical("CRITICAL: Failed to establish essential PostgreSQL connection pool on startup.", error=str(e), exc_info=True)
 
-    # 2. Construir el Pipeline Haystack
+    # 2. Construir el Pipeline Haystack y Verificar Milvus *una vez*
     if db_pool_initialized:
         try:
-            # *** CORRECCIÓN: Usar la función importada correctamente ***
-            GLOBAL_RAG_PIPELINE = build_rag_pipeline()
+            GLOBAL_RAG_PIPELINE = build_rag_pipeline() # Intenta construir, incluye init de Milvus
+            # Si build_rag_pipeline tuvo éxito (no lanzó excepción), significa que MilvusDocumentStore se inicializó
+            # Ahora verificamos la conexión activamente una vez
             dep_status = await check_pipeline_dependencies()
             if dep_status.get("milvus_connection") == "ok":
-                 log.info("Haystack RAG pipeline built and Milvus connection verified.")
+                 log.info("Haystack RAG pipeline built and Milvus connection verified during startup.")
                  pipeline_built = True
+                 milvus_ok = True
             else:
-                 log.warning("Haystack RAG pipeline built, but Milvus check failed.", milvus_status=dep_status.get("milvus_connection"))
-                 pipeline_built = True # Marcar como construido, pero health check lo refinará
+                 # El pipeline se construyó (componentes listos) pero Milvus no respondió al check
+                 log.warning("Haystack RAG pipeline built, but Milvus connection check failed during startup.", milvus_status=dep_status.get("milvus_connection"))
+                 pipeline_built = True
+                 milvus_ok = False # Marcar como no OK para el health check inicial
         except Exception as e:
+            # Si build_rag_pipeline falla (ej: error al inicializar MilvusDocumentStore)
             log.error("Failed to build Haystack RAG pipeline during startup.", error=str(e), exc_info=True)
+            pipeline_built = False
+            milvus_ok = False
 
-    # Marcar servicio como listo SOLO si las dependencias MÍNIMAS (DB) están OK
-    if db_pool_initialized:
+    # Marcar servicio como listo SOLO si la BD está OK y el pipeline se construyó
+    # (Incluso si Milvus falló la *verificación* inicial, el servicio puede intentar recuperarse)
+    if db_pool_initialized and pipeline_built:
         SERVICE_READY = True
-        log.info(f"{settings.PROJECT_NAME} startup sequence completed. Service marked as READY (DB OK). Pipeline status: {'Built' if pipeline_built else 'Build Failed'}")
+        MILVUS_STARTUP_OK = milvus_ok # Guardar estado de Milvus en startup
+        log.info(f"{settings.PROJECT_NAME} startup sequence completed. Service marked as READY (DB OK, Pipeline Built). Initial Milvus Check: {'OK' if milvus_ok else 'Failed'}")
     else:
         SERVICE_READY = False
-        log.critical(f"{settings.PROJECT_NAME} startup failed. Essential DB connection could not be established. Service marked as NOT READY.")
-        # sys.exit(1) # Podría forzar salida
+        MILVUS_STARTUP_OK = False
+        log.critical(f"{settings.PROJECT_NAME} startup failed. Essential dependencies (DB or Pipeline Build) could not be established. Service marked as NOT READY.")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    # (Sin cambios)
     log.info(f"Shutting down {settings.PROJECT_NAME}...")
     await postgres_client.close_db_pool()
     log.info("PostgreSQL connection pool closed.")
@@ -712,6 +725,7 @@ async def shutdown_event():
 # --- Exception Handlers (Sin cambios) ---
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc):
+    # (Sin cambios)
     log_level = log.warning if exc.status_code < 500 and exc.status_code != 404 else log.error
     log_level("HTTP Exception caught", status_code=exc.status_code, detail=exc.detail, path=str(request.url))
     return JSONResponse(
@@ -721,6 +735,7 @@ async def http_exception_handler(request, exc):
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc):
+    # (Sin cambios)
     log.warning("Request Validation Error", errors=exc.errors(), path=str(request.url))
     error_details = [{"loc": err.get("loc"), "msg": err.get("msg"), "type": err.get("type")} for err in exc.errors()]
     return JSONResponse(
@@ -730,6 +745,7 @@ async def validation_exception_handler(request, exc):
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request, exc):
+    # (Sin cambios)
     log.exception("Unhandled Exception caught", path=str(request.url))
     return JSONResponse(
         status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -737,7 +753,7 @@ async def generic_exception_handler(request, exc):
     )
 
 
-# --- Routers ---
+# --- Routers (Sin cambios) ---
 app.include_router(query.router, prefix=settings.API_V1_STR, tags=["Query"])
 
 # --- Root Endpoint / Health Check ---
@@ -749,48 +765,47 @@ app.include_router(query.router, prefix=settings.API_V1_STR, tags=["Query"])
 )
 async def read_root():
     """
-    Health check endpoint. Checks service readiness and critical dependencies like Database and Milvus.
-    Returns 503 Service Unavailable if the service is not ready or dependencies are down.
+    Health check endpoint. Checks basic service readiness and database connection.
+    Relies on startup checks for initial pipeline/Milvus status.
+    Returns 503 Service Unavailable if the service didn't start correctly or DB is down.
     """
-    global SERVICE_READY
+    global SERVICE_READY, MILVUS_STARTUP_OK
     log.debug("Root endpoint accessed (health check)")
 
+    # 1. Chequeo primario: ¿El servicio se inició correctamente?
     if not SERVICE_READY:
          log.warning("Health check failed: Service did not start successfully (SERVICE_READY is False).")
+         # Devolver 503 inmediatamente si el startup falló
          raise HTTPException(
              status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE,
-             detail="Service is not ready, essential connections likely failed during startup."
+             detail="Service failed to initialize required components during startup."
          )
 
-    # Realizar chequeos activos de dependencias
+    # 2. Chequeo activo RÁPIDO: Conexión a la base de datos
     db_status = "pending"
-    milvus_status = "pending"
-    overall_ready = True
-
-    # Chequeo activo de la base de datos
+    db_ok = False
     try:
         db_ok = await postgres_client.check_db_connection()
         db_status = "ok" if db_ok else "error: Connection failed"
-        if not db_ok: overall_ready = False; log.error("Health check failed: DB ping failed.")
+        if db_ok:
+             log.debug("Health check: DB ping successful.")
+        else:
+             log.error("Health check failed: DB ping failed.")
     except Exception as db_err:
         db_status = f"error: {type(db_err).__name__}"
-        overall_ready = False
         log.error("Health check failed: DB ping error.", error=str(db_err))
+        db_ok = False # Asegurar que db_ok es False si hay excepción
 
-    # Chequeo activo de Milvus
-    try:
-        # *** CORRECCIÓN: Usar la función importada correctamente ***
-        milvus_dep_status = await check_pipeline_dependencies()
-        milvus_status = milvus_dep_status.get("milvus_connection", "error: Check failed")
-        if "error" in milvus_status:
-            log.warning("Health check: Milvus check indicates an issue.", status=milvus_status)
-            # Considerar si Milvus es crítico para 'ready'
-            # overall_ready = False
-    except Exception as milvus_err:
-        milvus_status = f"error: {type(milvus_err).__name__}"
-        log.error("Health check failed: Milvus check error.", error=str(milvus_err))
-        # overall_ready = False
+    # 3. Estado de Milvus (Basado en el chequeo de startup)
+    # No hacemos chequeo activo aquí para mantener el probe rápido
+    milvus_status = "ok" if MILVUS_STARTUP_OK else "error: Failed startup check"
+    if not MILVUS_STARTUP_OK:
+        log.warning("Health check: Reporting Milvus as potentially down based on startup check.")
 
+    # 4. Determinar estado general y código HTTP
+    # El servicio se considera 'listo' para las sondas si la BD está OK.
+    # El estado de Milvus se reporta pero no necesariamente causa 503 aquí.
+    overall_ready = db_ok
     http_status = fastapi_status.HTTP_200_OK if overall_ready else fastapi_status.HTTP_503_SERVICE_UNAVAILABLE
 
     response_data = schemas.HealthCheckResponse(
@@ -799,19 +814,24 @@ async def read_root():
         ready=overall_ready,
         dependencies={
             "database": db_status,
-            "vector_store": milvus_status
+            "vector_store": milvus_status # Reportar estado de Milvus basado en startup
         }
     )
 
+    # Si la BD falla, lanzamos 503. Si solo Milvus falló en startup, devolvemos 200 OK
+    # pero indicando el error en 'dependencies'.
     if not overall_ready:
-         log.warning("Health check determined service is not ready.", dependencies=response_data.dependencies)
-         raise HTTPException(status_code=http_status, detail=response_data.model_dump())
+         log.warning("Health check determined service is not ready (DB connection failed).", dependencies=response_data.dependencies)
+         # Usar el detail del response model puede ser muy verboso para un 503 simple
+         raise HTTPException(status_code=http_status, detail="Service is unhealthy: Database connection failed.")
     else:
+         # Loguear incluso si Milvus tuvo problemas en startup pero la BD está OK
          log.info("Health check successful.", dependencies=response_data.dependencies)
          return response_data
 
 
 # --- Main execution (for local development) ---
+# (Sin cambios)
 if __name__ == "__main__":
     log.info(f"Starting Uvicorn server for {settings.PROJECT_NAME} local development...")
     log_level_str = settings.LOG_LEVEL.lower()
@@ -849,6 +869,9 @@ import asyncio
 import uuid
 from typing import Dict, Any, List, Tuple, Optional
 
+# Importar excepciones específicas si es necesario
+from pymilvus.exceptions import MilvusException
+
 from haystack import Pipeline, Document
 from haystack.components.embedders import OpenAITextEmbedder
 from haystack.components.builders.prompt_builder import PromptBuilder
@@ -865,30 +888,58 @@ log = structlog.get_logger(__name__)
 
 def get_milvus_document_store() -> MilvusDocumentStore:
     """Initializes the MilvusDocumentStore connection."""
+    connection_uri = str(settings.MILVUS_URI)
+    # Definir un timeout explícito para la conexión (en segundos)
+    connection_timeout = 30.0 # Ajustable, 30 segundos es un valor generoso para la conexión inicial
+
     log.debug("Initializing MilvusDocumentStore for Query Service",
-             connection_uri=str(settings.MILVUS_URI),
+             connection_uri=connection_uri,
              collection=settings.MILVUS_COLLECTION_NAME,
-             # Ya no se loguean los campos aquí porque no se pasan al constructor
-             search_params=settings.MILVUS_SEARCH_PARAMS)
+             search_params=settings.MILVUS_SEARCH_PARAMS,
+             connection_timeout=connection_timeout)
     try:
-        # *** CORRECCIÓN: Eliminar embedding_field, content_field, metadata_fields ***
+        # *** CORRECCIÓN: Añadir timeout a connection_args ***
         store = MilvusDocumentStore(
-            connection_args={"uri": str(settings.MILVUS_URI)},
+            connection_args={
+                "uri": connection_uri,
+                "timeout": connection_timeout # Añadir timeout explícito
+                # Si Milvus requiere auth, añadir aquí:
+                # "user": "your_milvus_user",
+                # "password": "your_milvus_password",
+                # "token": "your_milvus_token",
+            },
             collection_name=settings.MILVUS_COLLECTION_NAME,
-            # Los siguientes campos NO son argumentos válidos para el constructor:
-            # embedding_field=settings.MILVUS_EMBEDDING_FIELD,
-            # content_field=settings.MILVUS_CONTENT_FIELD,
-            # metadata_fields=settings.MILVUS_METADATA_FIELDS,
-            search_params=settings.MILVUS_SEARCH_PARAMS, # Parámetros de búsqueda sí son válidos
-            consistency_level="Strong",                 # Nivel de consistencia sí es válido
+            search_params=settings.MILVUS_SEARCH_PARAMS,
+            consistency_level="Strong",
         )
-        log.info("MilvusDocumentStore initialized successfully")
+        # Intentar una operación simple para forzar la conexión real y validarla
+        log.debug("Attempting to verify connection by counting documents...")
+        store.count_documents() # Esta llamada forzará la conexión si no se hizo ya
+        log.info("MilvusDocumentStore initialized and connection verified successfully")
         return store
+    except MilvusException as e:
+        # Capturar específicamente errores de Milvus
+        log.error(
+            "Failed to initialize or connect to MilvusDocumentStore",
+            error_code=e.code,
+            error_message=e.message,
+            connection_uri=connection_uri,
+            collection=settings.MILVUS_COLLECTION_NAME,
+            exc_info=True # Incluir traceback completo para MilvusException
+        )
+        # Lanzar un error más descriptivo
+        raise RuntimeError(
+            f"Could not connect to Milvus at {connection_uri}. "
+            f"Error code {e.code}: {e.message}. "
+            "Check Milvus service status, network connectivity/policies between namespaces, and credentials."
+        ) from e
     except Exception as e:
-        log.error("Failed to initialize MilvusDocumentStore", error=str(e), exc_info=True)
-        raise RuntimeError(f"Could not initialize Milvus Document Store: {e}") from e
+        # Capturar otros errores inesperados
+        log.error("Unexpected error during MilvusDocumentStore initialization", error=str(e), exc_info=True)
+        raise RuntimeError(f"Unexpected error initializing Milvus Document Store: {e}") from e
 
 
+# --- get_openai_text_embedder, get_milvus_retriever, get_prompt_builder (Sin cambios respecto a la versión funcional anterior) ---
 def get_openai_text_embedder() -> OpenAITextEmbedder:
     """Initializes the OpenAI Embedder for text (queries)."""
     log.debug("Initializing OpenAITextEmbedder", model=settings.OPENAI_EMBEDDING_MODEL)
@@ -904,12 +955,8 @@ def get_openai_text_embedder() -> OpenAITextEmbedder:
 def get_milvus_retriever(document_store: MilvusDocumentStore) -> MilvusEmbeddingRetriever:
     """Initializes the MilvusEmbeddingRetriever."""
     log.debug("Initializing MilvusEmbeddingRetriever")
-    # El retriever usará los nombres de campo por defecto ('embedding', 'content')
-    # o los configurados en la colección Milvus. No necesita pasarlos explícitamente aquí
-    # a menos que quieras sobreescribir los defaults del store/colección.
     return MilvusEmbeddingRetriever(
         document_store=document_store,
-        # top_k y filters se pasarán dinámicamente
     )
 
 def get_prompt_builder() -> PromptBuilder:
@@ -918,7 +965,7 @@ def get_prompt_builder() -> PromptBuilder:
     return PromptBuilder(template=settings.RAG_PROMPT_TEMPLATE)
 
 # --- Pipeline Construction ---
-
+# (Sin cambios respecto a la versión funcional anterior)
 _rag_pipeline_instance: Optional[Pipeline] = None
 
 def build_rag_pipeline() -> Pipeline:
@@ -935,18 +982,15 @@ def build_rag_pipeline() -> Pipeline:
     rag_pipeline = Pipeline()
 
     try:
-        # 1. Initialize components (get_milvus_document_store ya corregido)
-        doc_store = get_milvus_document_store()
+        doc_store = get_milvus_document_store() # Ahora debería fallar aquí si hay problemas
         text_embedder = get_openai_text_embedder()
         retriever = get_milvus_retriever(document_store=doc_store)
         prompt_builder = get_prompt_builder()
 
-        # 2. Add components
         rag_pipeline.add_component("text_embedder", text_embedder)
         rag_pipeline.add_component("retriever", retriever)
         rag_pipeline.add_component("prompt_builder", prompt_builder)
 
-        # 3. Connect components
         rag_pipeline.connect("text_embedder.embedding", "retriever.query_embedding")
         rag_pipeline.connect("retriever.documents", "prompt_builder.documents")
 
@@ -960,8 +1004,7 @@ def build_rag_pipeline() -> Pipeline:
 
 
 # --- Pipeline Execution ---
-# (El resto de la función run_rag_pipeline y check_pipeline_dependencies no necesita cambios
-#  respecto a la versión anterior, ya que el error estaba en get_milvus_document_store)
+# (Sin cambios respecto a la versión funcional anterior)
 async def run_rag_pipeline(
     query: str,
     company_id: str,
@@ -1053,6 +1096,7 @@ async def run_rag_pipeline(
         raise HTTPException(status_code=500, detail=f"Error processing query: {type(e).__name__}")
 
 
+# --- check_pipeline_dependencies (Sin cambios respecto a la versión funcional anterior) ---
 async def check_pipeline_dependencies() -> Dict[str, str]:
     """Checks critical dependencies for the pipeline (e.g., Milvus)."""
     results = {"milvus_connection": "pending"}
@@ -1063,7 +1107,7 @@ async def check_pipeline_dependencies() -> Dict[str, str]:
         log.debug("Milvus dependency check successful (count documents)", count=count)
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
-        results["milvus_connection"] = f"error: {error_msg[:100]}"
+        results["milvus_connection"] = f"error: {error_msg[:100]}" # Limitar longitud
         log.warning("Milvus dependency check failed", error=error_msg, exc_info=False)
     return results
 ```
