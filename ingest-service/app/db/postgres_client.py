@@ -1,4 +1,4 @@
-# ./app/db/postgres_client.py (CORREGIDO)
+# ./app/db/postgres_client.py (CORREGIDO - Log)
 import uuid
 from typing import Any, Optional, Dict, List
 import asyncpg
@@ -20,7 +20,7 @@ async def get_db_pool() -> asyncpg.Pool:
             # *** CORREGIDO: Loguear los parámetros que SÍ se usan para conectar ***
             log.info("Creating Supabase/PostgreSQL connection pool using arguments...",
                      host=settings.POSTGRES_SERVER,
-                     port=settings.POSTGRES_PORT, # Usará el puerto del Pooler (6543) desde config
+                     port=settings.POSTGRES_PORT, # Usará el puerto del Pooler (6543 por defecto) desde config
                      user=settings.POSTGRES_USER,
                      database=settings.POSTGRES_DB)
 

@@ -1,4 +1,4 @@
-# ./app/services/minio_client.py (CORREGIDO - download_file_stream ahora es sync)
+# ./app/services/minio_client.py (CORREGIDO - run_in_executor para llamadas sync)
 import io
 import uuid
 from typing import IO, BinaryIO # Usar BinaryIO para type hint
@@ -42,9 +42,7 @@ class MinioStorageClient:
             log.error(f"Error checking/creating MinIO bucket '{settings.MINIO_BUCKET_NAME}'", error=str(e), exc_info=True)
             raise
 
-    # upload_file puede permanecer async si la llamada a put_object se hace en executor
-    # o si se usa un cliente MinIO asíncrono en el futuro. Por ahora, lo dejamos async
-    # asumiendo que la tarea Celery lo llamará desde run_in_executor si es necesario.
+    # *** CORREGIDO: Usar run_in_executor para la llamada síncrona put_object ***
     async def upload_file(
         self,
         company_id: uuid.UUID,
@@ -85,14 +83,14 @@ class MinioStorageClient:
             raise # Re-raise generic exceptions
 
 
-    # *** CORREGIDO: Hacerla síncrona para llamarla desde run_in_executor ***
+    # *** CORREGIDO: Crear función síncrona para la lógica de descarga ***
     def download_file_stream_sync(
         self,
         object_name: str
     ) -> io.BytesIO:
         """
         Descarga un archivo de MinIO como un stream en memoria (BytesIO).
-        Esta es una operación SÍNCRONA.
+        Esta es una operación SÍNCRONA. Lanza FileNotFoundError si no existe.
         """
         download_log = log.bind(bucket=settings.MINIO_BUCKET_NAME, object_name=object_name)
         download_log.info("Downloading file from MinIO (sync)...")
@@ -106,7 +104,7 @@ class MinioStorageClient:
             file_stream.seek(0) # Reset stream position
             return file_stream
         except S3Error as e:
-            download_log.error("Failed to download file from MinIO (sync)", error=str(e), exc_info=True)
+            download_log.error("Failed to download file from MinIO (sync)", error=str(e), code=e.code, exc_info=False)
             # Es importante lanzar una excepción clara si el archivo no se encuentra
             if e.code == 'NoSuchKey':
                  raise FileNotFoundError(f"Object not found in MinIO: {object_name}") from e
@@ -123,15 +121,14 @@ class MinioStorageClient:
                 response.close()
                 response.release_conn()
 
-    # Mantenemos la versión async como wrapper por si se necesita en otros lados,
-    # pero ahora llama a la versión síncrona en el executor.
+    # *** CORREGIDO: La versión async ahora llama a la sync en el executor ***
     async def download_file_stream(
         self,
         object_name: str
     ) -> io.BytesIO:
         """
         Descarga un archivo de MinIO como un stream en memoria (BytesIO) de forma asíncrona.
-        Ejecuta la descarga síncrona en un executor.
+        Ejecuta la descarga síncrona en un executor. Lanza FileNotFoundError si no existe.
         """
         download_log = log.bind(bucket=settings.MINIO_BUCKET_NAME, object_name=object_name)
         download_log.info("Queueing file download from MinIO executor...")
@@ -146,7 +143,7 @@ class MinioStorageClient:
             return file_stream
         except FileNotFoundError: # Capturar el error específico de archivo no encontrado
             download_log.error("File not found in MinIO via executor", object_name=object_name)
-            raise # Relanzar FileNotFoundError
+            raise # Relanzar FileNotFoundError para que la tarea Celery lo maneje
         except Exception as e:
             download_log.error("Error downloading file via executor", error=str(e), exc_info=True)
             raise # Relanzar otras excepciones

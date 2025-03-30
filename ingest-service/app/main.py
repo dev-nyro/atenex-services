@@ -12,7 +12,7 @@ from app.api.v1.endpoints import ingest
 from app.core.config import settings
 from app.core.logging_config import setup_logging
 from app.db import postgres_client
-# Remove milvus_client import
+# Remove milvus_client import if not used directly (Haystack handles it)
 # from app.db import milvus_client
 
 # Configurar logging ANTES de importar cualquier otra cosa que loguee
@@ -32,11 +32,14 @@ app = FastAPI(
 # --- Event Handlers ---
 @app.on_event("startup")
 async def startup_event():
-    global SERVICE_READY # Declarar global al inicio si se modifica
+    # *** CORREGIDO: Declarar global al inicio si se modifica ***
+    global SERVICE_READY
     log.info("Starting up Ingest Service (Haystack)...")
     db_pool_initialized = False
     try:
+        # Intenta obtener el pool (lo crea si no existe)
         await postgres_client.get_db_pool()
+        # Verifica la conexión activa
         pool = await postgres_client.get_db_pool()
         async with pool.acquire() as conn:
             # Verificar conexión con timeout corto
@@ -48,6 +51,7 @@ async def startup_event():
     except Exception as e:
         log.critical("CRITICAL: Failed to establish/verify essential PostgreSQL connection pool on startup.", error=str(e), exc_info=True)
 
+    # Marca el servicio como listo SOLO si la BD conectó
     if db_pool_initialized:
         SERVICE_READY = True
         log.info("Ingest Service startup sequence completed and service marked as READY.")
@@ -115,16 +119,17 @@ async def read_root():
              detail="Service is not ready, essential connections likely failed during startup."
          )
 
-    # Chequeo activo de la base de datos
+    # Chequeo activo de la base de datos (ping)
     try:
         pool = await postgres_client.get_db_pool()
         async with pool.acquire() as conn:
-            await asyncio.wait_for(conn.execute("SELECT 1"), timeout=5.0) # Timeout bajo para ping
+            # Usa un timeout bajo para el ping
+            await asyncio.wait_for(conn.execute("SELECT 1"), timeout=5.0)
         log.debug("Health check: DB ping successful.")
         # Si el ping tiene éxito pero SERVICE_READY era False (raro, pero posible si hubo un error temporal), lo corregimos.
         if not SERVICE_READY:
              log.warning("DB Ping successful, but service was marked as not ready. Setting SERVICE_READY=True now.")
-             SERVICE_READY = True
+             SERVICE_READY = True # Marcar como listo si el ping funciona ahora
     except asyncio.TimeoutError:
         log.error("Health check failed: DB ping timed out (> 5 seconds).")
         # Marcar como no listo si falla el ping
@@ -157,6 +162,6 @@ if __name__ == "__main__":
         "app.main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
+        reload=True, # Activa reload para desarrollo local
         log_level=log_level_str
     )
