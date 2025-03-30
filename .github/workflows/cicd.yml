@@ -14,14 +14,14 @@ env:
   # --- Configuración Ingest Service ---
   INGEST_SERVICE_DIR: ingest-service # Directorio del servicio
   INGEST_IMAGE_NAME: ghcr.io/dev-nyro/ingest-service
-  INGEST_CONTEXT_PATH: ./${{ GITHUB.ENV.INGEST_SERVICE_DIR }} # Path relativo al Dockerfile y código
+  # INGEST_CONTEXT_PATH: Se construirá directamente en el step 'with'
   INGEST_MANIFEST_PATH_API: ${{ GITHUB.ENV.INGEST_SERVICE_DIR }}/deployment-api.yaml
   INGEST_MANIFEST_PATH_WORKER: ${{ GITHUB.ENV.INGEST_SERVICE_DIR }}/deployment-worker.yaml
 
   # --- Configuración Query Service ---
   QUERY_SERVICE_DIR: query-service # Directorio del servicio
   QUERY_IMAGE_NAME: ghcr.io/dev-nyro/query-service
-  QUERY_CONTEXT_PATH: ./${{ GITHUB.ENV.QUERY_SERVICE_DIR }} # Path relativo al Dockerfile y código
+  # QUERY_CONTEXT_PATH: Se construirá directamente en el step 'with'
   QUERY_MANIFEST_PATH: ${{ GITHUB.ENV.QUERY_SERVICE_DIR }}/deployment.yaml
 
 jobs:
@@ -29,40 +29,38 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: read    # Permiso para leer el código fuente
-      packages: write   # Permiso para escribir en GitHub Packages (GHCR)
-      pull-requests: read # Necesario para tj-actions/changed-files en PRs (aunque aquí es push)
+      contents: read
+      packages: write
+      pull-requests: read
 
-    outputs: # Definir outputs del job para saber si algo se construyó
-      ingest_built: ${{ steps.build_ingest.outputs.digest != '' }}
-      query_built: ${{ steps.build_query.outputs.digest != '' }}
+    outputs:
+      ingest_built: ${{ steps.build_ingest.outputs.digest != '' && steps.build_ingest.outcome == 'success' }} # Añadir chequeo de éxito
+      query_built: ${{ steps.build_query.outputs.digest != '' && steps.build_query.outcome == 'success' }} # Añadir chequeo de éxito
 
     steps:
-      # 1. Checkout del código fuente (necesitamos historial para diff)
+      # 1. Checkout del código fuente
       - name: Checkout Application Code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Obtener todo el historial para comparar cambios
+          fetch-depth: 0
 
       # 2. Detectar archivos modificados
       - name: Get changed files
         id: changed_files
-        uses: tj-actions/changed-files@v44 # Usar una versión específica
+        uses: tj-actions/changed-files@v44
         with:
-          # Listar archivos modificados relativos a las carpetas de los servicios
           files_yaml: |
             ingest:
               - '${{ env.INGEST_SERVICE_DIR }}/**'
             query:
               - '${{ env.QUERY_SERVICE_DIR }}/**'
 
-      # 3. Configurar Docker Buildx (Solo si hay cambios en algún servicio)
+      # 3. Configurar Docker Buildx (Condicional)
       - name: Set up Docker Buildx
-        # Ejecutar solo si algún servicio relevante cambió
         if: steps.changed_files.outputs.ingest_any_changed == 'true' || steps.changed_files.outputs.query_any_changed == 'true'
         uses: docker/setup-buildx-action@v3
 
-      # 4. Login a GitHub Container Registry (GHCR) (Solo si hay cambios)
+      # 4. Login a GHCR (Condicional)
       - name: Log in to GitHub Container Registry
         if: steps.changed_files.outputs.ingest_any_changed == 'true' || steps.changed_files.outputs.query_any_changed == 'true'
         uses: docker/login-action@v3
@@ -71,7 +69,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 5. Generar etiqueta común para las imágenes (Solo si hay cambios)
+      # 5. Generar etiqueta común (Condicional)
       - name: Generate Common Image Tag
         if: steps.changed_files.outputs.ingest_any_changed == 'true' || steps.changed_files.outputs.query_any_changed == 'true'
         id: image_tag_common
@@ -84,39 +82,38 @@ jobs:
       # 6. Construir y Empujar Imagen Docker - Ingest Service (Condicional)
       - name: Build and push Ingest Service Docker image
         id: build_ingest
-        # Ejecutar solo si hubo cambios en la carpeta ingest-service
         if: steps.changed_files.outputs.ingest_any_changed == 'true'
         uses: docker/build-push-action@v5
         with:
-          context: ${{ env.INGEST_CONTEXT_PATH }}
-          file: ${{ env.INGEST_CONTEXT_PATH }}/Dockerfile
+          # *** CORRECCIÓN: Construir context y file directamente aquí ***
+          context: ./${{ env.INGEST_SERVICE_DIR }}
+          file: ./${{ env.INGEST_SERVICE_DIR }}/Dockerfile
           push: ${{ github.event_name == 'push' }}
           tags: ${{ env.INGEST_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          outputs: type=registry,push=${{ github.event_name == 'push' }} # Necesitamos el output para el if del manifest
+          outputs: type=registry,push=${{ github.event_name == 'push' }}
 
       # 7. Construir y Empujar Imagen Docker - Query Service (Condicional)
       - name: Build and push Query Service Docker image
         id: build_query
-        # Ejecutar solo si hubo cambios en la carpeta query-service
         if: steps.changed_files.outputs.query_any_changed == 'true'
         uses: docker/build-push-action@v5
         with:
-          context: ${{ env.QUERY_CONTEXT_PATH }}
-          file: ${{ env.QUERY_CONTEXT_PATH }}/Dockerfile
+          # *** CORRECCIÓN: Construir context y file directamente aquí ***
+          context: ./${{ env.QUERY_SERVICE_DIR }}
+          file: ./${{ env.QUERY_SERVICE_DIR }}/Dockerfile
           push: ${{ github.event_name == 'push' }}
           tags: ${{ env.QUERY_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          outputs: type=registry,push=${{ github.event_name == 'push' }} # Necesitamos el output para el if del manifest
+          outputs: type=registry,push=${{ github.event_name == 'push' }}
 
-  # --- Job separado para actualizar manifests (más limpio) ---
-  # Se ejecuta solo si el job anterior tuvo éxito y si algo se construyó
+  # --- Job separado para actualizar manifests ---
   update-manifests:
-    needs: build-push-update # Depende del job anterior
+    needs: build-push-update
     runs-on: ubuntu-latest
-    # Ejecutar solo si el evento es push Y si al menos una imagen fue construida
+    # Condición if mejorada: Ejecutar si es push Y (ingest se construyó O query se construyó)
     if: github.event_name == 'push' && (needs.build-push-update.outputs.ingest_built == 'true' || needs.build-push-update.outputs.query_built == 'true')
 
     steps:
@@ -126,13 +123,12 @@ jobs:
         with:
           repository: ${{ env.MANIFEST_REPO_OWNER }}/${{ env.MANIFEST_REPO_NAME }}
           ref: ${{ env.MANIFEST_REPO_BRANCH }}
-          token: ${{ secrets.MANIFEST_PAT }} # PAT con permisos de escritura
+          token: ${{ secrets.MANIFEST_PAT }}
           path: manifests-repo
 
-      # 2. Obtener el tag común (necesitamos regenerarlo o pasarlo del job anterior)
-      #    Opción más simple: regenerarlo aquí.
+      # 2. Regenerar el tag común
       - name: Generate Common Image Tag (again)
-        id: image_tag_common # Mismo ID para consistencia
+        id: image_tag_common
         run: |
           TAG="${{ github.ref_name }}-$(echo $GITHUB_SHA | cut -c1-7)"
           TAG=$(echo $TAG | sed 's/[^a-zA-Z0-9.-]/-/g' | sed 's/^[.-]*//;s/[.-]*$//')
@@ -141,11 +137,15 @@ jobs:
 
       # 3. Actualizar archivos de Manifest (Condicionalmente dentro del script)
       - name: Update Manifest Files Conditionally
-        # Pasar los outputs del job anterior como env vars a este step
         env:
+          # Usar el contexto 'needs' para acceder a los outputs del job anterior
           INGEST_BUILT: ${{ needs.build-push-update.outputs.ingest_built }}
           QUERY_BUILT: ${{ needs.build-push-update.outputs.query_built }}
           COMMON_TAG: ${{ steps.image_tag_common.outputs.image_tag }}
+          # Pasar los paths de los manifests como env vars también
+          INGEST_MANIFEST_PATH_API_REL: ${{ env.INGEST_MANIFEST_PATH_API }}
+          INGEST_MANIFEST_PATH_WORKER_REL: ${{ env.INGEST_MANIFEST_PATH_WORKER }}
+          QUERY_MANIFEST_PATH_REL: ${{ env.QUERY_MANIFEST_PATH }}
         run: |
           echo "::group::Updating Manifest Files Conditionally"
           cd manifests-repo
@@ -154,62 +154,57 @@ jobs:
           echo "Query Built: $QUERY_BUILT"
           echo "Common Tag: $COMMON_TAG"
 
-          MANIFEST_UPDATED=false # Flag para saber si algo cambió
+          MANIFEST_UPDATED=false
 
-          # --- Update Ingest Service Manifests (si se construyó) ---
+          # --- Update Ingest Service ---
           if [ "$INGEST_BUILT" = "true" ]; then
             INGEST_TARGET_IMAGE="${{ env.INGEST_IMAGE_NAME }}:$COMMON_TAG"
             echo "Updating Ingest Service image to: $INGEST_TARGET_IMAGE"
-            INGEST_API_FILE="${{ env.INGEST_MANIFEST_PATH_API }}"
-            INGEST_WORKER_FILE="${{ env.INGEST_MANIFEST_PATH_WORKER }}"
 
-            if [ -f "$INGEST_API_FILE" ]; then
-              sed -i "s|image: .*|image: $INGEST_TARGET_IMAGE|" "$INGEST_API_FILE"
-              echo "Updated $INGEST_API_FILE"
+            if [ -f "$INGEST_MANIFEST_PATH_API_REL" ]; then
+              sed -i "s|image: .*|image: $INGEST_TARGET_IMAGE|" "$INGEST_MANIFEST_PATH_API_REL"
+              echo "Updated $INGEST_MANIFEST_PATH_API_REL"
               MANIFEST_UPDATED=true
             else
-              echo "WARNING: Ingest API manifest $INGEST_API_FILE not found!"
+              echo "WARNING: Ingest API manifest $INGEST_MANIFEST_PATH_API_REL not found!"
             fi
-            if [ -f "$INGEST_WORKER_FILE" ]; then
-              sed -i "s|image: .*|image: $INGEST_TARGET_IMAGE|" "$INGEST_WORKER_FILE"
-              echo "Updated $INGEST_WORKER_FILE"
+            if [ -f "$INGEST_MANIFEST_PATH_WORKER_REL" ]; then
+              sed -i "s|image: .*|image: $INGEST_TARGET_IMAGE|" "$INGEST_MANIFEST_PATH_WORKER_REL"
+              echo "Updated $INGEST_MANIFEST_PATH_WORKER_REL"
               MANIFEST_UPDATED=true
             else
-              echo "WARNING: Ingest Worker manifest $INGEST_WORKER_FILE not found!"
+              echo "WARNING: Ingest Worker manifest $INGEST_MANIFEST_PATH_WORKER_REL not found!"
             fi
           else
             echo "Skipping Ingest Service manifest update."
           fi
 
-          # --- Update Query Service Manifest (si se construyó) ---
+          # --- Update Query Service ---
           if [ "$QUERY_BUILT" = "true" ]; then
             QUERY_TARGET_IMAGE="${{ env.QUERY_IMAGE_NAME }}:$COMMON_TAG"
             echo "Updating Query Service image to: $QUERY_TARGET_IMAGE"
-            QUERY_FILE="${{ env.QUERY_MANIFEST_PATH }}"
 
-            if [ -f "$QUERY_FILE" ]; then
-              sed -i "s|image: .*|image: $QUERY_TARGET_IMAGE|" "$QUERY_FILE"
-              echo "Updated $QUERY_FILE"
+            if [ -f "$QUERY_MANIFEST_PATH_REL" ]; then
+              sed -i "s|image: .*|image: $QUERY_TARGET_IMAGE|" "$QUERY_MANIFEST_PATH_REL"
+              echo "Updated $QUERY_MANIFEST_PATH_REL"
               MANIFEST_UPDATED=true
             else
-              echo "ERROR: Query manifest file $QUERY_FILE not found!"
-              # Decidir si fallar o solo advertir
-              # exit 1
+              # Si el manifest no existe, podría ser un error grave
+              echo "ERROR: Query manifest file $QUERY_MANIFEST_PATH_REL not found!"
+              exit 1
             fi
           else
             echo "Skipping Query Service manifest update."
           fi
 
-          # Guardar el estado de actualización para el siguiente paso
           echo "manifest_updated=$MANIFEST_UPDATED" >> $GITHUB_OUTPUT
           echo "--- Checking Git Status ---"
           git status
           echo "::endgroup::"
-        id: update_manifest # Darle un ID al step para referenciar su output
+        id: update_manifest
 
       # 4. Commit y Push de los Cambios del Manifest (si hubo cambios)
       - name: Commit and Push Manifest Changes
-        # Ejecutar solo si el script anterior marcó que hubo actualizaciones
         if: steps.update_manifest.outputs.manifest_updated == 'true'
         run: |
           echo "::group::Committing and Pushing Manifest Changes"
@@ -217,14 +212,13 @@ jobs:
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
 
-          # Añadir todos los archivos bajo los directorios de servicio (más seguro que .)
-          git add ${{ env.INGEST_SERVICE_DIR }}/* ${{ env.QUERY_SERVICE_DIR }}/* || echo "No files to add in specified directories."
+          # Añadir todos los archivos modificados (más simple si confías en que solo se modificaron manifests)
+          git add .
 
           if git diff --staged --quiet; then
             echo "No changes staged. Nothing to commit."
           else
             echo "Manifest changes detected. Committing..."
-            # Mensaje de commit más genérico ya que puede ser uno o ambos
             COMMIT_MSG="Update service images to tag ${{ steps.image_tag_common.outputs.image_tag }} [CI]"
             git commit -m "$COMMIT_MSG"
             echo "Pushing changes to origin/${{ env.MANIFEST_REPO_BRANCH }}..."
