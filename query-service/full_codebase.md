@@ -852,7 +852,7 @@ from typing import Dict, Any, List, Tuple, Optional
 from haystack import Pipeline, Document
 from haystack.components.embedders import OpenAITextEmbedder
 from haystack.components.builders.prompt_builder import PromptBuilder
-from milvus_haystack import MilvusDocumentStore, MilvusEmbeddingRetriever # Integración correcta
+from milvus_haystack import MilvusDocumentStore, MilvusEmbeddingRetriever
 from haystack.utils import Secret
 
 from app.core.config import settings
@@ -865,33 +865,27 @@ log = structlog.get_logger(__name__)
 
 def get_milvus_document_store() -> MilvusDocumentStore:
     """Initializes the MilvusDocumentStore connection."""
-    # Loguear los parámetros que SÍ se usarán
     log.debug("Initializing MilvusDocumentStore for Query Service",
-             connection_uri=str(settings.MILVUS_URI), # Loguear la URI que se pasará
+             connection_uri=str(settings.MILVUS_URI),
              collection=settings.MILVUS_COLLECTION_NAME,
-             embedding_field=settings.MILVUS_EMBEDDING_FIELD,
-             content_field=settings.MILVUS_CONTENT_FIELD,
-             metadata_fields=settings.MILVUS_METADATA_FIELDS,
+             # Ya no se loguean los campos aquí porque no se pasan al constructor
              search_params=settings.MILVUS_SEARCH_PARAMS)
     try:
-        # *** CORRECCIÓN: Usar connection_args para la URI ***
+        # *** CORRECCIÓN: Eliminar embedding_field, content_field, metadata_fields ***
         store = MilvusDocumentStore(
-            connection_args={"uri": str(settings.MILVUS_URI)}, # Pasar la URI dentro de connection_args
+            connection_args={"uri": str(settings.MILVUS_URI)},
             collection_name=settings.MILVUS_COLLECTION_NAME,
-            # dim no suele ser necesario al conectar a una colección existente
-            embedding_field=settings.MILVUS_EMBEDDING_FIELD,
-            content_field=settings.MILVUS_CONTENT_FIELD,
-            metadata_fields=settings.MILVUS_METADATA_FIELDS, # Campos a recuperar de Milvus
-            search_params=settings.MILVUS_SEARCH_PARAMS,    # Parámetros para la búsqueda
-            consistency_level="Strong",                     # Nivel de consistencia
-            # index_params no se necesitan aquí, solo para escritura/creación
+            # Los siguientes campos NO son argumentos válidos para el constructor:
+            # embedding_field=settings.MILVUS_EMBEDDING_FIELD,
+            # content_field=settings.MILVUS_CONTENT_FIELD,
+            # metadata_fields=settings.MILVUS_METADATA_FIELDS,
+            search_params=settings.MILVUS_SEARCH_PARAMS, # Parámetros de búsqueda sí son válidos
+            consistency_level="Strong",                 # Nivel de consistencia sí es válido
         )
         log.info("MilvusDocumentStore initialized successfully")
         return store
     except Exception as e:
-        # Loguear el error específico de inicialización
         log.error("Failed to initialize MilvusDocumentStore", error=str(e), exc_info=True)
-        # Lanzar un error claro para que el startup/health check falle correctamente
         raise RuntimeError(f"Could not initialize Milvus Document Store: {e}") from e
 
 
@@ -901,8 +895,6 @@ def get_openai_text_embedder() -> OpenAITextEmbedder:
     api_key_secret = Secret.from_env_var("QUERY_OPENAI_API_KEY")
     if not api_key_secret.resolve_value():
          log.warning("QUERY_OPENAI_API_KEY environment variable not found or empty for OpenAI Embedder.")
-         # Podríamos lanzar un error si la clave es crítica para la funcionalidad básica
-         # raise ValueError("Missing OpenAI API Key for text embedder")
 
     return OpenAITextEmbedder(
         api_key=api_key_secret,
@@ -912,9 +904,12 @@ def get_openai_text_embedder() -> OpenAITextEmbedder:
 def get_milvus_retriever(document_store: MilvusDocumentStore) -> MilvusEmbeddingRetriever:
     """Initializes the MilvusEmbeddingRetriever."""
     log.debug("Initializing MilvusEmbeddingRetriever")
+    # El retriever usará los nombres de campo por defecto ('embedding', 'content')
+    # o los configurados en la colección Milvus. No necesita pasarlos explícitamente aquí
+    # a menos que quieras sobreescribir los defaults del store/colección.
     return MilvusEmbeddingRetriever(
         document_store=document_store,
-        # top_k y filters se pasarán dinámicamente en pipeline.run()
+        # top_k y filters se pasarán dinámicamente
     )
 
 def get_prompt_builder() -> PromptBuilder:
@@ -932,7 +927,6 @@ def build_rag_pipeline() -> Pipeline:
     Caches the pipeline instance globally after the first successful build.
     """
     global _rag_pipeline_instance
-    # Devolver instancia cacheada si ya existe
     if _rag_pipeline_instance:
         log.debug("Returning existing RAG pipeline instance.")
         return _rag_pipeline_instance
@@ -941,13 +935,13 @@ def build_rag_pipeline() -> Pipeline:
     rag_pipeline = Pipeline()
 
     try:
-        # 1. Initialize components (ahora get_milvus_document_store debería funcionar)
+        # 1. Initialize components (get_milvus_document_store ya corregido)
         doc_store = get_milvus_document_store()
         text_embedder = get_openai_text_embedder()
         retriever = get_milvus_retriever(document_store=doc_store)
         prompt_builder = get_prompt_builder()
 
-        # 2. Add components to the pipeline
+        # 2. Add components
         rag_pipeline.add_component("text_embedder", text_embedder)
         rag_pipeline.add_component("retriever", retriever)
         rag_pipeline.add_component("prompt_builder", prompt_builder)
@@ -957,18 +951,17 @@ def build_rag_pipeline() -> Pipeline:
         rag_pipeline.connect("retriever.documents", "prompt_builder.documents")
 
         log.info("Haystack RAG pipeline built successfully.")
-        _rag_pipeline_instance = rag_pipeline # Guardar instancia global
+        _rag_pipeline_instance = rag_pipeline
         return rag_pipeline
 
     except Exception as e:
-        # Loguear el error detallado si falla la construcción
         log.error("Failed to build Haystack RAG pipeline", error=str(e), exc_info=True)
-        # Lanzar para que el startup falle si no se puede construir el pipeline
         raise RuntimeError("Could not build the RAG pipeline") from e
 
 
 # --- Pipeline Execution ---
-
+# (El resto de la función run_rag_pipeline y check_pipeline_dependencies no necesita cambios
+#  respecto a la versión anterior, ya que el error estaba en get_milvus_document_store)
 async def run_rag_pipeline(
     query: str,
     company_id: str,
@@ -981,17 +974,14 @@ async def run_rag_pipeline(
     run_log = log.bind(query=query, company_id=company_id, user_id=user_id or "N/A")
     run_log.info("Running RAG pipeline...")
 
-    # Obtener o construir el pipeline (ahora debería funcionar en startup si Milvus está ok)
     try:
         pipeline = build_rag_pipeline()
     except Exception as build_err:
          run_log.error("Failed to get or build RAG pipeline for execution", error=str(build_err))
-         # Si no se puede construir el pipeline, no se puede procesar la query
          raise HTTPException(status_code=503, detail="RAG pipeline is not available.")
 
 
     retriever_top_k = top_k if top_k is not None else settings.RETRIEVER_TOP_K
-    # Usar el campo correcto definido en settings para el filtro
     retriever_filters = {settings.MILVUS_COMPANY_ID_FIELD: company_id}
     run_log.debug("Retriever filters prepared", filters=retriever_filters, top_k=retriever_top_k)
 
@@ -1003,7 +993,6 @@ async def run_rag_pipeline(
     run_log.debug("Pipeline input prepared", input_data=pipeline_input)
 
     try:
-        # Ejecutar Haystack pipeline en thread
         loop = asyncio.get_running_loop()
         pipeline_result = await loop.run_in_executor(
             None,
@@ -1037,11 +1026,9 @@ async def run_rag_pipeline(
 
         run_log.debug("Generated prompt for LLM", prompt_preview=generated_prompt[:200] + "...")
 
-        # Llamar a Gemini
         answer = await gemini_client.generate_answer(generated_prompt)
         run_log.info("Answer generated by Gemini", answer_preview=answer[:100] + "...")
 
-        # Loguear interacción
         log_id: Optional[uuid.UUID] = None
         try:
             doc_ids = [doc.id for doc in retrieved_docs]
@@ -1063,25 +1050,20 @@ async def run_rag_pipeline(
 
     except Exception as e:
         run_log.exception("Error occurred during RAG pipeline execution")
-        # Relanzar una excepción más genérica o específica según el caso
         raise HTTPException(status_code=500, detail=f"Error processing query: {type(e).__name__}")
 
-# Función para verificar dependencias (llamada desde health check)
+
 async def check_pipeline_dependencies() -> Dict[str, str]:
     """Checks critical dependencies for the pipeline (e.g., Milvus)."""
     results = {"milvus_connection": "pending"}
     try:
-        # Intentar obtener el DocumentStore como prueba de conexión/configuración
-        # Esto ahora debería funcionar o lanzar un error claro si Milvus no está accesible
-        store = get_milvus_document_store()
-        # Realizar una operación ligera para confirmar la conexión
+        store = get_milvus_document_store() # Ahora debería funcionar o lanzar error claro
         count = await asyncio.to_thread(store.count_documents)
         results["milvus_connection"] = "ok"
         log.debug("Milvus dependency check successful (count documents)", count=count)
     except Exception as e:
-        # Capturar cualquier excepción durante la inicialización o la operación
         error_msg = f"{type(e).__name__}: {str(e)}"
-        results["milvus_connection"] = f"error: {error_msg[:100]}" # Limitar longitud
+        results["milvus_connection"] = f"error: {error_msg[:100]}"
         log.warning("Milvus dependency check failed", error=error_msg, exc_info=False)
     return results
 ```
