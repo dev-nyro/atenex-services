@@ -239,3 +239,5 @@ if __name__ == "__main__":
         log_level=log_level_str,
         # Podrías añadir use_colors=True si tu terminal lo soporta y no usas JSON
     )
+
+#V 0.0.2

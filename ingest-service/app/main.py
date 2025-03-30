@@ -166,4 +166,4 @@ if __name__ == "__main__":
         log_level=log_level_str
     )
 
-#V 0.0.1
+#V 0.0.2
