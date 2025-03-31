@@ -5,34 +5,30 @@ FROM python:${PYTHON_VERSION}-slim as base
 # Python build stage
 FROM base as python-build-stage
 ARG PYTHON_VERSION
-ARG POETRY_VERSION=1.7.1 # Usa una versión específica de Poetry
+ARG POETRY_VERSION=1.7.1
 
 # System dependencies
 RUN apt-get update && apt-get install --no-install-recommends -y \
-    # poetry dependencies
     curl \
-    # clean up
     && apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
 
 # Install poetry
 ENV POETRY_HOME="/opt/poetry" \
     POETRY_VIRTUALENVS_IN_PROJECT=true \
-    POETRY_NO_INTERACTION=1 \
-    PATH="$POETRY_HOME/bin:$PATH"
+    POETRY_NO_INTERACTION=1
+# Corrección: Usar valor explícito en PATH
+ENV PATH="/opt/poetry/bin:$PATH"
 RUN curl -sSL https://install.python-poetry.org | python - --version ${POETRY_VERSION}
 
 # Set working directory
 WORKDIR /app
 
 # Copy only requirements to cache them
+# **ASEGÚRATE QUE ESTOS ARCHIVOS EXISTEN EN api-gateway/**
 COPY poetry.lock pyproject.toml ./
 
 # Install runtime dependencies
-# --no-root avoids installing the project itself, only dependencies
-# --no-dev excludes development dependencies
-# --compile might speed up startup slightly (optional)
 RUN poetry install --no-root --no-dev --compile
-
 
 # Runtime stage
 FROM base
@@ -40,7 +36,9 @@ ARG PYTHON_VERSION
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     # Set paths to find installed packages
-    PATH="/app/.venv/bin:$PATH"
+    PATH="/app/.venv/bin:$PATH" \
+    # Define el puerto por defecto que usará Gunicorn si no se sobrescribe
+    PORT=8080
 
 WORKDIR /app
 
@@ -49,16 +47,15 @@ COPY --from=python-build-stage /app/.venv /app/.venv
 # Copy application code
 COPY ./app ./app
 
-# Expose the port the app runs on (default 8080, configurable)
-# La variable PORT es leída por Gunicorn si se usa $(PORT) en el comando
-ENV PORT=8080
+# Expose the port the app runs on
 EXPOSE ${PORT}
 
-# Set user (optional but recommended for security)
-# RUN useradd --create-home --shell /bin/bash appuser
+# Set user (optional but recommended for security - requires directory permissions adjustment)
+# RUN groupadd -r appuser && useradd --no-log-init -r -g appuser appuser
+# RUN chown -R appuser:appuser /app
 # USER appuser
 
 # Command to run the application using Gunicorn
-# El puerto aquí debe coincidir con el EXPOSE y la configuración de K8s Service/Deployment
-# Usar $(PORT) permite que el puerto sea configurable a través de la variable de entorno.
-CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "4", "-b", "0.0.0.0:$(PORT)", "app.main:app"]
+# Corrección: Usar puerto explícito o ${PORT} en la forma shell de CMD si es necesario.
+# Aquí usamos el puerto 8080 directamente, que coincide con EXPOSE y la variable PORT.
+CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "4", "-b", "0.0.0.0:8080", "app.main:app"]
