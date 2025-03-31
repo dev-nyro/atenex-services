@@ -1,223 +1,143 @@
-name: CI/CD Pipeline Docker -> Manifest Update (Ingest & Query - Selective Build)
+# .github/workflows/CICD.yml
+name: Build and Push Microservices
 
 on:
   push:
-    branches: [ "develop" ] # Dispara en push a la rama develop
+    branches:
+      - develop # O la rama que uses para despliegue continuo
 
 env:
-  # --- Configuración General ---
-  REGISTRY: ghcr.io
-  MANIFEST_REPO_OWNER: dev-nyro
-  MANIFEST_REPO_NAME: manifests-nyro
-  MANIFEST_REPO_BRANCH: develop
-
-  # --- SOLO Directorios y Nombres Base ---
-  INGEST_SERVICE_DIR: ingest-service
-  INGEST_IMAGE_NAME: ghcr.io/dev-nyro/ingest-service
-  QUERY_SERVICE_DIR: query-service
-  QUERY_IMAGE_NAME: ghcr.io/dev-nyro/query-service
-  # !! Se eliminan las definiciones de INGEST_MANIFEST_PATH_* y QUERY_MANIFEST_PATH de aquí !!
+  # Define variables globales si son necesarias
+  # REGISTRY: ghcr.io
+  # IMAGE_OWNER: dev-nyro
 
 jobs:
-  build-push-update:
+  # --- TRABAJO EXISTENTE PARA INGEST SERVICE (EJEMPLO) ---
+  build_and_push_ingest:
     runs-on: ubuntu-latest
-
     permissions:
       contents: read
-      packages: write
-      pull-requests: read
-
-    outputs:
-      ingest_built: ${{ steps.build_ingest.outputs.digest != '' && steps.build_ingest.outcome == 'success' }}
-      query_built: ${{ steps.build_query.outputs.digest != '' && steps.build_query.outcome == 'success' }}
-
+      packages: write # Necesario para pushear a GHCR
+    defaults:
+      run:
+        working-directory: ./ingest-service # Directorio del Ingest Service
     steps:
-      # 1. Checkout del código fuente
-      - name: Checkout Application Code
+      - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      # 2. Detectar archivos modificados
-      - name: Get changed files
-        id: changed_files
-        uses: tj-actions/changed-files@v44
-        with:
-          files_yaml: |
-            ingest:
-              - '${{ env.INGEST_SERVICE_DIR }}/**'
-            query:
-              - '${{ env.QUERY_SERVICE_DIR }}/**'
-
-      # 3. Configurar Docker Buildx (Condicional)
       - name: Set up Docker Buildx
-        if: steps.changed_files.outputs.ingest_any_changed == 'true' || steps.changed_files.outputs.query_any_changed == 'true'
         uses: docker/setup-buildx-action@v3
 
-      # 4. Login a GHCR (Condicional)
       - name: Log in to GitHub Container Registry
-        if: steps.changed_files.outputs.ingest_any_changed == 'true' || steps.changed_files.outputs.query_any_changed == 'true'
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 5. Generar etiqueta común (Condicional)
-      - name: Generate Common Image Tag
-        if: steps.changed_files.outputs.ingest_any_changed == 'true' || steps.changed_files.outputs.query_any_changed == 'true'
-        id: image_tag_common
-        run: |
-          TAG="${{ github.ref_name }}-$(echo $GITHUB_SHA | cut -c1-7)"
-          TAG=$(echo $TAG | sed 's/[^a-zA-Z0-9.-]/-/g' | sed 's/^[.-]*//;s/[.-]*$//')
-          echo "Generated Common Tag: $TAG"
-          echo "image_tag=$TAG" >> $GITHUB_OUTPUT
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta_ingest
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/ingest-service
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=,suffix=,format=short
 
-      # 6. Construir y Empujar Imagen Docker - Ingest Service (Condicional)
-      - name: Build and push Ingest Service Docker image
-        id: build_ingest
-        if: steps.changed_files.outputs.ingest_any_changed == 'true'
+      - name: Build and push Docker image for Ingest Service
         uses: docker/build-push-action@v5
         with:
-          context: ./${{ env.INGEST_SERVICE_DIR }}
-          file: ./${{ env.INGEST_SERVICE_DIR }}/Dockerfile
-          push: ${{ github.event_name == 'push' }}
-          tags: ${{ env.INGEST_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
+          context: ./ingest-service # Asegurar el contexto correcto
+          push: true
+          tags: ${{ steps.meta_ingest.outputs.tags }}
+          labels: ${{ steps.meta_ingest.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          outputs: type=registry,push=${{ github.event_name == 'push' }}
 
-      # 7. Construir y Empujar Imagen Docker - Query Service (Condicional)
-      - name: Build and push Query Service Docker image
-        id: build_query
-        if: steps.changed_files.outputs.query_any_changed == 'true'
-        uses: docker/build-push-action@v5
-        with:
-          context: ./${{ env.QUERY_SERVICE_DIR }}
-          file: ./${{ env.QUERY_SERVICE_DIR }}/Dockerfile
-          push: ${{ github.event_name == 'push' }}
-          tags: ${{ env.QUERY_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          outputs: type=registry,push=${{ github.event_name == 'push' }}
-
-  # --- Job separado para actualizar manifests ---
-  update-manifests:
-    needs: build-push-update
+  # --- TRABAJO EXISTENTE PARA QUERY SERVICE (EJEMPLO) ---
+  build_and_push_query:
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (needs.build-push-update.outputs.ingest_built == 'true' || needs.build-push-update.outputs.query_built == 'true')
-
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        working-directory: ./query-service # Directorio del Query Service
     steps:
-      # 1. Checkout del repositorio de manifests
-      - name: Checkout Manifests Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
         with:
-          repository: ${{ env.MANIFEST_REPO_OWNER }}/${{ env.MANIFEST_REPO_NAME }}
-          ref: ${{ env.MANIFEST_REPO_BRANCH }}
-          token: ${{ secrets.MANIFEST_PAT }}
-          path: manifests-repo
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 2. Regenerar el tag común
-      - name: Generate Common Image Tag (again)
-        id: image_tag_common
-        run: |
-          TAG="${{ github.ref_name }}-$(echo $GITHUB_SHA | cut -c1-7)"
-          TAG=$(echo $TAG | sed 's/[^a-zA-Z0-9.-]/-/g' | sed 's/^[.-]*//;s/[.-]*$//')
-          echo "Using Common Tag: $TAG"
-          echo "image_tag=$TAG" >> $GITHUB_OUTPUT
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta_query
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/query-service
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=,suffix=,format=short
 
-      # 3. Actualizar archivos de Manifest (Condicionalmente dentro del script)
-      - name: Update Manifest Files Conditionally
-        env:
-          # Pasar outputs del job anterior
-          INGEST_BUILT: ${{ needs.build-push-update.outputs.ingest_built }}
-          QUERY_BUILT: ${{ needs.build-push-update.outputs.query_built }}
-          COMMON_TAG: ${{ steps.image_tag_common.outputs.image_tag }}
-          # *** CORRECCIÓN: Construir los paths relativos aquí usando las variables base ***
-          INGEST_MANIFEST_PATH_API_REL: ${{ env.INGEST_SERVICE_DIR }}/deployment-api.yaml
-          INGEST_MANIFEST_PATH_WORKER_REL: ${{ env.INGEST_SERVICE_DIR }}/deployment-worker.yaml
-          QUERY_MANIFEST_PATH_REL: ${{ env.QUERY_SERVICE_DIR }}/deployment.yaml
-        run: |
-          echo "::group::Updating Manifest Files Conditionally"
-          cd manifests-repo
-          echo "Current directory: $(pwd)"
-          echo "Ingest Built: $INGEST_BUILT"
-          echo "Query Built: $QUERY_BUILT"
-          echo "Common Tag: $COMMON_TAG"
-          echo "Ingest API Path: $INGEST_MANIFEST_PATH_API_REL"
-          echo "Ingest Worker Path: $INGEST_MANIFEST_PATH_WORKER_REL"
-          echo "Query Path: $QUERY_MANIFEST_PATH_REL"
+      - name: Build and push Docker image for Query Service
+        uses: docker/build-push-action@v5
+        with:
+          context: ./query-service # Asegurar el contexto correcto
+          push: true
+          tags: ${{ steps.meta_query.outputs.tags }}
+          labels: ${{ steps.meta_query.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-          MANIFEST_UPDATED=false
+  # --- NUEVO TRABAJO PARA API GATEWAY ---
+  build_and_push_gateway:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    # *** IMPORTANTE: Especificar el working-directory para este job ***
+    defaults:
+      run:
+        working-directory: ./api-gateway # Directorio del API Gateway
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-          # --- Update Ingest Service ---
-          if [ "$INGEST_BUILT" = "true" ]; then
-            INGEST_TARGET_IMAGE="${{ env.INGEST_IMAGE_NAME }}:$COMMON_TAG"
-            echo "Attempting to update Ingest Service image to: $INGEST_TARGET_IMAGE"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-            # Usar las variables _REL que ahora tienen el path correcto
-            if [ -f "$INGEST_MANIFEST_PATH_API_REL" ]; then
-              sed -i "s|image: .*|image: $INGEST_TARGET_IMAGE|" "$INGEST_MANIFEST_PATH_API_REL"
-              echo "Updated $INGEST_MANIFEST_PATH_API_REL"
-              MANIFEST_UPDATED=true
-            else
-              echo "WARNING: Ingest API manifest $INGEST_MANIFEST_PATH_API_REL not found!"
-            fi
-            if [ -f "$INGEST_MANIFEST_PATH_WORKER_REL" ]; then
-              sed -i "s|image: .*|image: $INGEST_TARGET_IMAGE|" "$INGEST_MANIFEST_PATH_WORKER_REL"
-              echo "Updated $INGEST_MANIFEST_PATH_WORKER_REL"
-              MANIFEST_UPDATED=true
-            else
-              echo "WARNING: Ingest Worker manifest $INGEST_MANIFEST_PATH_WORKER_REL not found!"
-            fi
-          else
-            echo "Skipping Ingest Service manifest update."
-          fi
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-          # --- Update Query Service ---
-          if [ "$QUERY_BUILT" = "true" ]; then
-            QUERY_TARGET_IMAGE="${{ env.QUERY_IMAGE_NAME }}:$COMMON_TAG"
-            echo "Attempting to update Query Service image to: $QUERY_TARGET_IMAGE"
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta_gateway # ID único para este step
+        uses: docker/metadata-action@v5
+        with:
+          # *** Nombre correcto de la imagen para el Gateway ***
+          images: ghcr.io/${{ github.repository_owner }}/api-gateway
+          tags: |
+            type=ref,event=branch # Tag por rama (ej: develop)
+            type=sha,prefix=,suffix=,format=short # Tag por commit corto
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', 'develop') }} # Tag 'latest' solo para rama develop
 
-            # Usar la variable _REL que ahora tiene el path correcto
-            if [ -f "$QUERY_MANIFEST_PATH_REL" ]; then
-              sed -i "s|image: .*|image: $QUERY_TARGET_IMAGE|" "$QUERY_MANIFEST_PATH_REL"
-              echo "Updated $QUERY_MANIFEST_PATH_REL"
-              MANIFEST_UPDATED=true
-            else
-              echo "ERROR: Query manifest file $QUERY_MANIFEST_PATH_REL not found!"
-              exit 1
-            fi
-          else
-            echo "Skipping Query Service manifest update."
-          fi
-
-          echo "manifest_updated=$MANIFEST_UPDATED" >> $GITHUB_OUTPUT
-          echo "--- Checking Git Status ---"
-          git status
-          echo "::endgroup::"
-        id: update_manifest
-
-      # 4. Commit y Push de los Cambios del Manifest (si hubo cambios)
-      - name: Commit and Push Manifest Changes
-        if: steps.update_manifest.outputs.manifest_updated == 'true'
-        run: |
-          echo "::group::Committing and Pushing Manifest Changes"
-          cd manifests-repo
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-
-          # Añadir todos los cambios detectados por git
-          git add .
-
-          if git diff --staged --quiet; then
-            echo "No changes staged. Nothing to commit."
-          else
-            echo "Manifest changes detected. Committing..."
-            COMMIT_MSG="Update service images to tag ${{ steps.image_tag_common.outputs.image_tag }} [CI]"
-            git commit -m "$COMMIT_MSG"
-            echo "Pushing changes to origin/${{ env.MANIFEST_REPO_BRANCH }}..."
-            git push origin ${{ env.MANIFEST_REPO_BRANCH }}
-            echo "Push successful."
-          fi
-          echo "::endgroup::"
+      - name: Build and push Docker image for API Gateway
+        uses: docker/build-push-action@v5
+        with:
+          # *** Contexto correcto para el build del Gateway ***
+          context: ./api-gateway
+          push: true
+          tags: ${{ steps.meta_gateway.outputs.tags }}
+          labels: ${{ steps.meta_gateway.outputs.labels }}
+          cache-from: type=gha # Habilitar caché de build de GitHub Actions
+          cache-to: type=gha,mode=max
