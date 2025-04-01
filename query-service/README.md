@@ -4,23 +4,30 @@
 
 El **Query Service** es el microservicio responsable de manejar las consultas en lenguaje natural de los usuarios dentro de la plataforma SaaS B2B. Su función principal es recibir una pregunta del usuario (`query`), utilizar un **pipeline de Retrieval-Augmented Generation (RAG) construido con [Haystack](https://haystack.deepset.ai/)** para encontrar información relevante en los documentos previamente ingeridos por el `ingest-service` (indexados en Milvus), generar una respuesta coherente utilizando un Large Language Model (LLM) externo (configurado para usar Google Gemini), y registrar la interacción para auditoría y análisis futuros.
 
-**Flujo principal:**
+**Además de procesar consultas individuales, el servicio ahora gestiona el historial de conversaciones persistente.** Permite a los usuarios continuar conversaciones existentes o iniciar nuevas, almacenando los mensajes de usuario y asistente en la base de datos relacional (Supabase).
 
-1.  **Recepción:** La API (`POST /api/v1/query`) recibe la consulta del usuario (`query`) y el identificador de la empresa (`X-Company-ID` en headers). Se asume que la autenticación (JWT) es manejada por un API Gateway o servicio previo.
-2.  **Validación:** Verifica la presencia y formato de `query` y `X-Company-ID`.
-3.  **Ejecución del Pipeline RAG (Orquestado en `app.pipelines.rag_pipeline.py`):**
-    *   **Embedding de Consulta:** Convierte la `query` en un vector usando `OpenAITextEmbedder` (modelo definido en config, ej: `text-embedding-3-small`).
-    *   **Recuperación (Retrieval):** `MilvusEmbeddingRetriever` busca en la colección Milvus (definida en config) los chunks de documentos más relevantes para el vector de la consulta. **Crucialmente, aplica un filtro estricto para devolver solo documentos pertenecientes al `company_id` proporcionado.** El número de documentos (`top_k`) es configurable.
-    *   **Construcción del Prompt:** `PromptBuilder` toma la `query` original y el contenido de los `documents` recuperados, y los inserta en una plantilla predefinida (configurable) diseñada para instruir al LLM.
-    *   **Generación de Respuesta (Llamada Externa):** Se utiliza el cliente `app.services.gemini_client.py` para enviar el prompt generado a la API de Google Gemini (modelo definido en config, ej: `gemini-1.5-flash-latest`).
-4.  **Persistencia del Log:** La función `app.db.postgres_client.log_query_interaction` registra la consulta, la respuesta generada, los IDs y scores de los documentos recuperados, y metadatos relevantes (como modelos usados) en la tabla `query_logs` de Supabase (PostgreSQL).
-5.  **Respuesta:** Devuelve la respuesta generada por Gemini y la información sobre los documentos recuperados al cliente (`QueryResponse`).
+**Flujo principal (con Chat):**
 
-Este servicio se centra en la recuperación eficiente y filtrada por tenant, y en la generación de respuestas contextualizadas, manteniendo la coherencia con la arquitectura y tecnologías del `ingest-service`.
+1.  **Recepción:** La API (`POST /api/v1/query`) recibe la consulta del usuario (`query`), el identificador de la empresa (`X-Company-ID` en headers) y opcionalmente un `chat_id`. Se asume que la autenticación (JWT) es manejada por un API Gateway o servicio previo, **y es necesaria para usar la funcionalidad de chat.**
+2.  **Validación:** Verifica la presencia y formato de `query`, `X-Company-ID` y la validez/propiedad del `chat_id` si se proporciona.
+3.  **Gestión del Chat:**
+    *   Si se proporciona un `chat_id` válido y perteneciente al usuario, se continúa la conversación existente.
+    *   Si no se proporciona `chat_id` o es inválido (y el usuario está autenticado), se crea un nuevo chat en la base de datos.
+    *   Se guarda el mensaje del usuario (`role: 'user'`) en la tabla `messages`.
+4.  **Ejecución del Pipeline RAG (Orquestado en `app.pipelines.rag_pipeline.py`):**
+    *   **Embedding de Consulta:** Convierte la `query` en un vector usando `OpenAITextEmbedder`.
+    *   **Recuperación (Retrieval):** `MilvusEmbeddingRetriever` busca en Milvus los chunks relevantes, **filtrando por `company_id`**.
+    *   **Construcción del Prompt:** `PromptBuilder` combina la `query` y los `documents` recuperados en una plantilla.
+    *   **Generación de Respuesta (Llamada Externa):** `app.services.gemini_client.py` envía el prompt a la API de Google Gemini.
+5.  **Persistencia del Mensaje del Asistente:** Se guarda el mensaje generado por el LLM (`role: 'assistant'`) en la tabla `messages`, incluyendo las fuentes (`retrieved_documents`) si las hubiera. Se actualiza el timestamp `updated_at` del chat.
+6.  **Persistencia del Log:** La función `app.db.postgres_client.log_query_interaction` registra la consulta, la respuesta, los documentos recuperados, metadatos y el `chat_id` asociado en la tabla `query_logs`.
+7.  **Respuesta:** Devuelve la respuesta generada, los documentos recuperados, el `query_log_id` y el `chat_id` (existente o nuevo) al cliente (`QueryResponse`).
+
+Este servicio se centra en la recuperación eficiente y filtrada por tenant, la generación de respuestas contextualizadas y ahora también en la **gestión persistente del historial de chat**, manteniendo la coherencia con la arquitectura y tecnologías del `ingest-service`.
 
 ## 2. Arquitectura General del Proyecto (Posición del Query Service)
 
-El `Query Service` (G1) se sitúa detrás del API Gateway y es invocado por este tras validar el JWT. Interactúa con Supabase (para logging), Milvus (para retrieval), OpenAI (para embedding de consulta) y Google Gemini (para generación de respuesta).
+El `Query Service` (G1) se sitúa detrás del API Gateway y es invocado por este tras validar el JWT. Interactúa con Supabase (para logging **y almacenamiento de chats/mensajes**), Milvus (para retrieval), OpenAI (para embedding de consulta) y Google Gemini (para generación de respuesta).
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#d3ffd4', 'edgeLabelBackground':'#fff', 'tertiaryColor': '#dcd0ff'}}}%%
@@ -37,22 +44,28 @@ flowchart TD
         E1 --> F3[(PostgreSQL - Supabase)]
         E1 --> F2[(Milvus Vector DB)]
 
-        C -->|Pregunta + JWT + X-Company-ID| G1["<strong>Query Service</strong><br/>(API + Pipeline Haystack RAG)"]
+        C -->|"Pregunta + JWT + X-Company-ID [+ chat_id]"| G1["<strong>Query Service</strong><br/>(API + Pipeline Haystack RAG + Chat Mgmt)"]
         %% Query Service Internals %%
-        subgraph QueryServiceInternals ["Query Service Pipeline (Conceptual)"]
+        subgraph QueryServiceInternals ["Query Service Pipeline & Chat (Conceptual)"]
             direction LR
-            QS_In[Input: Query, CompanyID] --> QS_Embed["Haystack: OpenAITextEmbedder"]
+            QS_In[Input: Query, CompanyID, UserID, chat_id?] --> QS_ChatMgmt{"Chat Logic<br/>(Get/Create ChatID)"}
+            QS_ChatMgmt -->|Save User Msg| F3
+            QS_ChatMgmt -->|Query, CompanyID| QS_Embed["Haystack: OpenAITextEmbedder"]
             QS_Embed -->|Query Vector| QS_Retrieve["Haystack: MilvusEmbeddingRetriever<br/>(Filtro por CompanyID)"]
             QS_Retrieve -->|Relevant Docs| QS_Prompt["Haystack: PromptBuilder"]
             QS_Prompt -->|Formatted Prompt| QS_ExtCall["Llamada Externa:<br/>GeminiClient"]
-            QS_ExtCall -->|Generated Answer| QS_Out[Output: Answer]
+            QS_ExtCall -->|Generated Answer| QS_SaveAssistant{Save Assistant Msg<br/>+ Sources}
+            QS_SaveAssistant -->|Save Assistant Msg| F3
+            QS_SaveAssistant -->|Answer, Docs, LogID, ChatID| QS_Out[Output]
+
         end
         G1 --> QS_In
         QS_Retrieve -->|Búsqueda Semántica| F2
         QS_ExtCall --> |API Call| I[Google Gemini API]
         QS_Out --> G1
 
-        G1 -->|Log Query/Response| F3
+        %% Logging happens after response generation %%
+        G1 -->|Log Query/Response + chat_id| F3
 
 
         E1 -->|Logs| H1["Monitoring Service"]
@@ -62,26 +75,29 @@ flowchart TD
     end
 
 ```
-*Nota: El pipeline de Haystack maneja el embedding y retrieval. La generación se realiza mediante una llamada directa a la API de Gemini desde el servicio.*
+*Nota: El pipeline de Haystack maneja embedding y retrieval. La generación usa Gemini. La gestión de chat (creación de ID, guardado de mensajes) se integra en el flujo del endpoint `/query` y usa Supabase.*
 
 ## 3. Características Clave
 
-*   **API RESTful:** Endpoint `POST /api/v1/query` para consultas.
+*   **API RESTful:**
+    *   Endpoint `POST /api/v1/query` para consultas RAG **y gestión de conversaciones**.
+    *   **Nuevos Endpoints para Gestión de Chat:** `GET /api/v1/chats`, `GET /api/v1/chats/{chat_id}/messages`, `DELETE /api/v1/chats/{chat_id}`.
 *   **Pipeline RAG con Haystack:** Orquesta embedding (OpenAI), retrieval filtrado (Milvus) y construcción de prompt.
 *   **Integración con Google Gemini:** Utiliza la API de Gemini para la generación final de respuestas.
-*   **Multi-tenancy Estricto:** Filtra documentos por `company_id` en Milvus durante el retrieval.
-*   **Logging de Consultas:** Persistencia detallada en Supabase (`query_logs`).
+*   **Gestión de Historial de Chat Persistente:** Almacena conversaciones (chats y mensajes) en Supabase (PostgreSQL), asociadas a usuarios y empresas.
+*   **Multi-tenancy Estricto:** Filtra documentos por `company_id` en Milvus durante el retrieval y asegura que los usuarios solo accedan a sus propios chats.
+*   **Logging de Consultas:** Persistencia detallada en Supabase (`query_logs`), **ahora incluyendo `chat_id`**.
 *   **Configuración Centralizada:** Uso de ConfigMaps (`query-service-config`) y Secrets (`query-service-secrets`) en Kubernetes.
 *   **Logging Estructurado:** Logs en JSON con `structlog`.
 *   **Health Check Robusto:** Endpoint `/` optimizado para Kubernetes probes.
-*   **Manejo de Errores:** Captura y loguea errores de dependencias y del pipeline.
+*   **Manejo de Errores:** Captura y loguea errores de dependencias, pipeline y validación.
 
 ## 4. Pila Tecnológica Principal
 
 *   **Lenguaje:** Python 3.10+
 *   **Framework API:** FastAPI
 *   **Orquestación RAG:** Haystack AI 2.x (`haystack-ai`)
-*   **Base de Datos Relacional (Logging):** Supabase (PostgreSQL) vía `asyncpg`.
+*   **Base de Datos Relacional (Logging & Chat):** Supabase (PostgreSQL) vía `asyncpg`.
 *   **Base de Datos Vectorial (Retrieval):** Milvus vía `milvus-haystack`.
 *   **Modelo de Embeddings (Query):** OpenAI (`text-embedding-3-small` por defecto) vía `openai`.
 *   **Modelo de Lenguaje Grande (Generación):** Google Gemini vía `google-generativeai`.
@@ -100,16 +116,17 @@ query-service/
 │   │       ├── __init__.py
 │   │       ├── endpoints/
 │   │       │   ├── __init__.py
-│   │       │   └── query.py      # Define POST /query
-│   │       └── schemas.py        # Define Pydantic models (Request/Response)
+│   │       │   ├── chat.py       # Define GET /chats, GET /chats/{id}/messages, DELETE /chats/{id}
+│   │       │   └── query.py      # Define POST /query (con lógica de chat integrada)
+│   │       └── schemas.py        # Define modelos Pydantic (Request/Response/Chat/Message)
 │   ├── core/
 │   │   ├── __init__.py
 │   │   ├── config.py         # Carga configuración (Pydantic BaseSettings)
 │   │   └── logging_config.py # Configura structlog
 │   ├── db/
 │   │   ├── __init__.py
-│   │   └── postgres_client.py # Cliente asyncpg para Supabase (logging)
-│   ├── main.py               # Entrypoint FastAPI, startup/shutdown, health check
+│   │   └── postgres_client.py # Cliente asyncpg para Supabase (logging, chats, messages)
+│   ├── main.py               # Entrypoint FastAPI, startup/shutdown, health check, routers
 │   ├── models/               # Vacío por ahora
 │   │   └── __init__.py
 │   ├── pipelines/            # Lógica del pipeline Haystack
@@ -132,20 +149,22 @@ query-service/
 
 Gestionada mediante ConfigMap `query-service-config` y Secret `query-service-secrets` en el namespace `nyro-develop`.
 
+*(La tabla de ConfigMap y Secret permanece sin cambios ya que no se añadieron nuevas variables de entorno específicas para la funcionalidad de chat en esta implementación)*
+
 ### ConfigMap (`query-service-config`)
 
 | Clave                           | Descripción                                                          | Ejemplo (Valor Esperado)                               | Notas                                                       |
 | :------------------------------ | :------------------------------------------------------------------- | :----------------------------------------------------- | :---------------------------------------------------------- |
 | `QUERY_LOG_LEVEL`               | Nivel de logging (DEBUG, INFO, WARNING, ERROR).                      | `INFO`                                                 |                                                             |
 | `QUERY_POSTGRES_SERVER`         | Host del Supabase Session Pooler.                                    | `aws-0-sa-east-1.pooler.supabase.com`                  |                                                             |
-| `QUERY_POSTGRES_PORT`           | Puerto del Supabase Session Pooler.                                  | `5432` (*Corregido*)                                   | Puerto estándar de PG, Pooler usa este por defecto ahora. |
+| `QUERY_POSTGRES_PORT`           | Puerto del Supabase Session Pooler.                                  | `5432`                                                 | Puerto estándar de PG.                                      |
 | `SUPABASE_PROJECT_REF`          | Referencia del proyecto Supabase (usada para construir user).         | `ymsilkrhstwxikjiqqog`                                 | **¡Ajustar a tu proyecto!**                               |
 | `QUERY_POSTGRES_USER`           | Usuario del Supabase Session Pooler (`postgres.<project-ref>`).      | `postgres.ymsilkrhstwxikjiqqog`                        | Construido a partir de `SUPABASE_PROJECT_REF` en `config.py` |
 | `QUERY_POSTGRES_DB`             | Base de datos en Supabase.                                           | `postgres`                                             |                                                             |
-| `QUERY_MILVUS_URI`              | URI del servicio Milvus (DNS interno de K8s).                        | `http://milvus-milvus.default.svc.cluster.local:19530` | **Corregido: apunta a `default` ns**                      |
+| `QUERY_MILVUS_URI`              | URI del servicio Milvus (DNS interno de K8s).                        | `http://milvus-milvus.default.svc.cluster.local:19530` | Apunta a `default` ns.                                      |
 | `QUERY_MILVUS_COLLECTION_NAME`  | Nombre de la colección Milvus.                                       | `document_chunks_haystack`                             | Debe coincidir con `ingest-service`                         |
-| `QUERY_MILVUS_EMBEDDING_FIELD`  | Nombre del campo vectorial en Milvus.                                | `embedding`                                            | Usado por el Retriever. Default `milvus-haystack`.        |
-| `QUERY_MILVUS_CONTENT_FIELD`    | Nombre del campo de contenido textual en Milvus.                     | `content`                                              | Usado por el Retriever. Default `milvus-haystack`.        |
+| `QUERY_MILVUS_EMBEDDING_FIELD`  | Nombre del campo vectorial en Milvus.                                | `embedding`                                            | Usado por el Retriever.                                     |
+| `QUERY_MILVUS_CONTENT_FIELD`    | Nombre del campo de contenido textual en Milvus.                     | `content`                                              | Usado por el Retriever.                                     |
 | `QUERY_MILVUS_COMPANY_ID_FIELD` | Nombre del campo de metadatos para filtrar por empresa.               | `company_id`                                           | **CRUCIAL** para multi-tenancy                            |
 | `QUERY_OPENAI_EMBEDDING_MODEL`  | Modelo de embedding OpenAI para la consulta.                         | `text-embedding-3-small`                               | **Debe coincidir** con `ingest-service`                   |
 | `QUERY_EMBEDDING_DIMENSION`     | Dimensión del vector de embedding (auto-ajustado en config).         | `1536`                                                 |                                                             |
@@ -174,65 +193,149 @@ Prefijo base: `/api/v1`
 ### Health Check
 
 *   **Endpoint:** `GET /`
-*   **Descripción:** Chequeo básico de Liveness/Readiness para Kubernetes. Verifica si el servicio se inició correctamente (variable interna `SERVICE_READY`). **No realiza chequeos activos de dependencias externas** para mayor estabilidad de los probes.
-*   **Respuesta Exitosa (`200 OK`):** Indica que el servicio arrancó y está aceptando conexiones.
+*   **Descripción:** Chequeo básico de Liveness/Readiness para Kubernetes. Verifica si el servicio se inició correctamente (variable interna `SERVICE_READY`).
+*   **Respuesta Exitosa (`200 OK`):**
     ```plain
     OK
     ```
-*   **Respuesta No Listo (`503 Service Unavailable`):** Indica que el flag `SERVICE_READY` es `False` (fallo crítico durante el startup).
+*   **Respuesta No Listo (`503 Service Unavailable`):**
     ```json
     { "detail": "Service is not ready or failed during startup." }
     ```
 
 ---
 
-### Realizar Consulta (RAG)
+### Realizar Consulta y Gestionar Chat
 
 *   **Endpoint:** `POST /query`
-*   **Descripción:** Recibe una consulta, ejecuta el pipeline RAG (embedding, retrieval filtrado, prompt, generación con Gemini), loguea la interacción y devuelve la respuesta.
+*   **Descripción:** Recibe una consulta del usuario. Si se incluye un `chat_id`, continúa esa conversación; de lo contrario, crea un nuevo chat. Guarda el mensaje del usuario, ejecuta el pipeline RAG (embedding, retrieval filtrado, prompt, generación con Gemini), guarda el mensaje del asistente (con fuentes), loguea la interacción (incluyendo `chat_id`) y devuelve la respuesta junto con el `chat_id` de la conversación. **Requiere autenticación.**
 *   **Headers Requeridos:**
-    *   `X-Company-ID`: (String UUID) Identificador de la empresa para filtrar documentos.
-    *   `Authorization`: (String) `Bearer <JWT_TOKEN>` (Se asume validado previamente).
+    *   `X-Company-ID`: (String UUID) Identificador de la empresa para filtrar documentos y chats.
+    *   `Authorization`: (String) `Bearer <JWT_TOKEN>` (Se asume validado previamente, necesario para identificar al usuario y gestionar sus chats).
 *   **Request Body:** (`application/json`)
     ```json
     {
       "query": "string",
-      "retriever_top_k": int | null // Opcional
+      "retriever_top_k": int | null, // Opcional: Número de documentos a recuperar
+      "chat_id": "uuid" | null       // Opcional: ID del chat a continuar. Si es null/omitido, se crea uno nuevo.
     }
     ```
     *   **Schema Pydantic:** `schemas.QueryRequest`
 *   **Respuesta Exitosa (`200 OK`):**
     ```json
     {
-      "answer": "string",
-      "retrieved_documents": [
+      "answer": "string",             // Respuesta generada por el LLM
+      "retrieved_documents": [        // Documentos usados como contexto
         {
-          "id": "string",
+          "id": "string",             // ID del chunk recuperado
           "score": float | null,
           "content_preview": "string" | null,
           "metadata": { ... } | null,
-          "document_id": "string" | null,
-          "file_name": "string" | null
+          "document_id": "string" | null, // ID del documento original
+          "file_name": "string" | null    // Nombre del archivo original
         }
       ],
-      "query_log_id": "uuid" | null
+      "query_log_id": "uuid" | null, // ID del log de esta interacción específica
+      "chat_id": "uuid"              // ID del chat (existente o nuevo) al que pertenece esta interacción
     }
     ```
     *   **Schema Pydantic:** `schemas.QueryResponse`
 *   **Respuestas de Error Comunes:**
-    *   `400 Bad Request`: `query` vacío o formato inválido.
-    *   `401 Unauthorized`: Falta `X-Company-ID`.
-    *   `500 Internal Server Error`: Error inesperado durante la ejecución del pipeline o llamada a Gemini.
-    *   `503 Service Unavailable`: Fallo al conectar con dependencias críticas (Milvus, Gemini API) durante el procesamiento de la query, o si el pipeline no pudo construirse en startup.
+    *   `400 Bad Request`: `query` vacío, formato inválido de UUID en `chat_id`.
+    *   `401 Unauthorized`: Falta `X-Company-ID` o el token `Authorization` no es válido/no se pudo extraer el `user_id`.
+    *   `403 Forbidden`: Se proporcionó un `chat_id` que no pertenece al usuario autenticado.
+    *   `422 Unprocessable Entity`: Error de validación en el request body.
+    *   `500 Internal Server Error`: Error inesperado durante la ejecución del pipeline, llamada a Gemini o guardado en DB.
+    *   `503 Service Unavailable`: Fallo al conectar con dependencias críticas (Milvus, Gemini API, DB) durante el procesamiento.
+
+---
+
+### Gestión de Historial de Chat
+
+Estos endpoints permiten al frontend gestionar el historial de conversaciones del usuario.
+
+#### Listar Chats del Usuario
+
+*   **Endpoint:** `GET /chats`
+*   **Descripción:** Recupera una lista resumida de todos los chats pertenecientes al usuario autenticado dentro de la empresa actual, ordenados por la fecha de la última actualización (mensaje más reciente).
+*   **Headers Requeridos:**
+    *   `X-Company-ID`: (String UUID) Identificador de la empresa.
+    *   `Authorization`: (String) `Bearer <JWT_TOKEN>`.
+*   **Respuesta Exitosa (`200 OK`):**
+    ```json
+    [
+      {
+        "id": "uuid",          // ID del chat
+        "title": "string" | null, // Título del chat
+        "updated_at": "datetime" // Timestamp de la última actualización
+      }
+    ]
+    ```
+    *   **Schema Pydantic:** `List[schemas.ChatSummary]`
+*   **Respuestas de Error Comunes:**
+    *   `401 Unauthorized`: Usuario no autenticado.
+    *   `500 Internal Server Error`: Error al consultar la base de datos.
+
+#### Obtener Mensajes de un Chat
+
+*   **Endpoint:** `GET /chats/{chat_id}/messages`
+*   **Descripción:** Recupera todos los mensajes (usuario y asistente) de un chat específico, ordenados cronológicamente. Verifica que el chat pertenezca al usuario autenticado.
+*   **Headers Requeridos:**
+    *   `X-Company-ID`: (String UUID) Identificador de la empresa.
+    *   `Authorization`: (String) `Bearer <JWT_TOKEN>`.
+*   **Path Parameters:**
+    *   `chat_id`: (UUID) El ID del chat cuyos mensajes se quieren obtener.
+*   **Respuesta Exitosa (`200 OK`):**
+    ```json
+    [
+      {
+        "id": "uuid",          // ID del mensaje
+        "role": "string",      // 'user' o 'assistant'
+        "content": "string",   // Contenido del mensaje
+        "sources": [           // Fuentes citadas por el asistente (si aplica)
+          {
+            "chunk_id": "string",
+            "document_id": "string" | null,
+            "file_name": "string" | null,
+            "score": float | null,
+            "preview": "string" | null
+          }
+        ] | null,
+        "created_at": "datetime" // Timestamp de creación del mensaje
+      }
+    ]
+    ```
+    *   **Schema Pydantic:** `List[schemas.ChatMessage]`
+*   **Respuestas de Error Comunes:**
+    *   `401 Unauthorized`: Usuario no autenticado.
+    *   `404 Not Found`: El `chat_id` no existe o no pertenece al usuario/empresa. *(Nota: La implementación actual devuelve 200 OK con lista vacía en este caso, podría ajustarse si se prefiere 404)*.
+    *   `422 Unprocessable Entity`: `chat_id` no es un UUID válido.
+    *   `500 Internal Server Error`: Error al consultar la base de datos.
+
+#### Borrar un Chat
+
+*   **Endpoint:** `DELETE /chats/{chat_id}`
+*   **Descripción:** Elimina permanentemente un chat específico y todos sus mensajes asociados. Verifica que el chat pertenezca al usuario autenticado antes de borrar.
+*   **Headers Requeridos:**
+    *   `X-Company-ID`: (String UUID) Identificador de la empresa.
+    *   `Authorization`: (String) `Bearer <JWT_TOKEN>`.
+*   **Path Parameters:**
+    *   `chat_id`: (UUID) El ID del chat a eliminar.
+*   **Respuesta Exitosa (`204 No Content`):** El chat se eliminó correctamente. No hay cuerpo en la respuesta.
+*   **Respuestas de Error Comunes:**
+    *   `401 Unauthorized`: Usuario no autenticado.
+    *   `404 Not Found`: El `chat_id` no existe o no pertenece al usuario/empresa.
+    *   `422 Unprocessable Entity`: `chat_id` no es un UUID válido.
+    *   `500 Internal Server Error`: Error durante la eliminación en la base de datos.
 
 ## 8. Dependencias Externas Clave
 
-*   **Supabase (PostgreSQL):** Almacenamiento de `query_logs`. Conectado vía Session Pooler.
+*   **Supabase (PostgreSQL):** Almacenamiento de `query_logs`, `chats` y `messages`. Conectado vía Session Pooler.
 *   **Milvus:** Base de datos vectorial para retrieval. Conectado vía DNS interno de Kubernetes.
 *   **OpenAI API:** Para generar embeddings de consulta. Acceso vía Internet.
 *   **Google Gemini API:** Para generar respuestas. Acceso vía Internet.
 *   **API Gateway:** Punto de entrada para las peticiones.
-*   **Auth Service:** (Implícito) Valida JWT.
+*   **Auth Service:** (Implícito) Valida JWT y proporciona `user_id`.
 
 ## 9. Pipeline Haystack (`app/pipelines/rag_pipeline.py`)
 
@@ -240,20 +343,24 @@ Prefijo base: `/api/v1`
 2.  **`MilvusEmbeddingRetriever`:** Busca en Milvus usando el embedding y el filtro `{ "company_id": <ID> }`.
 3.  **`PromptBuilder`:** Construye el prompt final usando la plantilla y los documentos recuperados.
 4.  **(Fuera del pipeline Haystack)** `GeminiClient`: Llama a la API de Google Gemini con el prompt generado.
+5.  **(Post-procesamiento en endpoint)** La respuesta de Gemini y las fuentes se guardan en la tabla `messages`, y la interacción se loguea en `query_logs` (incluyendo el `chat_id`).
 
 ## 10. Consideraciones Adicionales
 
-*   **Placeholder User ID:** La función `get_current_user_id` necesita ser implementada con la lógica real de extracción del ID de usuario desde el JWT.
-*   **Gestión de Contexto Largo:** No implementado activamente. Si el contexto recuperado es muy largo, la llamada a Gemini podría fallar o truncarse. Se requeriría lógica adicional (chunking, summarization, etc.) si esto es un problema.
-*   **Prompt Engineering:** La plantilla por defecto es básica. Podría necesitar ajustes finos para mejorar la calidad y el seguimiento de instrucciones por parte de Gemini.
-*   **Errores de API Externas:** El manejo de errores para OpenAI y Gemini se basa en reintentos (`tenacity`) y la captura de excepciones genéricas. Podría refinarse para manejar códigos de error específicos (rate limits, errores de autenticación, etc.).
+*   **Extracción User ID:** La función `get_current_user_id` actualmente decodifica el token sin verificar firma (asumiendo que el Gateway lo hace). Verifica la expiración. **Es crucial para la funcionalidad de chat.**
+*   **Gestión de Contexto Largo (Chat):** La implementación actual no pasa explícitamente el historial de mensajes anteriores al `PromptBuilder`. El RAG se basa solo en la última `query`. Para conversaciones más coherentes, se necesitaría modificar el `PromptBuilder` o la lógica previa para incluir mensajes relevantes del historial en el prompt de Gemini, gestionando los límites de tokens.
+*   **Gestión de Contexto Largo (RAG):** No implementado activamente. Si el contexto recuperado de Milvus es muy largo, la llamada a Gemini podría fallar.
+*   **Generación de Títulos de Chat:** El título inicial es muy básico (`Chat: <primeros 50 chars de query>`). Podría mejorarse generando un título más significativo usando el LLM después del primer o segundo intercambio.
+*   **Errores de API Externas:** Se usan reintentos (`tenacity`), pero podrían refinarse.
 
 ## 11. TODO / Mejoras Futuras
 
-*   **Implementar Extracción User ID:** Reemplazar el placeholder `get_current_user_id`.
-*   **Tests:** Añadir tests unitarios y de integración.
+*   **Tests:** Añadir tests unitarios y de integración, especialmente para la lógica de chat.
 *   **Observabilidad:** Integrar tracing distribuido (OpenTelemetry).
-*   **Manejo de Chat History:** Implementar la lógica para usar `chat_history` en el `PromptBuilder`.
-*   **Gestión de Contexto Largo:** Añadir estrategia si es necesario.
-*   **Evaluación RAG / Feedback:** Implementar mecanismos de evaluación y feedback.
+*   **Contexto de Chat en Prompt:** Implementar la lógica para pasar mensajes anteriores relevantes al `PromptBuilder` o directamente a Gemini, respetando límites de tokens.
+*   **Gestión de Contexto Largo (RAG):** Añadir estrategia si es necesario (chunking, summarization).
+*   **Mejorar Generación de Títulos:** Implementar una generación de títulos más inteligente.
+*   **Renombrar Chats:** Implementar `PATCH /api/v1/chats/{chat_id}`.
+*   **Evaluación RAG / Feedback:** Implementar mecanismos de evaluación.
 *   **Soporte Híbrido/Sparse:** Alinear con `ingest-service` si implementa otros tipos de retrieval.
+*   **Refinar Manejo de Errores 404/403:** Asegurar consistencia en si se devuelve 404 o lista vacía/etc. cuando no se encuentra un recurso o no se tiene acceso.
