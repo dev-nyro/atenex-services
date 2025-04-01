@@ -1,5 +1,5 @@
 # .github/workflows/CICD.yml
-name: CI/CD Pipeline Docker -> Manifest Update (Selective Build)
+name: CI/CD Pipeline Docker -> Manifest Update (Ingest, Query & Gateway - Selective Build)
 
 on:
   push:
@@ -7,43 +7,45 @@ on:
 
 env:
   # --- Configuración General ---
-  REGISTRY: ghcr.io # Registro de contenedores
-  MANIFEST_REPO_OWNER: dev-nyro # Dueño del repo de manifests
-  MANIFEST_REPO_NAME: manifests-nyro # Nombre del repo de manifests
-  MANIFEST_REPO_BRANCH: develop # Rama del repo de manifests a actualizar
+  REGISTRY: ghcr.io
+  MANIFEST_REPO_OWNER: dev-nyro
+  MANIFEST_REPO_NAME: manifests-nyro
+  MANIFEST_REPO_BRANCH: develop
 
   # --- Configuración Específica de Servicios ---
-  # IMPORTANTE: Estos deben coincidir con los directorios en tu repo de código fuente
+  # Directorios en el repo de código fuente
   INGEST_SERVICE_DIR: ingest-service
   QUERY_SERVICE_DIR: query-service
   GATEWAY_SERVICE_DIR: api-gateway
 
-  # Nombres base de las imágenes (sin el tag)
-  INGEST_IMAGE_NAME_BASE: ghcr.io/dev-nyro/ingest-service
-  QUERY_IMAGE_NAME_BASE: ghcr.io/dev-nyro/query-service
-  GATEWAY_IMAGE_NAME_BASE: ghcr.io/dev-nyro/api-gateway
+  # Nombres COMPLETOS de las imágenes (incluyendo registro y owner) - SIN TAG
+  # Estos se usarán para construir los tags y para el comando sed
+  INGEST_IMAGE_NAME: ghcr.io/dev-nyro/ingest-service
+  QUERY_IMAGE_NAME: ghcr.io/dev-nyro/query-service
+  GATEWAY_IMAGE_NAME: ghcr.io/dev-nyro/api-gateway
 
   # --- Rutas RELATIVAS a los archivos de deployment DENTRO del repo de manifests ---
   # ¡¡¡CRÍTICO!!! Asegúrate que estas rutas sean EXACTAS a la estructura de tu repo 'manifests-nyro'
-  INGEST_API_MANIFEST_PATH_REL: ingest-service/deployment-api.yaml # Ejemplo: si está en ingest-service/deployment-api.yaml
-  INGEST_WORKER_MANIFEST_PATH_REL: ingest-service/deployment-worker.yaml # Ejemplo: si tienes un worker separado
-  QUERY_MANIFEST_PATH_REL: query-service/deployment.yaml # Ejemplo: si está en query-service/deployment.yaml
-  GATEWAY_MANIFEST_PATH_REL: api-gateway/deployment.yaml # Ejemplo: si está en api-gateway/deployment.yaml
+  # Ajusta estos paths si la estructura de tu repo manifests-nyro es diferente
+  INGEST_MANIFEST_PATH_API_REL: ingest-service/deployment-api.yaml
+  INGEST_MANIFEST_PATH_WORKER_REL: ingest-service/deployment-worker.yaml # Dejar vacío "" si no hay worker manifest
+  QUERY_MANIFEST_PATH_REL: query-service/deployment.yaml
+  GATEWAY_MANIFEST_PATH_REL: api-gateway/deployment.yaml # Asegúrate que este es el path correcto en manifests-nyro
 
 jobs:
   # Job 1: Construir imágenes Docker si hay cambios y empujarlas a GHCR
-  build-push:
+  build-push: # Renombrado para mayor claridad
     runs-on: ubuntu-latest
     permissions:
-      contents: read # Necesario para checkout del código fuente
-      packages: write # Necesario para push a GHCR
+      contents: read # Para checkout
+      packages: write # Para push a GHCR
 
     outputs:
       # Outputs para indicar qué imágenes se construyeron y cuál es el tag común
       ingest_built: ${{ steps.build_ingest.outputs.digest != '' }}
       query_built: ${{ steps.build_query.outputs.digest != '' }}
       gateway_built: ${{ steps.build_gateway.outputs.digest != '' }}
-      image_tag: ${{ steps.image_tag_common.outputs.image_tag }} # Pasar el tag generado
+      image_tag: ${{ steps.image_tag_common.outputs.image_tag }} # Pasar el tag generado al siguiente job
 
     steps:
       # 1. Checkout del código fuente de la aplicación
@@ -62,11 +64,12 @@ jobs:
               - '${{ env.INGEST_SERVICE_DIR }}/**'
             query:
               - '${{ env.QUERY_SERVICE_DIR }}/**'
-            gateway:
+            gateway: # Asegurarse que detecta cambios en el directorio del gateway
               - '${{ env.GATEWAY_SERVICE_DIR }}/**'
 
       # 3. Configurar Docker Buildx (solo si algún servicio cambió)
       - name: Set up Docker Buildx
+        # Condición para ejecutar solo si hay cambios en CUALQUIERA de los servicios monitoreados
         if: steps.changed_files.outputs.ingest_any_changed == 'true' || steps.changed_files.outputs.query_any_changed == 'true' || steps.changed_files.outputs.gateway_any_changed == 'true'
         uses: docker/setup-buildx-action@v3
 
@@ -76,8 +79,8 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }} # Usuario que ejecuta la action
-          password: ${{ secrets.GITHUB_TOKEN }} # Token temporal de la action
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       # 5. Generar etiqueta común para las imágenes (solo si algún servicio cambió)
       - name: Generate Common Image Tag
@@ -90,7 +93,7 @@ jobs:
           TAG=$(echo "$TAG" | sed -e 's/[^a-zA-Z0-9.-]/-/g' -e 's/^[.-]*//' -e 's/[.-]*$//')
           TAG=${TAG::128} # Límite de 128 caracteres para tags Docker
           echo "Generated Common Tag: $TAG"
-          echo "image_tag=$TAG" >> $GITHUB_OUTPUT
+          echo "image_tag=$TAG" >> $GITHUB_OUTPUT # Guardar tag para output
 
       # 6. Construir y Empujar Imagen - Ingest Service (solo si cambió)
       - name: Build and push Ingest Service Docker image
@@ -98,12 +101,13 @@ jobs:
         if: steps.changed_files.outputs.ingest_any_changed == 'true'
         uses: docker/build-push-action@v5
         with:
-          context: ./${{ env.INGEST_SERVICE_DIR }} # Directorio del Dockerfile
-          file: ./${{ env.INGEST_SERVICE_DIR }}/Dockerfile # Ruta al Dockerfile
-          push: ${{ github.event_name == 'push' }} # Solo hacer push en evento 'push'
-          tags: ${{ env.INGEST_IMAGE_NAME_BASE }}:${{ steps.image_tag_common.outputs.image_tag }} # Imagen:tag
-          cache-from: type=gha # Usar caché de GitHub Actions
-          cache-to: type=gha,mode=max # Guardar caché
+          context: ./${{ env.INGEST_SERVICE_DIR }}
+          file: ./${{ env.INGEST_SERVICE_DIR }}/Dockerfile
+          push: ${{ github.event_name == 'push' }}
+          # Usar el nombre completo de imagen y el tag generado
+          tags: ${{ env.INGEST_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       # 7. Construir y Empujar Imagen - Query Service (solo si cambió)
       - name: Build and push Query Service Docker image
@@ -114,7 +118,7 @@ jobs:
           context: ./${{ env.QUERY_SERVICE_DIR }}
           file: ./${{ env.QUERY_SERVICE_DIR }}/Dockerfile
           push: ${{ github.event_name == 'push' }}
-          tags: ${{ env.QUERY_IMAGE_NAME_BASE }}:${{ steps.image_tag_common.outputs.image_tag }}
+          tags: ${{ env.QUERY_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -124,16 +128,16 @@ jobs:
         if: steps.changed_files.outputs.gateway_any_changed == 'true'
         uses: docker/build-push-action@v5
         with:
-          context: ./${{ env.GATEWAY_SERVICE_DIR }}
-          file: ./${{ env.GATEWAY_SERVICE_DIR }}/Dockerfile
+          context: ./${{ env.GATEWAY_SERVICE_DIR }} # Contexto correcto para gateway
+          file: ./${{ env.GATEWAY_SERVICE_DIR }}/Dockerfile # Dockerfile correcto para gateway
           push: ${{ github.event_name == 'push' }}
-          tags: ${{ env.GATEWAY_IMAGE_NAME_BASE }}:${{ steps.image_tag_common.outputs.image_tag }}
+          tags: ${{ env.GATEWAY_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }} # Nombre y tag correctos para gateway
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
   # Job 2: Actualizar los manifiestos en el repo 'manifests-nyro'
   update-manifests:
-    needs: build-push # Depende del job anterior
+    needs: build-push # Depende del job anterior (nombre corregido)
     runs-on: ubuntu-latest
     # Ejecutar solo si es un evento 'push' Y si AL MENOS UNA imagen fue construida
     if: github.event_name == 'push' && (needs.build-push.outputs.ingest_built == 'true' || needs.build-push.outputs.query_built == 'true' || needs.build-push.outputs.gateway_built == 'true')
@@ -145,13 +149,11 @@ jobs:
         with:
           repository: ${{ env.MANIFEST_REPO_OWNER }}/${{ env.MANIFEST_REPO_NAME }}
           ref: ${{ env.MANIFEST_REPO_BRANCH }}
-          # ¡IMPORTANTE! Necesitas un Personal Access Token (Classic) con permiso 'repo' (o 'contents: write')
-          # Guárdalo como un secreto en tu repositorio llamado MANIFEST_PAT
-          token: ${{ secrets.MANIFEST_PAT }}
-          path: manifests-repo # Hacer checkout en un subdirectorio para evitar conflictos
+          token: ${{ secrets.MANIFEST_PAT }} # PAT con permisos de escritura
+          path: manifests-repo # Checkout en subdirectorio
 
-      # 2. Usar el tag común generado en el job anterior
-      - name: Set Common Image Tag from previous job
+      # 2. Usar el tag común generado en el job anterior (NO REGENERAR)
+      - name: Set Common Image Tag from previous job output
         id: image_tag_common
         run: echo "image_tag=${{ needs.build-push.outputs.image_tag }}" >> $GITHUB_OUTPUT
 
@@ -165,16 +167,19 @@ jobs:
           GATEWAY_BUILT: ${{ needs.build-push.outputs.gateway_built }}
           COMMON_TAG: ${{ steps.image_tag_common.outputs.image_tag }}
           # Pasar las rutas relativas y nombres base de imagen definidos globalmente
-          INGEST_API_MANIFEST_PATH: ${{ env.INGEST_API_MANIFEST_PATH_REL }}
-          INGEST_WORKER_MANIFEST_PATH: ${{ env.INGEST_WORKER_MANIFEST_PATH_REL }}
+          # Asegúrate que estas rutas coinciden con tu repo manifests-nyro
+          INGEST_API_MANIFEST_PATH: ${{ env.INGEST_MANIFEST_PATH_API_REL }}
+          INGEST_WORKER_MANIFEST_PATH: ${{ env.INGEST_MANIFEST_PATH_WORKER_REL }}
           QUERY_MANIFEST_PATH: ${{ env.QUERY_MANIFEST_PATH_REL }}
-          GATEWAY_MANIFEST_PATH: ${{ env.GATEWAY_MANIFEST_PATH_REL }}
-          INGEST_IMAGE_BASE: ${{ env.INGEST_IMAGE_NAME_BASE }}
-          QUERY_IMAGE_BASE: ${{ env.QUERY_IMAGE_NAME_BASE }}
-          GATEWAY_IMAGE_BASE: ${{ env.GATEWAY_IMAGE_NAME_BASE }}
+          GATEWAY_MANIFEST_PATH: ${{ env.GATEWAY_MANIFEST_PATH_REL }} # Path para el gateway manifest
+          # Pasar nombres completos de imagen (sin tag)
+          INGEST_IMAGE: ${{ env.INGEST_IMAGE_NAME }}
+          QUERY_IMAGE: ${{ env.QUERY_IMAGE_NAME }}
+          GATEWAY_IMAGE: ${{ env.GATEWAY_IMAGE_NAME }} # Nombre completo de imagen para gateway
+          REGISTRY_URL: ${{ env.REGISTRY }} # Pasar URL del registro para el patrón sed
+          REPO_OWNER: ${{ env.MANIFEST_REPO_OWNER }} # Pasar owner para el patrón sed
         run: |
           echo "::group::Updating Manifest Files Conditionally"
-          # Navegar al directorio donde se hizo checkout del repo de manifests
           cd manifests-repo
           echo "Current directory: $(pwd)"
           echo "Ingest Built: $INGEST_BUILT"
@@ -184,48 +189,47 @@ jobs:
           echo "Ingest API Path: $INGEST_API_MANIFEST_PATH"
           echo "Ingest Worker Path: $INGEST_WORKER_MANIFEST_PATH"
           echo "Query Path: $QUERY_MANIFEST_PATH"
-          echo "Gateway Path: $GATEWAY_MANIFEST_PATH"
+          echo "Gateway Path: $GATEWAY_MANIFEST_PATH" # Verificar path del gateway
+          echo "Gateway Image Name: $GATEWAY_IMAGE" # Verificar nombre imagen gateway
 
           MANIFEST_UPDATED=false # Flag para saber si se hizo algún cambio real
           UPDATE_FAILED=false # Flag para saber si hubo algún error
 
-          # --- Función robusta para actualizar la línea 'image:' en un archivo YAML ---
-          # Argumentos: $1=ruta_manifest, $2=nombre_imagen_base, $3=nuevo_tag
-          update_image_in_manifest() {
+          # --- Función para actualizar la línea 'image:' en un archivo YAML ---
+          # Argumentos: $1=ruta_manifest, $2=nombre_imagen_completo_con_tag
+          # Usa las variables de entorno REGISTRY_URL y REPO_OWNER para construir el patrón
+          update_image() {
             local manifest_path="$1"
-            local image_base_name="$2"
-            local new_tag="$3"
-            local target_image="${image_base_name}:${new_tag}" # Imagen completa con tag
+            local target_image="$2" # Imagen completa con tag (ej: ghcr.io/owner/repo:tag)
+            # Extraer el nombre base de la imagen (sin tag) para el patrón sed
+            local image_base_name=$(echo "$target_image" | cut -d: -f1)
 
-            echo "Attempting to update image in '$manifest_path' for base '$image_base_name' to tag '$new_tag'"
+            echo "Attempting to update image in '$manifest_path' to: $target_image"
 
-            # Verificar si el archivo existe
             if [ ! -f "$manifest_path" ]; then
               echo "ERROR: Manifest file '$manifest_path' not found! Check env var MANIFEST_PATH_REL."
               UPDATE_FAILED=true
-              return 1 # Indicar fallo
+              return 1
             fi
 
-            # Construir el patrón sed:
-            # ^                             -> Inicio de línea
-            # \s* -> Cero o más espacios (para indentación)
-            # image:                        -> Literal 'image:'
-            # \s+                           -> Uno o más espacios
-            # ${image_base_name//\//\\/}   -> Nombre base de imagen, escapando '/' para sed
-            # :                             -> Literal ':'
-            # .* -> Cualquier caracter hasta el final (el tag viejo)
-            # $                             -> Fin de línea
+            # Construir el patrón sed de forma más segura:
+            # Busca una línea que empiece con espacios opcionales, 'image:', espacios, y el nombre base de la imagen (escapando /)
+            # seguido de ':' y cualquier cosa (el tag viejo).
+            # Esto evita reemplazar líneas incorrectas si el nombre base aparece en otro lugar.
             local sed_pattern="^\s*image:\s+${image_base_name//\//\\/}:.*$"
-            # Reemplazo: mantiene la indentación original encontrada (\1), añade 'image: ', y la nueva imagen:tag
-            local sed_replacement="\1image: ${target_image}"
+            # El reemplazo mantiene la indentación original (\1), añade 'image: ', y la nueva imagen:tag
+            # Usamos un delimitador diferente (@) por si acaso, aunque el escape de / debería funcionar.
+            local sed_replacement="image: ${target_image}" # El \1 no es necesario si reemplazamos toda la línea encontrada
+
+            echo "Using sed pattern: $sed_pattern"
+            echo "Using sed replacement: $sed_replacement"
 
             # Usar sed para reemplazar la línea. -i.bak crea un backup.
-            # Usamos 'sed -n' y 'p' para solo imprimir la línea modificada (si existe) y evitar errores si no hay match
-            # Luego usamos 'sed -i' real si el patrón fue encontrado.
+            # Comprobar primero si el patrón existe para evitar errores de sed si no hay match.
             if grep -qE "$sed_pattern" "$manifest_path"; then
                echo "Found image line matching pattern in '$manifest_path'. Attempting replacement..."
-               # Usar delimitador @ para evitar conflictos con / en la imagen
-               if sed -i.bak -E "s@(${sed_pattern})@${sed_replacement}@g" "$manifest_path"; then
+               # Reemplazar la línea completa que coincide con el patrón
+               if sed -i.bak -E "s@$sed_pattern@    $sed_replacement@" "$manifest_path"; then # Asegura 4 espacios de indentación
                   # Verificar si realmente hubo un cambio comparando con el backup
                   if ! cmp -s "$manifest_path" "$manifest_path.bak"; then
                     echo "Successfully updated image in '$manifest_path' to '$target_image'"
@@ -242,33 +246,37 @@ jobs:
                   return 1 # Indicar fallo
                fi
             else
-                echo "WARNING: Pattern '$sed_pattern' not found in '$manifest_path'. Skipping update for this file/image combination."
-                # No marcamos como fallo, podría ser intencional (ej. worker no usa imagen)
+                echo "WARNING: Pattern '$sed_pattern' not found in '$manifest_path'. Skipping update for this file."
+                # No marcamos como fallo, podría ser intencional o un error en el patrón/archivo.
                 return 0 # No es un error fatal no encontrar el patrón
             fi
           }
 
-          # --- Actualizar Ingest Service (API y Worker si aplica) ---
+          # --- Update Ingest Service ---
           if [ "$INGEST_BUILT" = "true" ]; then
-            update_image_in_manifest "$INGEST_API_MANIFEST_PATH" "$INGEST_IMAGE_BASE" "$COMMON_TAG"
+            INGEST_TARGET_IMAGE="${INGEST_IMAGE}:${COMMON_TAG}" # Construir imagen:tag
+            update_image "$INGEST_API_MANIFEST_PATH" "$INGEST_TARGET_IMAGE"
             # Solo intentar actualizar el worker si la ruta está definida y no vacía
             if [ -n "$INGEST_WORKER_MANIFEST_PATH" ]; then
-               update_image_in_manifest "$INGEST_WORKER_MANIFEST_PATH" "$INGEST_IMAGE_BASE" "$COMMON_TAG"
+               update_image "$INGEST_WORKER_MANIFEST_PATH" "$INGEST_TARGET_IMAGE" # Asume misma imagen
             fi
           else
             echo "Skipping Ingest Service manifest update (not built)."
           fi
 
-          # --- Actualizar Query Service ---
+          # --- Update Query Service ---
           if [ "$QUERY_BUILT" = "true" ]; then
-            update_image_in_manifest "$QUERY_MANIFEST_PATH" "$QUERY_IMAGE_BASE" "$COMMON_TAG"
+            QUERY_TARGET_IMAGE="${QUERY_IMAGE}:${COMMON_TAG}" # Construir imagen:tag
+            update_image "$QUERY_MANIFEST_PATH" "$QUERY_TARGET_IMAGE"
           else
             echo "Skipping Query Service manifest update (not built)."
           fi
 
-          # --- Actualizar API Gateway ---
+          # --- Update API Gateway ---
           if [ "$GATEWAY_BUILT" = "true" ]; then
-            update_image_in_manifest "$GATEWAY_MANIFEST_PATH" "$GATEWAY_IMAGE_BASE" "$COMMON_TAG"
+            GATEWAY_TARGET_IMAGE="${GATEWAY_IMAGE}:${COMMON_TAG}" # Construir imagen:tag para gateway
+            echo "Updating Gateway Manifest: Path='$GATEWAY_MANIFEST_PATH', Target Image='$GATEWAY_TARGET_IMAGE'" # Log de depuración
+            update_image "$GATEWAY_MANIFEST_PATH" "$GATEWAY_TARGET_IMAGE" # Llamar a update_image para gateway
           else
             echo "Skipping API Gateway manifest update (not built)."
           fi
@@ -289,28 +297,24 @@ jobs:
 
       # 4. Commit y Push de los Cambios del Manifest (solo si hubo cambios reales y no hubo errores)
       - name: Commit and Push Manifest Changes
-        # Ejecutar solo si el step anterior fue exitoso Y si el flag manifest_updated es true
         if: steps.update_manifest.outcome == 'success' && steps.update_manifest.outputs.manifest_updated == 'true'
         run: |
           echo "::group::Committing and Pushing Manifest Changes"
-          cd manifests-repo # Ir al directorio del repo de manifests
+          cd manifests-repo
 
-          # Configurar Git user para el commit
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
 
-          # Añadir todos los cambios (archivos .bak ya fueron borrados)
           git add .
 
-          # Comprobar si hay cambios para commitear (doble chequeo)
           if git diff --staged --quiet; then
             echo "No actual manifest changes staged. Skipping commit."
           else
             echo "Manifest changes detected. Committing..."
+            # Usar el tag del output del step anterior para el mensaje de commit
             COMMIT_MSG="Update service image(s) to tag ${{ steps.image_tag_common.outputs.image_tag }} [CI]"
             git commit -m "$COMMIT_MSG"
             echo "Pushing changes to origin/${{ env.MANIFEST_REPO_BRANCH }}..."
-            # Añadir reintento simple para push en caso de fallo temporal
             git push origin ${{ env.MANIFEST_REPO_BRANCH }} || (sleep 5 && git push origin ${{ env.MANIFEST_REPO_BRANCH }})
             echo "Push successful."
           fi
