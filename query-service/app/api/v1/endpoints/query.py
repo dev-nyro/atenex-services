@@ -4,7 +4,11 @@ from typing import Dict, Any, Optional
 import structlog
 import asyncio
 
-from fastapi import APIRouter, Depends, HTTPException, status, Header, Body
+# --- Añadir imports necesarios ---
+from jose import jwt, JWTError
+from jose.exceptions import ExpiredSignatureError, JWTClaimsError, JWSError
+
+from fastapi import APIRouter, Depends, HTTPException, status, Header, Body, Request # Request puede ser útil si se usa state
 
 from app.api.v1 import schemas
 from app.core.config import settings
@@ -17,18 +21,16 @@ log = structlog.get_logger(__name__)
 router = APIRouter()
 
 # --- Dependency for Company ID ---
-# (Reutilizado de ingest-service, adaptado si es necesario)
+# (Sin cambios)
 async def get_current_company_id(x_company_id: Optional[str] = Header(None)) -> uuid.UUID:
     """Obtiene y valida el X-Company-ID del header."""
     if not x_company_id:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, # O 400 Bad Request si se considera error de cliente
+            status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing X-Company-ID header",
         )
     try:
         company_uuid = uuid.UUID(x_company_id)
-        # Aquí podrías añadir una validación extra contra la tabla COMPANIES si fuera necesario
-        # por ahora, solo validamos el formato UUID
         return company_uuid
     except ValueError:
          raise HTTPException(
@@ -36,26 +38,96 @@ async def get_current_company_id(x_company_id: Optional[str] = Header(None)) -> 
             detail="Invalid X-Company-ID header format (must be UUID)",
         )
 
-# --- Placeholder Dependency for User ID ---
-# En una implementación real, esto extraería el user_id del token JWT
-# validado por el API Gateway o un middleware de autenticación.
-async def get_current_user_id(authorization: Optional[str] = Header(None)) -> Optional[uuid.UUID]:
-    """Placeholder para obtener el User ID (ej: de un token JWT)."""
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization.split(" ")[1]
-        # Aquí iría la lógica para decodificar el token y extraer el user_id
-        # Ejemplo hardcodeado (REEMPLAZAR CON LÓGICA REAL):
+# --- Dependency for User ID (IMPLEMENTACIÓN MVP) ---
+async def get_current_user_id(
+    # request: Request, # Descomentar si el Gateway inyecta user en request.state
+    authorization: Optional[str] = Header(None)
+) -> Optional[uuid.UUID]:
+    """
+    Extrae el User ID (sub o user_id) del token JWT en el header Authorization.
+
+    MVP Assumption: El API Gateway ya ha validado la firma y expiración del token.
+    Esta función solo decodifica para leer el payload sin re-validar firma.
+    Si la validación completa fuera necesaria aquí, se necesitaría la clave pública/secreto.
+    """
+    # --- Opción 1: Leer desde request.state (si el Gateway lo inyecta) ---
+    # user_payload = getattr(request.state, "user", None)
+    # if user_payload and isinstance(user_payload, dict):
+    #     user_id_str = user_payload.get("sub") or user_payload.get("user_id")
+    #     if user_id_str:
+    #         try:
+    #             return uuid.UUID(user_id_str)
+    #         except ValueError:
+    #             log.warning("User ID claim from request.state is not a valid UUID", claim_value=user_id_str)
+    #             # Podrías lanzar un error aquí si el user_id es mandatorio y malformado
+    #             return None # O manejar como anónimo/error
+    #     else:
+    #         log.warning("request.state.user found but missing 'sub' or 'user_id' claim")
+    #         # Continuar para intentar leer desde el header si no se encontró aquí
+
+    # --- Opción 2: Decodificar desde el Header Authorization (Implementación actual) ---
+    if not authorization or not authorization.startswith("Bearer "):
+        log.debug("No Authorization header found or not Bearer type.")
+        return None # Usuario anónimo o no autenticado
+
+    token = authorization.split(" ")[1]
+
+    try:
+        # Decodificar SIN verificar firma (asumiendo que el Gateway ya lo hizo)
+        # PERO SÍ verificando claims básicos como expiración si es posible/deseado
+        # Nota: python-jose podría requerir una key incluso para decodificación sin verificación
+        #       si ese es el caso y no tienes la key, la decodificación fallará.
+        #       Alternativamente, usar librerías que permitan decodificación forzada sin key.
+        #       Aquí intentamos decodificar sin verificar firma explícitamente.
+        #       Si la librería aún requiere una key (aunque sea dummy), esto fallará.
+        #       Ajustar 'options' según sea necesario y el comportamiento de la librería.
+        payload = jwt.decode(
+            token,
+            key="dummy", # Proporcionar una clave dummy si la librería lo requiere incluso sin verificar
+            options={
+                "verify_signature": False,
+                "verify_aud": False, # No verificar audiencia
+                "verify_iss": False, # No verificar issuer
+                "verify_exp": True,  # ¡SÍ verificar expiración! Es una buena práctica.
+                # "verify_nbf": True, # Verificar not before si se usa
+                # "verify_iat": True, # Verificar issued at si se usa
+                # "require": ["sub"] # Exigir claims específicos si es necesario
+            }
+        )
+
+        # Extraer 'sub' (estándar) o 'user_id' (personalizado)
+        user_id_str = payload.get("sub") or payload.get("user_id")
+
+        if not user_id_str:
+            log.warning("Token payload decoded but missing 'sub' or 'user_id' claim", token_payload_keys=list(payload.keys()))
+            return None # Claim necesario no encontrado
+
+        # Convertir a UUID
         try:
-            # Simular extracción de un UUID del token
-            # En un caso real, usarías python-jose u otra librería
-            payload = {"user_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479"} # Ejemplo
-            user_id_str = payload.get("user_id")
-            if user_id_str:
-                return uuid.UUID(user_id_str)
-        except Exception as e:
-            log.warning("Failed to simulate JWT decoding", error=str(e))
-            return None # O lanzar HTTPException si el token es inválido/requerido
-    return None # Retorna None si no hay token o no se puede extraer
+            user_uuid = uuid.UUID(user_id_str)
+            log.debug("Successfully extracted user ID from token", user_id=str(user_uuid))
+            return user_uuid
+        except ValueError:
+            log.warning("Claim 'sub' or 'user_id' is not a valid UUID", claim_value=user_id_str)
+            return None # ID malformado
+
+    except ExpiredSignatureError:
+        log.warning("JWT token has expired")
+        # Podrías lanzar HTTPException 401 aquí si un token expirado debe ser rechazado
+        # raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has expired")
+        return None # O tratar como anónimo/no válido
+    except JWTClaimsError as e:
+        log.warning("JWT claims verification failed", error=str(e))
+        # raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid token claims: {e}")
+        return None
+    except JWTError as e: # Error genérico de JWT (formato inválido, etc.)
+        log.warning("JWT processing error", error=str(e), token_snippet=token[:10]+"...")
+        # raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid token: {e}")
+        return None
+    except Exception as e: # Capturar cualquier otro error inesperado
+        log.exception("Unexpected error during user ID extraction from token")
+        # raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error processing token")
+        return None # Fallback a anónimo o error interno
 
 
 # --- Endpoint ---
@@ -69,41 +141,50 @@ async def get_current_user_id(authorization: Optional[str] = Header(None)) -> Op
 async def process_query(
     request_body: schemas.QueryRequest = Body(...),
     company_id: uuid.UUID = Depends(get_current_company_id),
-    user_id: Optional[uuid.UUID] = Depends(get_current_user_id), # Obtener user_id (puede ser None)
+    # --- Usar la dependencia actualizada ---
+    user_id: Optional[uuid.UUID] = Depends(get_current_user_id),
 ):
     """
     Endpoint principal para procesar consultas de usuario.
     """
     endpoint_log = log.bind(
         company_id=str(company_id),
+        # --- Loguear el user_id extraído o 'anonymous' ---
         user_id=str(user_id) if user_id else "anonymous",
         query=request_body.query[:100] + "..." if len(request_body.query) > 100 else request_body.query
     )
     endpoint_log.info("Received query request")
 
+    # --- Validación adicional (opcional): Requerir user_id si es mandatorio ---
+    # if not user_id:
+    #     endpoint_log.warning("Query request rejected: User ID could not be determined from token.")
+    #     raise HTTPException(
+    #         status_code=status.HTTP_401_UNAUTHORIZED,
+    #         detail="Could not identify user from token. Ensure a valid token is provided."
+    #     )
+
     try:
         # Ejecutar el pipeline RAG
         answer, retrieved_docs, log_id = await rag_pipeline.run_rag_pipeline(
             query=request_body.query,
-            company_id=str(company_id), # Pasar como string
-            user_id=str(user_id) if user_id else None, # Pasar como string o None
-            top_k=request_body.retriever_top_k # Pasar el top_k del request si existe
+            company_id=str(company_id),
+            # --- Pasar el user_id (UUID) convertido a string o None ---
+            user_id=str(user_id) if user_id else None,
+            top_k=request_body.retriever_top_k
         )
 
-        # Formatear documentos recuperados para la respuesta
+        # Formatear documentos recuperados para la respuesta (sin cambios)
         response_docs = []
         for doc in retrieved_docs:
-            # Extraer metadatos relevantes si existen
             doc_meta = doc.meta or {}
             original_doc_id = doc_meta.get("document_id")
             file_name = doc_meta.get("file_name")
 
             response_docs.append(schemas.RetrievedDocument(
-                id=doc.id, # ID del chunk de Milvus
+                id=doc.id,
                 score=doc.score,
-                # Generar un preview corto del contenido
                 content_preview=(doc.content[:150] + '...') if doc.content and len(doc.content) > 150 else doc.content,
-                metadata=doc_meta, # Incluir todos los metadatos recuperados
+                metadata=doc_meta,
                 document_id=original_doc_id,
                 file_name=file_name
             ))
@@ -113,15 +194,17 @@ async def process_query(
         return schemas.QueryResponse(
             answer=answer,
             retrieved_documents=response_docs,
-            query_log_id=log_id # Será None si el logging falló
+            query_log_id=log_id
         )
 
     except ValueError as ve:
         endpoint_log.warning("Value error during query processing", error=str(ve))
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
-    except ConnectionError as ce: # Podría venir de Milvus o DB si fallan las conexiones
+    except ConnectionError as ce:
          endpoint_log.error("Connection error during query processing", error=str(ce), exc_info=True)
          raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Service dependency unavailable: {ce}")
+    except HTTPException as http_exc: # Re-lanzar HTTPExceptions que puedan venir de las dependencias
+        raise http_exc
     except Exception as e:
         endpoint_log.exception("Unhandled exception during query processing")
         raise HTTPException(

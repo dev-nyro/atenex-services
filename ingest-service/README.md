@@ -29,99 +29,55 @@ Este enfoque asíncrono desacopla la carga y el procesamiento intensivo, mejoran
 *(El diagrama Mermaid existente es correcto y no necesita cambios)*
 
 ```mermaid
-%%{
-  init: {
-    'theme': 'base',
-    'themeVariables': {
-      'primaryColor': '#ffdfd3',
-      'edgeLabelBackground':'#eee',
-      'tertiaryColor': '#fff0ea',
-      'primaryTextColor': '#333',
-      'secondaryColor': '#f9bfa8',
-      'clusterBkg': '#fff7f5'
-    }
-  }
-}%%
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#ffdfd3', 'edgeLabelBackground':'#fff', 'tertiaryColor': '#dcd0ff'}}}%%
 flowchart TD
-    A[Usuario] -->|Upload Document + JWT| B(Frontend App)
-    B -->|HTTPS / REST API| C{API Gateway}
+    A[Usuario] -->|Sube documentos| B["Frontend Next.js (Vercel)"]
+    B -->|HTTPS / REST API| C["API Gateway (FastAPI)"]
 
-    subgraph external [Servicios Externos]
-        style external fill:#e6f7ff,stroke:#b3e0ff
-        D2[(Supabase Auth)]
-        F3[(PostgreSQL - Supabase Pooler)] # Referenciar Pooler
-        I[OpenAI API]
+    subgraph GKE["Google Kubernetes Engine"]
+        C -->|Validación JWT| D1[("Auth Service")]
+        D1 -->|Token Validation| D2[(Supabase Auth)]
+
+        C -->|Documentos + Metadata| E1["<strong>Ingest Service</strong><br/>(FastAPI + Celery)"]
+        
+        %% Subgraph para el flujo de la API
+        subgraph IngestAPI ["Ingest Service API Flow"]
+            direction TB
+            IA_In[POST /api/v1/ingest] --> IA_Val["Valida tipo de archivo<br/>y metadatos"]
+            IA_Val --> IA_MinIO["Guarda archivo en MinIO"]
+            IA_Val --> IA_PG["Crea registro en Supabase<br/>(status: uploaded)"]
+            IA_MinIO --> IA_Queue["Encola tarea en Redis"]
+        end
+
+        %% Subgraph para el worker Celery
+        subgraph CeleryWorker ["Celery Worker Pipeline"]
+            direction LR
+            CW_Start[Recibe tarea] --> CW_Fetch["Descarga archivo de MinIO"]
+            CW_Fetch --> CW_Update1["Actualiza status<br/>(processing)"]
+            CW_Update1 --> CW_Convert["Haystack: Converters<br/>(PDFToDocument, DOCXToDocument, etc.)"]
+            CW_Convert --> CW_Split["Haystack: DocumentSplitter"]
+            CW_Split --> CW_Embed["Haystack: OpenAIDocumentEmbedder"]
+            CW_Embed --> CW_Write["Haystack: DocumentWriter<br/>a Milvus"]
+            CW_Write --> CW_Update2["Actualiza status<br/>(processed + chunk_count)"]
+        end
+
+        E1 --> IngestAPI
+        IA_Queue -->|Celery Task| CeleryWorker
+        CeleryWorker -->|Lee/Escribe| F2[(Milvus Vector DB)]
+        CeleryWorker -->|Actualiza estado| F3[(PostgreSQL - Supabase)]
+        IngestAPI --> F1["(MinIO-S3)"]
+        IngestAPI --> F3
+        
+        %% Conexiones externas
+        CeleryWorker -->|"OCR (TODO)"| E3["OCR Service"]
+        E1 -->|Logs| H1["Monitoring Service"]
+        CeleryWorker -->|Logs| H1
+        H1 -->|Datos| H2[(Prometheus)]
+        H1 -->|Alertas| H3[(Grafana)]
     end
 
-    subgraph GKECluster [Cluster Kubernetes]
-        style GKECluster fill:#fff7f5,stroke:#ffb399
-        C -->|Validación JWT| D1(Auth Service)
-        D1 -->|Token Validation| D2
-
-        subgraph IngestService [Ingest Service]
-            style IngestService fill:#fff0ea,stroke:#ffb399
-            E1_API["<strong>Ingest Service API Pod</strong><br/>(FastAPI)"]
-            E2_Worker["<strong>Ingest Service Worker Pod</strong><br/>(Celery + Haystack Pipeline)"]
-        end
-
-        C -->|POST /ingest + File + Meta + X-Company-ID| E1_API
-        C -->|GET /ingest/status + X-Company-ID| E1_API
-        C -->|GET /ingest/status/{id} + X-Company-ID| E1_API
-
-        subgraph InternalDeps [Dependencias Internas K8s]
-          style InternalDeps fill:#e0f2f7,stroke:#a0d4e2
-            F1["(MinIO<br/>Object Storage)"]
-            F2[(Milvus<br/>Vector DB)]
-            F4[(Redis<br/>Celery Broker)]
-        end
-
-        subgraph Monitoring [Monitoring]
-          style Monitoring fill:#f0f0f0,stroke:#cccccc
-            H1[Monitoring Service]
-            H2[(Prometheus)]
-            H3[(Grafana)]
-        end
-
-        %% API Pod Flow - Ingest %%
-        E1_API -->|1. Upload File| F1
-        E1_API -->|2. Create Doc Record<br/>Status: uploaded| F3
-        E1_API -->|3. Update Record with Path| F3
-        E1_API -->|4. Enqueue Task| F4
-
-        %% Worker Pod Flow - Processing %%
-        F4 -->|5. Dequeue Task| E2_Worker
-        E2_Worker -->|6. Download File| F1
-        E2_Worker -->|7. Update Status: processing| F3
-
-        subgraph HaystackPipeline [Worker Internals: Haystack Pipeline Execution]
-           direction LR
-           style HaystackPipeline fill:#fff9e6,stroke:#ffd699
-           HP_In[Input: ByteStream + Meta] --> HP_Conv(Converter)
-           HP_Conv --> HP_Split(Splitter)
-           HP_Split -->|Chunks| HP_Embed(Embedder)
-           HP_Embed -->|Call External API| I
-           HP_Embed -->|Chunks + Embeddings| HP_Write(Writer)
-           HP_Write -->|Write Chunks + Vectors| F2
-        end
-
-        E2_Worker -->|8. Execute Pipeline| HP_In
-        HP_Write -->|9. Pipeline Result| E2_Worker
-        E2_Worker -->|10. Update Status: processed/error<br/>+ chunk_count| F3
-
-        %% API Pod Flow - Status Query %%
-        E1_API -->|Query Status| F3
-
-        %% Monitoring Connections %%
-        E1_API -->|Logs/Metrics| H1
-        E2_Worker -->|Logs/Metrics| H1
-        H1 --> H2 & H3
-
-    end
-
-    %% Notas:
-    %% - Supabase Pooler (F3) y OpenAI API (I) son externos al cluster.
-    %% - MinIO (F1), Milvus (F2), Redis (F4) son internos al cluster.
-    %% - El Pipeline Haystack se ejecuta DENTRO del Worker Pod (E2_Worker).
+    %% Conexiones a proveedores externos
+    CW_Embed -->|API Call| I[OpenAI API]
 ```
 
 ## 3. Características Clave
