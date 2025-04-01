@@ -1,4 +1,7 @@
 # api-gateway/app/main.py
+# --- Añadir la importación que faltaba ---
+import os
+# --- Fin de la corrección ---
 from fastapi import FastAPI, Request, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,6 +10,7 @@ import httpx
 import structlog
 import uvicorn # Para ejecución local si es necesario
 import time # Para medir tiempo de respuesta
+import uuid # Para generar request ID
 
 # Configuración y Settings (Asegúrate que carga bien ahora)
 from app.core.config import settings
@@ -82,11 +86,12 @@ app = FastAPI(
 @app.middleware("http")
 async def add_process_time_header_and_request_id(request: Request, call_next):
     start_time = time.time()
+    # Generar un nuevo UUID para cada request si no viene en header
     request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
 
     # Añadir request_id al contexto de structlog para todos los logs de esta petición
     with structlog.contextvars.bind_contextvars(request_id=request_id):
-        log.info("Request received", method=request.method, path=request.url.path, client_ip=request.client.host)
+        log.info("Request received", method=request.method, path=request.url.path, client_ip=request.client.host if request.client else "N/A")
         try:
             response = await call_next(request)
             process_time = time.time() - start_time
@@ -94,22 +99,30 @@ async def add_process_time_header_and_request_id(request: Request, call_next):
             response.headers["X-Request-ID"] = request_id # Devolver ID al cliente
             log.info("Request processed successfully", status_code=response.status_code, duration=round(process_time, 4))
         except Exception as e:
-             process_time = time.time() - start_time
-             log.exception("Unhandled exception during request processing", duration=round(process_time, 4), error=str(e))
-             # Re-lanzar para que el exception handler global lo capture
-             raise e
+            process_time = time.time() - start_time
+            log.exception("Unhandled exception during request processing", duration=round(process_time, 4), error=str(e))
+            # Re-lanzar para que el exception handler global lo capture
+            raise e
         return response
 
 
 # CORS (Configurar adecuadamente para producción)
 # Orígenes permitidos deberían ser la URL de tu frontend
 ALLOWED_ORIGINS = ["*"] # CAMBIAR EN PRODUCCIÓN a algo como ["https://tu-frontend.com"]
+
+# --- CORRECCIÓN: Añadir import os aquí ---
+# La línea original causaba NameError porque 'os' no estaba definido en este scope
 if os.getenv("ENVIRONMENT") == "production": # Ejemplo de cómo cambiar en prod
-    ALLOWED_ORIGINS = ["https://your-production-frontend.com"] # Reemplaza con tu URL real
+    log.warning("Production environment detected, restricting CORS origins.")
+    # Reemplaza con tu(s) URL(s) de frontend real(es) en producción
+    ALLOWED_ORIGINS = [
+        "https://your-production-frontend.com",
+        "https://another-allowed-origin.com"
+    ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=ALLOWED_ORIGINS, # Usar la lista definida arriba
     allow_credentials=True, # Permite cookies/auth headers
     allow_methods=["*"],    # O especifica métodos: ["GET", "POST", "PUT", "DELETE"]
     allow_headers=["*"],    # O especifica headers necesarios: ["Authorization", "Content-Type", "X-Company-ID"]
@@ -129,13 +142,13 @@ async def root():
     return {"message": f"{settings.PROJECT_NAME} is running!"}
 
 @app.get("/health",
-         tags=["Gateway Status"],
-         summary="Kubernetes Health Check",
-         response_description="Returns 'healthy' if the gateway is operational.",
-         status_code=status.HTTP_200_OK,
-         responses={
-             status.HTTP_503_SERVICE_UNAVAILABLE: {"description": "Gateway HTTP client is not ready"}
-         })
+          tags=["Gateway Status"],
+          summary="Kubernetes Health Check",
+          response_description="Returns 'healthy' if the gateway is operational.",
+          status_code=status.HTTP_200_OK,
+          responses={
+              status.HTTP_503_SERVICE_UNAVAILABLE: {"description": "Gateway HTTP client is not ready"}
+          })
 async def health_check(
     # Usar la dependencia para asegurar que el cliente está listo
     client: httpx.AsyncClient = Depends(gateway_router.get_client)
@@ -208,3 +221,4 @@ log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start."
 #         # loop="uvloop",
 #         # http="httptools" # También puede mejorar rendimiento
 #     )
+
