@@ -8,9 +8,10 @@ FROM base as python-build-stage
 ARG PYTHON_VERSION
 ARG POETRY_VERSION=1.7.1
 
-# System dependencies needed for poetry installation
+# System dependencies needed for poetry installation and sed
 RUN apt-get update && apt-get install --no-install-recommends -y \
     curl \
+    sed \
     && apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
 
 # Install poetry itself
@@ -24,15 +25,22 @@ RUN curl -sSL https://install.python-poetry.org | python - --version ${POETRY_VE
 WORKDIR /app
 
 # --- Dependency Installation ---
-# Copy ONLY pyproject.toml. Poetry will resolve dependencies from this.
+# Copy ONLY pyproject.toml.
 COPY pyproject.toml ./
 
+# *** NUEVO PASO: Eliminar temporalmente la dependencia de desarrollo conflictiva ***
+# Esto evita que pytest-httpx interfiera con la resolución de httpx para 'main'.
+# Usamos sed para eliminar la línea que empieza con 'pytest-httpx ='.
+# El delimitador | se usa en sed para evitar conflictos con / en paths si los hubiera.
+RUN sed -i '/^pytest-httpx =/d' pyproject.toml && \
+    echo "pyproject.toml modified for build:" && \
+    cat pyproject.toml # Opcional: mostrar el archivo modificado en los logs
+
 # Install runtime dependencies into the project's .venv directory.
-# Since poetry.lock is NOT copied, Poetry resolves from pyproject.toml.
-# --no-root: Don't install the project package itself, only dependencies.
-# *** CORRECCIÓN: Usar --only main en lugar de --no-dev ***
+# Poetry ahora resolverá solo desde el pyproject.toml modificado.
+# --no-root: Don't install the project package itself.
 # --only main: Install only dependencies from the main group (runtime).
-# --compile: Pre-compile pyc files (optional small optimization).
+# --compile: Pre-compile pyc files.
 RUN poetry install --no-root --only main --compile
 
 # --- Runtime Stage ---
@@ -43,9 +51,7 @@ ARG PYTHON_VERSION
 # Set environment variables for the runtime container
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    # Add the virtual environment's bin directory to the PATH
     PATH="/app/.venv/bin:$PATH" \
-    # Define the default port (can be overridden by K8s env var)
     PORT=8080
 
 # Set the working directory for the runtime container
@@ -55,18 +61,15 @@ WORKDIR /app
 COPY --from=python-build-stage /app/.venv /app/.venv
 
 # Copy the application code
-# Assumes your code is in an 'app' subdirectory within 'api-gateway'
 COPY ./app ./app
 
-# Expose the port the app runs on (matches Gunicorn command)
+# Expose the port the app runs on
 EXPOSE ${PORT}
 
-# Optional: Run as non-root user for security
+# Optional: Run as non-root user
 # RUN groupadd -r appuser && useradd --no-log-init -r -g appuser appuser
 # RUN chown -R appuser:appuser /app
 # USER appuser
 
 # Command to run the application using Gunicorn
-# Binds to the port defined by the PORT env var (defaulting to 8080)
-# Uses the virtual environment's python/gunicorn implicitly via PATH
 CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "4", "-b", "0.0.0.0:8080", "app.main:app"]
