@@ -30,9 +30,10 @@ COPY pyproject.toml ./
 # Install runtime dependencies into the project's .venv directory.
 # Since poetry.lock is NOT copied, Poetry resolves from pyproject.toml.
 # --no-root: Don't install the project package itself, only dependencies.
-# --no-dev: Exclude development dependencies.
+# *** CORRECCIÓN: Usar --only main en lugar de --no-dev ***
+# --only main: Install only dependencies from the main group (runtime).
 # --compile: Pre-compile pyc files (optional small optimization).
-RUN poetry install --no-root --no-dev --compile
+RUN poetry install --no-root --only main --compile
 
 # --- Runtime Stage ---
 # Creates the final image by copying the virtual environment and app code
