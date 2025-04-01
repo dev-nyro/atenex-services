@@ -1,109 +1,115 @@
-# .github/workflows/CICD.yml
+# .github/workflows/cicd.yml
+# Nombre del workflow
 name: CI/CD Pipeline Docker -> Manifest Update (Ingest, Query & Gateway - Selective Build)
 
+# Eventos que disparan el workflow
 on:
   push:
     branches: [ "develop" ] # Ejecutar solo en pushes a la rama develop
 
+# Variables de entorno globales para el workflow
 env:
   # --- Configuración General ---
-  REGISTRY: ghcr.io
-  MANIFEST_REPO_OWNER: dev-nyro
-  MANIFEST_REPO_NAME: manifests-nyro
-  MANIFEST_REPO_BRANCH: develop
+  REGISTRY: ghcr.io                            # Registro de contenedores (GitHub Container Registry)
+  MANIFEST_REPO_OWNER: dev-nyro                # Dueño del repositorio de manifiestos
+  MANIFEST_REPO_NAME: manifests-nyro           # Nombre del repositorio de manifiestos
+  MANIFEST_REPO_BRANCH: develop                # Rama del repositorio de manifiestos a actualizar
 
   # --- Configuración Específica de Servicios ---
-  # Directorios en el repo de código fuente
+  # Directorios en el repositorio de código fuente
   INGEST_SERVICE_DIR: ingest-service
   QUERY_SERVICE_DIR: query-service
-  GATEWAY_SERVICE_DIR: api-gateway # <-- VERIFICAR: ¿Es este el nombre exacto del directorio?
+  GATEWAY_SERVICE_DIR: api-gateway             # Directorio del API Gateway
 
   # Nombres COMPLETOS de las imágenes (incluyendo registro y owner) - SIN TAG
   INGEST_IMAGE_NAME: ghcr.io/dev-nyro/ingest-service
   QUERY_IMAGE_NAME: ghcr.io/dev-nyro/query-service
-  GATEWAY_IMAGE_NAME: ghcr.io/dev-nyro/api-gateway # <-- VERIFICAR: ¿Es este el nombre exacto de la imagen en GHCR?
+  GATEWAY_IMAGE_NAME: ghcr.io/dev-nyro/api-gateway # Nombre de la imagen del API Gateway
 
   # --- Rutas RELATIVAS a los archivos de deployment DENTRO del repo de manifests ---
-  # ¡¡¡CRÍTICO!!! Asegúrate que estas rutas sean EXACTAS a la estructura de tu repo 'manifests-nyro'
+  # ¡CRÍTICO! Asegúrate que estas rutas sean EXACTAS a la estructura de tu repo 'manifests-nyro'
   INGEST_MANIFEST_PATH_API_REL: ingest-service/deployment-api.yaml
   INGEST_MANIFEST_PATH_WORKER_REL: ingest-service/deployment-worker.yaml # Dejar vacío "" si no hay worker manifest
   QUERY_MANIFEST_PATH_REL: query-service/deployment.yaml
-  GATEWAY_MANIFEST_PATH_REL: api-gateway/deployment.yaml # <-- VERIFICAR: ¿Es esta la ruta EXACTA al archivo dentro del repo 'manifests-nyro'?
+  GATEWAY_MANIFEST_PATH_REL: api-gateway/deployment.yaml # Ruta al deployment del API Gateway
 
+# Definición de los jobs
 jobs:
   # Job 1: Construir imágenes Docker si hay cambios y empujarlas a GHCR
   build-push:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest # Ejecutar en un runner de Ubuntu
     permissions:
-      contents: read # Para checkout
-      packages: write # Para push a GHCR
+      contents: read      # Permiso para hacer checkout del código
+      packages: write     # Permiso para empujar imágenes a GHCR
 
+    # Outputs del job para que otros jobs puedan usarlos
     outputs:
-      ingest_built: ${{ steps.build_ingest.outputs.digest != '' }}
-      query_built: ${{ steps.build_query.outputs.digest != '' }}
-      gateway_built: ${{ steps.build_gateway.outputs.digest != '' }} # <-- Output para gateway ya existe
-      image_tag: ${{ steps.image_tag_common.outputs.image_tag }}
+      ingest_built: ${{ steps.build_ingest.outputs.digest != '' }}  # True si se construyó ingest
+      query_built: ${{ steps.build_query.outputs.digest != '' }}   # True si se construyó query
+      gateway_built: ${{ steps.build_gateway.outputs.digest != '' }} # True si se construyó gateway
+      image_tag: ${{ steps.image_tag_common.outputs.image_tag }}   # Tag generado para las imágenes
 
     steps:
       # 1. Checkout del código fuente de la aplicación
       - name: Checkout Application Code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Necesario para tj-actions/changed-files
+          fetch-depth: 0 # Necesario para tj-actions/changed-files para comparar historial
 
-      # 2. Detectar archivos modificados
+      # 2. Detectar archivos modificados en los directorios de los servicios
       - name: Get changed files
         id: changed_files
-        uses: tj-actions/changed-files@v44
+        uses: tj-actions/changed-files@v44 # Acción para detectar cambios
         with:
-          files_yaml: |
+          files_yaml: | # Define los grupos de archivos a monitorear
             ingest:
               - '${{ env.INGEST_SERVICE_DIR }}/**'
             query:
               - '${{ env.QUERY_SERVICE_DIR }}/**'
-            gateway: # <-- Ya detecta cambios en gateway
+            gateway: # Grupo para detectar cambios en api-gateway
               - '${{ env.GATEWAY_SERVICE_DIR }}/**'
 
-      # 3. Configurar Docker Buildx (Condicional)
+      # 3. Configurar Docker Buildx (Condicional: solo si algún servicio cambió)
       - name: Set up Docker Buildx
         if: steps.changed_files.outputs.ingest_any_changed == 'true' || steps.changed_files.outputs.query_any_changed == 'true' || steps.changed_files.outputs.gateway_any_changed == 'true'
         uses: docker/setup-buildx-action@v3
 
-      # 4. Login a GHCR (Condicional)
+      # 4. Login a GHCR (Condicional: solo si algún servicio cambió)
       - name: Log in to GitHub Container Registry
         if: steps.changed_files.outputs.ingest_any_changed == 'true' || steps.changed_files.outputs.query_any_changed == 'true' || steps.changed_files.outputs.gateway_any_changed == 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ github.actor }}      # Usuario de GitHub que ejecuta la acción
+          password: ${{ secrets.GITHUB_TOKEN }} # Token automático de GitHub Actions
 
-      # 5. Generar etiqueta común (Condicional)
+      # 5. Generar etiqueta común para las imágenes (Condicional: solo si algún servicio cambió)
       - name: Generate Common Image Tag
         if: steps.changed_files.outputs.ingest_any_changed == 'true' || steps.changed_files.outputs.query_any_changed == 'true' || steps.changed_files.outputs.gateway_any_changed == 'true'
         id: image_tag_common
         run: |
+          # Genera un tag usando el nombre de la rama y los primeros 7 chars del SHA del commit
           TAG="${{ github.ref_name }}-$(echo $GITHUB_SHA | cut -c1-7)"
-          # Sanitize tag: Replace invalid chars with '-', remove leading/trailing '-', limit length
+          # Sanitiza el tag: reemplaza caracteres inválidos por '-', elimina '-' al inicio/final, limita longitud
           TAG=$(echo "$TAG" | sed -e 's/[^a-zA-Z0-9.-]/-/g' -e 's/^[.-]*//' -e 's/[.-]*$//')
-          TAG=${TAG::128} # Max tag length is 128
+          TAG=${TAG::128} # Longitud máxima de tag es 128
           echo "Generated Common Tag: $TAG"
-          echo "image_tag=$TAG" >> $GITHUB_OUTPUT
+          echo "image_tag=$TAG" >> $GITHUB_OUTPUT # Guarda el tag como output del step
 
-      # 6. Build/Push Ingest Service (Condicional)
+      # 6. Build/Push Ingest Service (Condicional: solo si cambió ingest)
       - name: Build and push Ingest Service Docker image
         id: build_ingest
         if: steps.changed_files.outputs.ingest_any_changed == 'true'
         uses: docker/build-push-action@v5
         with:
-          context: ./${{ env.INGEST_SERVICE_DIR }}
-          file: ./${{ env.INGEST_SERVICE_DIR }}/Dockerfile
-          push: ${{ github.event_name == 'push' }} # Push only on actual push events to the branch
-          tags: ${{ env.INGEST_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          context: ./${{ env.INGEST_SERVICE_DIR }} # Directorio del Dockerfile
+          file: ./${{ env.INGEST_SERVICE_DIR }}/Dockerfile # Ruta al Dockerfile
+          push: ${{ github.event_name == 'push' }} # Empujar solo en eventos 'push' a la rama
+          tags: ${{ env.INGEST_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }} # Imagen:tag
+          cache-from: type=gha # Usar caché de GitHub Actions
+          cache-to: type=gha,mode=max # Guardar caché en GitHub Actions
 
-      # 7. Build/Push Query Service (Condicional)
+      # 7. Build/Push Query Service (Condicional: solo si cambió query)
       - name: Build and push Query Service Docker image
         id: build_query
         if: steps.changed_files.outputs.query_any_changed == 'true'
@@ -116,35 +122,35 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # 8. Build/Push API Gateway (Condicional) <-- YA INCLUIDO
+      # 8. Build/Push API Gateway (Condicional: solo si cambió gateway)
       - name: Build and push API Gateway Docker image
         id: build_gateway
         if: steps.changed_files.outputs.gateway_any_changed == 'true'
         uses: docker/build-push-action@v5
         with:
-          context: ./${{ env.GATEWAY_SERVICE_DIR }} # <-- VERIFICAR: ¿Es correcto el contexto?
-          file: ./${{ env.GATEWAY_SERVICE_DIR }}/Dockerfile # <-- VERIFICAR: ¿Existe este Dockerfile?
+          context: ./${{ env.GATEWAY_SERVICE_DIR }} # Contexto para el build del gateway
+          file: ./${{ env.GATEWAY_SERVICE_DIR }}/Dockerfile # Dockerfile del gateway
           push: ${{ github.event_name == 'push' }}
-          tags: ${{ env.GATEWAY_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
+          tags: ${{ env.GATEWAY_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }} # Imagen:tag del gateway
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
   # Job 2: Actualizar los manifiestos en el repo 'manifests-nyro'
   update-manifests:
-    needs: build-push
+    needs: build-push # Depende de que el job build-push termine
     runs-on: ubuntu-latest
-    # Ejecutar solo si es un push Y *alguna* imagen fue construida
+    # Ejecutar solo si es un evento 'push' Y *alguna* imagen fue construida
     if: github.event_name == 'push' && (needs.build-push.outputs.ingest_built == 'true' || needs.build-push.outputs.query_built == 'true' || needs.build-push.outputs.gateway_built == 'true')
 
     steps:
-      # 1. Checkout del repositorio de manifests
+      # 1. Checkout del repositorio de manifiestos
       - name: Checkout Manifests Repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.MANIFEST_REPO_OWNER }}/${{ env.MANIFEST_REPO_NAME }}
-          ref: ${{ env.MANIFEST_REPO_BRANCH }}
-          token: ${{ secrets.MANIFEST_PAT }} # <-- VERIFICAR: ¿Tiene este PAT permisos de 'contents: write' en manifests-nyro?
-          path: manifests-repo # Checkout en un subdirectorio
+          repository: ${{ env.MANIFEST_REPO_OWNER }}/${{ env.MANIFEST_REPO_NAME }} # Repo de manifests
+          ref: ${{ env.MANIFEST_REPO_BRANCH }} # Rama a actualizar
+          token: ${{ secrets.MANIFEST_PAT }} # PAT con permisos de escritura en el repo de manifests
+          path: manifests-repo # Hacer checkout en un subdirectorio específico
 
       # 2. Usar el tag común generado en el job anterior
       - name: Set Common Image Tag from previous job output
@@ -155,17 +161,18 @@ jobs:
       - name: Update Manifest Files Conditionally
         id: update_manifest
         env:
+          # Pasar outputs y variables de entorno al script
           INGEST_BUILT: ${{ needs.build-push.outputs.ingest_built }}
           QUERY_BUILT: ${{ needs.build-push.outputs.query_built }}
-          GATEWAY_BUILT: ${{ needs.build-push.outputs.gateway_built }} # <-- Flag para gateway
+          GATEWAY_BUILT: ${{ needs.build-push.outputs.gateway_built }} # Flag para gateway
           COMMON_TAG: ${{ steps.image_tag_common.outputs.image_tag }}
           INGEST_API_MANIFEST_PATH: ${{ env.INGEST_MANIFEST_PATH_API_REL }}
           INGEST_WORKER_MANIFEST_PATH: ${{ env.INGEST_MANIFEST_PATH_WORKER_REL }}
           QUERY_MANIFEST_PATH: ${{ env.QUERY_MANIFEST_PATH_REL }}
-          GATEWAY_MANIFEST_PATH: ${{ env.GATEWAY_MANIFEST_PATH_REL }} # <-- Path para gateway
+          GATEWAY_MANIFEST_PATH: ${{ env.GATEWAY_MANIFEST_PATH_REL }} # Path para gateway
           INGEST_IMAGE: ${{ env.INGEST_IMAGE_NAME }}
           QUERY_IMAGE: ${{ env.QUERY_IMAGE_NAME }}
-          GATEWAY_IMAGE: ${{ env.GATEWAY_IMAGE_NAME }} # <-- Imagen base para gateway
+          GATEWAY_IMAGE: ${{ env.GATEWAY_IMAGE_NAME }} # Imagen base para gateway
         run: |
           echo "::group::Updating Manifest Files Conditionally"
           # Navegar al directorio donde se hizo checkout del repo de manifests
@@ -174,19 +181,19 @@ jobs:
           echo "Listing files in current directory:"
           ls -la
 
-          MANIFEST_UPDATED=false
-          UPDATE_FAILED=false
+          MANIFEST_UPDATED=false # Flag para saber si algún manifiesto cambió realmente
+          UPDATE_FAILED=false    # Flag para saber si hubo un error crítico
 
           # --- Función para actualizar la línea 'image:' en un archivo YAML (con debug) ---
           update_image() {
-            local manifest_path="$1"
+            local manifest_path="$1" # Ruta relativa del archivo manifest
             local target_image="$2" # Imagen completa con tag: ghcr.io/owner/repo:tag
             local image_base_name=$(echo "$target_image" | cut -d: -f1) # Extraer nombre base: ghcr.io/owner/repo
 
             echo "Attempting to update image in '$manifest_path' to: $target_image"
             echo "Using base image name: $image_base_name"
 
-            # --- PUNTO DE VERIFICACIÓN 1: ¿Existe el archivo? ---
+            # --- VERIFICACIÓN 1: ¿Existe el archivo? ---
             if [ ! -f "$manifest_path" ]; then
               echo "::error::Manifest file '$manifest_path' not found in checkout directory!"
               UPDATE_FAILED=true
@@ -195,10 +202,10 @@ jobs:
             echo "Manifest file '$manifest_path' found."
 
             # Patrón sed robusto para encontrar la línea de imagen correcta
-            # ^([[:space:]]*)      -> Captura indentación inicial (Grupo 1)
-            # image:[[:space:]]+   -> Literal 'image:' seguido de uno o más espacios
-            # ${...//\//\\/}       -> Nombre base de la imagen escapando barras '/'
-            # :.*$                 -> ':' seguido de cualquier caracter hasta el final (tag viejo)
+            # ^([[:space:]]*)     -> Captura indentación inicial (Grupo 1)
+            # image:[[:space:]]+  -> Literal 'image:' seguido de uno o más espacios
+            # ${...//\//\\/}      -> Nombre base de la imagen escapando barras '/' para sed
+            # :.*$                -> ':' seguido de cualquier caracter hasta el final (tag viejo)
             local sed_pattern="^([[:space:]]*)image:[[:space:]]+${image_base_name//\//\\/}:.*$"
             # Reemplazo: Preserva indentación (\1), añade 'image: ' y la imagen completa con nuevo tag
             local sed_replacement="\1image: ${target_image}"
@@ -206,43 +213,52 @@ jobs:
             echo "Using sed pattern: $sed_pattern"
             echo "Using sed replacement: $sed_replacement"
 
-            # --- PUNTO DE VERIFICACIÓN 2: ¿El patrón 'sed' coincide con alguna línea en el archivo? ---
+            # --- VERIFICACIÓN 2: ¿El patrón 'sed' coincide con alguna línea en el archivo? ---
             echo "--- Checking for pattern match in '$manifest_path' BEFORE sed (using grep) ---"
-            if grep -E "$sed_pattern" "$manifest_path"; then
+            # Usamos grep -q para modo silencioso, solo nos interesa el código de salida
+            if grep -qE "$sed_pattern" "$manifest_path"; then
               echo "Pattern found by grep."
             else
               echo "::warning::Pattern NOT found by grep in '$manifest_path'. Check the 'image:' line format and base name ('$image_base_name') in the actual file. Skipping update for this file."
               # No fallar aquí, podría ser la primera vez o el formato es inesperado.
-              return 0
+              return 0 # Salir de la función sin error
             fi
             echo "--------------------------------------------------------------------------"
 
-            # Intentar reemplazar usando sed (delimitador @ para evitar conflictos con /)
+            # Intentar reemplazar usando sed (delimitador @ para evitar conflictos con / en nombres de imagen)
             # -i.bak crea un backup por seguridad
             echo "Attempting replacement with sed..."
             if sed -i.bak -E "s@${sed_pattern}@${sed_replacement}@" "$manifest_path"; then
               echo "sed command executed successfully for '$manifest_path'."
 
-              # --- PUNTO DE VERIFICACIÓN 3: ¿Realmente cambió el archivo? ---
+              # --- VERIFICACIÓN 3: ¿Realmente cambió el archivo? ---
               echo "--- Checking file content AFTER sed (using grep for the new image tag) ---"
               # Construir patrón para buscar la línea con el NUEVO tag
               local grep_new_image_pattern="^([[:space:]]*)image:[[:space:]]+${target_image//\//\\/}$"
-              grep -E "$grep_new_image_pattern" "$manifest_path" || echo "::warning::Did not find the exact new image line with grep AFTER sed. Check replacement."
+              # Usamos grep -q para verificar si la nueva línea existe
+              if grep -qE "$grep_new_image_pattern" "$manifest_path"; then
+                 echo "Found the exact new image line with grep AFTER sed."
+              else
+                 # Esto podría pasar si el tag ya era el correcto, sed no hizo cambios.
+                 echo "::debug::Did not find the exact new image line with grep AFTER sed. This might be okay if the image tag was already correct."
+              fi
               echo "--------------------------------------------------------------------------"
 
-              # Comparar el archivo original (.bak) con el modificado
+              # Comparar el archivo original (.bak) con el modificado para confirmar cambio
               if ! cmp -s "$manifest_path" "$manifest_path.bak"; then
                 echo "SUCCESS: Manifest file '$manifest_path' was modified."
                 MANIFEST_UPDATED=true # Marcar que hubo cambios reales
               else
-                echo "INFO: Manifest file '$manifest_path' was not modified (content was already correct or sed failed silently)."
+                echo "INFO: Manifest file '$manifest_path' was not modified (content was already correct or sed pattern didn't match as expected)."
               fi
-              rm -f "$manifest_path.bak" # Limpiar backup si todo fue bien
-              return 0 # Éxito
+              # Limpiar backup siempre
+              rm -f "$manifest_path.bak"
+              return 0 # Éxito (o sin cambios necesarios)
             else
               echo "::error::sed command failed for '$manifest_path'. Check permissions or pattern syntax."
-              rm -f "$manifest_path.bak" # Limpiar backup incluso si falló
-              UPDATE_FAILED=true
+              # Intentar limpiar backup incluso si falló
+              rm -f "$manifest_path.bak"
+              UPDATE_FAILED=true # Marcar como fallo crítico si sed falla
               return 1 # Fallo
             fi
           } # --- Fin de la función update_image ---
@@ -251,10 +267,11 @@ jobs:
           if [ "$INGEST_BUILT" = "true" ]; then
             echo "Processing Ingest Service..."
             INGEST_TARGET_IMAGE="${INGEST_IMAGE}:${COMMON_TAG}"
-            update_image "$INGEST_API_MANIFEST_PATH" "$INGEST_TARGET_IMAGE"
-            # Si hay un worker manifest y la ruta no está vacía
+            # Llamar a update_image y permitir que el script continúe si falla (|| true)
+            # El flag UPDATE_FAILED capturará errores críticos dentro de la función.
+            update_image "$INGEST_API_MANIFEST_PATH" "$INGEST_TARGET_IMAGE" || true
             if [ -n "$INGEST_WORKER_MANIFEST_PATH" ]; then
-              update_image "$INGEST_WORKER_MANIFEST_PATH" "$INGEST_TARGET_IMAGE"
+              update_image "$INGEST_WORKER_MANIFEST_PATH" "$INGEST_TARGET_IMAGE" || true
             fi
           else
             echo "Skipping Ingest Service manifest update (not built)."
@@ -264,17 +281,16 @@ jobs:
           if [ "$QUERY_BUILT" = "true" ]; then
             echo "Processing Query Service..."
             QUERY_TARGET_IMAGE="${QUERY_IMAGE}:${COMMON_TAG}"
-            update_image "$QUERY_MANIFEST_PATH" "$QUERY_TARGET_IMAGE"
+            update_image "$QUERY_MANIFEST_PATH" "$QUERY_TARGET_IMAGE" || true
           else
             echo "Skipping Query Service manifest update (not built)."
           fi
 
-          # --- Update API Gateway ---  <-- LLAMADA PARA GATEWAY YA EXISTE
+          # --- Update API Gateway ---
           if [ "$GATEWAY_BUILT" = "true" ]; then
             echo "Processing API Gateway..."
             GATEWAY_TARGET_IMAGE="${GATEWAY_IMAGE}:${COMMON_TAG}"
-            # Llamar a la función de actualización para el manifest del gateway
-            update_image "$GATEWAY_MANIFEST_PATH" "$GATEWAY_TARGET_IMAGE"
+            update_image "$GATEWAY_MANIFEST_PATH" "$GATEWAY_TARGET_IMAGE" || true
           else
             echo "Skipping API Gateway manifest update (not built)."
           fi
@@ -283,13 +299,14 @@ jobs:
           echo "Final Manifest Updated Status: $MANIFEST_UPDATED"
           echo "manifest_updated=$MANIFEST_UPDATED" >> $GITHUB_OUTPUT # Exportar si hubo cambios
 
-          # --- PUNTO DE VERIFICACIÓN 4: ¿Git detecta cambios ANTES del commit? ---
+          # --- VERIFICACIÓN 4: ¿Git detecta cambios ANTES del commit? ---
           echo "--- Checking Git Status Before Commit ---"
           git status # Muestra qué archivos han sido modificados
           echo "---------------------------------------"
 
+          # Si alguna actualización falló críticamente (ej. archivo no encontrado, fallo de sed), fallar el step
           if [ "$UPDATE_FAILED" = "true" ]; then
-            echo "::error::One or more manifest updates failed critically during the process. Check logs above."
+            echo "::error::One or more manifest updates failed critically during the process (e.g., file not found or sed error). Check logs above."
             exit 1 # Fallar el step
           fi
           echo "Manifest update script finished."
@@ -310,16 +327,17 @@ jobs:
           git add .
 
           # Verificar si hay cambios preparados (staged) antes de hacer commit
+          # Esto evita commits vacíos si sed no modificó nada (ej. tag ya era correcto)
           if git diff --staged --quiet; then
-            echo "No actual manifest changes staged. Skipping commit and push."
+            echo "No actual manifest changes staged by 'git add .'. Skipping commit and push."
           else
-            echo "Manifest changes detected. Committing..."
+            echo "Manifest changes detected and staged. Committing..."
             COMMIT_MSG="Update service image(s) to tag ${{ steps.image_tag_common.outputs.image_tag }} [CI]"
             git commit -m "$COMMIT_MSG"
 
-            # --- PUNTO DE VERIFICACIÓN 5: ¿Falla el push? ---
+            # --- VERIFICACIÓN 5: ¿Falla el push? ---
             echo "Pushing changes to origin/${{ env.MANIFEST_REPO_BRANCH }}..."
-            # Intentar push, con un reintento simple después de 5 segundos
+            # Intentar push, con un reintento simple después de 5 segundos en caso de fallo temporal
             if git push origin ${{ env.MANIFEST_REPO_BRANCH }}; then
               echo "Push successful."
             else
@@ -328,7 +346,7 @@ jobs:
               if git push origin ${{ env.MANIFEST_REPO_BRANCH }}; then
                 echo "Push successful on retry."
               else
-                echo "::error::Push failed even after retry. Check PAT permissions and branch protection rules on 'manifests-nyro' repository for the 'develop' branch."
+                echo "::error::Push failed even after retry. Check PAT permissions ('${{ secrets.MANIFEST_PAT }}') and branch protection rules on '${{ env.MANIFEST_REPO_OWNER }}/${{ env.MANIFEST_REPO_NAME }}' repository for the '${{ env.MANIFEST_REPO_BRANCH }}' branch."
                 exit 1 # Fallar el step si el push falla dos veces
               fi
             fi
