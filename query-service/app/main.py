@@ -1,5 +1,7 @@
 # ./app/main.py
 from fastapi import FastAPI, HTTPException, status as fastapi_status
+# --- CORRECCIÓN: Importar RequestValidationError ---
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 import structlog
 import uvicorn
@@ -15,7 +17,6 @@ log = structlog.get_logger(__name__)
 
 # Importar routers y otros módulos
 from app.api.v1.endpoints import query
-# --- Importar el nuevo router de chat ---
 from app.api.v1.endpoints import chat as chat_router
 from app.db import postgres_client
 from app.pipelines.rag_pipeline import build_rag_pipeline, check_pipeline_dependencies
@@ -29,11 +30,11 @@ GLOBAL_RAG_PIPELINE = None
 app = FastAPI(
     title=settings.PROJECT_NAME,
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
-    version="0.2.0", # Incrementar versión por nueva feature
+    version="0.2.0", # Mantener versión incrementada
     description="Microservice to handle user queries using a Haystack RAG pipeline with Milvus and Gemini, including chat history management.",
 )
 
-# --- Event Handlers (Sin cambios) ---
+# --- Event Handlers (Sin cambios en lógica) ---
 @app.on_event("startup")
 async def startup_event():
     global SERVICE_READY, GLOBAL_RAG_PIPELINE
@@ -70,28 +71,36 @@ async def shutdown_event():
     log.info("PostgreSQL connection pool closed.")
     log.info(f"{settings.PROJECT_NAME} shutdown complete.")
 
-# --- Exception Handlers (Sin cambios) ---
+# --- Exception Handlers ---
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc):
     log_level = log.warning if exc.status_code < 500 and exc.status_code != 404 else log.error
     log_level("HTTP Exception caught", status_code=exc.status_code, detail=exc.detail, path=str(request.url))
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
+# --- Manejador donde ocurría el error ---
 @app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request, exc):
+async def validation_exception_handler(request, exc: RequestValidationError): # Añadir tipo para claridad
+    # Usar exc.errors() para obtener detalles específicos
     log.warning("Request Validation Error", errors=exc.errors(), path=str(request.url))
+    # Formatear los errores para la respuesta JSON
     error_details = [{"loc": err.get("loc"), "msg": err.get("msg"), "type": err.get("type")} for err in exc.errors()]
-    return JSONResponse(status_code=fastapi_status.HTTP_422_UNPROCESSABLE_ENTITY, content={"detail": "Validation Error", "errors": error_details})
+    return JSONResponse(
+        status_code=fastapi_status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": "Validation Error", "errors": error_details},
+    )
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request, exc):
     log.exception("Unhandled Exception caught", path=str(request.url))
-    return JSONResponse(status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR, content={"detail": "An internal server error occurred."})
+    return JSONResponse(
+        status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "An internal server error occurred."},
+    )
 
 
 # --- Routers ---
 app.include_router(query.router, prefix=settings.API_V1_STR, tags=["Query & Chat Interaction"])
-# --- Añadir el router de chat ---
 app.include_router(chat_router.router, prefix=settings.API_V1_STR, tags=["Chat Management"])
 
 
