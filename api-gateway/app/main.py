@@ -207,4 +207,4 @@ log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start."
 #         # Considera usar el loop uvloop para mejor rendimiento si está instalado
 #         # loop="uvloop",
 #         # http="httptools" # También puede mejorar rendimiento
-#     )
+#     ) 
