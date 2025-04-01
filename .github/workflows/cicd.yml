@@ -22,12 +22,13 @@ env:
   GATEWAY_SERVICE_DIR: api-gateway             # Directorio del API Gateway
 
   # Nombres COMPLETOS de las imágenes (incluyendo registro y owner) - SIN TAG
+  # ¡ASEGÚRATE QUE ESTOS NOMBRES COINCIDAN EXACTAMENTE CON LOS USADOS EN LOS DEPLOYMENTS YAML (antes del tag)!
   INGEST_IMAGE_NAME: ghcr.io/dev-nyro/ingest-service
   QUERY_IMAGE_NAME: ghcr.io/dev-nyro/query-service
   GATEWAY_IMAGE_NAME: ghcr.io/dev-nyro/api-gateway # Nombre de la imagen del API Gateway
 
   # --- Rutas RELATIVAS a los archivos de deployment DENTRO del repo de manifests ---
-  # ¡CRÍTICO! Asegúrate que estas rutas sean EXACTAS a la estructura de tu repo 'manifests-nyro'
+  # ¡CRÍTICO! Asegúrate que estas rutas sean EXACTAS a la estructura de tu repo 'manifests-nyro' en la rama 'develop'
   INGEST_MANIFEST_PATH_API_REL: ingest-service/deployment-api.yaml
   INGEST_MANIFEST_PATH_WORKER_REL: ingest-service/deployment-worker.yaml # Dejar vacío "" si no hay worker manifest
   QUERY_MANIFEST_PATH_REL: query-service/deployment.yaml
@@ -184,7 +185,7 @@ jobs:
           MANIFEST_UPDATED=false # Flag para saber si algún manifiesto cambió realmente
           UPDATE_FAILED=false    # Flag para saber si hubo un error crítico
 
-          # --- Función para actualizar la línea 'image:' en un archivo YAML (con debug) ---
+          # --- Función para actualizar la línea 'image:' en un archivo YAML (con debug y verificaciones) ---
           update_image() {
             local manifest_path="$1" # Ruta relativa del archivo manifest
             local target_image="$2" # Imagen completa con tag: ghcr.io/owner/repo:tag
@@ -194,8 +195,9 @@ jobs:
             echo "Using base image name: $image_base_name"
 
             # --- VERIFICACIÓN 1: ¿Existe el archivo? ---
+            # Asegura que la ruta definida en las variables de entorno es correcta.
             if [ ! -f "$manifest_path" ]; then
-              echo "::error::Manifest file '$manifest_path' not found in checkout directory!"
+              echo "::error::Manifest file '$manifest_path' not found in checkout directory! Check MANIFEST_REPO structure and *_MANIFEST_PATH_REL variables."
               UPDATE_FAILED=true
               return 1 # Salir de la función con error
             fi
@@ -214,14 +216,13 @@ jobs:
             echo "Using sed replacement: $sed_replacement"
 
             # --- VERIFICACIÓN 2: ¿El patrón 'sed' coincide con alguna línea en el archivo? ---
+            # Asegura que la línea 'image:' en el YAML usa el nombre base correcto.
             echo "--- Checking for pattern match in '$manifest_path' BEFORE sed (using grep) ---"
-            # Usamos grep -q para modo silencioso, solo nos interesa el código de salida
             if grep -qE "$sed_pattern" "$manifest_path"; then
-              echo "Pattern found by grep."
+              echo "Pattern found by grep. Ready to replace."
             else
-              echo "::warning::Pattern NOT found by grep in '$manifest_path'. Check the 'image:' line format and base name ('$image_base_name') in the actual file. Skipping update for this file."
-              # No fallar aquí, podría ser la primera vez o el formato es inesperado.
-              return 0 # Salir de la función sin error
+              echo "::warning::Pattern NOT found by grep in '$manifest_path'. Check the 'image:' line format and base name ('$image_base_name') in the actual file. Does it match the *_IMAGE_NAME variable? Skipping update for this file."
+              return 0 # Salir de la función sin error, pero sin actualizar
             fi
             echo "--------------------------------------------------------------------------"
 
@@ -232,19 +233,8 @@ jobs:
               echo "sed command executed successfully for '$manifest_path'."
 
               # --- VERIFICACIÓN 3: ¿Realmente cambió el archivo? ---
-              echo "--- Checking file content AFTER sed (using grep for the new image tag) ---"
-              # Construir patrón para buscar la línea con el NUEVO tag
-              local grep_new_image_pattern="^([[:space:]]*)image:[[:space:]]+${target_image//\//\\/}$"
-              # Usamos grep -q para verificar si la nueva línea existe
-              if grep -qE "$grep_new_image_pattern" "$manifest_path"; then
-                 echo "Found the exact new image line with grep AFTER sed."
-              else
-                 # Esto podría pasar si el tag ya era el correcto, sed no hizo cambios.
-                 echo "::debug::Did not find the exact new image line with grep AFTER sed. This might be okay if the image tag was already correct."
-              fi
-              echo "--------------------------------------------------------------------------"
-
-              # Comparar el archivo original (.bak) con el modificado para confirmar cambio
+              # Compara el archivo modificado con el backup para confirmar que hubo un cambio.
+              echo "--- Comparing original and modified file ---"
               if ! cmp -s "$manifest_path" "$manifest_path.bak"; then
                 echo "SUCCESS: Manifest file '$manifest_path' was modified."
                 MANIFEST_UPDATED=true # Marcar que hubo cambios reales
@@ -255,9 +245,9 @@ jobs:
               rm -f "$manifest_path.bak"
               return 0 # Éxito (o sin cambios necesarios)
             else
+              # Si sed falla, es un error crítico.
               echo "::error::sed command failed for '$manifest_path'. Check permissions or pattern syntax."
-              # Intentar limpiar backup incluso si falló
-              rm -f "$manifest_path.bak"
+              rm -f "$manifest_path.bak" # Intentar limpiar backup
               UPDATE_FAILED=true # Marcar como fallo crítico si sed falla
               return 1 # Fallo
             fi
@@ -267,9 +257,7 @@ jobs:
           if [ "$INGEST_BUILT" = "true" ]; then
             echo "Processing Ingest Service..."
             INGEST_TARGET_IMAGE="${INGEST_IMAGE}:${COMMON_TAG}"
-            # Llamar a update_image y permitir que el script continúe si falla (|| true)
-            # El flag UPDATE_FAILED capturará errores críticos dentro de la función.
-            update_image "$INGEST_API_MANIFEST_PATH" "$INGEST_TARGET_IMAGE" || true
+            update_image "$INGEST_API_MANIFEST_PATH" "$INGEST_TARGET_IMAGE" || true # Continuar aunque falle uno
             if [ -n "$INGEST_WORKER_MANIFEST_PATH" ]; then
               update_image "$INGEST_WORKER_MANIFEST_PATH" "$INGEST_TARGET_IMAGE" || true
             fi
@@ -287,9 +275,11 @@ jobs:
           fi
 
           # --- Update API Gateway ---
+          # Esta sección maneja la actualización para api-gateway
           if [ "$GATEWAY_BUILT" = "true" ]; then
             echo "Processing API Gateway..."
             GATEWAY_TARGET_IMAGE="${GATEWAY_IMAGE}:${COMMON_TAG}"
+            # Llama a la misma función robusta para actualizar el manifest del gateway
             update_image "$GATEWAY_MANIFEST_PATH" "$GATEWAY_TARGET_IMAGE" || true
           else
             echo "Skipping API Gateway manifest update (not built)."
@@ -346,6 +336,7 @@ jobs:
               if git push origin ${{ env.MANIFEST_REPO_BRANCH }}; then
                 echo "Push successful on retry."
               else
+                # Si el push falla, el error más probable son permisos o reglas de protección de rama.
                 echo "::error::Push failed even after retry. Check PAT permissions ('${{ secrets.MANIFEST_PAT }}') and branch protection rules on '${{ env.MANIFEST_REPO_OWNER }}/${{ env.MANIFEST_REPO_NAME }}' repository for the '${{ env.MANIFEST_REPO_BRANCH }}' branch."
                 exit 1 # Fallar el step si el push falla dos veces
               fi
