@@ -1,4 +1,4 @@
-# ./app/db/postgres_client.py (CORREGIDO - Deshabilitar caché de statements para PgBouncer/Pooler)
+# ./app/db/postgres_client.py (AÑADIDA función list_documents_by_company)
 import uuid
 from typing import Any, Optional, Dict, List
 import asyncpg
@@ -110,9 +110,6 @@ async def close_db_pool():
         _pool = None
         log.info("Supabase/PostgreSQL connection pool closed.")
 
-# --- Funciones create_document, update_document_status, get_document_status ---
-# (Sin cambios necesarios en la lógica interna de estas funciones)
-
 async def create_document(
     company_id: uuid.UUID,
     file_name: str,
@@ -131,7 +128,7 @@ async def create_document(
         async with pool.acquire() as connection:
             # Con statement_cache_size=0, asyncpg no usará prepared statements internamente aquí
             result = await connection.fetchval(
-                query, doc_id, company_id, file_name, file_type, metadata, DocumentStatus.UPLOADED.value
+                query, doc_id, company_id, file_name, file_type, json.dumps(metadata), DocumentStatus.UPLOADED.value # Asegurar que metadata se guarda como JSON
             )
         if result:
             log.info("Document record created in Supabase", document_id=doc_id, company_id=company_id)
@@ -167,12 +164,14 @@ async def update_document_status(
         params.append(chunk_count)
         current_param_index += 1
     if status == DocumentStatus.ERROR:
-        safe_error_message = (error_message or "Unknown processing error")[:1000]
+        safe_error_message = (error_message or "Unknown processing error")[:1000] # Limitar longitud
         fields_to_update.append(f"error_message = ${current_param_index}")
         params.append(safe_error_message)
         current_param_index += 1
     else:
+        # Limpiar error_message si el estado no es ERROR
         fields_to_update.append("error_message = NULL")
+
     query = f"UPDATE documents SET {', '.join(fields_to_update)} WHERE id = $1;"
     try:
         async with pool.acquire() as connection:
@@ -193,13 +192,19 @@ async def update_document_status(
 async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]]:
     """Obtiene el estado y otros datos de un documento de la tabla DOCUMENTS."""
     pool = await get_db_pool()
-    query = "SELECT id, company_id, status, file_name, file_type, chunk_count, error_message, updated_at FROM documents WHERE id = $1;"
+    # Asegurar que seleccionamos las columnas correctas para StatusResponse
+    query = """
+        SELECT id, status, file_name, file_type, chunk_count, error_message, updated_at, company_id
+        FROM documents
+        WHERE id = $1;
+    """
     try:
         async with pool.acquire() as connection:
             # Con statement_cache_size=0, asyncpg no usará prepared statements internamente aquí
             record = await connection.fetchrow(query, document_id)
         if record:
             log.debug("Document status retrieved from Supabase", document_id=document_id)
+            # Convertir asyncpg.Record a Dict para consistencia
             return dict(record)
         else:
             log.warning("Document status requested for non-existent ID", document_id=document_id)
@@ -207,3 +212,30 @@ async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]
     except Exception as e:
         log.error("Failed to get document status from Supabase", error=str(e), document_id=document_id, exc_info=True)
         raise
+
+# --- NUEVA FUNCIÓN ---
+async def list_documents_by_company(company_id: uuid.UUID) -> List[Dict[str, Any]]:
+    """
+    Obtiene una lista de documentos (con su estado) para una compañía específica,
+    ordenados por fecha de actualización descendente.
+    """
+    pool = await get_db_pool()
+    # Seleccionar las columnas necesarias para el schema StatusResponse
+    query = """
+        SELECT id, status, file_name, file_type, chunk_count, error_message, updated_at
+        FROM documents
+        WHERE company_id = $1
+        ORDER BY updated_at DESC;
+    """
+    db_log = log.bind(company_id=str(company_id))
+    try:
+        async with pool.acquire() as connection:
+            # Con statement_cache_size=0, asyncpg no usará prepared statements internamente aquí
+            records = await connection.fetch(query, company_id)
+
+        result_list = [dict(record) for record in records] # Convertir lista de Records a lista de Dicts
+        db_log.info(f"Retrieved {len(result_list)} documents for company")
+        return result_list
+    except Exception as e:
+        db_log.error("Failed to list documents by company from Supabase", error=str(e), exc_info=True)
+        raise # Relanzar para que el endpoint maneje el error
