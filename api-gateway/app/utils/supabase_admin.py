@@ -1,6 +1,6 @@
 # api-gateway/app/utils/supabase_admin.py
 from supabase.client import Client, create_client
-from supabase.lib.client_options import ClientOptions
+# from supabase.lib.client_options import ClientOptions # No necesitamos options por ahora
 from functools import lru_cache
 import structlog
 
@@ -21,20 +21,23 @@ def get_supabase_admin_client() -> Client:
         Instancia del cliente Supabase Admin.
     """
     supabase_url = settings.SUPABASE_URL
-    service_key = settings.SUPABASE_SERVICE_ROLE_KEY.get_secret_value() # Obtener valor real
+    # --- MODIFICACIÓN: Acceder a la clave como string normal ---
+    service_key = settings.SUPABASE_SERVICE_ROLE_KEY
+    # ----------------------------------------------------------
 
     if not supabase_url:
         log.critical("Supabase URL is not configured for Admin Client.")
         raise ValueError("Supabase URL not configured in settings.")
+    # --- MODIFICACIÓN: Validar el placeholder como string ---
     if not service_key or service_key == "YOUR_SUPABASE_SERVICE_ROLE_KEY_HERE":
         log.critical("Supabase Service Role Key is not configured or using default for Admin Client.")
         raise ValueError("Supabase Service Role Key not configured securely in settings.")
+    # -------------------------------------------------------
 
     log.info("Initializing Supabase Admin Client...")
     try:
-        # Especificar schema 'auth' explícitamente si interactuamos con él directamente
-        # options = ClientOptions(schema="auth")
-        supabase_admin: Client = create_client(supabase_url, service_key) #, options=options)
+        # Pasar la clave como string directamente
+        supabase_admin: Client = create_client(supabase_url, service_key)
         log.info("Supabase Admin Client initialized successfully.")
         return supabase_admin
     except Exception as e:
@@ -42,4 +45,4 @@ def get_supabase_admin_client() -> Client:
         raise ValueError(f"Failed to initialize Supabase Admin Client: {e}")
 
 # Instancia global (opcional, pero común con lru_cache)
-# supabase_admin_client = get_supabase_admin_client()
+# supabase_admin_client = get_supabase_admin_client() # Podría llamarse aquí o bajo demanda
