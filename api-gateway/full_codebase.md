@@ -12,9 +12,12 @@ app/
 │   ├── config.py
 │   └── logging_config.py
 ├── main.py
-└── routers
-    ├── __init__.py
-    └── gateway_router.py
+├── routers
+│   ├── __init__.py
+│   ├── gateway_router.py
+│   └── user_router.py
+└── utils
+    └── supabase_admin.py
 ```
 
 # Codebase: `app`
@@ -38,95 +41,131 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Optional, Annotated, Dict, Any
 import structlog
 
+# --- MODIFICACIÓN: Importar verify_token CON el nuevo parámetro ---
 from .jwt_handler import verify_token
 
 log = structlog.get_logger(__name__)
-
-# Define el esquema de seguridad para documentación OpenAPI y extracción de token.
-# auto_error=False significa que manejaremos el error si falta el token nosotros mismos.
 bearer_scheme = HTTPBearer(bearerFormat="JWT", auto_error=False)
 
-async def get_current_user_payload(
+async def _get_user_payload_internal(
     request: Request,
-    # Usa Annotated y Depends para inyectar el resultado de bearer_scheme
-    authorization: Annotated[Optional[HTTPAuthorizationCredentials], Depends(bearer_scheme)]
+    authorization: Annotated[Optional[HTTPAuthorizationCredentials], Depends(bearer_scheme)],
+    require_company_id: bool # Parámetro interno para controlar la verificación
 ) -> Optional[Dict[str, Any]]:
     """
-    Dependencia FastAPI para intentar validar el token JWT si está presente.
-
-    - Si el token es válido, devuelve el payload decodificado.
-    - Si el token es inválido o expirado, lanza la HTTPException de verify_token (401).
-    - Si no hay token (authorization is None o no es Bearer), devuelve None.
-
-    Almacena el payload (o None) en request.state.user para posible uso posterior.
-    Esta dependencia NO fuerza la autenticación, solo la intenta si hay token.
+    Función interna para obtener y validar el payload, controlando si se requiere company_id.
     """
+    request.state.user = None # Resetear estado por defecto
+
     if authorization is None:
-        # No hay header Authorization o no es Bearer.
-        log.debug("No Authorization Bearer header found. Proceeding as anonymous.")
-        request.state.user = None # Marcar que no hay usuario autenticado
+        log.debug("No Authorization Bearer header found.")
         return None
 
     token = authorization.credentials
     try:
-        payload = verify_token(token) # Lanza HTTPException(401) o (500) si es inválido
-        request.state.user = payload # Almacenar payload para otros middlewares/endpoints
-        log.debug("Token verified in dependency. User payload set in request.state",
-                  subject=payload.get('sub'),
-                  company_id=payload.get('company_id'))
+        # --- MODIFICACIÓN: Pasar require_company_id a verify_token ---
+        payload = verify_token(token, require_company_id=require_company_id)
+        request.state.user = payload
+        log_msg = "Token verified" + (" (company_id required)" if require_company_id else " (company_id not required)")
+        log.debug(log_msg, subject=payload.get('sub'), company_id=payload.get('company_id'))
         return payload
     except HTTPException as e:
-        # Propaga la excepción HTTP generada por verify_token (normalmente 401)
         log.info(f"Token verification failed in dependency: {e.detail}", status_code=e.status_code)
-        request.state.user = None # Asegurar que no hay payload en estado
-        # IMPORTANTE: Re-lanzamos la excepción para que FastAPI la maneje
-        # y la ruta que depende de 'require_user' no se ejecute.
+        # Re-lanzar la excepción (401 o 403) para que FastAPI la maneje
         raise e
-    # No es necesario capturar Exception genérica aquí, verify_token ya lo hace
+    except Exception as e:
+        # Capturar errores inesperados de verify_token (aunque no debería ocurrir)
+        log.exception("Unexpected error during internal payload retrieval", error=e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal error during authentication check."
+        )
 
+# --- Dependencia Estándar (sin cambios en su definición externa) ---
+# Intenta obtener el payload, requiere company_id por defecto.
+# Devuelve None si no hay token, lanza 401/403 si el token es inválido o falta company_id.
+async def get_current_user_payload(
+    request: Request,
+    authorization: Annotated[Optional[HTTPAuthorizationCredentials], Depends(bearer_scheme)]
+) -> Optional[Dict[str, Any]]:
+    """
+    Dependencia FastAPI para intentar validar el token JWT (requiriendo company_id).
+    """
+    # Llama a la función interna requiriendo company_id
+    try:
+        return await _get_user_payload_internal(request, authorization, require_company_id=True)
+    except HTTPException as e:
+        # Si _get_user_payload_internal lanza 401/403, lo relanzamos
+        raise e
+    except Exception as e:
+         # Manejar cualquier otro error inesperado aquí también
+         log.exception("Unexpected error in get_current_user_payload wrapper", error=e)
+         raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+# --- Dependencia que Requiere Usuario (sin cambios) ---
+# Falla si get_current_user_payload devuelve None o lanza excepción.
 async def require_user(
-    # Usar Annotated y Depends para obtener el resultado de get_current_user_payload
-    # FastAPI primero ejecutará get_current_user_payload. Si esa dependencia
-    # lanza una excepción (ej: 401 por token inválido), la ejecución se detiene
-    # y esta dependencia 'require_user' ni siquiera se completa.
     user_payload: Annotated[Optional[Dict[str, Any]], Depends(get_current_user_payload)]
 ) -> Dict[str, Any]:
     """
     Dependencia FastAPI que *asegura* que una ruta requiere un usuario autenticado
-    y con un token válido.
-
-    Reutiliza get_current_user_payload. Si get_current_user_payload:
-    - Devuelve un payload: Esta dependencia devuelve ese payload.
-    - Devuelve None (sin token): Esta dependencia lanza un 401 explícito.
-    - Lanza una excepción (token inválido): FastAPI ya habrá detenido la ejecución.
-
-    Returns:
-        El payload del usuario si la autenticación fue exitosa.
-
-    Raises:
-        HTTPException(401): Si no se proporcionó un token válido.
+    con un token válido Y con company_id asociado.
     """
     if user_payload is None:
-        # Esto ocurre si get_current_user_payload devolvió None (porque no había token).
-        # Si había un token pero era inválido, get_current_user_payload ya lanzó 401.
+        # Esto ocurre si get_current_user_payload devolvió None (sin token)
         log.info("Access denied: Authentication required but no valid token was found or provided.")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated",
-            headers={"WWW-Authenticate": "Bearer"}, # Indica que se requiere Bearer token
+            headers={"WWW-Authenticate": "Bearer"},
         )
-    # Si llegamos aquí, user_payload es un diccionario válido
-    log.debug("User requirement met.", subject=user_payload.get('sub'))
+    # Si get_current_user_payload lanzó 401/403, la ejecución ya se detuvo.
+    log.debug("User requirement met (with company_id check).", subject=user_payload.get('sub'))
     return user_payload
 
-# No usaremos un Middleware global para JWT, aplicaremos 'require_user' por ruta.
+# --- NUEVA Dependencia: Requiere Autenticación pero NO company_id ---
+async def require_authenticated_user_no_company_check(
+    request: Request,
+    authorization: Annotated[Optional[HTTPAuthorizationCredentials], Depends(bearer_scheme)]
+) -> Dict[str, Any]:
+    """
+    Dependencia FastAPI que asegura que el usuario está autenticado (token válido)
+    pero NO requiere que el company_id esté presente en el token todavía.
+    Útil para endpoints como el de asociación de compañía.
+    """
+    try:
+        # Llama a la función interna SIN requerir company_id
+        payload = await _get_user_payload_internal(request, authorization, require_company_id=False)
+
+        if payload is None:
+            # Si no hay token, lanzar 401
+            log.info("Access denied: Authentication required for initial setup but no token provided.")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication required",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        # Si había token pero era inválido (firma, exp, aud), _get_user_payload_internal ya lanzó 401.
+        log.debug("User requirement met (without company_id check).", subject=payload.get('sub'))
+        return payload
+    except HTTPException as e:
+        # Re-lanzar 401 si el token era inválido
+        raise e
+    except Exception as e:
+        log.exception("Unexpected error in require_authenticated_user_no_company_check", error=e)
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+# Alias para claridad
+InitialAuth = Annotated[Dict[str, Any], Depends(require_authenticated_user_no_company_check)]
+StrictAuth = Annotated[Dict[str, Any], Depends(require_user)]
 ```
 
 ## File: `app\auth\jwt_handler.py`
 ```py
 # api-gateway/app/auth/jwt_handler.py
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional # Añadir Optional y List
+from typing import Dict, Any, List, Optional
 from jose import JWTError, jwt
 from fastapi import HTTPException, status
 import structlog
@@ -137,27 +176,21 @@ log = structlog.get_logger(__name__)
 
 SECRET_KEY = settings.JWT_SECRET
 ALGORITHM = settings.JWT_ALGORITHM
-
-# --- Claims Requeridos de un Token Supabase VÁLIDO ---
-# Ajusta esto según lo que REALMENTE necesites y lo que Supabase incluya.
-# 'sub' (Subject = User ID), 'aud' (Audience), 'exp' (Expiration) son estándar.
-# Necesitas verificar si 'company_id' está directamente o dentro de app_metadata/user_metadata.
-# Si está en metadata, la validación aquí solo asegura que el token es válido,
-# y la extracción del company_id se haría después.
-REQUIRED_CLAIMS = ['sub', 'aud', 'exp'] # Mínimo requerido estándar
-
-# --- Audiencia Esperada (IMPORTANTE) ---
-# Los tokens JWT de Supabase suelen tener 'authenticated' como audiencia para usuarios logueados.
-# Verifica esto en un token real de tu proyecto Supabase.
+REQUIRED_CLAIMS = ['sub', 'aud', 'exp']
 EXPECTED_AUDIENCE = 'authenticated'
 
-def verify_token(token: str) -> Dict[str, Any]:
+# --- MODIFICACIÓN: Añadir parámetro require_company_id ---
+def verify_token(token: str, require_company_id: bool = True) -> Dict[str, Any]:
     """
     Verifica el token JWT usando el secreto y algoritmo de Supabase.
     Valida la firma, expiración, audiencia y claims requeridos.
+    Opcionalmente requiere la presencia de 'company_id' en app_metadata.
 
     Args:
         token: El string del token JWT.
+        require_company_id: Si es True (default), falla si 'company_id'
+                            no se encuentra en app_metadata. Si es False,
+                            permite tokens válidos sin company_id.
 
     Returns:
         El payload decodificado si el token es válido.
@@ -165,12 +198,17 @@ def verify_token(token: str) -> Dict[str, Any]:
     Raises:
         HTTPException(401): Si el token es inválido, expirado, malformado,
                            le faltan claims, o la audiencia no es correcta.
+        HTTPException(403): Si require_company_id es True y falta company_id.
         HTTPException(500): Si ocurre un error inesperado.
     """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""},
+    )
+    forbidden_exception = HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="User authenticated, but company association is missing in token.",
     )
     internal_error_exception = HTTPException(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -184,23 +222,21 @@ def verify_token(token: str) -> Dict[str, Any]:
 
     if SECRET_KEY == "YOUR_DEFAULT_JWT_SECRET_KEY_CHANGE_ME_IN_ENV_OR_SECRET":
          log.critical("FATAL: Attempting JWT verification with default insecure secret!")
-         raise internal_error_exception # No permitir operación con secreto por defecto
+         raise internal_error_exception
 
     try:
         payload = jwt.decode(
             token,
             SECRET_KEY,
             algorithms=[ALGORITHM],
-            audience=EXPECTED_AUDIENCE, # <-- VALIDACIÓN DE AUDIENCIA
+            audience=EXPECTED_AUDIENCE,
             options={
                 "verify_signature": True,
-                "verify_aud": True, # <-- HABILITAR VALIDACIÓN DE AUDIENCIA
+                "verify_aud": True,
                 "verify_exp": True,
-                # "require": REQUIRED_CLAIMS # 'require' puede ser muy estricto, validamos manualmente
             }
         )
 
-        # Validación manual de claims requeridos (más flexible que 'require')
         missing_claims = [claim for claim in REQUIRED_CLAIMS if claim not in payload]
         if missing_claims:
             log.warning("Token verification failed: Missing required claims.",
@@ -209,56 +245,36 @@ def verify_token(token: str) -> Dict[str, Any]:
             credentials_exception.detail = f"Token missing required claims: {', '.join(missing_claims)}"
             raise credentials_exception
 
-        # --- EXTRACCIÓN DE COMPANY_ID (¡IMPORTANTE!) ---
-        # Supabase a menudo almacena datos personalizados en 'app_metadata' o 'user_metadata'.
-        # NECESITAS VERIFICAR DÓNDE ESTÁ 'company_id' en tus tokens reales.
         company_id: Optional[str] = None
-        # Opción 1: Directamente en el payload (menos común para Supabase)
-        # company_id = payload.get('company_id')
-
-        # Opción 2: Dentro de app_metadata (más común para datos relacionados con la app)
         app_metadata = payload.get('app_metadata')
         if isinstance(app_metadata, dict):
-            company_id = app_metadata.get('company_id')
-            # Podrías tener otros datos aquí: provider, roles, etc.
-            # log.debug("Extracted app_metadata", data=app_metadata)
+            company_id_raw = app_metadata.get('company_id')
+            if company_id_raw is not None:
+                 company_id = str(company_id_raw) # Asegurar string
+                 payload['company_id'] = company_id # Añadir al payload para conveniencia
 
-        # Opción 3: Dentro de user_metadata (más común para preferencias del usuario)
-        # user_metadata = payload.get('user_metadata')
-        # if isinstance(user_metadata, dict) and not company_id: # Solo si no se encontró en app_metadata
-        #     company_id = user_metadata.get('company_id')
-
-        # --- FIN EXTRACCIÓN COMPANY_ID ---
-
-        # Validar que company_id se encontró (si es requerido por tu lógica)
-        if company_id is None:
-             log.error("Token verification successful, BUT 'company_id' not found in expected claims (app_metadata?).",
+        # --- MODIFICACIÓN: Aplicar requerimiento de company_id ---
+        if require_company_id and company_id is None:
+             log.error("Token lacks required 'company_id' in app_metadata.",
                        token_subject=payload.get('sub'),
                        payload_keys=list(payload.keys()))
-             # Lanzar 403 Forbidden porque el usuario está autenticado pero no autorizado para proceder
-             # sin company_id en este contexto. O podrías devolver el payload y manejarlo en el router.
-             raise HTTPException(
-                 status_code=status.HTTP_403_FORBIDDEN,
-                 detail="User authenticated, but company association is missing in token.",
-             )
-        else:
-             # Añadir company_id al payload devuelto para fácil acceso
-             payload['company_id'] = str(company_id) # Asegurar que sea string
-             log.debug("Token verified successfully and company_id found.",
-                       subject=payload.get('sub'),
-                       company_id=payload['company_id'])
+             raise forbidden_exception # Lanzar 403 si se requiere y falta
+        elif company_id:
+             log.debug("Token verified, company_id present.",
+                       subject=payload.get('sub'), company_id=company_id)
+        else: # company_id is None but require_company_id is False
+             log.debug("Token verified, company_id not required or not present.",
+                       subject=payload.get('sub'))
+        # --- FIN MODIFICACIÓN ---
 
-
-        # 'sub' (user_id) ya está validado por REQUIRED_CLAIMS
         if 'sub' not in payload:
              log.error("Critical: 'sub' claim missing after initial check.", payload_keys=list(payload.keys()))
-             raise credentials_exception # Debería haber fallado antes
+             raise credentials_exception
 
         return payload
 
     except JWTError as e:
         log.warning(f"JWT Verification Error: {e}", token_provided=True, algorithm=ALGORITHM, audience=EXPECTED_AUDIENCE)
-        # Ajustar el mensaje según el tipo de error
         error_desc = str(e)
         if "Signature verification failed" in error_desc:
             credentials_exception.detail = "Invalid token signature."
@@ -269,17 +285,11 @@ def verify_token(token: str) -> Dict[str, Any]:
         elif "Audience verification failed" in error_desc:
              credentials_exception.detail = "Invalid token audience."
              credentials_exception.headers["WWW-Authenticate"] = f"Bearer error=\"invalid_token\", error_description=\"Invalid audience, expected '{EXPECTED_AUDIENCE}'\""
-        elif "required claim" in error_desc.lower():
-             # Esto no debería pasar con la validación manual, pero por si acaso
-             credentials_exception.detail = f"Token missing required claim: {e}"
-             credentials_exception.headers["WWW-Authenticate"] = "Bearer error=\"invalid_token\", error_description=\"Missing required claim\""
         else:
             credentials_exception.detail = f"Token validation failed: {e}"
-
         raise credentials_exception from e
     except HTTPException as e:
-        # Re-lanzar HTTPException (como la 403 por falta de company_id)
-        raise e
+        raise e # Re-lanzar 403 o cualquier otra HTTPException
     except Exception as e:
         log.exception(f"Unexpected error during token verification: {e}")
         raise internal_error_exception from e
@@ -299,10 +309,11 @@ from functools import lru_cache
 import sys
 import logging
 from typing import Optional
+# (-) Quitar la importación de SecretStr si ya no se usa en ningún otro lugar
+# from pydantic import SecretStr
 
 K8S_INGEST_SVC_URL_DEFAULT = "http://ingest-api-service.nyro-develop.svc.cluster.local:80"
 K8S_QUERY_SVC_URL_DEFAULT = "http://query-service.nyro-develop.svc.cluster.local:80"
-# K8S_AUTH_SVC_URL_DEFAULT = "http://auth-service.nyro-develop.svc.cluster.local:80" # Si aplica
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -318,13 +329,20 @@ class Settings(BaseSettings):
 
     INGEST_SERVICE_URL: str = os.getenv("GATEWAY_INGEST_SERVICE_URL", K8S_INGEST_SVC_URL_DEFAULT)
     QUERY_SERVICE_URL: str = os.getenv("GATEWAY_QUERY_SERVICE_URL", K8S_QUERY_SVC_URL_DEFAULT)
-    AUTH_SERVICE_URL: Optional[str] = os.getenv("GATEWAY_AUTH_SERVICE_URL") # Para proxy de auth
+    AUTH_SERVICE_URL: Optional[str] = os.getenv("GATEWAY_AUTH_SERVICE_URL")
 
-    # JWT settings - Leído desde Secret K8s o .env
-    # IMPORTANTE: El valor por defecto aquí SÓLO debe usarse para desarrollo local
-    # NUNCA debe ser el valor real en producción/k8s.
+    # JWT settings
     JWT_SECRET: str = "YOUR_DEFAULT_JWT_SECRET_KEY_CHANGE_ME_IN_ENV_OR_SECRET"
     JWT_ALGORITHM: str = "HS256"
+
+    # --- MODIFICACIÓN: Cambiar tipo a str ---
+    # La clave se leerá como una string normal desde la variable de entorno.
+    # La seguridad recae en cómo se inyecta esa variable (ej. K8s Secret).
+    SUPABASE_SERVICE_ROLE_KEY: str = "YOUR_SUPABASE_SERVICE_ROLE_KEY_HERE"
+    # ----------------------------------------
+    SUPABASE_URL: Optional[str] = os.getenv("NEXT_PUBLIC_SUPABASE_URL") # Reutilizar la URL pública
+
+    DEFAULT_COMPANY_ID: Optional[str] = os.getenv("GATEWAY_DEFAULT_COMPANY_ID")
 
     LOG_LEVEL: str = "INFO"
     HTTP_CLIENT_TIMEOUT: int = 60
@@ -334,8 +352,11 @@ class Settings(BaseSettings):
 @lru_cache()
 def get_settings() -> Settings:
     log = logging.getLogger(__name__)
-    log.setLevel(logging.INFO)
-    log.addHandler(logging.StreamHandler(sys.stdout))
+    # Asegurarse de que el logger esté configurado antes de usarlo
+    if not log.handlers:
+        log.setLevel(logging.INFO)
+        log.addHandler(logging.StreamHandler(sys.stdout))
+
     log.info("Loading Gateway settings...")
     try:
         settings_instance = Settings()
@@ -344,18 +365,44 @@ def get_settings() -> Settings:
         log.info(f"  INGEST_SERVICE_URL: {settings_instance.INGEST_SERVICE_URL}")
         log.info(f"  QUERY_SERVICE_URL: {settings_instance.QUERY_SERVICE_URL}")
         log.info(f"  AUTH_SERVICE_URL: {settings_instance.AUTH_SERVICE_URL or 'Not Set'}")
-        # *** VERIFICACIÓN CRÍTICA DEL SECRETO JWT ***
+
+        # Verificación JWT Secret
         if settings_instance.JWT_SECRET == "YOUR_DEFAULT_JWT_SECRET_KEY_CHANGE_ME_IN_ENV_OR_SECRET":
             log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
             log.critical("! FATAL: GATEWAY_JWT_SECRET is using the default insecure value!")
             log.critical("! Set GATEWAY_JWT_SECRET via env var or K8s Secret.")
             log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-            # Considera salir si es crítico en producción:
-            # if os.getenv("ENVIRONMENT") == "production":
-            #     sys.exit("FATAL: GATEWAY_JWT_SECRET not configured securely.")
         else:
             log.info(f"  JWT_SECRET: *** SET (Loaded from Secret/Env) ***")
         log.info(f"  JWT_ALGORITHM: {settings_instance.JWT_ALGORITHM}")
+
+        # Verificaciones Supabase URL y Service Key
+        if not settings_instance.SUPABASE_URL:
+             log.critical("! FATAL: Supabase URL is not configured (check NEXT_PUBLIC_SUPABASE_URL env var).")
+             sys.exit("FATAL: Supabase URL not configured.")
+        else:
+             log.info(f"  SUPABASE_URL: {settings_instance.SUPABASE_URL}")
+
+        # --- MODIFICACIÓN: Validar la clave de servicio como string ---
+        # Comprobar si sigue siendo el valor placeholder.
+        if settings_instance.SUPABASE_SERVICE_ROLE_KEY == "YOUR_SUPABASE_SERVICE_ROLE_KEY_HERE":
+            log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            log.critical("! FATAL: GATEWAY_SUPABASE_SERVICE_ROLE_KEY is using the default placeholder!")
+            log.critical("! Set GATEWAY_SUPABASE_SERVICE_ROLE_KEY via env var or K8s Secret.")
+            log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            # Considera salir si es crítico
+            # sys.exit("FATAL: GATEWAY_SUPABASE_SERVICE_ROLE_KEY not configured securely.")
+        else:
+            # No loguear la clave, solo confirmar que está configurada.
+            log.info("  SUPABASE_SERVICE_ROLE_KEY: *** SET (Loaded from Secret/Env) ***")
+        # -------------------------------------------------------------
+
+        # Verificación Default Company ID
+        if not settings_instance.DEFAULT_COMPANY_ID:
+            log.warning("! WARNING: GATEWAY_DEFAULT_COMPANY_ID is not set. Company association might fail.")
+        else:
+            log.info(f"  DEFAULT_COMPANY_ID: {settings_instance.DEFAULT_COMPANY_ID}")
+
         log.info(f"  LOG_LEVEL: {settings_instance.LOG_LEVEL}")
         log.info(f"  HTTP_CLIENT_TIMEOUT: {settings_instance.HTTP_CLIENT_TIMEOUT}")
         return settings_instance
@@ -457,247 +504,187 @@ def setup_logging():
 ## File: `app\main.py`
 ```py
 # api-gateway/app/main.py
-# --- Añadir la importación que faltaba ---
 import os
-# --- Fin de la corrección ---
 from fastapi import FastAPI, Request, Depends, HTTPException, status
+from typing import Optional
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import httpx
 import structlog
-import uvicorn # Para ejecución local si es necesario
-import time # Para medir tiempo de respuesta
-import uuid # Para generar request ID
+import uvicorn
+import time
+import uuid
+from supabase.client import Client as SupabaseClient # Importar tipo
 
-# Configuración y Settings (Asegúrate que carga bien ahora)
+# Configuración y Settings
 from app.core.config import settings
-# Configuración de Logging (structlog) ANTES de importar otros módulos que logueen
+# Configuración de Logging
 from app.core.logging_config import setup_logging
 setup_logging() # Configurar logging al inicio
 
-# Routers (Solo el gateway)
+# --- NUEVO: Importar cliente Supabase Admin ---
+from app.utils.supabase_admin import get_supabase_admin_client
+
+# Routers
 from app.routers import gateway_router
+# --- NUEVO: Importar user_router ---
+from app.routers import user_router
 
 log = structlog.get_logger("api_gateway.main")
 
-# --- Ciclo de vida de la aplicación para gestionar el cliente HTTP ---
+# --- Variables globales para clientes ---
+# (Se inicializan en lifespan)
+proxy_http_client: Optional[httpx.AsyncClient] = None
+supabase_admin_client: Optional[SupabaseClient] = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global proxy_http_client, supabase_admin_client # Declarar que modificaremos las globales
     # Startup: Inicializar cliente HTTP global
-    log.info("Application startup: Initializing global HTTP client...",
-             timeout=settings.HTTP_CLIENT_TIMEOUT,
-             max_connections=settings.HTTP_CLIENT_MAX_CONNECTIONS,
-             max_keepalive=settings.HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS)
-    limits = httpx.Limits(
-        max_keepalive_connections=settings.HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS,
-        max_connections=settings.HTTP_CLIENT_MAX_CONNECTIONS
-    )
-    timeout = httpx.Timeout(settings.HTTP_CLIENT_TIMEOUT, connect=10.0) # Timeout general y de conexión
-    # Podrías añadir reintentos con un transport personalizado si httpx no lo hace por defecto
-    # transport = httpx.AsyncHTTPTransport(retries=2) # Requiere instalar httpcore[http2] o similar
+    log.info("Application startup: Initializing global HTTP client...")
+    # ... (código de inicialización de httpx existente) ...
     try:
-        gateway_router.http_client = httpx.AsyncClient(
-            # transport=transport,
-            limits=limits,
-            timeout=timeout,
-            follow_redirects=False, # El gateway no debe seguir redirects automáticamente
-            http2=True # Habilitar HTTP/2 si los backends lo soportan
+        # ... (inicialización de httpx.AsyncClient) ...
+        proxy_http_client = httpx.AsyncClient( # Asignar a la variable global
+             # ... (configuración httpx) ...
+             limits = httpx.Limits(
+                max_keepalive_connections=settings.HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS,
+                max_connections=settings.HTTP_CLIENT_MAX_CONNECTIONS
+             ),
+             timeout = httpx.Timeout(settings.HTTP_CLIENT_TIMEOUT, connect=10.0),
+             follow_redirects=False,
+             http2=True
         )
+        gateway_router.http_client = proxy_http_client # Asignar también al router si lo usa directamente
         log.info("HTTP Client initialized successfully.")
-        # Realizar una prueba de conexión simple (opcional)
-        # await gateway_router.http_client.get("http://google.com", timeout=5.0)
-        # log.info("HTTP client test connection successful.")
     except Exception as e:
         log.exception("Failed to initialize HTTP client during startup!", error=e)
-        # Podrías decidir salir si el cliente es esencial y falla al inicio
+        proxy_http_client = None
+        gateway_router.http_client = None
+
+    # --- NUEVO: Inicializar Cliente Supabase Admin ---
+    log.info("Initializing Supabase Admin Client...")
+    try:
+        supabase_admin_client = get_supabase_admin_client() # Obtener instancia cachead
+        # Podrías añadir una verificación simple aquí si quieres
+        # await supabase_admin_client.auth.admin.list_users(limit=1)
+        log.info("Supabase Admin Client initialized successfully.")
+    except Exception as e:
+        log.exception("Failed to initialize Supabase Admin Client during startup!", error=e)
+        supabase_admin_client = None # Marcar como no disponible si falla
+        # Considera salir si es crítico
         # import sys
-        # sys.exit("Failed to initialize HTTP client")
-        gateway_router.http_client = None # Marcar como no disponible
+        # sys.exit("Failed to initialize Supabase Admin Client")
+    # --- FIN NUEVO ---
 
     yield # La aplicación se ejecuta aquí
 
-    # Shutdown: Cerrar cliente HTTP global
-    log.info("Application shutdown: Closing HTTP client...")
-    if gateway_router.http_client and not gateway_router.http_client.is_closed:
+    # Shutdown: Cerrar clientes
+    log.info("Application shutdown: Closing clients...")
+    # Cerrar HTTP Client
+    if proxy_http_client and not proxy_http_client.is_closed:
         try:
-            await gateway_router.http_client.aclose()
+            await proxy_http_client.aclose()
             log.info("HTTP Client closed successfully.")
         except Exception as e:
             log.exception("Error closing HTTP client during shutdown.", error=e)
     else:
         log.warning("HTTP Client was not initialized or already closed.")
 
+    # Cerrar Supabase Admin Client (actualmente no tiene un método aclose explícito)
+    # La librería maneja conexiones subyacentes, pero logueamos que terminamos.
+    if supabase_admin_client:
+        log.info("Supabase Admin Client shutdown (no explicit close needed).")
 
 # --- Creación de la aplicación FastAPI ---
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    description="Punto de entrada único y seguro para los microservicios de Nyro. Gestiona autenticación y enrutamiento.",
-    version="1.0.0", # Ajusta la versión
-    lifespan=lifespan, # Usar el gestor de ciclo de vida para el cliente HTTP
-    # openapi_url=f"{settings.API_V1_STR}/openapi.json" # Opcional: ruta para spec OpenAPI
+    description="Punto de entrada único y seguro para los microservicios de Nyro.",
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 # --- Middlewares ---
-
-# Middleware para añadir Request ID y medir tiempo de respuesta
+# ... (Middleware de Request ID/Timing sin cambios) ...
 @app.middleware("http")
 async def add_process_time_header_and_request_id(request: Request, call_next):
     start_time = time.time()
-    # Generar un nuevo UUID para cada request si no viene en header
     request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
-
-    # Añadir request_id al contexto de structlog para todos los logs de esta petición
     with structlog.contextvars.bind_contextvars(request_id=request_id):
-        log.info("Request received", method=request.method, path=request.url.path, client_ip=request.client.host if request.client else "N/A")
+        # log.info("Request received", method=request.method, path=request.url.path, client_ip=request.client.host if request.client else "N/A")
         try:
             response = await call_next(request)
             process_time = time.time() - start_time
             response.headers["X-Process-Time"] = str(process_time)
-            response.headers["X-Request-ID"] = request_id # Devolver ID al cliente
-            log.info("Request processed successfully", status_code=response.status_code, duration=round(process_time, 4))
+            response.headers["X-Request-ID"] = request_id
+            # log.info("Request processed successfully", status_code=response.status_code, duration=round(process_time, 4))
         except Exception as e:
             process_time = time.time() - start_time
             log.exception("Unhandled exception during request processing", duration=round(process_time, 4), error=str(e))
-            # Re-lanzar para que el exception handler global lo capture
             raise e
         return response
 
-
-# --- Configuración CORS ---
-# Orígenes permitidos: Tu URL de Vercel, tu URL de ngrok, y localhost para desarrollo local del frontend
-# ¡IMPORTANTE! Reemplaza con tus URLs reales.
-VERCEL_FRONTEND_URL = os.getenv("VERCEL_FRONTEND_URL", "https://TU_APP_EN_VERCEL.vercel.app") # Lee desde env o usa un placeholder
-NGROK_URL = os.getenv("NGROK_URL", "https://b0c3-2001-1388-53a1-a7c9-8901-65aa-f1fe-6a8.ngrok-free.app") # URL de ngrok proporcionada
+# ... (Configuración CORS sin cambios) ...
+VERCEL_FRONTEND_URL = os.getenv("VERCEL_FRONTEND_URL", "https://TU_APP_EN_VERCEL.vercel.app")
+NGROK_URL = os.getenv("NGROK_URL", "https://b0c3-2001-1388-53a1-a7c9-8901-65aa-f1fe-6a8.ngrok-free.app")
 LOCALHOST_FRONTEND = "http://localhost:3000"
-
-allowed_origins = [
-    LOCALHOST_FRONTEND,
-    VERCEL_FRONTEND_URL,
-]
-
-# Añadir ngrok URL si está definida
+allowed_origins = [LOCALHOST_FRONTEND, VERCEL_FRONTEND_URL]
 if NGROK_URL:
-    # ngrok puede dar http y https, permitir ambos si es necesario, pero prefiere https
     if NGROK_URL.startswith("https://"):
         allowed_origins.append(NGROK_URL)
-        allowed_origins.append(NGROK_URL.replace("https://", "http://")) # Permitir http también si es necesario
-    elif NGROK_URL.startswith("http://"):
-         allowed_origins.append(NGROK_URL)
-         allowed_origins.append(NGROK_URL.replace("http://", "https://"))
-    else:
-         log.warning(f"NGROK_URL format not recognized: {NGROK_URL}")
-
-
-# En producción estricta, podrías quitar localhost y ngrok
-# if os.getenv("ENVIRONMENT") == "production":
-#     allowed_origins = [VERCEL_FRONTEND_URL]
-
+        # Opcional: permitir http si es necesario para ngrok local
+        # allowed_origins.append(NGROK_URL.replace("https://", "http://"))
+    else: log.warning(f"NGROK_URL format not recognized or insecure: {NGROK_URL}")
 log.info("Configuring CORS", allowed_origins=allowed_origins)
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins, # Lista de orígenes permitidos
-    allow_credentials=True,        # Permite cookies/headers de auth
-    allow_methods=["*"],           # Métodos permitidos (GET, POST, etc.)
-    allow_headers=["*", "Authorization", "Content-Type", "X-Requested-With"], # Headers permitidos
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*", "Authorization", "Content-Type", "X-Requested-With"],
 )
 
-
-# Podrías añadir otros middlewares aquí (ej: tracing con OpenTelemetry)
-
 # --- Routers ---
-# Incluir el router principal del gateway
 app.include_router(gateway_router.router)
+# --- NUEVO: Incluir user_router ---
+app.include_router(user_router.router)
 
-# --- Endpoints Básicos del Propio Gateway ---
+# --- Endpoints Básicos del Propio Gateway (sin cambios) ---
 @app.get("/", tags=["Gateway Status"], summary="Root endpoint")
 async def root():
-    """Endpoint raíz para verificar que el Gateway está activo."""
     return {"message": f"{settings.PROJECT_NAME} is running!"}
 
-@app.get("/health",
-          tags=["Gateway Status"],
-          summary="Kubernetes Health Check",
-          response_description="Returns 'healthy' if the gateway is operational.",
-          status_code=status.HTTP_200_OK,
-          responses={
-              status.HTTP_503_SERVICE_UNAVAILABLE: {"description": "Gateway HTTP client is not ready"}
-          })
-async def health_check(
-    # Usar la dependencia para asegurar que el cliente está listo
-    client: httpx.AsyncClient = Depends(gateway_router.get_client)
-):
-    """
-    Endpoint de health check para Kubernetes Liveness/Readiness probes.
-    Verifica si el cliente HTTP interno está inicializado y no cerrado.
-    Si get_client() falla, devolverá 503 automáticamente.
-    """
-    log.debug("Health check endpoint called, client is available.")
-    # Podrías añadir chequeos pasivos adicionales si es necesario (ej: config cargada)
-    return {"status": "healthy", "service": settings.PROJECT_NAME}
+@app.get("/health", tags=["Gateway Status"], summary="Kubernetes Health Check", status_code=status.HTTP_200_OK)
+async def health_check(client: httpx.AsyncClient = Depends(gateway_router.get_client)):
+     # Verificar también cliente admin si es crítico
+     admin_client: Optional[SupabaseClient] = supabase_admin_client
+     if not admin_client:
+         log.error("Health check failed: Supabase Admin Client not available.")
+         raise HTTPException(status_code=503, detail="Gateway service dependency unavailable (Admin Client).")
+     log.debug("Health check passed.")
+     return {"status": "healthy", "service": settings.PROJECT_NAME}
 
-# --- Manejador de Excepciones Global (personalizado) ---
-# Captura las HTTPException y las loguea de forma estructurada
+
+# --- Manejadores de Excepciones Globales (sin cambios) ---
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    # Usar el logger vinculado con request_id si existe
+    # ... (código existente) ...
     req_id = structlog.contextvars.get_contextvars().get("request_id", "N/A")
     bound_log = log.bind(request_id=req_id)
+    bound_log.warning("HTTP Exception occurred", status_code=exc.status_code, detail=exc.detail)
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
 
-    bound_log.warning(
-        "HTTP Exception occurred",
-        status_code=exc.status_code,
-        detail=exc.detail,
-        method=request.method,
-        path=request.url.path,
-        client_ip=request.client.host if request.client else "N/A",
-        headers=dict(exc.headers) if exc.headers else None # Loguear headers de la excepción (ej: WWW-Authenticate)
-    )
-    # Devolver la respuesta JSON estándar para HTTPException
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"detail": exc.detail},
-        headers=exc.headers, # Preservar headers como WWW-Authenticate
-    )
 
-# Captura cualquier otra excepción no manejada y devuelve un 500 genérico
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
+    # ... (código existente) ...
     req_id = structlog.contextvars.get_contextvars().get("request_id", "N/A")
     bound_log = log.bind(request_id=req_id)
+    bound_log.exception("Unhandled internal server error occurred in gateway")
+    return JSONResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content={"detail": "An internal server error occurred."})
 
-    bound_log.exception(
-        "Unhandled internal server error occurred in gateway",
-        method=request.method,
-        path=request.url.path,
-        client_ip=request.client.host if request.client else "N/A",
-        error_type=type(exc).__name__,
-        error=str(exc)
-    )
-    # Devolver una respuesta genérica 500 para no exponer detalles internos
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": "An internal server error occurred."},
-    )
-
-log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start.")
-
-# --- Ejecución Local (Opcional, para desarrollo) ---
-# if __name__ == "__main__":
-#     print(f"--- Starting {settings.PROJECT_NAME} locally with Uvicorn ---")
-#     uvicorn.run(
-#         "app.main:app",
-#         host="0.0.0.0",
-#         port=8080, # Puerto del Gateway, diferente a los microservicios
-#         reload=True, # Activar reload para desarrollo (¡cuidado con el cliente HTTP!)
-#         log_level=settings.LOG_LEVEL.lower(),
-#         # Considera usar el loop uvloop para mejor rendimiento si está instalado
-#         # loop="uvloop",
-#         # http="httptools" # También puede mejorar rendimiento
-#     )
-
-
+log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start.") 
 ```
 
 ## File: `app\routers\__init__.py`
@@ -917,6 +904,168 @@ else:
      @router.api_route("/api/v1/auth/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"], include_in_schema=False)
      async def auth_not_configured(path: str):
          raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Authentication endpoint proxy not configured in the gateway.")
+```
+
+## File: `app\routers\user_router.py`
+```py
+# api-gateway/app/routers/user_router.py
+from fastapi import APIRouter, Depends, HTTPException, status, Body
+from typing import Annotated, Dict, Any, Optional
+import structlog
+from pydantic import BaseModel, Field # Para el cuerpo de la petición (opcional)
+
+from app.auth.auth_middleware import InitialAuth # Usar la dependencia que NO requiere company_id
+from app.utils.supabase_admin import get_supabase_admin_client
+from app.core.config import settings
+from supabase import Client as SupabaseClient # Tipado para el cliente admin
+from gotrue.errors import AuthApiError # Para capturar errores específicos de Supabase Admin
+
+log = structlog.get_logger(__name__)
+router = APIRouter(prefix="/api/v1/users", tags=["Users"])
+
+# Opcional: Modelo Pydantic si queremos pasar company_id en el body
+# class CompanyAssociationRequest(BaseModel):
+#     company_id: str = Field(..., description="The Company ID to associate with the user.")
+
+@router.post(
+    "/me/ensure-company",
+    status_code=status.HTTP_200_OK,
+    summary="Ensure User Company Association",
+    description="Checks if the authenticated user has a company ID associated in their token metadata. If not, attempts to associate a default company ID using admin privileges.",
+    response_description="Returns success message if association exists or was successful.",
+    responses={
+        status.HTTP_400_BAD_REQUEST: {"description": "Default Company ID not configured"},
+        status.HTTP_401_UNAUTHORIZED: {"description": "Authentication token missing or invalid"},
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {"description": "Failed to update user metadata"},
+    }
+)
+async def ensure_company_association(
+    # Usar InitialAuth: valida token pero no requiere company_id
+    user_payload: InitialAuth,
+    # Inyectar cliente Supabase Admin
+    supabase_admin: Annotated[SupabaseClient, Depends(get_supabase_admin_client)],
+    # Opcional: Recibir company_id del body (menos seguro, preferible determinar en backend)
+    # request_body: Optional[CompanyAssociationRequest] = None
+):
+    user_id = user_payload.get("sub")
+    current_company_id = user_payload.get("company_id") # Puede ser None
+
+    log_ctx = {"user_id": user_id}
+    log.info("Ensure company association endpoint called.", **log_ctx)
+
+    if current_company_id:
+        log.info("User already has company ID associated.", company_id=current_company_id, **log_ctx)
+        return {"message": "Company association already exists."}
+
+    # Determinar el Company ID a asignar
+    # Opción 1: Usar el default configurado en settings (recomendado para empezar)
+    company_id_to_assign = settings.DEFAULT_COMPANY_ID
+    if not company_id_to_assign:
+        log.error("Cannot associate company: GATEWAY_DEFAULT_COMPANY_ID is not configured.", **log_ctx)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server configuration error: Default company ID not set."
+        )
+
+    # Opción 2: Usar el ID del body (si se implementa el modelo Pydantic)
+    # if request_body:
+    #    company_id_to_assign = request_body.company_id
+    # else:
+    #    # Fallar si se esperaba del body y no vino
+    #    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Company ID required in request body.")
+
+    # Opción 3: Lógica más compleja (ej: lookup por email domain) - implementar aquí si es necesario
+
+    log.info(f"Attempting to associate user with Company ID: {company_id_to_assign}", **log_ctx)
+
+    try:
+        # Obtener metadatos existentes para no sobrescribir otros datos
+        # Nota: Esto requiere otra llamada, puede ser opcional si sabes que app_metadata está vacío
+        get_user_response = await supabase_admin.auth.admin.get_user_by_id(user_id)
+        existing_app_metadata = get_user_response.user.app_metadata or {}
+        existing_user_metadata = get_user_response.user.user_metadata or {} # Preservar user_metadata también
+
+        # Crear nuevos metadatos fusionando los existentes con el nuevo company_id
+        new_app_metadata = {**existing_app_metadata, "company_id": company_id_to_assign}
+        # Podrías añadir roles aquí también si es necesario:
+        # new_app_metadata["roles"] = ["user"] # Ejemplo
+
+        update_response = await supabase_admin.auth.admin.update_user_by_id(
+            user_id,
+            attributes={
+                'app_metadata': new_app_metadata,
+                # Opcional: Actualizar user_metadata si es necesario, pero usualmente no desde aquí
+                # 'user_metadata': existing_user_metadata
+            }
+        )
+        log.info("Successfully updated user app_metadata with company ID.", company_id=company_id_to_assign, **log_ctx)
+        # update_response.user contiene el usuario actualizado
+        return {"message": "Company association successful.", "company_id": company_id_to_assign}
+
+    except AuthApiError as e:
+        log.error(f"Supabase Admin API error during user update: {e}", status_code=e.status, **log_ctx)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update user data in authentication system: {e.message}"
+        )
+    except Exception as e:
+        log.exception("Unexpected error during company association.", **log_ctx)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while associating company."
+        )
+```
+
+## File: `app\utils\supabase_admin.py`
+```py
+# api-gateway/app/utils/supabase_admin.py
+from supabase.client import Client, create_client
+# from supabase.lib.client_options import ClientOptions # No necesitamos options por ahora
+from functools import lru_cache
+import structlog
+
+from app.core.config import settings
+
+log = structlog.get_logger(__name__)
+
+@lru_cache()
+def get_supabase_admin_client() -> Client:
+    """
+    Crea y devuelve un cliente Supabase inicializado con la Service Role Key.
+    Utiliza caché para devolver la misma instancia.
+
+    Raises:
+        ValueError: Si la URL de Supabase o la Service Role Key no están configuradas.
+
+    Returns:
+        Instancia del cliente Supabase Admin.
+    """
+    supabase_url = settings.SUPABASE_URL
+    # --- MODIFICACIÓN: Acceder a la clave como string normal ---
+    service_key = settings.SUPABASE_SERVICE_ROLE_KEY
+    # ----------------------------------------------------------
+
+    if not supabase_url:
+        log.critical("Supabase URL is not configured for Admin Client.")
+        raise ValueError("Supabase URL not configured in settings.")
+    # --- MODIFICACIÓN: Validar el placeholder como string ---
+    if not service_key or service_key == "YOUR_SUPABASE_SERVICE_ROLE_KEY_HERE":
+        log.critical("Supabase Service Role Key is not configured or using default for Admin Client.")
+        raise ValueError("Supabase Service Role Key not configured securely in settings.")
+    # -------------------------------------------------------
+
+    log.info("Initializing Supabase Admin Client...")
+    try:
+        # Pasar la clave como string directamente
+        supabase_admin: Client = create_client(supabase_url, service_key)
+        log.info("Supabase Admin Client initialized successfully.")
+        return supabase_admin
+    except Exception as e:
+        log.exception("Failed to initialize Supabase Admin Client", error=e)
+        raise ValueError(f"Failed to initialize Supabase Admin Client: {e}")
+
+# Instancia global (opcional, pero común con lru_cache)
+# supabase_admin_client = get_supabase_admin_client() # Podría llamarse aquí o bajo demanda
 ```
 
 ## File: `pyproject.toml`
