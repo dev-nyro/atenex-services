@@ -11,22 +11,23 @@ Este servicio actúa como el **API Gateway** para la plataforma SaaS B2B de Nyro
     *   Valida la **expiración** (`exp`).
     *   Valida la **audiencia** (`aud` debe ser `'authenticated'`).
     *   Verifica la presencia de **claims requeridos** (`sub`, `aud`, `exp`).
-    *   **Extrae y requiere el `company_id`** del claim `app_metadata` dentro del token. Si falta, la solicitud es rechazada (403 Forbidden).
+    *   **Para rutas protegidas estándar:** Extrae y **requiere** el `company_id` del claim `app_metadata` dentro del token. Si falta, la solicitud es rechazada (403 Forbidden).
+    *   **Para asociación inicial:** Proporciona un endpoint (`/api/v1/users/me/ensure-company`) que valida el token pero *no* requiere `company_id` inicialmente, permitiendo asociar uno.
     *   Asegura que solo las solicitudes autenticadas y autorizadas lleguen a los servicios protegidos.
+*   **Asociación de Compañía (Inicial):**
+    *   Provee un endpoint (`POST /api/v1/users/me/ensure-company`) para que usuarios recién autenticados (sin `company_id` en su token) puedan ser asociados a una compañía.
+    *   Utiliza el cliente **Supabase Admin** (con la `Service Role Key`) para actualizar el `app_metadata` del usuario con un `company_id` (generalmente uno por defecto configurable).
 *   **Inyección de Headers:** Añade headers críticos a las solicitudes reenviadas a los servicios backend, basados en el payload del token validado:
     *   `X-Company-ID`: Extraído de `app_metadata.company_id`.
     *   `X-User-ID`: Extraído del claim `sub` (Subject/User ID de Supabase).
     *   `X-User-Email`: Extraído del claim `email`.
 *   **Proxy Inverso:** Reenvía eficientemente las solicitudes (incluyendo cuerpo y query params) a los servicios correspondientes utilizando un cliente HTTP asíncrono (`httpx`).
-*   **Centralized CORS:** Gestiona la configuración de Cross-Origin Resource Sharing (CORS) en un solo lugar, permitiendo el acceso desde frontends específicos (localhost, Vercel, Ngrok).
-*   **Punto de Observabilidad:**
-    *   **Logging Estructurado (JSON):** Utiliza `structlog` para logs detallados y consistentes.
-    *   **Request ID:** Genera/propaga un `X-Request-ID` para trazar solicitudes.
-    *   **Timing:** Mide y loguea el tiempo de procesamiento de cada solicitud (`X-Process-Time`).
-*   **Manejo de Errores:** Proporciona respuestas de error estandarizadas y loguea excepciones no controladas.
-*   **Health Check:** Endpoint `/health` para verificaciones de estado (Kubernetes probes).
+*   **Centralized CORS:** Gestiona la configuración de Cross-Origin Resource Sharing (CORS) en un solo lugar.
+*   **Punto de Observabilidad:** Logging estructurado (JSON), Request ID, Timing.
+*   **Manejo de Errores:** Respuestas de error estandarizadas y logging de excepciones.
+*   **Health Check:** Endpoint `/health` para verificaciones de estado (Kubernetes probes), incluyendo chequeo del cliente Supabase Admin.
 
-Este Gateway está diseñado para ser ligero y eficiente, enfocándose en la seguridad y el enrutamiento, y delegando la lógica de negocio a los microservicios correspondientes.
+Este Gateway está diseñado para ser ligero y eficiente, enfocándose en la seguridad y el enrutamiento, y delegando la lógica de negocio a los microservicios correspondientes, pero también manejando la lógica crítica de asociación inicial de compañía.
 
 ## 2. Arquitectura General del Proyecto (Posición del Gateway)
 
@@ -37,8 +38,9 @@ flowchart TD
 
     subgraph KubernetesCluster ["Kubernetes Cluster (nyro-develop ns)"]
         direction LR
-        C -- Valida JWT -->|Añade Headers:<br/>X-Company-ID,<br/>X-User-ID,<br/>X-User-Email| I["Ingest Service API"]
-        C -- Valida JWT -->|Añade Headers:<br/>X-Company-ID,<br/>X-User-ID,<br/>X-User-Email| Q["Query Service API"]
+        C -- Valida JWT (Requiere company_id) -->|Añade Headers:<br/>X-Company-ID,<br/>X-User-ID,<br/>X-User-Email| I["Ingest Service API"]
+        C -- Valida JWT (Requiere company_id) -->|Añade Headers:<br/>X-Company-ID,<br/>X-User-ID,<br/>X-User-Email| Q["Query Service API"]
+        C -- Valida JWT (SIN company_id) -->|Llama a Supabase Admin API<br/>(Actualiza app_metadata)| SupaAdmin["Supabase Admin API<br/>(via utils/supabase_admin)"]
         C -- Proxy Directo (Opcional) -->|Sin validación JWT en Gateway| Auth["(Opcional) Auth Service<br/>o Supabase Directo"]
 
         I --> DBi[("Supabase (Metadata)")]
@@ -52,27 +54,30 @@ flowchart TD
         Q --> Emb[("OpenAI Embedding API")]
 
         Auth --> DBa[("Supabase Auth")]
+        SupaAdmin --> DBa # El admin API modifica auth.users
     end
 
     Supabase[("Supabase<br/>(Auth, DB)")] -->|Emite JWT| A
-    Supabase -->|JWT Secret| C
+    Supabase -->|JWT Secret, Service Key| C
 ```
 
 ## 3. Características Clave
 
-*   **Proxy Inverso Asíncrono:** Reenvía tráfico a `ingest-service` y `query-service` usando `httpx`. Soporta streaming de request/response bodies.
-*   **Validación de Tokens JWT de Supabase:** Verifica tokens usando `python-jose`. Valida firma, expiración, audiencia (`'authenticated'`), claims requeridos (`sub`, `aud`, `exp`), y la presencia obligatoria de `company_id` en `app_metadata`.
+*   **Proxy Inverso Asíncrono:** Reenvía tráfico a `ingest-service` y `query-service` usando `httpx`.
+*   **Validación de Tokens JWT de Supabase:** Verifica tokens (`python-jose`). Valida firma, expiración, audiencia (`'authenticated'`), claims requeridos (`sub`, `aud`, `exp`). **Requiere `company_id` en `app_metadata` para rutas estándar.**
+*   **Asociación Inicial de Compañía:** Endpoint dedicado (`/api/v1/users/me/ensure-company`) que valida el token sin requerir `company_id` y usa la **Supabase Service Role Key** para actualizar `app_metadata` del usuario.
 *   **Inyección de Headers de Contexto:** Añade `X-Company-ID`, `X-User-ID`, `X-User-Email` a las solicitudes downstream.
-*   **Routing basado en Path:** Usa FastAPI para dirigir `/api/v1/ingest/*` e `/api/v1/query/*`.
-*   **Autenticación por Ruta:** Utiliza dependencias (`Depends(require_user)`) de FastAPI para proteger rutas específicas.
-*   **Cliente HTTP Asíncrono Reutilizable:** Gestiona un pool de conexiones `httpx` a través del ciclo de vida de FastAPI (`lifespan`) para eficiencia.
-*   **Logging Estructurado (JSON):** Logs detallados con `structlog`, incluyendo `request_id`, `user_id`, `company_id` cuando aplique.
-*   **Configuración Centralizada:** Carga configuración desde variables de entorno y `.env` (`pydantic-settings`), con prefijo `GATEWAY_`. **Incluye verificación crítica para el secreto JWT.**
-*   **Middleware:** Incluye middleware para CORS, Request ID y timing.
-*   **Manejo de Errores:** Handlers globales para `HTTPException` y errores genéricos (500).
-*   **Despliegue Contenerizado:** Dockerfile y manifests de Kubernetes listos.
-*   **Health Check:** Endpoint `/health` para K8s probes, verifica disponibilidad del cliente HTTP interno.
-*   **(Opcional) Proxy de Autenticación:** Puede reenviar tráfico a un servicio de autenticación (`/api/v1/auth/*`) sin requerir validación de token en el gateway.
+*   **Routing basado en Path:** Usa FastAPI para dirigir `/api/v1/ingest/*`, `/api/v1/query/*`, y `/api/v1/users/*`.
+*   **Autenticación por Ruta:** Utiliza dependencias (`StrictAuth`, `InitialAuth`) de FastAPI para proteger rutas con diferentes requisitos.
+*   **Cliente HTTP Asíncrono Reutilizable:** Gestiona un pool de conexiones `httpx`.
+*   **Cliente Supabase Admin Reutilizable:** Gestiona una instancia del cliente Supabase (`supabase-py`) inicializada con la Service Role Key.
+*   **Logging Estructurado (JSON):** Logs detallados con `structlog`.
+*   **Configuración Centralizada:** Carga configuración desde variables de entorno (`pydantic-settings`), prefijo `GATEWAY_`. **Incluye verificaciones críticas para secretos (JWT y Service Key).**
+*   **Middleware:** CORS, Request ID, Timing.
+*   **Manejo de Errores:** Handlers globales.
+*   **Despliegue Contenerizado:** Dockerfile y manifests K8s listos.
+*   **Health Check:** Endpoint `/health` verifica cliente HTTP y cliente Supabase Admin.
+*   **(Opcional) Proxy de Autenticación:** Ruta `/api/v1/auth/*`.
 
 ## 4. Pila Tecnológica Principal
 
@@ -80,10 +85,11 @@ flowchart TD
 *   **Framework API:** FastAPI
 *   **Cliente HTTP:** HTTPX
 *   **Validación JWT:** python-jose[cryptography]
+*   **Cliente Supabase Admin:** supabase-py
 *   **Configuración:** pydantic-settings
 *   **Logging:** structlog
 *   **Despliegue:** Docker, Kubernetes, Gunicorn + Uvicorn
-*   **Autenticación:** Supabase (emisor de JWTs)
+*   **Autenticación:** Supabase (emisor de JWTs, proveedor de identidad)
 
 ## 5. Estructura de la Codebase
 
@@ -91,213 +97,218 @@ flowchart TD
 api-gateway/
 ├── app/
 │   ├── __init__.py
-│   ├── auth/                 # Lógica de autenticación y validación de tokens Supabase
+│   ├── auth/                 # Lógica de autenticación y validación de tokens
 │   │   ├── __init__.py
-│   │   ├── auth_middleware.py # Dependencias FastAPI (get_current_user_payload, require_user)
-│   │   └── jwt_handler.py     # Función verify_token (lógica central de validación Supabase JWT)
+│   │   ├── auth_middleware.py # Dependencias (StrictAuth, InitialAuth, etc.)
+│   │   └── jwt_handler.py     # Función verify_token (con require_company_id)
 │   ├── core/                 # Configuración y Logging Core
 │   │   ├── __init__.py
-│   │   ├── config.py         # Carga de Settings (pydantic-settings), validación JWT_SECRET
-│   │   └── logging_config.py # Configuración de structlog (JSON output)
-│   ├── main.py               # Entrypoint FastAPI, lifespan (cliente httpx), middlewares (CORS, ID, Timing), health checks, exception handlers
-│   └── routers/              # Definición de rutas proxy
-│       ├── __init__.py
-│       └── gateway_router.py # Lógica principal de proxying, inyección de headers, definición de rutas (/ingest, /query, /auth)
+│   │   ├── config.py         # Carga de Settings (vars, secretos)
+│   │   └── logging_config.py # Configuración de structlog (JSON)
+│   ├── main.py               # Entrypoint FastAPI, lifespan (clientes), middlewares, health checks, handlers
+│   ├── routers/              # Definición de rutas
+│   │   ├── __init__.py
+│   │   ├── gateway_router.py # Rutas proxy (/ingest, /query, /auth)
+│   │   └── user_router.py    # Rutas de usuario (/users/me/ensure-company)
+│   └── utils/                # Utilidades
+│       └── supabase_admin.py # Cliente Supabase Admin
 ├── k8s/                      # Manifests de Kubernetes
 │   ├── gateway-configmap.yaml
 │   ├── gateway-deployment.yaml
-│   ├── gateway-secret.yaml   # (Estructura, valor real en gestor de secretos)
+│   ├── gateway-secret.yaml   # (Estructura, valores reales en gestor de secretos)
 │   └── gateway-service.yaml
 ├── Dockerfile                # Define cómo construir la imagen Docker
-├── pyproject.toml            # Define dependencias (Poetry)
+├── pyproject.toml            # Define dependencias (Poetry) - ¡Incluye supabase!
 ├── poetry.lock               # Lockfile de dependencias
 └── README.md                 # Este archivo
 ```
 
 ## 6. Configuración
 
-El servicio se configura principalmente mediante variables de entorno (o un archivo `.env` para desarrollo local), utilizando el prefijo `GATEWAY_`.
+Configuración mediante variables de entorno (prefijo `GATEWAY_`).
 
 **Variables de Entorno Clave:**
 
-| Variable                                | Descripción                                                                 | Ejemplo (Valor Esperado en K8s)                                  | Gestionado por |
-| :-------------------------------------- | :-------------------------------------------------------------------------- | :--------------------------------------------------------------- | :------------- |
-| `GATEWAY_LOG_LEVEL`                     | Nivel de logging (DEBUG, INFO, WARNING, ERROR).                             | `INFO`                                                           | ConfigMap      |
-| `GATEWAY_INGEST_SERVICE_URL`            | URL base del Ingest Service API (dentro del cluster).                         | `http://ingest-api-service.nyro-develop.svc.cluster.local:80`  | ConfigMap      |
-| `GATEWAY_QUERY_SERVICE_URL`             | URL base del Query Service API (dentro del cluster).                          | `http://query-service.nyro-develop.svc.cluster.local:80`     | ConfigMap      |
-| `GATEWAY_AUTH_SERVICE_URL`              | (Opcional) URL base del Auth Service para proxy directo.                      | `http://auth-service.nyro-develop.svc.cluster.local:80`      | ConfigMap      |
-| **`GATEWAY_JWT_SECRET`**                | **Clave secreta JWT de tu proyecto Supabase.** ¡Crítico para seguridad!       | *Valor secreto obtenido de Supabase*                             | **Secret**     |
-| `GATEWAY_JWT_ALGORITHM`                 | Algoritmo usado para los tokens JWT (debe coincidir con Supabase).           | `HS256` (Típico en Supabase)                                     | ConfigMap      |
-| `GATEWAY_HTTP_CLIENT_TIMEOUT`           | Timeout (segundos) para llamadas a servicios downstream.                      | `60`                                                             | ConfigMap      |
-| `GATEWAY_HTTP_CLIENT_MAX_CONNECTIONS`   | Máximo número total de conexiones salientes.                                | `100`                                                            | ConfigMap      |
-| `GATEWAY_HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS` | Máximo número de conexiones keep-alive.                           | `20`                                                             | ConfigMap      |
-| `VERCEL_FRONTEND_URL`                   | (Opcional) URL del frontend en Vercel para CORS.                            | `https://<tu-app>.vercel.app`                                     | ConfigMap/Env  |
-| `NGROK_URL`                             | (Opcional) URL de ngrok para desarrollo/pruebas CORS.                       | `https://<tu-id>.ngrok-free.app`                                 | ConfigMap/Env  |
-| `PORT`                                  | Puerto en el que corre Gunicorn dentro del contenedor.                        | `8080` (coincide con Dockerfile/Deployment)                       | Deployment     |
+| Variable                                | Descripción                                                                      | Ejemplo (Valor Esperado en K8s)                                  | Gestionado por |
+| :-------------------------------------- | :------------------------------------------------------------------------------- | :--------------------------------------------------------------- | :------------- |
+| `GATEWAY_LOG_LEVEL`                     | Nivel de logging (DEBUG, INFO, WARNING, ERROR).                                  | `INFO`                                                           | ConfigMap      |
+| `GATEWAY_INGEST_SERVICE_URL`            | URL base del Ingest Service API.                                                 | `http://ingest-api-service.nyro-develop.svc.cluster.local:80`  | ConfigMap      |
+| `GATEWAY_QUERY_SERVICE_URL`             | URL base del Query Service API.                                                  | `http://query-service.nyro-develop.svc.cluster.local:80`     | ConfigMap      |
+| `GATEWAY_AUTH_SERVICE_URL`              | (Opcional) URL base del Auth Service para proxy directo.                           | `http://auth-service.nyro-develop.svc.cluster.local:80`      | ConfigMap      |
+| **`GATEWAY_JWT_SECRET`**                | **Clave secreta JWT de tu proyecto Supabase.** (Para validar tokens de usuario)   | *Valor secreto obtenido de Supabase*                             | **Secret**     |
+| `GATEWAY_JWT_ALGORITHM`                 | Algoritmo usado para los tokens JWT (debe coincidir con Supabase).                | `HS256`                                                          | ConfigMap      |
+| **`GATEWAY_SUPABASE_URL`**              | **URL de tu proyecto Supabase.** (Necesaria para el cliente Admin)                  | `https://<tu-ref>.supabase.co`                                   | ConfigMap      |
+| **`GATEWAY_SUPABASE_SERVICE_ROLE_KEY`** | **Clave de Servicio (Admin) de Supabase.** ¡MUY SENSIBLE! (Para actualizar users) | *Valor secreto obtenido de Supabase*                             | **Secret**     |
+| **`GATEWAY_DEFAULT_COMPANY_ID`**        | **UUID de la compañía por defecto** a asignar a nuevos usuarios.                   | *UUID válido de una compañía*                                    | ConfigMap      |
+| `GATEWAY_HTTP_CLIENT_TIMEOUT`           | Timeout (segundos) para llamadas HTTP downstream.                                | `60`                                                             | ConfigMap      |
+| `GATEWAY_HTTP_CLIENT_MAX_CONNECTIONS`   | Máximo número total de conexiones HTTP salientes.                               | `200` (Ajustado)                                                 | ConfigMap      |
+| `GATEWAY_HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS` | Máximo número de conexiones HTTP keep-alive.                            | `100` (Ajustado)                                                 | ConfigMap      |
+| `VERCEL_FRONTEND_URL`                   | (Opcional) URL del frontend en Vercel para CORS.                                 | `https://<tu-app>.vercel.app`                                     | ConfigMap/Env  |
+| `NGROK_URL`                             | (Opcional) URL de ngrok para desarrollo/pruebas CORS.                            | `https://<tu-id>.ngrok-free.app`                                 | ConfigMap/Env  |
+| `PORT`                                  | Puerto interno del contenedor (Gunicorn).                                        | `8080`                                                           | Deployment     |
 
-**¡ADVERTENCIA DE SEGURIDAD JWT!**
+**¡ADVERTENCIAS DE SEGURIDAD IMPORTANTES!**
 
-*   La variable `GATEWAY_JWT_SECRET` **DEBE** configurarse con el secreto JWT real de tu proyecto Supabase (lo encuentras en la configuración de tu proyecto Supabase > API > JWT Settings).
-*   **NUNCA** despliegues con el valor por defecto `"YOUR_DEFAULT_JWT_SECRET_KEY_CHANGE_ME_IN_ENV_OR_SECRET"`. El código en `app/core/config.py` incluye una verificación que emitirá logs CRÍTICOS si se detecta el valor por defecto.
-*   En Kubernetes, este valor debe gestionarse a través de un `Secret` (`api-gateway-secrets`), no un `ConfigMap`.
+*   **`GATEWAY_JWT_SECRET`:** Debe ser el secreto JWT real de Supabase. **NUNCA** usar el valor por defecto. Gestionar vía K8s Secret.
+*   **`GATEWAY_SUPABASE_SERVICE_ROLE_KEY`:** Esta clave otorga **acceso total** a tu backend de Supabase, ¡trátala con extremo cuidado! **NUNCA** usar el valor placeholder. **DEBE** gestionarse vía K8s Secret.
+*   **`GATEWAY_SUPABASE_URL`:** Debe ser la URL correcta de tu proyecto Supabase.
+*   **`GATEWAY_DEFAULT_COMPANY_ID`:** Debe ser un UUID válido correspondiente a una compañía real en tu sistema.
 
 **Kubernetes:**
 
-*   La configuración general se inyecta a través de `api-gateway-config` (ConfigMap).
-*   El secreto JWT se inyecta a través de `api-gateway-secrets` (Secret).
-*   Ambos deben existir en el namespace `nyro-develop`. Revisa los archivos en `k8s/`.
+*   Configuración general (`GATEWAY_..._URL`, `...TIMEOUT`, `LOG_LEVEL`, `DEFAULT_COMPANY_ID`, `SUPABASE_URL`) -> `api-gateway-config` (ConfigMap).
+*   Secretos (`GATEWAY_JWT_SECRET`, `GATEWAY_SUPABASE_SERVICE_ROLE_KEY`) -> `api-gateway-secrets` (Secret).
+*   Ambos deben existir en el namespace `nyro-develop`.
 
-## 7. Flujo de Autenticación (Detallado con Supabase JWT)
+## 7. Flujo de Autenticación y Asociación de Compañía
 
-1.  **Solicitud del Cliente:** El cliente (ej: frontend) obtiene un token JWT de Supabase después de que el usuario inicia sesión. Envía una solicitud a una ruta protegida del Gateway (ej: `/api/v1/ingest/upload`) incluyendo el header: `Authorization: Bearer <supabase_jwt_token>`.
-2.  **Recepción en Gateway:** FastAPI recibe la solicitud. Para rutas protegidas con `Depends(require_user)`, el middleware de autenticación se activa.
-3.  **Extracción del Token:** La dependencia `get_current_user_payload` utiliza `HTTPBearer` para extraer el token del header `Authorization`.
-4.  **Validación del Token (`verify_token`):**
-    *   Se llama a la función `verify_token` en `app/auth/jwt_handler.py`.
-    *   **Firma:** Se verifica la firma del token usando `GATEWAY_JWT_SECRET` y `GATEWAY_JWT_ALGORITHM`. (Fallo -> 401)
-    *   **Expiración:** Se comprueba si el claim `exp` es futuro. (Fallo -> 401)
-    *   **Audiencia:** Se comprueba si el claim `aud` es igual a `'authenticated'`. (Fallo -> 401)
-    *   **Claims Requeridos:** Se verifica la presencia de `sub`, `aud`, `exp`. (Fallo -> 401)
-    *   **Extracción y Validación de `company_id`:** Se busca `company_id` dentro del claim `app_metadata` del payload decodificado.
-        *   Si `company_id` **no se encuentra**, se lanza `HTTPException(403, detail="User authenticated, but company association is missing in token.")`. El usuario está autenticado (token válido) pero no autorizado para proceder en este contexto.
-        *   Si `company_id` **se encuentra**, se añade al diccionario del payload que será devuelto.
-5.  **Resultado de Validación:**
-    *   **Éxito:** `verify_token` devuelve el payload decodificado y validado (incluyendo `company_id`, `sub`, `email`, etc.).
-    *   **Fallo:** `verify_token` lanza una `HTTPException` (normalmente 401 o 403) con detalles específicos y headers `WWW-Authenticate`. FastAPI detiene el procesamiento y devuelve el error al cliente.
-6.  **Dependencia `require_user`:**
-    *   Si `get_current_user_payload` devolvió un payload válido, `require_user` simplemente lo devuelve, permitiendo que la ejecución continúe hacia la función de la ruta.
-    *   Si `get_current_user_payload` devolvió `None` (porque no se envió el header `Authorization`), `require_user` lanza `HTTPException(401, detail="Not authenticated")`.
-7.  **Procesamiento en el Router (`gateway_router.py`):**
-    *   La función de la ruta (ej: `proxy_ingest_service`) recibe el `user_payload` validado.
-    *   La función `_proxy_request` extrae la información necesaria del `user_payload`:
-        *   `user_payload['sub']` -> Header `X-User-ID`
-        *   `user_payload['company_id']` -> Header `X-Company-ID`
-        *   `user_payload['email']` -> Header `X-User-Email`
-    *   Estos headers se añaden a la solicitud que se enviará al microservicio backend.
-8.  **Proxy al Backend:** La solicitud, ahora enriquecida con los headers de contexto, se reenvía al microservicio correspondiente (Ingesta o Consulta).
-9.  **Respuesta del Backend:** La respuesta del microservicio se devuelve al cliente a través del Gateway.
+Este Gateway implementa dos flujos principales relacionados con la autenticación:
+
+**A) Validación Estándar (Rutas Protegidas como `/ingest`, `/query`):**
+
+1.  **Solicitud del Cliente:** Frontend envía request con `Authorization: Bearer <token_con_company_id>`.
+2.  **Recepción y Extracción:** Gateway recibe la solicitud. La dependencia `StrictAuth` (que usa `require_user`) se activa. `get_current_user_payload` extrae el token.
+3.  **Validación del Token (`verify_token` con `require_company_id=True`):**
+    *   Verifica firma, expiración, audiencia (`'authenticated'`), claims (`sub`, `aud`, `exp`).
+    *   Busca y **requiere** `company_id` en `app_metadata`. Si falta -> **403 Forbidden**.
+    *   Si todo OK, devuelve el payload (incluyendo `company_id`).
+4.  **Dependencia `StrictAuth`:** Confirma que se obtuvo un payload válido.
+5.  **Inyección y Proxy:** El router extrae `X-User-ID`, `X-Company-ID`, `X-User-Email` del payload y los inyecta en la solicitud antes de reenviarla al servicio backend correspondiente.
+
+**B) Asociación Inicial de Compañía (Endpoint `/users/me/ensure-company`):**
+
+1.  **Contexto:** El frontend detecta (tras login/confirmación) que el token JWT del usuario *no* tiene `company_id` en `app_metadata`.
+2.  **Solicitud del Cliente:** Frontend envía `POST /api/v1/users/me/ensure-company` con el token JWT actual (sin `company_id`).
+3.  **Recepción y Extracción:** Gateway recibe la solicitud. La dependencia `InitialAuth` (que usa `require_authenticated_user_no_company_check`) se activa. `_get_user_payload_internal` extrae el token.
+4.  **Validación del Token (`verify_token` con `require_company_id=False`):**
+    *   Verifica firma, expiración, audiencia, claims (`sub`, `aud`, `exp`).
+    *   **NO requiere** `company_id`. Si el token es válido por lo demás, devuelve el payload.
+5.  **Dependencia `InitialAuth`:** Confirma que se obtuvo un payload válido (aunque no tenga `company_id`).
+6.  **Lógica del Endpoint (`ensure_company_association`):**
+    *   Obtiene el `user_id` (`sub`) del payload.
+    *   Determina el `company_id` a asignar (usando `GATEWAY_DEFAULT_COMPANY_ID` de la configuración).
+    *   Obtiene el cliente **Supabase Admin** (inicializado con `GATEWAY_SUPABASE_SERVICE_ROLE_KEY`).
+    *   Llama a `supabase_admin.auth.admin.update_user_by_id()` para actualizar el `app_metadata` del usuario (`user_id`) con el `company_id` asignado.
+7.  **Respuesta al Cliente:** Devuelve 200 OK si la actualización fue exitosa.
+8.  **Refresco en Frontend:** El frontend, al recibir el 200 OK, debe llamar a `supabase.auth.refreshSession()` para obtener un *nuevo* token JWT que ahora incluirá el `company_id` en `app_metadata`. Las futuras llamadas usarán este token actualizado y pasarán la validación estándar (Flujo A).
 
 ## 8. API Endpoints
 
 *   **`GET /`**
-    *   **Descripción:** Endpoint raíz para verificar que el Gateway está activo.
+    *   **Descripción:** Endpoint raíz.
     *   **Autenticación:** No requerida.
     *   **Respuesta:** `{"message": "Nyro API Gateway is running!"}`
 
 *   **`GET /health`**
-    *   **Descripción:** Endpoint de Health Check para Kubernetes (Liveness/Readiness). Verifica si el servicio está operativo y el cliente HTTP interno está listo.
+    *   **Descripción:** Health Check (K8s probes). Verifica cliente HTTP y cliente Supabase Admin.
     *   **Autenticación:** No requerida.
-    *   **Respuesta Exitosa (200 OK):** `{"status": "healthy", "service": "Nyro API Gateway"}`
-    *   **Respuesta Fallida (503 Service Unavailable):** Si el cliente HTTP no está inicializado.
+    *   **Respuesta OK (200):** `{"status": "healthy", "service": "Nyro API Gateway"}`
+    *   **Respuesta Error (503):** Si alguna dependencia (cliente HTTP, cliente Admin) no está lista.
 
 *   **`/api/v1/ingest/{path:path}` (Proxy)**
     *   **Métodos:** `GET`, `POST`, `PUT`, `DELETE`, `PATCH`
-    *   **Descripción:** Reenvía todas las solicitudes bajo esta ruta al `Ingest Service` (`GATEWAY_INGEST_SERVICE_URL`).
-    *   **Autenticación:** **Requerida.** Se necesita un `Authorization: Bearer <supabase_jwt_token>` válido. El token debe ser válido (firma, exp, aud='authenticated') y contener `company_id` en `app_metadata`.
+    *   **Descripción:** Reenvía al `Ingest Service`.
+    *   **Autenticación:** **Requerida (StrictAuth).** Token JWT válido con `company_id` en `app_metadata`.
     *   **Headers Inyectados:** `X-Company-ID`, `X-User-ID`, `X-User-Email`.
-    *   **Ejemplo:** `POST /api/v1/ingest/documents`
 
 *   **`/api/v1/query/{path:path}` (Proxy)**
     *   **Métodos:** `GET`, `POST`, `PUT`, `DELETE`, `PATCH`
-    *   **Descripción:** Reenvía todas las solicitudes bajo esta ruta al `Query Service` (`GATEWAY_QUERY_SERVICE_URL`).
-    *   **Autenticación:** **Requerida.** Mismos requisitos que para `/ingest`.
+    *   **Descripción:** Reenvía al `Query Service`.
+    *   **Autenticación:** **Requerida (StrictAuth).** Token JWT válido con `company_id` en `app_metadata`.
     *   **Headers Inyectados:** `X-Company-ID`, `X-User-ID`, `X-User-Email`.
-    *   **Ejemplo:** `POST /api/v1/query/ask`
+
+*   **`POST /api/v1/users/me/ensure-company`**
+    *   **Descripción:** Asocia un `company_id` por defecto al usuario autenticado si aún no tiene uno en su `app_metadata`. Usa privilegios de administrador (Service Role Key).
+    *   **Autenticación:** **Requerida (InitialAuth).** Token JWT válido (firma, exp, aud), pero **no** requiere `company_id` preexistente.
+    *   **Headers Inyectados:** Ninguno (este endpoint actúa sobre Supabase, no hace proxy).
+    *   **Cuerpo (Request):** Vacío (el `company_id` se determina en el backend).
+    *   **Respuesta OK (200):** `{"message": "Company association successful."}` o `{"message": "Company association already exists."}`.
+    *   **Respuesta Error:** 401 (Token inválido/ausente), 500 (Error de configuración o al actualizar Supabase).
 
 *   **`/api/v1/auth/{path:path}` (Proxy Opcional)**
-    *   **Métodos:** `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS`
-    *   **Descripción:** (Si `GATEWAY_AUTH_SERVICE_URL` está configurado) Reenvía todas las solicitudes bajo esta ruta al servicio de autenticación especificado. Útil para endpoints como login, signup, refresh token, etc., que manejan su propia lógica de autenticación/token.
-    *   **Autenticación:** **No requerida por el Gateway.** El Gateway *no* valida el token JWT para estas rutas. Cualquier token enviado se pasa directamente al servicio de autenticación.
-    *   **Headers Inyectados:** Ninguno (a menos que se modifique `_proxy_request` específicamente para este caso).
+    *   **Métodos:** Todos
+    *   **Descripción:** (Si `GATEWAY_AUTH_SERVICE_URL` está configurado) Reenvía al servicio de autenticación.
+    *   **Autenticación:** **No requerida por el Gateway.**
+    *   **Headers Inyectados:** Ninguno.
     *   **Si no está configurado:** Devuelve `501 Not Implemented`.
 
 ## 9. Ejecución Local (Desarrollo)
 
-1.  **Asegúrate de tener Poetry instalado.** ([https://python-poetry.org/docs/#installation](https://python-poetry.org/docs/#installation))
-2.  **Clona el repositorio** (si aún no lo has hecho).
-3.  **Navega al directorio `api-gateway`:**
-    ```bash
-    cd api-gateway
-    ```
-4.  **Instala dependencias:**
-    ```bash
-    poetry install
-    ```
-5.  **Crea un archivo `.env`** en la raíz de `api-gateway/` con las variables necesarias. **¡Usa tu secreto JWT real de Supabase!**
+1.  Instalar Poetry.
+2.  Clonar repo, `cd api-gateway`.
+3.  `poetry install`
+4.  Crear archivo `.env` en `api-gateway/` con:
     ```dotenv
     # api-gateway/.env
 
-    # --- Logging ---
-    GATEWAY_LOG_LEVEL=DEBUG # Más verboso para desarrollo
+    GATEWAY_LOG_LEVEL=DEBUG
 
-    # --- Service URLs (Ajusta si corres otros servicios localmente) ---
-    GATEWAY_INGEST_SERVICE_URL="http://localhost:8001" # Ejemplo: Puerto del Ingest Service local
-    GATEWAY_QUERY_SERVICE_URL="http://localhost:8002"  # Ejemplo: Puerto del Query Service local
-    # GATEWAY_AUTH_SERVICE_URL="http://localhost:8000" # Descomenta si usas un Auth Service local
+    # URLs de servicios locales (ajustar puertos)
+    GATEWAY_INGEST_SERVICE_URL="http://localhost:8001"
+    GATEWAY_QUERY_SERVICE_URL="http://localhost:8002"
+    # GATEWAY_AUTH_SERVICE_URL="http://localhost:8000"
 
-    # --- Supabase JWT Configuration (¡IMPORTANTE!) ---
-    GATEWAY_JWT_SECRET="TU_SUPABASE_JWT_SECRET_REAL_AQUI" # ¡Pega tu secreto de Supabase!
-    GATEWAY_JWT_ALGORITHM="HS256" # Verifica que coincida con Supabase
+    # --- Supabase Config (¡IMPORTANTE!) ---
+    # Secreto para validar tokens de usuario
+    GATEWAY_JWT_SECRET="TU_SUPABASE_JWT_SECRET_REAL_AQUI"
+    GATEWAY_JWT_ALGORITHM="HS256"
+    # URL del proyecto Supabase
+    GATEWAY_SUPABASE_URL="https://<tu-ref>.supabase.co" # <-- TU URL REAL
+    # Clave de Servicio (Admin) - ¡Tratar como secreto!
+    GATEWAY_SUPABASE_SERVICE_ROLE_KEY="TU_SUPABASE_SERVICE_ROLE_KEY_REAL_AQUI"
+    # ID de Compañía por defecto
+    GATEWAY_DEFAULT_COMPANY_ID="TU_UUID_DE_COMPAÑIA_POR_DEFECTO" # <-- UUID VÁLIDO
 
-    # --- HTTP Client Settings (Opcional, usa defaults si no se especifican) ---
+    # HTTP Client (Opcional)
     GATEWAY_HTTP_CLIENT_TIMEOUT=60
-    # GATEWAY_HTTP_CLIENT_MAX_CONNECTIONS=100
-    # GATEWAY_HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS=20
+    GATEWAY_HTTP_CLIENT_MAX_CONNECTIONS=100
+    GATEWAY_HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS=20 # Ajusta si corregiste nombre
 
-    # --- CORS Settings (Opcional, para permitir otros orígenes locales) ---
-    # VERCEL_FRONTEND_URL="http://localhost:3000" # Si tu frontend corre en 3000
-    # NGROK_URL="https://<id>.ngrok-free.app" # Si usas ngrok
-
+    # CORS (Opcional)
+    # VERCEL_FRONTEND_URL="http://localhost:3000"
+    # NGROK_URL="https://<id>.ngrok-free.app"
     ```
-6.  **Ejecuta el servidor Uvicorn:**
+5.  Ejecutar Uvicorn:
     ```bash
     poetry run uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
     ```
-    *   `--host 0.0.0.0`: Escucha en todas las interfaces de red.
-    *   `--port 8080`: Puerto estándar para el gateway (diferente a los microservicios).
-    *   `--reload`: Uvicorn reiniciará automáticamente cuando detecte cambios en el código (útil en desarrollo).
-
-7.  El API Gateway estará disponible en `http://localhost:8080`. Puedes probar los endpoints `/` y `/health`. Para probar rutas protegidas (`/api/v1/ingest/*`, `/api/v1/query/*`), necesitarás enviar una solicitud con un header `Authorization: Bearer <token>` válido obtenido de tu instancia de Supabase.
+6.  Gateway disponible en `http://localhost:8080`.
 
 ## 10. Despliegue
 
 *   **Docker:**
-    1.  Construye la imagen Docker usando el `Dockerfile` proporcionado:
-        ```bash
-        docker build -t ghcr.io/dev-nyro/api-gateway:latest .
-        # O usa tu propio registro de contenedor
-        # docker build -t tu-registro/api-gateway:v1.0.0 .
-        ```
-    2.  Empuja la imagen a tu registro de contenedores (ej: GHCR, Docker Hub, GCR):
-        ```bash
-        docker push ghcr.io/dev-nyro/api-gateway:latest
-        # docker push tu-registro/api-gateway:v1.0.0
-        ```
+    1.  `docker build -t <tu-imagen> .`
+    2.  `docker push <tu-imagen>`
 
 *   **Kubernetes:**
-    1.  **Pre-requisito:** Asegúrate de que el namespace `nyro-develop` existe en tu cluster.
-    2.  **Crear el Secret:** Crea el secreto `api-gateway-secrets` en el namespace `nyro-develop` con el valor real de `GATEWAY_JWT_SECRET`. **¡NO LO COMMITTEES AL REPOSITORIO!**
+    1.  Asegurar namespace `nyro-develop`.
+    2.  **Crear Secretos:** Crear `api-gateway-secrets` en `nyro-develop` con los valores reales de `GATEWAY_JWT_SECRET` y `GATEWAY_SUPABASE_SERVICE_ROLE_KEY`. **¡NO COMMITEAR VALORES REALES!**
         ```bash
+        # Crear o actualizar el secreto
         kubectl create secret generic api-gateway-secrets \
           --namespace nyro-develop \
-          --from-literal=GATEWAY_JWT_SECRET='TU_SUPABASE_JWT_SECRET_REAL_AQUI'
+          --from-literal=GATEWAY_JWT_SECRET='TU_SUPABASE_JWT_SECRET_REAL_AQUI' \
+          --from-literal=GATEWAY_SUPABASE_SERVICE_ROLE_KEY='TU_SUPABASE_SERVICE_ROLE_KEY_REAL_AQUI' \
+          --dry-run=client -o yaml | kubectl apply -f -
         ```
-        *(Reemplaza `'TU_SUPABASE_JWT_SECRET_REAL_AQUI'` con tu secreto)*
-    3.  **Aplicar los Manifests:** Aplica los archivos YAML de la carpeta `k8s/` en el orden correcto (ConfigMap/Secret antes que Deployment):
+        *(Reemplaza los placeholders con tus claves reales)*
+    3.  **Aplicar Manifests:**
         ```bash
+        # Asegúrate que configmap.yaml tenga GATEWAY_SUPABASE_URL y GATEWAY_DEFAULT_COMPANY_ID
         kubectl apply -f k8s/gateway-configmap.yaml -n nyro-develop
-        # El secreto ya fue creado en el paso anterior
+        # El secreto ya fue creado/actualizado
         kubectl apply -f k8s/gateway-deployment.yaml -n nyro-develop
         kubectl apply -f k8s/gateway-service.yaml -n nyro-develop
         ```
-    4.  Verifica que los pods se inicien correctamente y que el servicio esté disponible. El servicio `gateway-service` (tipo ClusterIP por defecto) expondrá el gateway dentro del cluster. Necesitarás un Ingress Controller o un Service tipo LoadBalancer para exponerlo externamente.
+    4.  Verificar pods y servicio.
 
 ## 11. TODO / Mejoras Futuras
 
-*   **Rate Limiting:** Implementar limitación de tasa (ej: usando `slowapi` o soluciones a nivel de Ingress) para proteger los servicios backend contra abuso.
-*   **Tracing Distribuido:** Integrar OpenTelemetry para trazar solicitudes a través del Gateway y los microservicios downstream.
-*   **Caching:** Considerar caching de respuestas para endpoints específicos si aplica (ej: configuración, datos raramente cambiantes).
-*   **Tests de Integración:** Añadir tests que simulen solicitudes completas a través del gateway, incluyendo validación JWT y proxying.
-*   **Refinar Manejo de Errores:** Mapear errores específicos de los servicios downstream a respuestas de error más informativas (sin exponer detalles internos).
-*   **Configuración CORS más granular:** Ajustar `allow_methods`, `allow_headers` de forma más restrictiva para producción.
-*   **WebSockets Proxy:** Si algún servicio backend requiere WebSockets, añadir soporte para proxy WebSocket.
+*   **Rate Limiting.**
+*   **Tracing Distribuido (OpenTelemetry).**
+*   **Caching.**
+*   **Tests de Integración** (incluyendo el flujo de asociación de compañía).
+*   **Manejo de Errores más Refinado.**
+*   **Configuración CORS más Granular.**
+*   **Proxy WebSockets.**
+*   **Lógica más robusta para determinar `company_id`** en lugar de usar solo `GATEWAY_DEFAULT_COMPANY_ID` (ej., basado en invitaciones, dominio de email, selección del usuario).
