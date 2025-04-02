@@ -179,4 +179,4 @@ async def generic_exception_handler(request: Request, exc: Exception):
     bound_log.exception("Unhandled internal server error occurred in gateway")
     return JSONResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content={"detail": "An internal server error occurred."})
 
-log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start.")
+log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start.") 
