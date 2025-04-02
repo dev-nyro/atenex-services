@@ -126,25 +126,35 @@ async def require_user(
 ```py
 # api-gateway/app/auth/jwt_handler.py
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from typing import Dict, Any, List, Optional # Añadir Optional y List
 from jose import JWTError, jwt
 from fastapi import HTTPException, status
 import structlog
 
-# Importar settings refactorizadas
 from app.core.config import settings
 
 log = structlog.get_logger(__name__)
 
 SECRET_KEY = settings.JWT_SECRET
 ALGORITHM = settings.JWT_ALGORITHM
-# Define los claims que esperas encontrar en un token válido
-# Basado en los READMEs, 'company_id' es crucial
-REQUIRED_CLAIMS = ['sub', 'company_id', 'exp'] # 'sub' (subject) y 'exp' (expiration) son estándar
+
+# --- Claims Requeridos de un Token Supabase VÁLIDO ---
+# Ajusta esto según lo que REALMENTE necesites y lo que Supabase incluya.
+# 'sub' (Subject = User ID), 'aud' (Audience), 'exp' (Expiration) son estándar.
+# Necesitas verificar si 'company_id' está directamente o dentro de app_metadata/user_metadata.
+# Si está en metadata, la validación aquí solo asegura que el token es válido,
+# y la extracción del company_id se haría después.
+REQUIRED_CLAIMS = ['sub', 'aud', 'exp'] # Mínimo requerido estándar
+
+# --- Audiencia Esperada (IMPORTANTE) ---
+# Los tokens JWT de Supabase suelen tener 'authenticated' como audiencia para usuarios logueados.
+# Verifica esto en un token real de tu proyecto Supabase.
+EXPECTED_AUDIENCE = 'authenticated'
 
 def verify_token(token: str) -> Dict[str, Any]:
     """
-    Verifica el token JWT proporcionado.
+    Verifica el token JWT usando el secreto y algoritmo de Supabase.
+    Valida la firma, expiración, audiencia y claims requeridos.
 
     Args:
         token: El string del token JWT.
@@ -154,13 +164,13 @@ def verify_token(token: str) -> Dict[str, Any]:
 
     Raises:
         HTTPException(401): Si el token es inválido, expirado, malformado,
-                           o le faltan claims requeridos.
-        HTTPException(500): Si ocurre un error inesperado durante la verificación.
+                           le faltan claims, o la audiencia no es correcta.
+        HTTPException(500): Si ocurre un error inesperado.
     """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""}, # Añadir info según RFC 6750
+        headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""},
     )
     internal_error_exception = HTTPException(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -172,20 +182,25 @@ def verify_token(token: str) -> Dict[str, Any]:
         credentials_exception.detail = "Authentication token was not provided."
         raise credentials_exception
 
+    if SECRET_KEY == "YOUR_DEFAULT_JWT_SECRET_KEY_CHANGE_ME_IN_ENV_OR_SECRET":
+         log.critical("FATAL: Attempting JWT verification with default insecure secret!")
+         raise internal_error_exception # No permitir operación con secreto por defecto
+
     try:
         payload = jwt.decode(
             token,
             SECRET_KEY,
             algorithms=[ALGORITHM],
+            audience=EXPECTED_AUDIENCE, # <-- VALIDACIÓN DE AUDIENCIA
             options={
                 "verify_signature": True,
-                "verify_aud": False, # Ajustar si usas 'aud' (audiencia)
-                "verify_exp": True, # jose-jwt verifica la expiración por defecto
-                "require": REQUIRED_CLAIMS # Exigir claims requeridos
+                "verify_aud": True, # <-- HABILITAR VALIDACIÓN DE AUDIENCIA
+                "verify_exp": True,
+                # "require": REQUIRED_CLAIMS # 'require' puede ser muy estricto, validamos manualmente
             }
         )
 
-        # Verificación adicional (aunque 'require' ya lo hace, por si acaso)
+        # Validación manual de claims requeridos (más flexible que 'require')
         missing_claims = [claim for claim in REQUIRED_CLAIMS if claim not in payload]
         if missing_claims:
             log.warning("Token verification failed: Missing required claims.",
@@ -194,38 +209,80 @@ def verify_token(token: str) -> Dict[str, Any]:
             credentials_exception.detail = f"Token missing required claims: {', '.join(missing_claims)}"
             raise credentials_exception
 
-        # Validar que 'exp' no está en el pasado (jose-jwt ya lo hace, pero doble check)
-        exp_timestamp = payload.get("exp")
-        if datetime.now(timezone.utc) >= datetime.fromtimestamp(exp_timestamp, timezone.utc):
-             # Esto no debería ocurrir si jose-jwt funciona, pero por si acaso
-             log.warning("Token verification failed: Token has expired (redundant check).",
-                         token_exp=exp_timestamp,
-                         token_subject=payload.get('sub'))
-             credentials_exception.detail = "Token has expired"
-             raise credentials_exception
+        # --- EXTRACCIÓN DE COMPANY_ID (¡IMPORTANTE!) ---
+        # Supabase a menudo almacena datos personalizados en 'app_metadata' o 'user_metadata'.
+        # NECESITAS VERIFICAR DÓNDE ESTÁ 'company_id' en tus tokens reales.
+        company_id: Optional[str] = None
+        # Opción 1: Directamente en el payload (menos común para Supabase)
+        # company_id = payload.get('company_id')
 
-        # Log de éxito (opcional, puede ser verboso)
-        log.debug("Token verified successfully",
-                  subject=payload.get('sub'),
-                  company_id=payload.get('company_id'))
+        # Opción 2: Dentro de app_metadata (más común para datos relacionados con la app)
+        app_metadata = payload.get('app_metadata')
+        if isinstance(app_metadata, dict):
+            company_id = app_metadata.get('company_id')
+            # Podrías tener otros datos aquí: provider, roles, etc.
+            # log.debug("Extracted app_metadata", data=app_metadata)
+
+        # Opción 3: Dentro de user_metadata (más común para preferencias del usuario)
+        # user_metadata = payload.get('user_metadata')
+        # if isinstance(user_metadata, dict) and not company_id: # Solo si no se encontró en app_metadata
+        #     company_id = user_metadata.get('company_id')
+
+        # --- FIN EXTRACCIÓN COMPANY_ID ---
+
+        # Validar que company_id se encontró (si es requerido por tu lógica)
+        if company_id is None:
+             log.error("Token verification successful, BUT 'company_id' not found in expected claims (app_metadata?).",
+                       token_subject=payload.get('sub'),
+                       payload_keys=list(payload.keys()))
+             # Lanzar 403 Forbidden porque el usuario está autenticado pero no autorizado para proceder
+             # sin company_id en este contexto. O podrías devolver el payload y manejarlo en el router.
+             raise HTTPException(
+                 status_code=status.HTTP_403_FORBIDDEN,
+                 detail="User authenticated, but company association is missing in token.",
+             )
+        else:
+             # Añadir company_id al payload devuelto para fácil acceso
+             payload['company_id'] = str(company_id) # Asegurar que sea string
+             log.debug("Token verified successfully and company_id found.",
+                       subject=payload.get('sub'),
+                       company_id=payload['company_id'])
+
+
+        # 'sub' (user_id) ya está validado por REQUIRED_CLAIMS
+        if 'sub' not in payload:
+             log.error("Critical: 'sub' claim missing after initial check.", payload_keys=list(payload.keys()))
+             raise credentials_exception # Debería haber fallado antes
 
         return payload
 
     except JWTError as e:
-        # Errores específicos de JWT (firma inválida, malformado, expirado, claim faltante)
-        log.warning(f"JWT Verification Error: {e}", token_provided=True)
-        credentials_exception.detail = f"Could not validate credentials: {e}"
-        # Podrías dar detalles más específicos basados en el tipo de JWTError
-        if "expired" in str(e).lower():
-             credentials_exception.headers["WWW-Authenticate"] = "Bearer error=\"invalid_token\", error_description=\"The token has expired\""
+        log.warning(f"JWT Verification Error: {e}", token_provided=True, algorithm=ALGORITHM, audience=EXPECTED_AUDIENCE)
+        # Ajustar el mensaje según el tipo de error
+        error_desc = str(e)
+        if "Signature verification failed" in error_desc:
+            credentials_exception.detail = "Invalid token signature."
+            credentials_exception.headers["WWW-Authenticate"] = "Bearer error=\"invalid_token\", error_description=\"Invalid signature\""
+        elif "Token is expired" in error_desc:
+            credentials_exception.detail = "Token has expired."
+            credentials_exception.headers["WWW-Authenticate"] = "Bearer error=\"invalid_token\", error_description=\"The token has expired\""
+        elif "Audience verification failed" in error_desc:
+             credentials_exception.detail = "Invalid token audience."
+             credentials_exception.headers["WWW-Authenticate"] = f"Bearer error=\"invalid_token\", error_description=\"Invalid audience, expected '{EXPECTED_AUDIENCE}'\""
+        elif "required claim" in error_desc.lower():
+             # Esto no debería pasar con la validación manual, pero por si acaso
+             credentials_exception.detail = f"Token missing required claim: {e}"
+             credentials_exception.headers["WWW-Authenticate"] = "Bearer error=\"invalid_token\", error_description=\"Missing required claim\""
+        else:
+            credentials_exception.detail = f"Token validation failed: {e}"
+
         raise credentials_exception from e
+    except HTTPException as e:
+        # Re-lanzar HTTPException (como la 403 por falta de company_id)
+        raise e
     except Exception as e:
-        # Errores inesperados durante la decodificación/validación
         log.exception(f"Unexpected error during token verification: {e}")
         raise internal_error_exception from e
-
-# --- create_access_token function removed ---
-# El Gateway solo VERIFICA tokens, no los crea.
 ```
 
 ## File: `app\core\__init__.py`
@@ -243,73 +300,64 @@ import sys
 import logging
 from typing import Optional
 
-# Usar nombres de servicio DNS de Kubernetes como defaults
-# Asegúrate que los nombres ('ingest-api-service', 'query-service') y namespace ('nyro-develop') son correctos
-# El puerto es 80 porque el Service de K8s mapeará este puerto al containerPort (8000, 8001, etc.)
 K8S_INGEST_SVC_URL_DEFAULT = "http://ingest-api-service.nyro-develop.svc.cluster.local:80"
 K8S_QUERY_SVC_URL_DEFAULT = "http://query-service.nyro-develop.svc.cluster.local:80"
-# K8S_AUTH_SVC_URL_DEFAULT = "http://auth-service.nyro-develop.svc.cluster.local:80" # Si tuvieras un servicio de Auth separado
+# K8S_AUTH_SVC_URL_DEFAULT = "http://auth-service.nyro-develop.svc.cluster.local:80" # Si aplica
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file='.env', # Busca un archivo .env
-        env_prefix='GATEWAY_', # Prefijo para variables de entorno del Gateway
+        env_file='.env',
+        env_prefix='GATEWAY_',
         case_sensitive=False,
         env_file_encoding='utf-8',
-        extra='ignore' # Ignora variables de entorno extra
+        extra='ignore'
     )
 
     PROJECT_NAME: str = "Nyro API Gateway"
-    API_V1_STR: str = "/api/v1" # Prefijo común para rutas proxificadas
+    API_V1_STR: str = "/api/v1"
 
-    # URLs de los servicios downstream (leer de env vars o usar defaults de K8s)
     INGEST_SERVICE_URL: str = os.getenv("GATEWAY_INGEST_SERVICE_URL", K8S_INGEST_SVC_URL_DEFAULT)
     QUERY_SERVICE_URL: str = os.getenv("GATEWAY_QUERY_SERVICE_URL", K8S_QUERY_SVC_URL_DEFAULT)
-    # AUTH_SERVICE_URL: Optional[str] = os.getenv("GATEWAY_AUTH_SERVICE_URL") # Descomentar si hay Auth Service
+    AUTH_SERVICE_URL: Optional[str] = os.getenv("GATEWAY_AUTH_SERVICE_URL") # Para proxy de auth
 
-    # JWT settings (Debe ser el mismo secreto que usan los microservicios o el servicio de Auth)
-    # ¡¡¡ ESTA VARIABLE DEBE SER CONFIGURADA EN EL ENTORNO O SECRETO K8S !!!
-    JWT_SECRET: str = "YOUR_DEFAULT_JWT_SECRET_KEY_CHANGE_ME"
+    # JWT settings - Leído desde Secret K8s o .env
+    # IMPORTANTE: El valor por defecto aquí SÓLO debe usarse para desarrollo local
+    # NUNCA debe ser el valor real en producción/k8s.
+    JWT_SECRET: str = "YOUR_DEFAULT_JWT_SECRET_KEY_CHANGE_ME_IN_ENV_OR_SECRET"
     JWT_ALGORITHM: str = "HS256"
 
-    # Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
     LOG_LEVEL: str = "INFO"
+    HTTP_CLIENT_TIMEOUT: int = 60
+    HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS: int = 20
+    HTTP_CLIENT_MAX_CONNECTIONS: int = 100
 
-    # HTTP Client settings para llamadas downstream
-    HTTP_CLIENT_TIMEOUT: int = 60 # Timeout en segundos para llamadas a microservicios
-    HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS: int = 20 # Pool de conexiones keep-alive
-    HTTP_CLIENT_MAX_CONNECTIONS: int = 100 # Conexiones totales máximas
-
-# --- Instancia Global ---
 @lru_cache()
 def get_settings() -> Settings:
-    # Usar logger estándar aquí porque structlog se configura después
     log = logging.getLogger(__name__)
-    log.setLevel(logging.INFO) # Asegurar que vemos los logs iniciales
+    log.setLevel(logging.INFO)
     log.addHandler(logging.StreamHandler(sys.stdout))
-
     log.info("Loading Gateway settings...")
     try:
         settings_instance = Settings()
-        # Log settings (¡cuidado con los secretos!)
         log.info("Gateway Settings Loaded:")
         log.info(f"  PROJECT_NAME: {settings_instance.PROJECT_NAME}")
         log.info(f"  INGEST_SERVICE_URL: {settings_instance.INGEST_SERVICE_URL}")
         log.info(f"  QUERY_SERVICE_URL: {settings_instance.QUERY_SERVICE_URL}")
-        # log.info(f"  AUTH_SERVICE_URL: {settings_instance.AUTH_SERVICE_URL}") # Si existe
-        # *** IMPORTANTE: Verificar y advertir si el secreto JWT no está configurado ***
-        if settings_instance.JWT_SECRET == "YOUR_DEFAULT_JWT_SECRET_KEY_CHANGE_ME":
+        log.info(f"  AUTH_SERVICE_URL: {settings_instance.AUTH_SERVICE_URL or 'Not Set'}")
+        # *** VERIFICACIÓN CRÍTICA DEL SECRETO JWT ***
+        if settings_instance.JWT_SECRET == "YOUR_DEFAULT_JWT_SECRET_KEY_CHANGE_ME_IN_ENV_OR_SECRET":
             log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
             log.critical("! FATAL: GATEWAY_JWT_SECRET is using the default insecure value!")
-            log.critical("! Please set GATEWAY_JWT_SECRET environment variable or in secrets.")
+            log.critical("! Set GATEWAY_JWT_SECRET via env var or K8s Secret.")
             log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-            # Considera salir si es crítico: sys.exit("FATAL: GATEWAY_JWT_SECRET not configured securely.")
+            # Considera salir si es crítico en producción:
+            # if os.getenv("ENVIRONMENT") == "production":
+            #     sys.exit("FATAL: GATEWAY_JWT_SECRET not configured securely.")
         else:
-             log.info(f"  JWT_SECRET: *** SET ***") # No loguear el secreto real
+            log.info(f"  JWT_SECRET: *** SET (Loaded from Secret/Env) ***")
         log.info(f"  JWT_ALGORITHM: {settings_instance.JWT_ALGORITHM}")
         log.info(f"  LOG_LEVEL: {settings_instance.LOG_LEVEL}")
         log.info(f"  HTTP_CLIENT_TIMEOUT: {settings_instance.HTTP_CLIENT_TIMEOUT}")
-
         return settings_instance
     except Exception as e:
         log.exception(f"FATAL: Error loading Gateway settings: {e}")
@@ -516,26 +564,43 @@ async def add_process_time_header_and_request_id(request: Request, call_next):
         return response
 
 
-# CORS (Configurar adecuadamente para producción)
-# Orígenes permitidos deberían ser la URL de tu frontend
-ALLOWED_ORIGINS = ["*"] # CAMBIAR EN PRODUCCIÓN a algo como ["https://tu-frontend.com"]
+# --- Configuración CORS ---
+# Orígenes permitidos: Tu URL de Vercel, tu URL de ngrok, y localhost para desarrollo local del frontend
+# ¡IMPORTANTE! Reemplaza con tus URLs reales.
+VERCEL_FRONTEND_URL = os.getenv("VERCEL_FRONTEND_URL", "https://TU_APP_EN_VERCEL.vercel.app") # Lee desde env o usa un placeholder
+NGROK_URL = os.getenv("NGROK_URL", "https://b0c3-2001-1388-53a1-a7c9-8901-65aa-f1fe-6a8.ngrok-free.app") # URL de ngrok proporcionada
+LOCALHOST_FRONTEND = "http://localhost:3000"
 
-# --- CORRECCIÓN: Añadir import os aquí ---
-# La línea original causaba NameError porque 'os' no estaba definido en este scope
-if os.getenv("ENVIRONMENT") == "production": # Ejemplo de cómo cambiar en prod
-    log.warning("Production environment detected, restricting CORS origins.")
-    # Reemplaza con tu(s) URL(s) de frontend real(es) en producción
-    ALLOWED_ORIGINS = [
-        "https://your-production-frontend.com",
-        "https://another-allowed-origin.com"
-    ]
+allowed_origins = [
+    LOCALHOST_FRONTEND,
+    VERCEL_FRONTEND_URL,
+]
+
+# Añadir ngrok URL si está definida
+if NGROK_URL:
+    # ngrok puede dar http y https, permitir ambos si es necesario, pero prefiere https
+    if NGROK_URL.startswith("https://"):
+        allowed_origins.append(NGROK_URL)
+        allowed_origins.append(NGROK_URL.replace("https://", "http://")) # Permitir http también si es necesario
+    elif NGROK_URL.startswith("http://"):
+         allowed_origins.append(NGROK_URL)
+         allowed_origins.append(NGROK_URL.replace("http://", "https://"))
+    else:
+         log.warning(f"NGROK_URL format not recognized: {NGROK_URL}")
+
+
+# En producción estricta, podrías quitar localhost y ngrok
+# if os.getenv("ENVIRONMENT") == "production":
+#     allowed_origins = [VERCEL_FRONTEND_URL]
+
+log.info("Configuring CORS", allowed_origins=allowed_origins)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS, # Usar la lista definida arriba
-    allow_credentials=True, # Permite cookies/auth headers
-    allow_methods=["*"],    # O especifica métodos: ["GET", "POST", "PUT", "DELETE"]
-    allow_headers=["*"],    # O especifica headers necesarios: ["Authorization", "Content-Type", "X-Company-ID"]
+    allow_origins=allowed_origins, # Lista de orígenes permitidos
+    allow_credentials=True,        # Permite cookies/headers de auth
+    allow_methods=["*"],           # Métodos permitidos (GET, POST, etc.)
+    allow_headers=["*", "Authorization", "Content-Type", "X-Requested-With"], # Headers permitidos
 )
 
 
@@ -684,175 +749,174 @@ def get_client() -> httpx.AsyncClient:
         )
     return http_client
 
+# api-gateway/app/routers/gateway_router.py
+# ... (importaciones y código existente) ...
+
 async def _proxy_request(
     request: Request,
     target_url: str,
     client: httpx.AsyncClient,
-    user_payload: Optional[dict] # Payload del usuario autenticado (viene de require_user)
+    # user_payload es el diccionario devuelto por verify_token (via require_user)
+    user_payload: Optional[Dict[str, Any]] # Puede ser None para rutas no protegidas
 ):
-    """Función interna para realizar el proxy de la petición de forma segura."""
+    """Función interna para realizar el proxy de la petición."""
     method = request.method
     downstream_url = httpx.URL(target_url)
+    log_context = {} # Para añadir al log
 
-    # 1. Preparar Headers para downstream
+    # 1. Preparar Headers
     headers_to_forward = {}
-    # Añadir X-Request-ID o similar para tracing si no existe
-    # request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
-    # headers_to_forward["x-request-id"] = request_id
-    # log = log.bind(request_id=request_id) # Vincular ID a logs
+    # ... (código para copiar headers y quitar hop-by-hop) ...
 
-    for name, value in request.headers.items():
-        if name.lower() not in HOP_BY_HOP_HEADERS:
-            headers_to_forward[name] = value
+    # 2. Inyectar Headers basados en el Payload del Token (SI EXISTE)
+    if user_payload:
+        # Extraer user_id (del claim 'sub')
+        user_id = user_payload.get('sub')
+        if user_id:
+            headers_to_forward['X-User-ID'] = str(user_id)
+            log_context['user_id'] = user_id
+        else:
+            log.warning("User payload present but 'sub' (user_id) claim missing!", payload_keys=list(user_payload.keys()))
+            # Decide si esto es un error fatal (403) o si puedes continuar
 
-    # Añadir/Sobrescribir X-Company-ID basado en el token verificado
-    if user_payload and 'company_id' in user_payload:
-        company_id = str(user_payload['company_id'])
-        headers_to_forward['X-Company-ID'] = company_id
-        log = log.bind(company_id=company_id) # Vincular company_id a logs
-    else:
-        # Si una ruta protegida llegó aquí sin company_id en el token, es un error de configuración/token
-        log.error("Protected route reached without company_id in user payload!", user_payload=user_payload)
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Missing company identifier.")
+        # Extraer company_id (que añadimos en verify_token)
+        company_id = user_payload.get('company_id')
+        if company_id:
+            headers_to_forward['X-Company-ID'] = str(company_id) # Asegurar string
+            log_context['company_id'] = company_id
+        else:
+            # Esto no debería ocurrir si verify_token lo requiere y lo añade,
+            # pero es una verificación de seguridad adicional.
+            log.error("CRITICAL: Valid user payload is missing 'company_id'!", payload_info=user_payload)
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal configuration error: Company ID missing after auth.")
 
-    # Pasar información del usuario si es necesario (con prefijo para evitar colisiones)
-    # if user_payload and 'user_id' in user_payload:
-    #     headers_to_forward['X-User-ID'] = str(user_payload['user_id'])
-    # if user_payload and 'role' in user_payload:
-    #     headers_to_forward['X-User-Role'] = str(user_payload['role'])
+        # Podrías extraer y añadir otros headers como X-User-Email, X-User-Roles etc.
+        user_email = user_payload.get('email')
+        if user_email:
+             headers_to_forward['X-User-Email'] = str(user_email)
+             log_context['user_email'] = user_email
 
-    # 2. Preparar Query Params y Body
+    # Vincular contexto al logger para esta petición
+    log_with_context = log.bind(**log_context)
+
+    # ... (código para preparar query params y body) ...
     query_params = request.query_params
-    # Leer el body como stream para evitar cargarlo en memoria si es grande
     request_body_bytes = request.stream()
 
     # 3. Realizar la petición downstream
-    log.info(f"Proxying request", method=method, path=request.url.path, target=str(downstream_url))
-    # log.debug(f"Forwarding Headers", headers=headers_to_forward) # Puede ser verboso
+    log_with_context.info(f"Proxying request", method=method, path=request.url.path, target=str(downstream_url))
 
     try:
-        # Construir el request para httpx
         req = client.build_request(
             method=method,
             url=downstream_url,
             headers=headers_to_forward,
             params=query_params,
-            content=request_body_bytes # Pasar el stream directamente
+            content=request_body_bytes
         )
-        # Enviar el request y obtener la respuesta como stream
-        rp = await client.send(req, stream=True) # stream=True es clave
+        rp = await client.send(req, stream=True)
 
-        # 4. Preparar y devolver la respuesta al cliente original
-        # Loguear la respuesta del downstream
-        log.info(f"Received response from downstream", status_code=rp.status_code, target=str(downstream_url))
+        # ... (código para procesar y devolver la respuesta) ...
+        log_with_context.info(f"Received response from downstream", status_code=rp.status_code, target=str(downstream_url))
+        # ... (filtrar headers de respuesta) ...
+        response_headers = {k: v for k, v in rp.headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
 
-        # Filtrar hop-by-hop headers de la respuesta
-        response_headers = {}
-        for name, value in rp.headers.items():
-            if name.lower() not in HOP_BY_HOP_HEADERS:
-                response_headers[name] = value
-
-        # Devolver como StreamingResponse para eficiencia
         return StreamingResponse(
-            rp.aiter_raw(), # Stream de bytes de la respuesta
+            rp.aiter_raw(),
             status_code=rp.status_code,
             headers=response_headers,
             media_type=rp.headers.get("content-type"),
         )
 
+    # ... (manejo de excepciones httpx) ...
     except httpx.TimeoutException as exc:
-        log.error(f"Request to downstream service timed out", target=str(downstream_url), timeout=settings.HTTP_CLIENT_TIMEOUT, error=str(exc))
-        raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=f"Upstream service at {downstream_url.host} timed out.")
+         log_with_context.error(f"Request timed out", target=str(downstream_url), error=str(exc))
+         raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=f"Upstream service timeout.")
     except httpx.ConnectError as exc:
-        log.error(f"Could not connect to downstream service", target=str(downstream_url), error=str(exc))
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Upstream service at {downstream_url.host} is unavailable.")
-    except httpx.RequestError as exc: # Otros errores de request (SSL, etc.)
-        log.error(f"Error during request to downstream service", target=str(downstream_url), error=str(exc), exc_info=True)
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Error communicating with upstream service: {type(exc).__name__}")
+         log_with_context.error(f"Connection error", target=str(downstream_url), error=str(exc))
+         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Upstream service unavailable.")
     except Exception as exc:
-        log.exception(f"Unexpected error during proxy request", target=str(downstream_url))
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An internal gateway error occurred.")
+        log_with_context.exception(f"Unexpected error during proxy", target=str(downstream_url))
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal gateway error.")
     finally:
-        # Asegurarse de cerrar la respuesta si no se usa StreamingResponse o si hay error antes
-        if 'rp' in locals() and rp and not rp.is_closed:
+        # Cerrar respuesta si es necesario
+        if 'rp' in locals() and rp and hasattr(rp, 'aclose') and callable(rp.aclose):
              await rp.aclose()
 
 
-# --- Rutas Proxy Específicas ---
+# --- Rutas Proxy ---
+# Asegúrate que las rutas que requieren autenticación tengan `Depends(require_user)`
 
-# Usamos un path parameter genérico '{path:path}' para capturar todo después del prefijo
-# Aplicamos la dependencia 'require_user' a todas las rutas proxificadas
 @router.api_route(
     "/api/v1/ingest/{path:path}",
-    methods=["GET", "POST", "PUT", "DELETE", "PATCH"], # Excluir OPTIONS/HEAD si no se manejan explícitamente
-    dependencies=[Depends(require_user)], # Proteger rutas de ingesta
-    tags=["Proxy"],
-    summary="Proxy to Ingest Service",
-    # include_in_schema=False # Ocultar de OpenAPI para no duplicar? Depende de la estrategia
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+    dependencies=[Depends(require_user)], # <-- REQUIERE AUTH
+    tags=["Proxy - Ingest"],
+    summary="Proxy to Ingest Service (Auth Required)",
 )
 async def proxy_ingest_service(
     request: Request,
     path: str,
     client: Annotated[httpx.AsyncClient, Depends(get_client)],
-    user: Annotated[dict, Depends(require_user)] # Inyectar payload validado
+    # Inyecta el payload validado por require_user
+    user_payload: Annotated[Dict[str, Any], Depends(require_user)]
 ):
-    """Proxy genérico para todas las rutas bajo /api/v1/ingest/"""
     base_url = settings.INGEST_SERVICE_URL.rstrip('/')
-    # Construir la URL completa del servicio downstream
-    target_url = f"{base_url}{request.url.path}" # Usar path completo original
-    if request.url.query:
-        target_url += f"?{request.url.query}"
-
-    return await _proxy_request(request, target_url, client, user)
+    target_url = f"{base_url}/api/v1/ingest/{path}" # Reconstruir URL destino
+    if request.url.query: target_url += f"?{request.url.query}"
+    return await _proxy_request(request, target_url, client, user_payload)
 
 @router.api_route(
     "/api/v1/query/{path:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
-    dependencies=[Depends(require_user)], # Proteger rutas de consulta
-    tags=["Proxy"],
-    summary="Proxy to Query Service",
-    # include_in_schema=False
+    dependencies=[Depends(require_user)], # <-- REQUIERE AUTH
+    tags=["Proxy - Query"],
+    summary="Proxy to Query Service (Auth Required)",
 )
 async def proxy_query_service(
     request: Request,
     path: str,
     client: Annotated[httpx.AsyncClient, Depends(get_client)],
-    user: Annotated[dict, Depends(require_user)]
+    user_payload: Annotated[Dict[str, Any], Depends(require_user)]
 ):
-    """Proxy genérico para todas las rutas bajo /api/v1/query/"""
     base_url = settings.QUERY_SERVICE_URL.rstrip('/')
-    target_url = f"{base_url}{request.url.path}"
-    if request.url.query:
-        target_url += f"?{request.url.query}"
-
-    return await _proxy_request(request, target_url, client, user)
+    target_url = f"{base_url}/api/v1/query/{path}" # Reconstruir URL destino
+    if request.url.query: target_url += f"?{request.url.query}"
+    return await _proxy_request(request, target_url, client, user_payload)
 
 
-# --- Proxy para Auth Service (Opcional) ---
-# Si tienes un servicio de Auth separado para /login, /register, etc.
-# Estas rutas NO estarían protegidas por 'require_user'
-# if settings.AUTH_SERVICE_URL:
-#     @router.api_route(
-#         "/api/auth/{path:path}",
-#         methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
-#         tags=["Proxy"],
-#         summary="Proxy to Authentication Service",
-#         # include_in_schema=False
-#     )
-#     async def proxy_auth_service(
-#         request: Request,
-#         path: str,
-#         client: Annotated[httpx.AsyncClient, Depends(get_client)],
-#         # NO hay dependencia 'require_user' aquí
-#     ):
-#         """Proxy genérico para el servicio de autenticación."""
-#         base_url = settings.AUTH_SERVICE_URL.rstrip('/')
-#         target_url = f"{base_url}{request.url.path}"
-#         if request.url.query:
-#             target_url += f"?{request.url.query}"
+# --- Proxy para Auth Service (OPCIONAL - SIN require_user) ---
+# Si tienes un microservicio de Auth o quieres proxyficar llamadas a Supabase Auth
+if settings.AUTH_SERVICE_URL:
+    log.info(f"Auth service proxy enabled for: {settings.AUTH_SERVICE_URL}")
+    @router.api_route(
+        "/api/v1/auth/{path:path}", # Usar prefijo /api/v1 consistentemente?
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+        tags=["Proxy - Auth"],
+        summary="Proxy to Authentication Service (No Gateway Auth)",
+    )
+    async def proxy_auth_service(
+        request: Request,
+        path: str,
+        client: Annotated[httpx.AsyncClient, Depends(get_client)],
+        # NO hay dependencia require_user aquí
+    ):
+        """Proxy genérico para el servicio de autenticación."""
+        base_url = settings.AUTH_SERVICE_URL.rstrip('/')
+        # Construir URL destino, asumiendo que el Auth service espera la ruta completa
+        # Ejemplo: /api/v1/auth/login -> http://auth-service/api/v1/auth/login
+        target_url = f"{base_url}/api/v1/auth/{path}"
+        if request.url.query: target_url += f"?{request.url.query}"
 
-#         # Pasar user_payload=None ya que estas rutas no requieren autenticación previa
-#         return await _proxy_request(request, target_url, client, user_payload=None)
+        # Pasar user_payload=None ya que estas rutas no requieren token *validado por el gateway*
+        # (el token podría pasarse para operaciones como 'refresh' o 'get user info')
+        return await _proxy_request(request, target_url, client, user_payload=None)
+else:
+     log.warning("Auth service proxy is not configured (GATEWAY_AUTH_SERVICE_URL not set).")
+     # Podrías añadir una ruta aquí para devolver un 501 Not Implemented si se llama a /api/v1/auth/*
+     @router.api_route("/api/v1/auth/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"], include_in_schema=False)
+     async def auth_not_configured(path: str):
+         raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Authentication endpoint proxy not configured in the gateway.")
 ```
 
 ## File: `pyproject.toml`

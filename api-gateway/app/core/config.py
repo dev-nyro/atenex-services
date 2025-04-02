@@ -5,10 +5,11 @@ from functools import lru_cache
 import sys
 import logging
 from typing import Optional
+# (-) Quitar la importación de SecretStr si ya no se usa en ningún otro lugar
+# from pydantic import SecretStr
 
 K8S_INGEST_SVC_URL_DEFAULT = "http://ingest-api-service.nyro-develop.svc.cluster.local:80"
 K8S_QUERY_SVC_URL_DEFAULT = "http://query-service.nyro-develop.svc.cluster.local:80"
-# K8S_AUTH_SVC_URL_DEFAULT = "http://auth-service.nyro-develop.svc.cluster.local:80" # Si aplica
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -24,13 +25,20 @@ class Settings(BaseSettings):
 
     INGEST_SERVICE_URL: str = os.getenv("GATEWAY_INGEST_SERVICE_URL", K8S_INGEST_SVC_URL_DEFAULT)
     QUERY_SERVICE_URL: str = os.getenv("GATEWAY_QUERY_SERVICE_URL", K8S_QUERY_SVC_URL_DEFAULT)
-    AUTH_SERVICE_URL: Optional[str] = os.getenv("GATEWAY_AUTH_SERVICE_URL") # Para proxy de auth
+    AUTH_SERVICE_URL: Optional[str] = os.getenv("GATEWAY_AUTH_SERVICE_URL")
 
-    # JWT settings - Leído desde Secret K8s o .env
-    # IMPORTANTE: El valor por defecto aquí SÓLO debe usarse para desarrollo local
-    # NUNCA debe ser el valor real en producción/k8s.
+    # JWT settings
     JWT_SECRET: str = "YOUR_DEFAULT_JWT_SECRET_KEY_CHANGE_ME_IN_ENV_OR_SECRET"
     JWT_ALGORITHM: str = "HS256"
+
+    # --- MODIFICACIÓN: Cambiar tipo a str ---
+    # La clave se leerá como una string normal desde la variable de entorno.
+    # La seguridad recae en cómo se inyecta esa variable (ej. K8s Secret).
+    SUPABASE_SERVICE_ROLE_KEY: str = "YOUR_SUPABASE_SERVICE_ROLE_KEY_HERE"
+    # ----------------------------------------
+    SUPABASE_URL: Optional[str] = os.getenv("NEXT_PUBLIC_SUPABASE_URL") # Reutilizar la URL pública
+
+    DEFAULT_COMPANY_ID: Optional[str] = os.getenv("GATEWAY_DEFAULT_COMPANY_ID")
 
     LOG_LEVEL: str = "INFO"
     HTTP_CLIENT_TIMEOUT: int = 60
@@ -40,8 +48,11 @@ class Settings(BaseSettings):
 @lru_cache()
 def get_settings() -> Settings:
     log = logging.getLogger(__name__)
-    log.setLevel(logging.INFO)
-    log.addHandler(logging.StreamHandler(sys.stdout))
+    # Asegurarse de que el logger esté configurado antes de usarlo
+    if not log.handlers:
+        log.setLevel(logging.INFO)
+        log.addHandler(logging.StreamHandler(sys.stdout))
+
     log.info("Loading Gateway settings...")
     try:
         settings_instance = Settings()
@@ -50,18 +61,44 @@ def get_settings() -> Settings:
         log.info(f"  INGEST_SERVICE_URL: {settings_instance.INGEST_SERVICE_URL}")
         log.info(f"  QUERY_SERVICE_URL: {settings_instance.QUERY_SERVICE_URL}")
         log.info(f"  AUTH_SERVICE_URL: {settings_instance.AUTH_SERVICE_URL or 'Not Set'}")
-        # *** VERIFICACIÓN CRÍTICA DEL SECRETO JWT ***
+
+        # Verificación JWT Secret
         if settings_instance.JWT_SECRET == "YOUR_DEFAULT_JWT_SECRET_KEY_CHANGE_ME_IN_ENV_OR_SECRET":
             log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
             log.critical("! FATAL: GATEWAY_JWT_SECRET is using the default insecure value!")
             log.critical("! Set GATEWAY_JWT_SECRET via env var or K8s Secret.")
             log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-            # Considera salir si es crítico en producción:
-            # if os.getenv("ENVIRONMENT") == "production":
-            #     sys.exit("FATAL: GATEWAY_JWT_SECRET not configured securely.")
         else:
             log.info(f"  JWT_SECRET: *** SET (Loaded from Secret/Env) ***")
         log.info(f"  JWT_ALGORITHM: {settings_instance.JWT_ALGORITHM}")
+
+        # Verificaciones Supabase URL y Service Key
+        if not settings_instance.SUPABASE_URL:
+             log.critical("! FATAL: Supabase URL is not configured (check NEXT_PUBLIC_SUPABASE_URL env var).")
+             sys.exit("FATAL: Supabase URL not configured.")
+        else:
+             log.info(f"  SUPABASE_URL: {settings_instance.SUPABASE_URL}")
+
+        # --- MODIFICACIÓN: Validar la clave de servicio como string ---
+        # Comprobar si sigue siendo el valor placeholder.
+        if settings_instance.SUPABASE_SERVICE_ROLE_KEY == "YOUR_SUPABASE_SERVICE_ROLE_KEY_HERE":
+            log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            log.critical("! FATAL: GATEWAY_SUPABASE_SERVICE_ROLE_KEY is using the default placeholder!")
+            log.critical("! Set GATEWAY_SUPABASE_SERVICE_ROLE_KEY via env var or K8s Secret.")
+            log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            # Considera salir si es crítico
+            # sys.exit("FATAL: GATEWAY_SUPABASE_SERVICE_ROLE_KEY not configured securely.")
+        else:
+            # No loguear la clave, solo confirmar que está configurada.
+            log.info("  SUPABASE_SERVICE_ROLE_KEY: *** SET (Loaded from Secret/Env) ***")
+        # -------------------------------------------------------------
+
+        # Verificación Default Company ID
+        if not settings_instance.DEFAULT_COMPANY_ID:
+            log.warning("! WARNING: GATEWAY_DEFAULT_COMPANY_ID is not set. Company association might fail.")
+        else:
+            log.info(f"  DEFAULT_COMPANY_ID: {settings_instance.DEFAULT_COMPANY_ID}")
+
         log.info(f"  LOG_LEVEL: {settings_instance.LOG_LEVEL}")
         log.info(f"  HTTP_CLIENT_TIMEOUT: {settings_instance.HTTP_CLIENT_TIMEOUT}")
         return settings_instance
