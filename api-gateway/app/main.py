@@ -106,26 +106,43 @@ async def add_process_time_header_and_request_id(request: Request, call_next):
         return response
 
 
-# CORS (Configurar adecuadamente para producción)
-# Orígenes permitidos deberían ser la URL de tu frontend
-ALLOWED_ORIGINS = ["*"] # CAMBIAR EN PRODUCCIÓN a algo como ["https://tu-frontend.com"]
+# --- Configuración CORS ---
+# Orígenes permitidos: Tu URL de Vercel, tu URL de ngrok, y localhost para desarrollo local del frontend
+# ¡IMPORTANTE! Reemplaza con tus URLs reales.
+VERCEL_FRONTEND_URL = os.getenv("VERCEL_FRONTEND_URL", "https://TU_APP_EN_VERCEL.vercel.app") # Lee desde env o usa un placeholder
+NGROK_URL = os.getenv("NGROK_URL", "https://b0c3-2001-1388-53a1-a7c9-8901-65aa-f1fe-6a8.ngrok-free.app") # URL de ngrok proporcionada
+LOCALHOST_FRONTEND = "http://localhost:3000"
 
-# --- CORRECCIÓN: Añadir import os aquí ---
-# La línea original causaba NameError porque 'os' no estaba definido en este scope
-if os.getenv("ENVIRONMENT") == "production": # Ejemplo de cómo cambiar en prod
-    log.warning("Production environment detected, restricting CORS origins.")
-    # Reemplaza con tu(s) URL(s) de frontend real(es) en producción
-    ALLOWED_ORIGINS = [
-        "https://your-production-frontend.com",
-        "https://another-allowed-origin.com"
-    ]
+allowed_origins = [
+    LOCALHOST_FRONTEND,
+    VERCEL_FRONTEND_URL,
+]
+
+# Añadir ngrok URL si está definida
+if NGROK_URL:
+    # ngrok puede dar http y https, permitir ambos si es necesario, pero prefiere https
+    if NGROK_URL.startswith("https://"):
+        allowed_origins.append(NGROK_URL)
+        allowed_origins.append(NGROK_URL.replace("https://", "http://")) # Permitir http también si es necesario
+    elif NGROK_URL.startswith("http://"):
+         allowed_origins.append(NGROK_URL)
+         allowed_origins.append(NGROK_URL.replace("http://", "https://"))
+    else:
+         log.warning(f"NGROK_URL format not recognized: {NGROK_URL}")
+
+
+# En producción estricta, podrías quitar localhost y ngrok
+# if os.getenv("ENVIRONMENT") == "production":
+#     allowed_origins = [VERCEL_FRONTEND_URL]
+
+log.info("Configuring CORS", allowed_origins=allowed_origins)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS, # Usar la lista definida arriba
-    allow_credentials=True, # Permite cookies/auth headers
-    allow_methods=["*"],    # O especifica métodos: ["GET", "POST", "PUT", "DELETE"]
-    allow_headers=["*"],    # O especifica headers necesarios: ["Authorization", "Content-Type", "X-Company-ID"]
+    allow_origins=allowed_origins, # Lista de orígenes permitidos
+    allow_credentials=True,        # Permite cookies/headers de auth
+    allow_methods=["*"],           # Métodos permitidos (GET, POST, etc.)
+    allow_headers=["*", "Authorization", "Content-Type", "X-Requested-With"], # Headers permitidos
 )
 
 
