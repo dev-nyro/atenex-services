@@ -2,126 +2,136 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from typing import Annotated, Dict, Any, Optional
 import structlog
-from pydantic import BaseModel, Field # Importado pero no usado, podría quitarse si no hay body
+from pydantic import BaseModel # BaseModel no se usa aquí si no hay body
 
-# --- RESTAURAR DEPENDENCIAS ---
-from app.auth.auth_middleware import InitialAuth # Usar la dependencia que NO requiere company_id
-from app.utils.supabase_admin import get_supabase_admin_client
+# Usar InitialAuth (valida token, NO requiere company_id)
+from app.auth.auth_middleware import InitialAuth
+from app.utils.supabase_admin import get_supabase_admin_client # Getter
 from supabase import Client as SupabaseClient
-from gotrue.errors import AuthApiError # Para capturar errores específicos de Supabase Auth
+from gotrue.errors import AuthApiError # Para capturar errores específicos
 
 from app.core.config import settings # Necesitamos settings para el default company id
 
 log = structlog.get_logger(__name__)
 router = APIRouter(prefix="/api/v1/users", tags=["Users"])
 
+# Variable global para el cliente (menos ideal, ver nota en main.py)
+# Es mejor usar Depends(get_supabase_admin_client)
+supabase_admin: Optional[SupabaseClient] = None
+
 @router.post(
     "/me/ensure-company",
     status_code=status.HTTP_200_OK,
-    # --- RESTAURAR DESCRIPCIÓN ORIGINAL ---
     summary="Ensure User Company Association",
-    description="Checks if the authenticated user (valid JWT required) already has a company ID associated in their app_metadata. If not, associates the default company ID configured in the gateway using admin privileges. Returns success message or indicates if association already existed.",
+    description="Checks if the authenticated user (valid JWT required) already has a company ID associated. If not, associates the default company ID using admin privileges. Requires GATEWAY_DEFAULT_COMPANY_ID to be configured.",
     responses={
         status.HTTP_200_OK: {"description": "Company association successful or already existed."},
+        # 400 si el servidor no está configurado para asociar
         status.HTTP_400_BAD_REQUEST: {"description": "Default Company ID not configured on server."},
-        status.HTTP_401_UNAUTHORIZED: {"description": "Authentication token missing or invalid (signature, expiration, audience)."},
-        status.HTTP_500_INTERNAL_SERVER_ERROR: {"description": "Server configuration error or failed to update user metadata."},
+        status.HTTP_401_UNAUTHORIZED: {"description": "Authentication token missing or invalid."},
+        # 500 para errores de Supabase u otros inesperados
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {"description": "Failed to check or update user metadata."},
         status.HTTP_503_SERVICE_UNAVAILABLE: {"description": "Supabase Admin client not available."},
     }
 )
 async def ensure_company_association(
-    # --- RESTAURAR DEPENDENCIAS ---
-    user_payload: InitialAuth, # Valida token SIN requerir company_id
-    supabase_admin: Annotated[Optional[SupabaseClient], Depends(get_supabase_admin_client)], # Hacer opcional y verificar
+    # Usa InitialAuth: requiere token válido, pero no company_id
+    user_payload: InitialAuth,
+    # Inyecta el cliente admin usando el getter (más seguro que global)
+    admin_client: Annotated[SupabaseClient, Depends(get_supabase_admin_client)],
 ):
-    # --- RESTAURAR LÓGICA ORIGINAL CON MEJORAS ---
-    if not supabase_admin:
-        log.error("Supabase Admin client dependency failed.")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Admin client is not available."
-        )
-
+    """
+    Endpoint para asegurar que un usuario autenticado tiene un company_id.
+    Si no lo tiene (ni en token ni en DB), asigna el configurado por defecto.
+    """
     user_id = user_payload.get("sub")
     # company_id puede o no estar en el payload de InitialAuth
     current_company_id_from_token = user_payload.get("company_id")
 
-    # Vincular contexto de structlog para esta petición específica
+    # Vincular contexto de structlog
     bound_log = log.bind(user_id=user_id)
-
     bound_log.info("Ensure company association endpoint called.")
 
+    # 1. Comprobar si ya existe en el token (optimización rápida)
     if current_company_id_from_token:
         bound_log.info("User token already contains company ID.", company_id=current_company_id_from_token)
-        # Podríamos verificar si coincide con el default, pero por ahora asumimos que si existe, está bien.
-        return {"message": "Company association already exists.", "company_id": current_company_id_from_token}
+        return {"message": "Company association already exists (found in token).", "company_id": current_company_id_from_token}
 
-    # Si el token no lo tiene, verificar directamente en Supabase (más seguro)
-    # Esto evita problemas si el token está desactualizado
+    # 2. Verificar directamente en Supabase (más fiable que el token)
     try:
-        bound_log.debug("Fetching current user data from Supabase Admin to double-check app_metadata...")
-        get_user_response = await supabase_admin.auth.admin.get_user_by_id(user_id)
+        bound_log.debug("Fetching current user data from Supabase Admin...")
+        get_user_response = await admin_client.auth.admin.get_user_by_id(user_id)
         user_data = get_user_response.user
-        existing_app_metadata = user_data.app_metadata if user_data else {}
-        current_company_id_from_db = existing_app_metadata.get("company_id") if existing_app_metadata else None
+        # Extraer metadatos de forma segura
+        existing_app_metadata = user_data.app_metadata if user_data and hasattr(user_data, 'app_metadata') else {}
+        # Validar que company_id sea un string no vacío si existe
+        current_company_id_from_db = existing_app_metadata.get("company_id") if isinstance(existing_app_metadata, dict) else None
+        current_company_id_from_db = str(current_company_id_from_db) if current_company_id_from_db else None
 
         if current_company_id_from_db:
              bound_log.info("User already has company ID associated in database.", company_id=current_company_id_from_db)
-             # Devolver el ID de la DB que es el más actualizado
-             return {"message": "Company association already exists.", "company_id": current_company_id_from_db}
+             return {"message": "Company association already exists (found in database).", "company_id": current_company_id_from_db}
 
     except AuthApiError as e:
-        bound_log.error(f"Supabase Admin API error fetching user data: {e}", status_code=e.status)
-        # Podría ser un 404 si el user_id es inválido, aunque no debería si el token era válido
+        # Error específico al llamar a Supabase Admin API
+        bound_log.error("Supabase Admin API error fetching user data", status_code=e.status, error_message=e.message)
+        # Podría ser 404 si el user_id es inválido (aunque no debería pasar si el token era válido)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch user data from authentication system: {e.message}"
+            detail=f"Failed to verify user data: {e.message}"
         )
     except Exception as e:
+        # Otro error inesperado al buscar usuario
         bound_log.exception("Unexpected error fetching user data for company check.")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An unexpected error occurred while checking user data."
         )
 
-    # Si llegamos aquí, el usuario NO tiene company_id ni en token ni en DB
-    bound_log.info("User lacks company ID. Proceeding with association.")
+    # 3. Si llegamos aquí, el usuario NO tiene company_id. Proceder a asociar.
+    bound_log.info("User lacks company ID. Attempting association.")
 
+    # --- VERIFICACIÓN CRÍTICA: ¿Está configurado el ID por defecto? ---
     company_id_to_assign = settings.DEFAULT_COMPANY_ID
     if not company_id_to_assign:
-        bound_log.error("Cannot associate company: GATEWAY_DEFAULT_COMPANY_ID is not configured.")
-        # Devolver 400 Bad Request porque es un problema de configuración que impide la operación
+        bound_log.critical("CONFIGURATION ERROR: GATEWAY_DEFAULT_COMPANY_ID is not set. Cannot associate company.")
+        # Devolver 400 Bad Request porque la solicitud no se puede cumplir debido a config del servidor
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=status.HTTP_400_BAD_REQUEST, # Cambiado de 500 a 400
             detail="Server configuration error: Default company ID for association is not set."
         )
+    # --- FIN VERIFICACIÓN ---
 
     bound_log.info(f"Attempting to associate user with Default Company ID.", default_company_id=company_id_to_assign)
 
-    # Usar los metadatos existentes recuperados antes si es posible
+    # Preparar los nuevos metadatos, manteniendo los existentes si los hubiera
     new_app_metadata = {**(existing_app_metadata or {}), "company_id": company_id_to_assign}
 
+    # 4. Intentar actualizar el usuario en Supabase
     try:
         bound_log.debug("Updating user with new app_metadata via Supabase Admin", new_metadata=new_app_metadata)
-        update_response = await supabase_admin.auth.admin.update_user_by_id(
+        # Usar el cliente inyectado por dependencia
+        update_response = await admin_client.auth.admin.update_user_by_id(
             user_id,
+            # Asegúrate que el payload de attributes sea el correcto para supabase-py v2+
             attributes={'app_metadata': new_app_metadata}
         )
-        # Verificar si la respuesta indica éxito (puede variar según la librería)
-        # En supabase-py v2+, la ausencia de error suele indicar éxito.
+        # Supabase-py v2+ no devuelve mucho en la respuesta exitosa, la ausencia de error es el indicador.
+        # Podríamos verificar update_response.user si es necesario.
         bound_log.info("Successfully updated user app_metadata with company ID.", assigned_company_id=company_id_to_assign)
         return {"message": "Company association successful.", "company_id": company_id_to_assign}
 
     except AuthApiError as e:
-        bound_log.error(f"Supabase Admin API error during user update: {e}", status_code=e.status)
+        # Error específico al actualizar usuario en Supabase
+        bound_log.error("Supabase Admin API error during user update", status_code=e.status, error_message=e.message)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update user data in authentication system: {e.message}"
+            detail=f"Failed to associate company: {e.message}"
         )
     except Exception as e:
+        # Otro error inesperado durante la actualización
         bound_log.exception("Unexpected error during company association update.")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An unexpected error occurred while associating company."
         )
-    # --- FIN LÓGICA ORIGINAL RESTAURADA ---

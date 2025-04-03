@@ -2,7 +2,7 @@
 # api-gateway/app/core/config.py
 import os
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field, validator, ValidationError # Importar validator y ValidationError
+from pydantic import Field, validator, ValidationError, HttpUrl # Importar validator, ValidationError, HttpUrl
 from functools import lru_cache
 import sys
 import logging
@@ -12,10 +12,6 @@ import uuid # Para validar UUID
 # URLs por defecto si no se especifican en el entorno (típico para K8s)
 K8S_INGEST_SVC_URL_DEFAULT = "http://ingest-api-service.nyro-develop.svc.cluster.local:80"
 K8S_QUERY_SVC_URL_DEFAULT = "http://query-service.nyro-develop.svc.cluster.local:80"
-
-# ----- ELIMINAR ESTA LÍNEA -----
-# from app.core.config import settings # Importar settings ya parseadas y validadas <--- ¡¡¡ELIMINAR!!!
-# -------------------------------
 
 class Settings(BaseSettings):
     # Configuración de Pydantic-Settings
@@ -32,34 +28,27 @@ class Settings(BaseSettings):
     API_V1_STR: str = "/api/v1"
 
     # URLs de Servicios Backend (Obligatorias)
-    # Pydantic-settings buscará GATEWAY_INGEST_SERVICE_URL y GATEWAY_QUERY_SERVICE_URL
-    # Si no se encuentran y no hay default, lanzará ValidationError
-    INGEST_SERVICE_URL: str = K8S_INGEST_SVC_URL_DEFAULT
-    QUERY_SERVICE_URL: str = K8S_QUERY_SVC_URL_DEFAULT
-    AUTH_SERVICE_URL: Optional[str] = None # Opcional (GATEWAY_AUTH_SERVICE_URL)
+    INGEST_SERVICE_URL: HttpUrl = K8S_INGEST_SVC_URL_DEFAULT # Usar HttpUrl para validación básica
+    QUERY_SERVICE_URL: HttpUrl = K8S_QUERY_SVC_URL_DEFAULT  # Usar HttpUrl
+    AUTH_SERVICE_URL: Optional[HttpUrl] = None # Opcional (GATEWAY_AUTH_SERVICE_URL)
 
     # Configuración JWT (Obligatoria)
-    # Buscará GATEWAY_JWT_SECRET y GATEWAY_JWT_ALGORITHM
     JWT_SECRET: str # Obligatorio, sin valor por defecto inseguro
     JWT_ALGORITHM: str = "HS256" # Valor por defecto común para Supabase
 
     # Configuración Supabase Admin (Obligatoria)
-    # Buscará GATEWAY_SUPABASE_URL y GATEWAY_SUPABASE_SERVICE_ROLE_KEY
-    SUPABASE_URL: str # Obligatorio
+    SUPABASE_URL: HttpUrl # Obligatorio, usar HttpUrl
     SUPABASE_SERVICE_ROLE_KEY: str # Obligatorio, sin valor por defecto inseguro
 
     # Configuración de Asociación de Compañía
-    # Buscará GATEWAY_DEFAULT_COMPANY_ID
     DEFAULT_COMPANY_ID: Optional[str] = None # Opcional, pero necesario para la asociación
 
     # Configuración General
     LOG_LEVEL: str = "INFO"
     HTTP_CLIENT_TIMEOUT: int = 60 # Timeout en segundos para llamadas downstream
-    # Nombre corregido según logs iniciales (aunque el código usaba KEEPALIAS)
-    # Mantendremos el nombre que Pydantic buscará (GATEWAY_HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS)
-    # Si el nombre real de la variable de entorno es diferente, Pydantic fallará.
-    HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS: int = 20 # Máximo conexiones keep-alive
-    HTTP_CLIENT_MAX_CONNECTIONS: int = 100 # Máximo conexiones totales
+    # Nombre de Pydantic (KEEPALIAS) vs httpx (keepalive) - Mantener el de Pydantic si la variable de entorno se llama así.
+    HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS: int = 100 # Máximo conexiones keep-alive
+    HTTP_CLIENT_MAX_CONNECTIONS: int = 200 # Máximo conexiones totales
 
     # Validadores Pydantic
     @validator('JWT_SECRET')
@@ -76,18 +65,13 @@ class Settings(BaseSettings):
         # Podría añadirse validación de formato si Supabase tiene uno específico (ej. longitud)
         return v
 
-    @validator('SUPABASE_URL')
-    def check_supabase_url(cls, v):
-        if not v or not v.startswith("https://"):
-             raise ValueError("GATEWAY_SUPABASE_URL must be a valid HTTPS URL.")
-        # Podría validarse el formato más estrictamente
-        return v
+    # La validación de URL ahora la hace Pydantic con HttpUrl, no se necesita check_supabase_url
 
     @validator('DEFAULT_COMPANY_ID', always=True) # always=True para que se ejecute incluso si es None
-    def check_default_company_id(cls, v):
+    def check_default_company_id_format(cls, v): # Renombrado para claridad
         if v is not None: # Solo validar si se proporciona un valor
             try:
-                uuid.UUID(v)
+                uuid.UUID(str(v)) # Convertir a string por si acaso
             except ValueError:
                 raise ValueError(f"GATEWAY_DEFAULT_COMPANY_ID ('{v}') is not a valid UUID.")
         # Si es None, es válido (aunque la lógica de asociación fallará si se necesita)
@@ -96,18 +80,23 @@ class Settings(BaseSettings):
     @validator('LOG_LEVEL')
     def check_log_level(cls, v):
         valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
-        if v.upper() not in valid_levels:
+        normalized_v = v.upper()
+        if normalized_v not in valid_levels:
             raise ValueError(f"Invalid LOG_LEVEL '{v}'. Must be one of {valid_levels}")
-        return v.upper() # Normalizar a mayúsculas
+        return normalized_v # Normalizar a mayúsculas
 
 # Usar lru_cache para asegurar que las settings se cargan una sola vez
 @lru_cache()
 def get_settings() -> Settings:
     # Configurar un logger temporal BÁSICO para la carga de settings
     # Esto evita problemas si el logging completo aún no está configurado
-    temp_log = logging.getLogger(__name__)
+    temp_log = logging.getLogger("api_gateway.config.loader") # Nombre más específico
     if not temp_log.handlers:
-        temp_log.addHandler(logging.StreamHandler(sys.stdout))
+        handler = logging.StreamHandler(sys.stdout)
+        # Formato simple para logs de carga
+        formatter = logging.Formatter('%(levelname)s: %(message)s')
+        handler.setFormatter(formatter)
+        temp_log.addHandler(handler)
         temp_log.setLevel(logging.INFO) # Usar INFO para ver mensajes de carga
 
     temp_log.info("Loading Gateway settings...")
@@ -116,20 +105,21 @@ def get_settings() -> Settings:
         # y ejecutará los validadores
         settings_instance = Settings()
 
-        # Loguear valores cargados (excepto secretos)
+        # Loguear valores cargados (excepto secretos) - Convertir HttpUrl a string para loggear
         temp_log.info("Gateway Settings Loaded Successfully:")
         temp_log.info(f"  PROJECT_NAME: {settings_instance.PROJECT_NAME}")
-        temp_log.info(f"  INGEST_SERVICE_URL: {settings_instance.INGEST_SERVICE_URL}")
-        temp_log.info(f"  QUERY_SERVICE_URL: {settings_instance.QUERY_SERVICE_URL}")
-        temp_log.info(f"  AUTH_SERVICE_URL: {settings_instance.AUTH_SERVICE_URL or 'Not Set'}")
+        temp_log.info(f"  INGEST_SERVICE_URL: {str(settings_instance.INGEST_SERVICE_URL)}")
+        temp_log.info(f"  QUERY_SERVICE_URL: {str(settings_instance.QUERY_SERVICE_URL)}")
+        temp_log.info(f"  AUTH_SERVICE_URL: {str(settings_instance.AUTH_SERVICE_URL) if settings_instance.AUTH_SERVICE_URL else 'Not Set'}")
         temp_log.info(f"  JWT_SECRET: *** SET (Validated) ***")
         temp_log.info(f"  JWT_ALGORITHM: {settings_instance.JWT_ALGORITHM}")
-        temp_log.info(f"  SUPABASE_URL: {settings_instance.SUPABASE_URL}")
+        temp_log.info(f"  SUPABASE_URL: {str(settings_instance.SUPABASE_URL)}")
         temp_log.info(f"  SUPABASE_SERVICE_ROLE_KEY: *** SET (Validated) ***")
         if settings_instance.DEFAULT_COMPANY_ID:
-            temp_log.info(f"  DEFAULT_COMPANY_ID: {settings_instance.DEFAULT_COMPANY_ID}")
+            temp_log.info(f"  DEFAULT_COMPANY_ID: {settings_instance.DEFAULT_COMPANY_ID} (Validated as UUID if set)")
         else:
-            temp_log.warning("  DEFAULT_COMPANY_ID: Not Set (Company association endpoint will fail if called)")
+            # Es una advertencia porque el endpoint de asociación fallará si se llama
+            temp_log.warning("  DEFAULT_COMPANY_ID: Not Set (Ensure-company endpoint requires this)")
         temp_log.info(f"  LOG_LEVEL: {settings_instance.LOG_LEVEL}")
         temp_log.info(f"  HTTP_CLIENT_TIMEOUT: {settings_instance.HTTP_CLIENT_TIMEOUT}")
         temp_log.info(f"  HTTP_CLIENT_MAX_CONNECTIONS: {settings_instance.HTTP_CLIENT_MAX_CONNECTIONS}")
@@ -142,7 +132,9 @@ def get_settings() -> Settings:
         temp_log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         temp_log.critical("! FATAL: Error validating Gateway settings:")
         for error in e.errors():
-            temp_log.critical(f"!  - {' -> '.join(map(str, error['loc']))}: {error['msg']}")
+            loc = " -> ".join(map(str, error['loc'])) if error.get('loc') else 'N/A'
+            temp_log.critical(f"!  - {loc}: {error['msg']}")
+        temp_log.critical("! Check your .env file or environment variables.")
         temp_log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         sys.exit("FATAL: Invalid Gateway configuration. Check logs.")
     except Exception as e:
