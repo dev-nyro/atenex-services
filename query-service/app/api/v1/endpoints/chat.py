@@ -3,7 +3,7 @@ import uuid
 from typing import List, Optional
 import structlog
 
-from fastapi import APIRouter, Depends, HTTPException, status, Path
+from fastapi import APIRouter, Depends, HTTPException, status, Path, Query
 
 from app.api.v1 import schemas
 from app.db import postgres_client

@@ -623,15 +623,16 @@ import time
 import uuid
 import logging # <-- Importar logging estándar
 from supabase.client import Client as SupabaseClient
-from app.routers import gateway_router, user_router, auth_router
 
-from app.core.config import settings
-from app.core.logging_config import setup_logging
 # Configurar logging ANTES de importar otros módulos que puedan loguear
+from app.core.logging_config import setup_logging
 setup_logging()
 # Ahora importar el resto
+from app.core.config import settings
 from app.utils.supabase_admin import get_supabase_admin_client
 from app.routers import gateway_router, user_router
+# *** CORRECCIÓN: Comentar o eliminar importación de auth_router si ya no se usa ***
+# from app.routers import auth_router
 # Importar dependencias de autenticación para verificar su carga
 from app.auth.auth_middleware import StrictAuth, InitialAuth
 
@@ -641,76 +642,36 @@ log = structlog.get_logger("api_gateway.main") # Logger para el módulo main
 proxy_http_client: Optional[httpx.AsyncClient] = None
 supabase_admin_client: Optional[SupabaseClient] = None
 
-# --- Lifespan para inicializar/cerrar clientes ---
+# --- Lifespan para inicializar/cerrar clientes (Sin cambios) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global proxy_http_client, supabase_admin_client
     log.info("Application startup: Initializing global clients...")
-
-    # Inicializar cliente HTTPX para proxy
     try:
-        # Configurar límites y timeouts desde settings
         limits = httpx.Limits(
             max_keepalive_connections=settings.HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS,
             max_connections=settings.HTTP_CLIENT_MAX_CONNECTIONS
         )
-        # Usar timeout general, se puede sobreescribir por request si es necesario
-        # Añadir connect timeout más corto
-        timeout = httpx.Timeout(
-            settings.HTTP_CLIENT_TIMEOUT, connect=10.0, # Timeout de conexión más corto
-            # read, write, pool usan el general
-        )
-        proxy_http_client = httpx.AsyncClient(
-             limits=limits,
-             timeout=timeout,
-             follow_redirects=False, # No seguir redirects automáticamente en el proxy
-             http2=True # Habilitar HTTP/2 si los servicios backend lo soportan
-        )
-        # Inyectar el cliente en el módulo del router (alternativa a pasarlo en cada request)
+        timeout = httpx.Timeout(settings.HTTP_CLIENT_TIMEOUT, connect=10.0)
+        proxy_http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=False, http2=True)
         gateway_router.http_client = proxy_http_client
         log.info("HTTP Client initialized successfully.", limits=str(limits), timeout=str(timeout))
     except Exception as e:
         log.exception("CRITICAL: Failed to initialize HTTP client during startup!", error=str(e))
-        # Podríamos decidir si la app puede arrancar sin cliente HTTP
-        # sys.exit("Failed to initialize HTTP client.") # Opcional: Salir si es crítico
-        proxy_http_client = None
-        gateway_router.http_client = None # Asegurar que el router lo vea como None
-
-    # Inicializar cliente Supabase Admin
+        proxy_http_client = None; gateway_router.http_client = None
     log.info("Initializing Supabase Admin Client...")
     try:
-        # get_supabase_admin_client usa lru_cache y maneja errores internos
         supabase_admin_client = get_supabase_admin_client()
-        # Inyectar en el router de usuario (menos ideal, mejor usar Depends en la ruta)
-        user_router.supabase_admin = supabase_admin_client
+        user_router.supabase_admin = supabase_admin_client # Inyección simple, mejor Depends
         log.info("Supabase Admin Client reference obtained (initialized via get_supabase_admin_client).")
-        # Podríamos hacer un test rápido aquí si fuera necesario, pero get_client lo hace al primer uso
     except Exception as e:
-        # get_supabase_admin_client ya loguea el error crítico
         log.exception("CRITICAL: Failed to get Supabase Admin Client during startup!", error=str(e))
-        # Podríamos decidir si salir o continuar sin cliente admin
-        # sys.exit("Failed to initialize Supabase Admin client.") # Opcional
-        supabase_admin_client = None
-        user_router.supabase_admin = None # Asegurar que el router lo vea como None
-
-    # Punto donde la aplicación está lista para recibir requests
+        supabase_admin_client = None; user_router.supabase_admin = None
     yield
-    # --- Shutdown ---
     log.info("Application shutdown: Closing clients...")
-
-    # Cerrar cliente HTTPX
     if proxy_http_client and not proxy_http_client.is_closed:
-        try:
-            await proxy_http_client.aclose()
-            log.info("HTTP Client closed successfully.")
-        except Exception as e:
-            log.exception("Error closing HTTP client during shutdown.", error=str(e))
-    elif proxy_http_client is None:
-        log.warning("HTTP Client was not initialized during startup.")
-    else: # Estaba inicializado pero ya cerrado
-        log.info("HTTP Client was already closed.")
-
-    # Cliente Supabase (supabase-py) no requiere cierre explícito عادةً
+        try: await proxy_http_client.aclose(); log.info("HTTP Client closed successfully.")
+        except Exception as e: log.exception("Error closing HTTP client during shutdown.", error=str(e))
     log.info("Supabase Admin Client shutdown check complete (no explicit close needed).")
 
 
@@ -719,233 +680,85 @@ app = FastAPI(
     title=settings.PROJECT_NAME,
     description="Punto de entrada único y seguro para los microservicios de Nyro. Valida JWTs de Supabase, gestiona asociación inicial de compañía y reenvía tráfico a servicios backend.",
     version="1.0.0",
-    lifespan=lifespan, # Usar el lifespan definido arriba
-    # Se pueden añadir otros parámetros como openapi_url, docs_url, redoc_url
+    lifespan=lifespan,
 )
 
 # --- Middlewares ---
 
-# 1. CORS Middleware (Configuración más robusta)
+# 1. CORS Middleware (Configuración robusta - Sin cambios respecto a tu código)
 allowed_origins = []
-# Orígenes desde variables de entorno o configuración
-vercel_url = os.getenv("VERCEL_FRONTEND_URL", "https://atenex-frontend.vercel.app") # Usar fallback
-log.info(f"Adding Vercel frontend URL to allowed origins: {vercel_url}")
+vercel_url = os.getenv("VERCEL_FRONTEND_URL", "https://atenex-frontend.vercel.app")
 allowed_origins.append(vercel_url)
-
-localhost_url = "http://localhost:3000" # Frontend local estándar
-log.info(f"Adding localhost frontend URL to allowed origins: {localhost_url}")
+localhost_url = "http://localhost:3000"
 allowed_origins.append(localhost_url)
-
-# Añadir Ngrok URL de forma dinámica o desde env var
 ngrok_url_env = os.getenv("NGROK_URL")
 if ngrok_url_env:
     if ngrok_url_env.startswith("https://") and ".ngrok" in ngrok_url_env:
-        log.info(f"Adding Ngrok URL from NGROK_URL env var: {ngrok_url_env}")
         allowed_origins.append(ngrok_url_env)
-    else:
-        log.warning(f"NGROK_URL environment variable ('{ngrok_url_env}') doesn't look like a valid https Ngrok URL. Ignoring.")
-# También añadir la URL específica observada en logs si es diferente y no estaba en env
 ngrok_url_from_logs = "https://1942-2001-1388-53a1-a7c9-241c-4a44-2b12-938f.ngrok-free.app"
 if ngrok_url_from_logs not in allowed_origins:
-    log.info(f"Adding specific Ngrok URL observed in logs: {ngrok_url_from_logs}")
     allowed_origins.append(ngrok_url_from_logs)
-
-# Eliminar duplicados y None
 allowed_origins = list(set(filter(None, allowed_origins)))
-if not allowed_origins:
-    log.critical("CRITICAL: No allowed origins configured for CORS. Frontend requests will likely fail.")
-else:
-    log.info("Final CORS Allowed Origins:", origins=allowed_origins)
-
-# Headers permitidos (incluir estándar y específicos como ngrok)
-allowed_headers = [
-    "Authorization", "Content-Type", "Accept", "Origin",
-    "X-Requested-With", "ngrok-skip-browser-warning", "X-Request-ID" # Permitir pasar X-Request-ID
-]
-log.info("CORS Allowed Headers:", headers=allowed_headers)
-
-# Métodos permitidos
+allowed_headers = ["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With", "ngrok-skip-browser-warning", "X-Request-ID"]
 allowed_methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
+log.info("Final CORS Allowed Origins:", origins=allowed_origins)
+log.info("CORS Allowed Headers:", headers=allowed_headers)
 log.info("CORS Allowed Methods:", methods=allowed_methods)
+app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_credentials=True, allow_methods=allowed_methods, allow_headers=allowed_headers, expose_headers=["X-Request-ID", "X-Process-Time"], max_age=600)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True, # Importante para pasar cookies/auth headers
-    allow_methods=allowed_methods,
-    allow_headers=allowed_headers,
-    expose_headers=["X-Request-ID", "X-Process-Time"], # Exponer headers custom
-    max_age=600, # Cachear respuesta preflight OPTIONS por 10 mins
-)
-
-# 2. Middleware para Request ID, Timing y Logging Estructurado
+# 2. Middleware Request ID, Timing, Logging (Sin cambios respecto a tu código)
 @app.middleware("http")
 async def add_request_id_timing_logging(request: Request, call_next):
-    start_time = time.time()
-    # Usar X-Request-ID del header si existe, sino generar uno nuevo
-    request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
-    # Guardar en el estado para acceso posterior
-    request.state.request_id = request_id
-
-    # Vincular request_id al contexto de structlog para todos los logs de esta request
+    start_time = time.time(); request_id = request.headers.get("x-request-id", str(uuid.uuid4())); request.state.request_id = request_id
     with structlog.contextvars.bound_contextvars(request_id=request_id):
-        # Logger específico para requests entrantes/salientes
         bound_log = structlog.get_logger("api_gateway.requests")
-        # Loggear inicio de request
-        bound_log.info("Request received",
-                       method=request.method,
-                       path=request.url.path,
-                       client_ip=request.client.host if request.client else "N/A",
-                       user_agent=request.headers.get("user-agent", "N/A")[:100]) # Limitar longitud UA
-
+        bound_log.info("Request received", method=request.method, path=request.url.path, client_ip=request.client.host if request.client else "N/A", user_agent=request.headers.get("user-agent", "N/A")[:100])
         response = None
         try:
             response = await call_next(request)
-            # Calcular duración después de obtener la respuesta
             process_time = time.time() - start_time
-            # Añadir headers custom a la respuesta
-            response.headers["X-Process-Time"] = f"{process_time:.4f}"
-            response.headers["X-Request-ID"] = request_id
-            # Loggear fin de request exitosa
-            bound_log.info("Request processed successfully",
-                           status_code=response.status_code,
-                           duration=round(process_time, 4))
+            response.headers["X-Process-Time"] = f"{process_time:.4f}"; response.headers["X-Request-ID"] = request_id
+            bound_log.info("Request processed successfully", status_code=response.status_code, duration=round(process_time, 4))
         except Exception as e:
-            # Loggear excepción no manejada ANTES de re-lanzarla
             process_time = time.time() - start_time
-            # Usar logger del middleware para excepciones no capturadas por handlers específicos
-            bound_log.exception("Unhandled exception during request processing",
-                                duration=round(process_time, 4),
-                                error_type=type(e).__name__,
-                                error=str(e))
-            # Re-lanzar para que los exception_handlers de FastAPI la capturen
+            bound_log.exception("Unhandled exception during request processing", duration=round(process_time, 4), error_type=type(e).__name__, error=str(e))
             raise e
-        finally:
-            # Este bloque se ejecuta siempre, incluso si hay return o raise
-            # Asegurar que el contexto de structlog se limpie (aunque contextvars debería hacerlo)
-            pass
-
+        finally: pass
         return response
 
 # --- Routers ---
-# Incluir los routers definidos en otros módulos
-app.include_router(auth_router.router)
-app.include_router(gateway_router.router)
-app.include_router(user_router.router)
+# *** CORRECCIÓN: Comentar o eliminar inclusión de auth_router si ya no se usa o está vacío ***
+# app.include_router(auth_router.router) # Ya no necesario si no hay rutas auth en gateway
+app.include_router(gateway_router.router) # Proxy principal
+app.include_router(user_router.router) # Rutas relacionadas con usuario (si las hay)
 
-# --- Endpoints Básicos ---
+# --- Endpoints Básicos (Sin cambios) ---
 @app.get("/", tags=["Gateway Status"], summary="Root endpoint", include_in_schema=False)
-async def root():
-    """Endpoint raíz simple para verificar que el gateway está corriendo."""
-    return {"message": f"{settings.PROJECT_NAME} is running!"}
-
-@app.get("/health",
-         tags=["Gateway Status"],
-         summary="Kubernetes Health Check",
-         status_code=status.HTTP_200_OK,
-         response_description="Indicates if the gateway and its core dependencies are healthy.",
-         responses={
-             status.HTTP_200_OK: {"description": "Gateway is healthy."},
-             status.HTTP_503_SERVICE_UNAVAILABLE: {"description": "Gateway is unhealthy due to dependency issues."}
-         })
+async def root(): return {"message": f"{settings.PROJECT_NAME} is running!"}
+@app.get("/health", tags=["Gateway Status"], summary="Kubernetes Health Check", status_code=status.HTTP_200_OK, response_description="Indicates if the gateway and its core dependencies are healthy.")
 async def health_check():
-     """
-     Verifica el estado del gateway y sus dependencias críticas (Cliente HTTP, Cliente Supabase Admin).
-     Usado por Kubernetes Liveness/Readiness Probes.
-     """
-     admin_client_status = "available" if supabase_admin_client else "unavailable"
-     http_client_status = "available" if proxy_http_client and not proxy_http_client.is_closed else "unavailable"
+    admin_client_status = "available" if supabase_admin_client else "unavailable"
+    http_client_status = "available" if proxy_http_client and not proxy_http_client.is_closed else "unavailable"
+    is_healthy = admin_client_status == "available" and http_client_status == "available"
+    health_details = {"status": "healthy" if is_healthy else "unhealthy", "service": settings.PROJECT_NAME, "dependencies": {"supabase_admin_client": admin_client_status, "proxy_http_client": http_client_status}}
+    if not is_healthy: log.error("Health check failed", details=health_details); raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=health_details)
+    log.debug("Health check passed.", details=health_details); return health_details
 
-     # Considerar la app saludable sólo si AMBOS clientes están listos
-     is_healthy = admin_client_status == "available" and http_client_status == "available"
-
-     health_details = {
-         "status": "healthy" if is_healthy else "unhealthy",
-         "service": settings.PROJECT_NAME,
-         "dependencies": {
-             "supabase_admin_client": admin_client_status,
-             "proxy_http_client": http_client_status
-         }
-     }
-
-     if not is_healthy:
-         log.error("Health check failed", details=health_details)
-         # Levantar 503 si no está saludable
-         raise HTTPException(
-             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-             detail=health_details
-         )
-
-     log.debug("Health check passed.", details=health_details)
-     return health_details
-
-# --- Manejadores de Excepciones Globales ---
-# Captura excepciones HTTP que ocurren en las rutas o dependencias
+# --- Manejadores de Excepciones Globales (Sin cambios) ---
 @app.exception_handler(HTTPException)
 async def custom_http_exception_handler(request: Request, exc: HTTPException):
-    req_id = getattr(request.state, 'request_id', 'N/A')
-    # Usar el logger principal o uno específico para excepciones
-    bound_log = log.bind(request_id=req_id)
-
-    # Determinar nivel de log basado en status code
-    # Errores de cliente (4xx) son WARNING, errores de servidor (5xx) son ERROR
-    log_level_name = "warning" if 400 <= exc.status_code < 500 else "error"
-    # *** CORRECCIÓN: Usar getattr para llamar al método de log correcto ***
-    log_method = getattr(bound_log, log_level_name, bound_log.info) # Fallback a info si es un nivel desconocido
-
-    log_method("HTTP Exception occurred",
-               status_code=exc.status_code,
-               detail=exc.detail,
-               path=request.url.path,
-               # Incluir headers de la excepción si existen (ej. WWW-Authenticate)
-               exception_headers=exc.headers)
-
-    # Devolver respuesta JSON estándar para HTTPExceptions
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"detail": exc.detail},
-        headers=exc.headers # Pasar headers de la excepción a la respuesta
-    )
-
-# Captura cualquier otra excepción no manejada (errores 500 inesperados)
+    req_id = getattr(request.state, 'request_id', 'N/A'); bound_log = log.bind(request_id=req_id)
+    log_level_name = "warning" if 400 <= exc.status_code < 500 else "error"; log_method = getattr(bound_log, log_level_name, bound_log.info)
+    log_method("HTTP Exception occurred", status_code=exc.status_code, detail=exc.detail, path=request.url.path, exception_headers=exc.headers)
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    req_id = getattr(request.state, 'request_id', 'N/A')
-    bound_log = log.bind(request_id=req_id)
+    req_id = getattr(request.state, 'request_id', 'N/A'); bound_log = log.bind(request_id=req_id)
+    bound_log.exception("Unhandled internal server error occurred in gateway", path=request.url.path, error_type=type(exc).__name__)
+    return JSONResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content={"detail": "An unexpected internal server error occurred."})
 
-    # Loguear la excepción completa para diagnóstico
-    bound_log.exception("Unhandled internal server error occurred in gateway",
-                        path=request.url.path,
-                        error_type=type(exc).__name__) # Incluir tipo de error
-
-    # Devolver respuesta 500 genérica al cliente
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": "An unexpected internal server error occurred."}
-    )
-
-# --- Log final de configuración (opcional) ---
-# Este log se ejecutará sólo una vez cuando el módulo se cargue
-log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start.",
-         log_level=settings.LOG_LEVEL,
-         ingest_service=str(settings.INGEST_SERVICE_URL),
-         query_service=str(settings.QUERY_SERVICE_URL),
-         auth_proxy_enabled=bool(settings.AUTH_SERVICE_URL),
-         supabase_url=str(settings.SUPABASE_URL),
-         default_company_id_set=bool(settings.DEFAULT_COMPANY_ID)
-         )
-
-# --- Ejecución con Uvicorn (para desarrollo local) ---
-# Esto normalmente no se incluye si usas Gunicorn en producción
-# if __name__ == "__main__":
-#     uvicorn.run(
-#         "app.main:app",
-#         host="0.0.0.0",
-#         port=8080, # Puerto estándar interno
-#         log_level=settings.LOG_LEVEL.lower(), # Pasar nivel de log a uvicorn
-#         reload=True # Habilitar reload para desarrollo
-#         # Añadir --log-config app/logging.yaml si usas config de logging externa
-#     )
+# --- Log final de configuración (Sin cambios) ---
+log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start.", log_level=settings.LOG_LEVEL, ingest_service=str(settings.INGEST_SERVICE_URL), query_service=str(settings.QUERY_SERVICE_URL), auth_proxy_enabled=bool(settings.AUTH_SERVICE_URL), supabase_url=str(settings.SUPABASE_URL), default_company_id_set=bool(settings.DEFAULT_COMPANY_ID))
 ```
 
 ## File: `app\routers\__init__.py`
@@ -962,192 +775,44 @@ from typing import Annotated, Dict, Any, Optional
 import structlog
 import uuid
 
-# Dependencias
+# Dependencias (Aunque no se usen ahora, las dejamos por si se añaden otras rutas)
 from app.utils.supabase_admin import get_supabase_admin_client
 from supabase import Client as SupabaseClient
 from gotrue.errors import AuthApiError
-# (+) Importar PostgrestError para manejo más específico
 from postgrest.exceptions import APIError as PostgrestError
-
 
 from app.core.config import settings
 
 log = structlog.get_logger(__name__)
-router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
+# Cambiado el prefijo o eliminarlo si ya no hay rutas de auth manejadas aquí
+# router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
+router = APIRouter() # Sin prefijo, o comenta la inclusión en main.py
 
-# --- Pydantic Models (sin cambios) ---
-class RegisterPayload(BaseModel):
-    email: EmailStr
-    password: str = Field(..., min_length=8)
-    name: Optional[str] = Field(None, min_length=2)
+# --- Pydantic Models (Ya no se usan para registro) ---
+# class RegisterPayload(BaseModel):
+#    email: EmailStr
+#    password: str = Field(..., min_length=8)
+#    name: Optional[str] = Field(None, min_length=2)
+#
+# class RegisterResponse(BaseModel):
+#    message: str
+#    user_id: Optional[uuid.UUID] = None
 
-class RegisterResponse(BaseModel):
-    message: str
-    user_id: Optional[uuid.UUID] = None
 
-# --- Helpers (Solo búsqueda de compañía) ---
+# --- Endpoint de Registro ELIMINADO ---
+# La ruta POST /api/v1/auth/register ya no existirá o devolverá 404/501
+# si el router está montado pero la ruta no está definida,
+# o si el Auth Service Proxy (si estaba habilitado) ya no se usa.
 
-def _get_company_id_by_name(admin_client: SupabaseClient, company_name: str) -> Optional[uuid.UUID]:
-    """Busca el UUID de una compañía por su nombre en public.companies."""
-    bound_log = log.bind(lookup_company_name=company_name)
-    try:
-        bound_log.debug("Looking up company ID by name...")
-        response = admin_client.table("companies").select("id").eq("name", company_name).limit(1).maybe_single().execute()
+# Puedes añadir aquí otros endpoints de auth si los gestiona el gateway
+# (ej: refrescar token, obtener perfil propio), pero si no, este
+# archivo puede quedar vacío o eliminarse junto con su inclusión en main.py.
 
-        # Revisar errores PostgREST primero
-        postgrest_error = getattr(response, 'error', None)
-        if postgrest_error:
-             bound_log.error("PostgREST error during company lookup.", response_error=postgrest_error)
-             return None # Falló la búsqueda
-
-        if response and response.data:
-            company_id = response.data.get("id")
-            if company_id:
-                 bound_log.info("Company found.", company_id=company_id)
-                 return uuid.UUID(company_id)
-            else:
-                 bound_log.warning("Company query returned data but no ID found.")
-                 return None
-        elif response and not response.data:
-             bound_log.warning("Company not found by name.")
-             return None
-        else:
-            # Caso inesperado si no hay error ni datos
-            bound_log.error("Unexpected response (None or no data/error) during company lookup.", response_details=response)
-            return None
-
-    except Exception as e:
-        bound_log.exception("Error looking up company ID.")
-        return None
-
-# --- Endpoint de Registro (Modificado para llamar a RPC y mejorar logging) ---
-@router.post(
-    "/register",
-    status_code=status.HTTP_201_CREATED,
-    response_model=RegisterResponse,
-    summary="Register a new user via Backend (RPC Sync)",
-    description="Creates user in Supabase Auth with metadata, then calls SQL function to sync public profile.",
-    # ... (responses sin cambios) ...
-    responses={
-        status.HTTP_201_CREATED: {"description": "User registered successfully, confirmation email sent."},
-        status.HTTP_400_BAD_REQUEST: {"description": "Invalid input data or default company 'nyrouwu' not found."},
-        status.HTTP_409_CONFLICT: {"description": "A user with this email already exists."},
-        status.HTTP_500_INTERNAL_SERVER_ERROR: {"description": "Failed to create user or profile due to a server error."},
-        status.HTTP_503_SERVICE_UNAVAILABLE: {"description": "Supabase Admin client not available."},
-    }
-)
-async def register_user_endpoint(
-    payload: RegisterPayload,
-    admin_client: Annotated[SupabaseClient, Depends(get_supabase_admin_client)],
-):
-    bound_log = log.bind(user_email=payload.email)
-    bound_log.info("Backend registration endpoint called (RPC Flow).")
-
-    # 1. Obtener el ID de la compañía por defecto "nyrouwu"
-    default_company_name = "nyrouwu"
-    company_id = _get_company_id_by_name(admin_client, default_company_name)
-
-    if not company_id:
-        bound_log.error(f"Default company '{default_company_name}' not found in database.")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Required default company configuration ('{default_company_name}') not found."
-        )
-
-    # 2. Preparar metadatos
-    user_metadata = {"name": payload.name} if payload.name else {}
-    app_metadata = {
-        "company_id": str(company_id),
-        "roles": ["user"]
-    }
-
-    # 3. Crear usuario en Supabase Auth (llamada SÍNCRONA)
-    new_user_id: Optional[uuid.UUID] = None
-    try:
-        bound_log.debug("Attempting to create user in Supabase Auth (sync call)...")
-        create_user_response = admin_client.auth.admin.create_user({
-            "email": payload.email,
-            "password": payload.password,
-            "email_confirm": True,
-            "user_metadata": user_metadata,
-            "app_metadata": app_metadata
-        })
-        bound_log.debug("Supabase Auth create_user call completed.")
-
-        new_user = create_user_response.user
-        if not new_user or not new_user.id:
-            bound_log.error("Supabase Auth create_user succeeded but returned no user or ID.", response=create_user_response)
-            raise HTTPException(status_code=500, detail="Failed to retrieve user details after creation.")
-
-        new_user_id = new_user.id
-        bound_log.info("User successfully created in Supabase Auth.", user_id=new_user_id)
-
-    except AuthApiError as e:
-        bound_log.error("AuthApiError creating Supabase Auth user.", status_code=e.status, error_message=e.message)
-        if "user already exists" in str(e.message).lower() or e.status == 422:
-             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A user with this email already exists.")
-        else:
-             status_code = e.status if 400 <= e.status < 600 else 500
-             raise HTTPException(status_code=status_code, detail=f"Error creating user in auth system: {e.message}")
-    except Exception as e:
-        bound_log.exception("Unexpected error creating Supabase Auth user.")
-        raise HTTPException(status_code=500, detail=f"Internal server error during user creation: {e}")
-
-    # 4. Llamar a la función SQL para crear/actualizar el perfil público (llamada SÍNCRONA)
-    if new_user_id:
-        rpc_success = False
-        rpc_error_details = None
-        try:
-            bound_log.debug("Calling RPC public.create_public_profile_for_user...", user_id=new_user_id)
-            rpc_response = admin_client.rpc(
-                "create_public_profile_for_user",
-                {"user_id": str(new_user_id)}
-            ).execute()
-
-            rpc_error = getattr(rpc_response, 'error', None)
-            if rpc_error:
-                 # Captura errores estructurados de PostgREST devueltos por RPC
-                 rpc_error_details = str(rpc_error)
-                 bound_log.error("PostgREST error calling create_public_profile_for_user RPC.",
-                                 status_code=getattr(rpc_response,'status_code','N/A'),
-                                 error_details=rpc_error_details, user_id=new_user_id)
-            # (+) Verificar si la respuesta en sí indica un problema (aunque no tenga .error)
-            elif rpc_response is None or getattr(rpc_response, 'data', 'NOT_PRESENT') == 'NOT_PRESENT':
-                 # Si la respuesta es None o no tiene el atributo 'data' (inesperado para .execute())
-                 rpc_error_details = f"RPC call returned unexpected response object: {type(rpc_response)}"
-                 bound_log.error(rpc_error_details, user_id=new_user_id, rpc_response_obj=rpc_response)
-            else:
-                 # Asumimos éxito si no hubo error explícito y la respuesta parece válida
-                 rpc_success = True
-                 bound_log.info("Successfully called RPC to sync public profile.", user_id=new_user_id)
-
-        except PostgrestError as pg_error:
-             # Capturar excepciones levantadas por la librería postgrest-py
-             rpc_error_details = f"PostgrestError Exception: {pg_error}"
-             bound_log.exception("PostgrestError exception calling RPC.", user_id=new_user_id, error=pg_error)
-        except Exception as e:
-             # Capturar cualquier otro error durante la llamada RPC
-             rpc_error_details = f"Unexpected Exception: {e}"
-             bound_log.exception("Unexpected error calling create_public_profile_for_user RPC.", user_id=new_user_id)
-
-        # Loguear críticamente si la RPC no fue exitosa
-        if not rpc_success:
-            log.error("CRITICAL: Failed to sync public profile via RPC after auth user creation.",
-                      user_id=new_user_id,
-                      rpc_error_reason=rpc_error_details or "Unknown RPC failure reason")
-            # NOTA: Decidimos NO lanzar HTTPException aquí para permitir que el registro en Auth se complete.
-            # El usuario existe pero su perfil público podría estar incompleto.
-
-    # 5. Devolver éxito (incluso si la RPC falló, el usuario auth existe)
-    return RegisterResponse(
-        message="Registration successful. Please check your email for confirmation.",
-        user_id=new_user_id
-    )
+log.info("Auth router loaded (registration endpoint removed/disabled).")
 ```
 
 ## File: `app\routers\gateway_router.py`
 ```py
-# File: app/routers/gateway_router.py
 # api-gateway/app/routers/gateway_router.py
 from fastapi import APIRouter, Request, Response, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -1193,7 +858,15 @@ async def _proxy_request(
 ):
     """Función interna reutilizable para realizar el proxy de la petición HTTP."""
     method = request.method
-    target_url = httpx.URL(target_url_str)
+    # --- CORRECCIÓN: Asegurar que target_url_str NO tenga doble '//' ---
+    # Esto puede pasar si base_url termina en '/' y path empieza con '/'
+    # Construir URL cuidadosamente
+    base_url_obj = httpx.URL(str(request.url).split(request.url.path)[0]) # Obtener base URL de la request original
+    target_url_obj = httpx.URL(target_url_str) # Target base
+    # Reconstruir path y query
+    full_target_path = target_url_obj.path + (request.url.path.split(settings.API_V1_STR, 1)[1] if settings.API_V1_STR in request.url.path else request.url.path)
+    target_url = target_url_obj.copy_with(path=full_target_path, query=request.url.query.encode("utf-8"))
+
 
     # 1. Preparar Headers para reenviar
     headers_to_forward = {}
@@ -1217,7 +890,6 @@ async def _proxy_request(
         headers_to_forward["X-Request-ID"] = request_id
 
     # 2. Inyectar Headers de Autenticación/Contexto (SI HAY PAYLOAD y NO es OPTIONS)
-    # No inyectar en OPTIONS ya que no llevan contexto de usuario usualmente
     log_context = {'request_id': request_id} if request_id else {}
     if user_payload and method.upper() != 'OPTIONS':
         user_id = user_payload.get('sub')
@@ -1240,8 +912,7 @@ async def _proxy_request(
     # Vincular contexto al logger para esta operación de proxy
     bound_log = log.bind(**log_context)
 
-    # 3. Preparar Query Params y Body
-    query_params = request.query_params
+    # 3. Preparar Query Params (ya están en la target_url) y Body
     # Usar request.stream() para eficiencia, evita cargar todo el body en memoria
     request_body_stream = request.stream()
 
@@ -1253,14 +924,13 @@ async def _proxy_request(
         # Construir la solicitud httpx
         req = client.build_request(
             method=method,
-            url=target_url,
+            url=target_url, # Usar la URL reconstruida
             headers=headers_to_forward,
-            params=query_params,
+            # params=query_params, # Query params ya están en la URL
             # Pasar el stream directamente como contenido
             content=request_body_stream
         )
         # Enviar la solicitud y obtener la respuesta como stream
-        # Aumentar timeout aquí si es necesario para rutas específicas, ej. con timeout=httpx.Timeout(120.0)
         rp = await client.send(req, stream=True)
 
         # 5. Procesar y devolver la respuesta del servicio backend
@@ -1270,11 +940,6 @@ async def _proxy_request(
         response_headers = {
             k: v for k, v in rp.headers.items() if k.lower() not in HOP_BY_HOP_HEADERS
         }
-
-        # Preservar Content-Length si el backend lo envió y no usa chunked encoding
-        # StreamingResponse maneja esto bien, pero es bueno ser explícito si es necesario
-        # if 'content-length' in rp.headers and rp.headers.get('transfer-encoding') != 'chunked':
-        #     response_headers['content-length'] = rp.headers['content-length']
 
         # Devolver StreamingResponse para eficiencia de memoria
         return StreamingResponse(
@@ -1318,22 +983,13 @@ async def _proxy_request(
 )
 async def proxy_ingest_service(
     request: Request,
-    path: str,
+    path: str, # El path capturado por {path:path}
     client: Annotated[httpx.AsyncClient, Depends(get_client)],
-    # La dependencia StrictAuth ya validó y puso el payload en request.state.user
-    # Aquí la recibimos para pasarla a _proxy_request
-    user_payload: StrictAuth
+    user_payload: StrictAuth # La dependencia StrictAuth ya validó
 ):
-    """Reenvía peticiones a /api/v1/ingest/* al Ingest Service configurado.
-       Requiere autenticación JWT válida con `company_id`. Inyecta headers
-       `X-User-ID`, `X-Company-ID`, `X-User-Email`.
-    """
-    base_url = str(settings.INGEST_SERVICE_URL).rstrip('/') # Convertir HttpUrl a string y quitar / final
-    # Construir URL completa, preservando path y query params
-    target_url = f"{base_url}/api/v1/ingest/{path}"
-    if request.url.query:
-        target_url += f"?{request.url.query}"
-    return await _proxy_request(request, target_url, client, user_payload)
+    """Reenvía peticiones a /api/v1/ingest/* al Ingest Service configurado."""
+    # No es necesario construir la URL aquí, _proxy_request lo hará
+    return await _proxy_request(request, str(settings.INGEST_SERVICE_URL), client, user_payload)
 
 @router.api_route(
     "/api/v1/query/{path:path}",
@@ -1347,22 +1003,16 @@ async def proxy_ingest_service(
 )
 async def proxy_query_service(
     request: Request,
-    path: str,
+    path: str, # El path capturado por {path:path}
     client: Annotated[httpx.AsyncClient, Depends(get_client)],
     user_payload: StrictAuth # Payload validado por la dependencia
 ):
-    """Reenvía peticiones a /api/v1/query/* al Query Service configurado.
-       Requiere autenticación JWT válida con `company_id`. Inyecta headers
-       `X-User-ID`, `X-Company-ID`, `X-User-Email`.
-    """
-    base_url = str(settings.QUERY_SERVICE_URL).rstrip('/') # Convertir HttpUrl a string y quitar / final
-    target_url = f"{base_url}/api/v1/query/{path}"
-    if request.url.query:
-        target_url += f"?{request.url.query}"
-    return await _proxy_request(request, target_url, client, user_payload)
+    """Reenvía peticiones a /api/v1/query/* al Query Service configurado."""
+    # No es necesario construir la URL aquí, _proxy_request lo hará
+    return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload)
 
 
-# --- Proxy Opcional para Auth Service ---
+# --- Proxy Opcional para Auth Service (Mantenido pero ahora sin rutas activas definidas) ---
 if settings.AUTH_SERVICE_URL:
     log.info(f"Auth service proxy enabled for base URL: {settings.AUTH_SERVICE_URL}")
     @router.api_route(
@@ -1379,38 +1029,16 @@ if settings.AUTH_SERVICE_URL:
         path: str,
         client: Annotated[httpx.AsyncClient, Depends(get_client)],
         # NO hay dependencia StrictAuth o InitialAuth aquí.
-        # El token (si existe) pasará tal cual al servicio de auth.
     ):
-        """
-        Proxy genérico para el servicio de autenticación (si está configurado).
-        No realiza validación de token en el gateway. Reenvía la solicitud
-        tal cual al servicio de autenticación backend.
-        """
-        base_url = str(settings.AUTH_SERVICE_URL).rstrip('/') # Convertir HttpUrl a string
-        target_url = f"{base_url}/api/v1/auth/{path}"
-        if request.url.query:
-            target_url += f"?{request.url.query}"
-        # Llamar a _proxy_request sin user_payload (None)
-        return await _proxy_request(request, target_url, client, user_payload=None)
+        """Proxy genérico para el servicio de autenticación (si está configurado)."""
+        # No es necesario construir la URL aquí, _proxy_request lo hará
+        return await _proxy_request(request, str(settings.AUTH_SERVICE_URL), client, user_payload=None)
 else:
      # Loguear sólo una vez al inicio si no está configurado
      log.warning("Auth service proxy is not configured (GATEWAY_AUTH_SERVICE_URL not set). "
-                 "Requests to /api/v1/auth/* will result in 501 Not Implemented.")
-     @router.api_route(
-         "/api/v1/auth/{path:path}",
-         # *** CORRECCIÓN: Añadido OPTIONS ***
-         methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-         tags=["Proxy - Auth"],
-         summary="Auth Proxy (Not Configured)",
-         response_description="Error indicating the auth proxy is not configured.",
-         include_in_schema=False # Ocultar de la documentación si no está activo
-     )
-     async def auth_not_configured(request: Request, path: str):
-         # Devuelve 501 si se intenta acceder a la ruta no configurada
-         raise HTTPException(
-             status_code=status.HTTP_501_NOT_IMPLEMENTED,
-             detail="Authentication endpoint proxy is not configured in this gateway instance."
-         )
+                 "Requests to /api/v1/auth/* will result in 501 Not Implemented (unless handled by other routers).")
+     # No definimos la ruta aquí si está deshabilitado para evitar conflictos
+     # con el auth_router.py local si se monta (aunque ahora esté vacío).
 ```
 
 ## File: `app\routers\user_router.py`

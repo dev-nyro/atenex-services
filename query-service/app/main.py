@@ -100,9 +100,8 @@ async def generic_exception_handler(request, exc):
 
 
 # --- Routers ---
-app.include_router(query.router, prefix=settings.API_V1_STR, tags=["Query & Chat Interaction"])
-app.include_router(chat_router.router, prefix=settings.API_V1_STR, tags=["Chat Management"])
-
+app.include_router(query_router.router, prefix=settings.API_V1_STR + "/query", tags=["Query & Chat Interaction"])
+app.include_router(chat_router.router, prefix=settings.API_V1_STR + "/query", tags=["Chat Management"]) # Chat usa el mismo prefijo base
 
 # --- Root Endpoint / Health Check (Sin cambios) ---
 @app.get("/", tags=["Health Check"], summary="Service Liveness/Readiness Check", description="Basic Kubernetes probe endpoint. Returns 200 OK with 'OK' text if the service started successfully, otherwise 503.")
