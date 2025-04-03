@@ -11,7 +11,7 @@ from supabase import Client as SupabaseClient
 from gotrue.errors import AuthApiError
 from gotrue.types import UserResponse, User
 from postgrest import APIResponse as PostgrestAPIResponse
-from postgrest.utils import SyncFilterRequestBuilder # Para tipado del select
+from postgrest.builder import SyncFilterRequestBuilder # Para tipado del select
 
 from app.core.config import settings
 
