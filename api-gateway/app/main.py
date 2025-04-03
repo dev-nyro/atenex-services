@@ -12,6 +12,7 @@ import time
 import uuid
 import logging # <-- Importar logging estándar
 from supabase.client import Client as SupabaseClient
+from app.routers import gateway_router, user_router, auth_router
 
 from app.core.config import settings
 from app.core.logging_config import setup_logging
@@ -217,6 +218,7 @@ async def add_request_id_timing_logging(request: Request, call_next):
 
 # --- Routers ---
 # Incluir los routers definidos en otros módulos
+app.include_router(auth_router.router)
 app.include_router(gateway_router.router)
 app.include_router(user_router.router)
 
