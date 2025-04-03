@@ -11,6 +11,7 @@ from supabase import Client as SupabaseClient
 from gotrue.errors import AuthApiError
 from gotrue.types import UserResponse, User
 from postgrest import APIResponse as PostgrestAPIResponse
+from postgrest.utils import SyncFilterRequestBuilder # Para tipado del select
 
 from app.core.config import settings
 
@@ -20,34 +21,56 @@ router = APIRouter(prefix="/api/v1/users", tags=["Users"])
 # Inyección global (menos ideal)
 supabase_admin: Optional[SupabaseClient] = None
 
-# --- Helper _create_public_user_profile (sin cambios respecto a la versión anterior) ---
+# --- Helper _create_public_user_profile (Revisado para retornar None en error no HTTP) ---
 async def _create_public_user_profile(
     admin_client: SupabaseClient,
     user_id: str,
     email: Optional[str],
     name: Optional[str]
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]: # Ahora puede retornar None si falla internamente
+    """Helper para crear el perfil en public.users. Retorna el perfil o None."""
     bound_log = log.bind(user_id=user_id)
     bound_log.info("Public user profile not found, creating...")
     user_profile_data = {
         "id": user_id,
         "email": email,
-        "full_name": name,
+        "full_name": name or "User", # Asegurar un valor para full_name
         "role": "user",
+        # Añadir otros valores por defecto necesarios para tu tabla 'users'
+        "is_active": True,
+        # "company_id": None, # Se asignará después
     }
     try:
-        # LLAMADA SINCRONA CORRECTA
-        insert_response: PostgrestAPIResponse = admin_client.table("users").insert(user_profile_data).execute()
+        # Llamada síncrona
+        insert_builder: SyncFilterRequestBuilder = admin_client.table("users").insert(user_profile_data, returning="representation")
+        insert_response: PostgrestAPIResponse = insert_builder.execute()
+
+        # Verificar errores de PostgREST explícitamente
+        postgrest_error = getattr(insert_response, 'error', None)
+        if postgrest_error:
+             bound_log.error("PostgREST error during public profile insert.",
+                             status_code=insert_response.status_code,
+                             error_details=postgrest_error)
+             # Lanzar excepción para que sea capturada en el endpoint principal
+             raise HTTPException(status_code=500, detail=f"Database error creating profile: {postgrest_error.get('message', 'Unknown DB error')}")
+
         if insert_response.data and len(insert_response.data) > 0:
             bound_log.info("Successfully created public user profile.", profile_data=insert_response.data[0])
             return insert_response.data[0]
         else:
-            bound_log.error("Failed to create or retrieve public user profile after insert.", response_status=insert_response.status_code, response_error=getattr(insert_response, 'error', None))
-            raise HTTPException(status_code=500, detail="Failed to create user profile.")
+            bound_log.error("Profile insert succeeded but no data returned.", response_status=insert_response.status_code)
+            # Considerar esto un error, ya que esperábamos datos de vuelta
+            raise HTTPException(status_code=500, detail="Failed to retrieve profile after creation.")
+
+    except HTTPException as e: # Re-lanzar HTTPExceptions
+        raise e
     except Exception as e:
-        bound_log.exception("Error creating public user profile.")
-        detail = f"Database error creating profile: {e}"
-        raise HTTPException(status_code=500, detail=detail) from e
+        # Otros errores inesperados durante la inserción
+        bound_log.exception("Unexpected error creating public user profile.")
+        # NO lanzar HTTPException aquí, retornar None y dejar que el caller maneje
+        # raise HTTPException(status_code=500, detail=f"Internal error creating profile: {e}") from e
+        return None # Indicar fallo
+
 
 @router.post(
     "/me/ensure-company",
@@ -77,58 +100,68 @@ async def ensure_company_association(
     bound_log = log.bind(user_id=user_id)
     bound_log.info("Ensure profile and company association endpoint called.")
 
-    # 1. Verificar/Crear perfil en public.users
     public_profile: Optional[Dict] = None
-    auth_user: Optional[User] = None
+    auth_user: Optional[User] = None # Para almacenar datos de auth si es necesario crear perfil
 
+    # --- Paso 1: Verificar/Crear perfil público ---
     try:
         bound_log.debug("Checking for existing public user profile...")
-        # *** CORRECCIÓN: Usar select() sin maybe_single() y añadir limit(1) ***
-        # Esto evita la cabecera Accept que causa el 406
-        select_response: PostgrestAPIResponse = admin_client.table("users").select("id").eq("id", user_id).limit(1).execute()
+        # Usar select genérico sin maybe_single() para evitar error 406 si RLS está mal
+        select_builder: SyncFilterRequestBuilder = admin_client.table("users").select("id, email, full_name, role, company_id").eq("id", user_id).limit(1) # Seleccionar campos necesarios
+        select_response: PostgrestAPIResponse = select_builder.execute()
 
-        # *** CORRECCIÓN: Añadir check explícito para None ***
         if select_response is None:
-            bound_log.critical("Supabase client returned None unexpectedly from select query.", user_id=user_id)
-            raise HTTPException(status_code=500, detail="Internal error communicating with database (select response was None).")
+             bound_log.critical("Supabase client returned None unexpectedly from select query.", user_id=user_id)
+             raise HTTPException(status_code=500, detail="Internal error communicating with database (select response was None).")
+
+        postgrest_error = getattr(select_response, 'error', None)
+        if postgrest_error:
+             bound_log.error("PostgREST error checking public profile.", status_code=select_response.status_code, error_details=postgrest_error)
+             raise HTTPException(status_code=select_response.status_code if select_response.status_code >= 400 else 500,
+                                 detail=f"Database error checking profile: {postgrest_error.get('message', 'Unknown PostgREST error')}")
 
         # Ahora es seguro acceder a .data
         if select_response.data and len(select_response.data) > 0:
-            # Perfil existe, podríamos obtener todos los datos si quisiéramos,
-            # pero por ahora sabemos que existe. Asignamos el ID para futuras referencias.
             public_profile = select_response.data[0]
-            bound_log.info("Public user profile found.", profile_id=public_profile.get("id"))
+            bound_log.info("Public user profile found.")
         else:
-            # Perfil no existe, crear
-            bound_log.info("Public profile not found. Fetching auth user data to create profile.")
+            # Perfil no existe, proceder a crearlo
+            bound_log.info("Public profile not found. Fetching auth user data.")
             try:
                 auth_user_response: UserResponse = await admin_client.auth.admin.get_user_by_id(user_id)
                 auth_user = auth_user_response.user if auth_user_response else None
-                if not auth_user:
-                     bound_log.error("User exists in token but not found in auth.users via admin API.")
-                     raise HTTPException(status_code=500, detail="User data inconsistency.")
+                if not auth_user: raise HTTPException(status_code=500, detail="User data inconsistency.")
+
                 email_for_profile = auth_user.email or email_from_token
                 name_for_profile = (auth_user.user_metadata.get('name') or auth_user.user_metadata.get('full_name')) if auth_user.user_metadata else name_from_token
+
                 public_profile = await _create_public_user_profile(admin_client, user_id, email_for_profile, name_for_profile)
-            except AuthApiError as e:
-                 bound_log.error("Supabase Admin API error fetching auth user data", status_code=e.status, error_message=e.message)
-                 raise HTTPException(status_code=500, detail=f"Failed to fetch auth data: {e.message}")
-            except HTTPException as e: raise e
-            except Exception as e:
-                 bound_log.exception("Unexpected error during auth user fetch or profile creation.")
-                 raise HTTPException(status_code=500, detail="Failed during profile creation.")
 
+                # Verificar si la creación falló (retornó None)
+                if public_profile is None:
+                    bound_log.error("Profile creation helper returned None, indicating an internal error.")
+                    raise HTTPException(status_code=500, detail="Failed during profile creation process.")
+
+            except Exception as creation_e:
+                 bound_log.exception("Error during profile creation steps.")
+                 if isinstance(creation_e, HTTPException): raise creation_e
+                 raise HTTPException(status_code=500, detail=f"Failed during profile creation: {creation_e}")
+
+    except HTTPException as e: # Captura HTTPExceptions de los bloques anteriores
+        raise e
     except Exception as e:
-        # Este es el bloque donde caía el AttributeError
-        bound_log.exception("Error checking/creating public user profile.")
-        if isinstance(e, HTTPException): raise e
-        # Mensaje más genérico, ya que el error específico puede variar
-        raise HTTPException(status_code=500, detail=f"Error accessing user profile data: {str(e) or type(e).__name__}")
+        # Captura el AttributeError o cualquier otro error inesperado aquí
+        error_details = traceback.format_exc()
+        bound_log.exception("Unexpected error checking/creating public user profile.", error_message=str(e), traceback=error_details)
+        # Devolver el mensaje de error específico al frontend
+        raise HTTPException(status_code=500, detail=f"Error accessing user profile data: {e}")
 
+    # --- Paso 2: Verificar/Asociar Company ID ---
+    # Si llegamos aquí, tenemos un `public_profile` válido (existente o recién creado)
+    # Necesitamos verificar `company_id` en `auth.users` (app_metadata)
 
-    # 2. Verificar/Asociar Company ID (Lógica sin cambios respecto a la versión anterior)
-    # ... (re-fetch auth_user si no se obtuvo antes) ...
-    if not auth_user: # Re-fetch si el perfil ya existía
+    # Re-obtener auth_user si no lo obtuvimos durante la creación del perfil
+    if not auth_user:
         try:
             bound_log.debug("Re-fetching auth user data for company check.")
             auth_user_response = await admin_client.auth.admin.get_user_by_id(user_id)
@@ -145,11 +178,10 @@ async def ensure_company_association(
     if company_id_from_auth:
         bound_log.info("User already has company ID in auth.users metadata.", company_id=company_id_from_auth)
         # Sincronizar con public.users si es necesario
-        public_company_id = public_profile.get('company_id') if public_profile else None
+        public_company_id = public_profile.get('company_id') # Ya tenemos public_profile
         if str(public_company_id) != company_id_from_auth:
              bound_log.warning("Mismatch company ID. Updating profile.", auth_cid=company_id_from_auth, profile_cid=public_company_id)
              try:
-                 # QUITAR await
                  admin_client.table("users").update({"company_id": company_id_from_auth}).eq("id", user_id).execute()
              except Exception:
                  bound_log.exception("Failed to sync existing company ID to public profile.")
@@ -167,22 +199,27 @@ async def ensure_company_association(
 
     try:
         bound_log.debug("Updating auth.users app_metadata.", metadata_to_send=new_app_metadata)
-        # MANTENER await
         update_auth_response: UserResponse = await admin_client.auth.admin.update_user_by_id(
             user_id, attributes={'app_metadata': new_app_metadata}
         )
         updated_user_auth = update_auth_response.user if update_auth_response else None
         if not (updated_user_auth and getattr(updated_user_auth, 'app_metadata', {}).get("company_id") == company_id_to_assign):
-            bound_log.error("Failed to confirm company ID update in auth.users metadata response.", update_response=updated_user_auth)
-            raise HTTPException(status_code=500, detail="Failed to confirm company ID update in auth system.")
+             bound_log.error("Failed to confirm company ID update in auth.users metadata response.", update_response=updated_user_auth)
+             raise HTTPException(status_code=500, detail="Failed to confirm company ID update in auth system.")
         bound_log.info("Successfully updated auth.users app_metadata.")
 
-        # Actualizar también public.users
+        # Actualizar public.users
         try:
             bound_log.debug("Updating public.users company_id column.")
-            # QUITAR await
-            admin_client.table("users").update({"company_id": company_id_to_assign}).eq("id", user_id).execute()
-            bound_log.info("Successfully updated public.users company_id.")
+            # Llamada síncrona
+            update_public_response = admin_client.table("users").update({"company_id": company_id_to_assign}).eq("id", user_id).execute()
+            # Verificar si hubo error en la actualización pública
+            public_update_error = getattr(update_public_response, 'error', None)
+            if public_update_error:
+                 bound_log.error("PostgREST error updating company_id in public.users.", error_details=public_update_error)
+                 # Considerar si esto es un error fatal o solo advertencia
+            else:
+                 bound_log.info("Successfully updated public.users company_id.")
         except Exception as pub_e:
              bound_log.exception("Failed to update company_id in public.users table.")
 
