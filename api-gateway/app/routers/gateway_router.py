@@ -1,4 +1,3 @@
-# File: app/routers/gateway_router.py
 # api-gateway/app/routers/gateway_router.py
 from fastapi import APIRouter, Request, Response, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -44,7 +43,15 @@ async def _proxy_request(
 ):
     """Función interna reutilizable para realizar el proxy de la petición HTTP."""
     method = request.method
-    target_url = httpx.URL(target_url_str)
+    # --- CORRECCIÓN: Asegurar que target_url_str NO tenga doble '//' ---
+    # Esto puede pasar si base_url termina en '/' y path empieza con '/'
+    # Construir URL cuidadosamente
+    base_url_obj = httpx.URL(str(request.url).split(request.url.path)[0]) # Obtener base URL de la request original
+    target_url_obj = httpx.URL(target_url_str) # Target base
+    # Reconstruir path y query
+    full_target_path = target_url_obj.path + (request.url.path.split(settings.API_V1_STR, 1)[1] if settings.API_V1_STR in request.url.path else request.url.path)
+    target_url = target_url_obj.copy_with(path=full_target_path, query=request.url.query.encode("utf-8"))
+
 
     # 1. Preparar Headers para reenviar
     headers_to_forward = {}
@@ -68,7 +75,6 @@ async def _proxy_request(
         headers_to_forward["X-Request-ID"] = request_id
 
     # 2. Inyectar Headers de Autenticación/Contexto (SI HAY PAYLOAD y NO es OPTIONS)
-    # No inyectar en OPTIONS ya que no llevan contexto de usuario usualmente
     log_context = {'request_id': request_id} if request_id else {}
     if user_payload and method.upper() != 'OPTIONS':
         user_id = user_payload.get('sub')
@@ -91,8 +97,7 @@ async def _proxy_request(
     # Vincular contexto al logger para esta operación de proxy
     bound_log = log.bind(**log_context)
 
-    # 3. Preparar Query Params y Body
-    query_params = request.query_params
+    # 3. Preparar Query Params (ya están en la target_url) y Body
     # Usar request.stream() para eficiencia, evita cargar todo el body en memoria
     request_body_stream = request.stream()
 
@@ -104,14 +109,13 @@ async def _proxy_request(
         # Construir la solicitud httpx
         req = client.build_request(
             method=method,
-            url=target_url,
+            url=target_url, # Usar la URL reconstruida
             headers=headers_to_forward,
-            params=query_params,
+            # params=query_params, # Query params ya están en la URL
             # Pasar el stream directamente como contenido
             content=request_body_stream
         )
         # Enviar la solicitud y obtener la respuesta como stream
-        # Aumentar timeout aquí si es necesario para rutas específicas, ej. con timeout=httpx.Timeout(120.0)
         rp = await client.send(req, stream=True)
 
         # 5. Procesar y devolver la respuesta del servicio backend
@@ -121,11 +125,6 @@ async def _proxy_request(
         response_headers = {
             k: v for k, v in rp.headers.items() if k.lower() not in HOP_BY_HOP_HEADERS
         }
-
-        # Preservar Content-Length si el backend lo envió y no usa chunked encoding
-        # StreamingResponse maneja esto bien, pero es bueno ser explícito si es necesario
-        # if 'content-length' in rp.headers and rp.headers.get('transfer-encoding') != 'chunked':
-        #     response_headers['content-length'] = rp.headers['content-length']
 
         # Devolver StreamingResponse para eficiencia de memoria
         return StreamingResponse(
@@ -169,22 +168,13 @@ async def _proxy_request(
 )
 async def proxy_ingest_service(
     request: Request,
-    path: str,
+    path: str, # El path capturado por {path:path}
     client: Annotated[httpx.AsyncClient, Depends(get_client)],
-    # La dependencia StrictAuth ya validó y puso el payload en request.state.user
-    # Aquí la recibimos para pasarla a _proxy_request
-    user_payload: StrictAuth
+    user_payload: StrictAuth # La dependencia StrictAuth ya validó
 ):
-    """Reenvía peticiones a /api/v1/ingest/* al Ingest Service configurado.
-       Requiere autenticación JWT válida con `company_id`. Inyecta headers
-       `X-User-ID`, `X-Company-ID`, `X-User-Email`.
-    """
-    base_url = str(settings.INGEST_SERVICE_URL).rstrip('/') # Convertir HttpUrl a string y quitar / final
-    # Construir URL completa, preservando path y query params
-    target_url = f"{base_url}/api/v1/ingest/{path}"
-    if request.url.query:
-        target_url += f"?{request.url.query}"
-    return await _proxy_request(request, target_url, client, user_payload)
+    """Reenvía peticiones a /api/v1/ingest/* al Ingest Service configurado."""
+    # No es necesario construir la URL aquí, _proxy_request lo hará
+    return await _proxy_request(request, str(settings.INGEST_SERVICE_URL), client, user_payload)
 
 @router.api_route(
     "/api/v1/query/{path:path}",
@@ -198,22 +188,16 @@ async def proxy_ingest_service(
 )
 async def proxy_query_service(
     request: Request,
-    path: str,
+    path: str, # El path capturado por {path:path}
     client: Annotated[httpx.AsyncClient, Depends(get_client)],
     user_payload: StrictAuth # Payload validado por la dependencia
 ):
-    """Reenvía peticiones a /api/v1/query/* al Query Service configurado.
-       Requiere autenticación JWT válida con `company_id`. Inyecta headers
-       `X-User-ID`, `X-Company-ID`, `X-User-Email`.
-    """
-    base_url = str(settings.QUERY_SERVICE_URL).rstrip('/') # Convertir HttpUrl a string y quitar / final
-    target_url = f"{base_url}/api/v1/query/{path}"
-    if request.url.query:
-        target_url += f"?{request.url.query}"
-    return await _proxy_request(request, target_url, client, user_payload)
+    """Reenvía peticiones a /api/v1/query/* al Query Service configurado."""
+    # No es necesario construir la URL aquí, _proxy_request lo hará
+    return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload)
 
 
-# --- Proxy Opcional para Auth Service ---
+# --- Proxy Opcional para Auth Service (Mantenido pero ahora sin rutas activas definidas) ---
 if settings.AUTH_SERVICE_URL:
     log.info(f"Auth service proxy enabled for base URL: {settings.AUTH_SERVICE_URL}")
     @router.api_route(
@@ -230,35 +214,13 @@ if settings.AUTH_SERVICE_URL:
         path: str,
         client: Annotated[httpx.AsyncClient, Depends(get_client)],
         # NO hay dependencia StrictAuth o InitialAuth aquí.
-        # El token (si existe) pasará tal cual al servicio de auth.
     ):
-        """
-        Proxy genérico para el servicio de autenticación (si está configurado).
-        No realiza validación de token en el gateway. Reenvía la solicitud
-        tal cual al servicio de autenticación backend.
-        """
-        base_url = str(settings.AUTH_SERVICE_URL).rstrip('/') # Convertir HttpUrl a string
-        target_url = f"{base_url}/api/v1/auth/{path}"
-        if request.url.query:
-            target_url += f"?{request.url.query}"
-        # Llamar a _proxy_request sin user_payload (None)
-        return await _proxy_request(request, target_url, client, user_payload=None)
+        """Proxy genérico para el servicio de autenticación (si está configurado)."""
+        # No es necesario construir la URL aquí, _proxy_request lo hará
+        return await _proxy_request(request, str(settings.AUTH_SERVICE_URL), client, user_payload=None)
 else:
      # Loguear sólo una vez al inicio si no está configurado
      log.warning("Auth service proxy is not configured (GATEWAY_AUTH_SERVICE_URL not set). "
-                 "Requests to /api/v1/auth/* will result in 501 Not Implemented.")
-     @router.api_route(
-         "/api/v1/auth/{path:path}",
-         # *** CORRECCIÓN: Añadido OPTIONS ***
-         methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-         tags=["Proxy - Auth"],
-         summary="Auth Proxy (Not Configured)",
-         response_description="Error indicating the auth proxy is not configured.",
-         include_in_schema=False # Ocultar de la documentación si no está activo
-     )
-     async def auth_not_configured(request: Request, path: str):
-         # Devuelve 501 si se intenta acceder a la ruta no configurada
-         raise HTTPException(
-             status_code=status.HTTP_501_NOT_IMPLEMENTED,
-             detail="Authentication endpoint proxy is not configured in this gateway instance."
-         )
+                 "Requests to /api/v1/auth/* will result in 501 Not Implemented (unless handled by other routers).")
+     # No definimos la ruta aquí si está deshabilitado para evitar conflictos
+     # con el auth_router.py local si se monta (aunque ahora esté vacío).

@@ -966,7 +966,9 @@ import uuid
 from app.utils.supabase_admin import get_supabase_admin_client
 from supabase import Client as SupabaseClient
 from gotrue.errors import AuthApiError
-from postgrest import APIResponse as PostgrestAPIResponse
+# (+) Importar PostgrestError para manejo más específico
+from postgrest.exceptions import APIError as PostgrestError
+
 
 from app.core.config import settings
 
@@ -992,6 +994,12 @@ def _get_company_id_by_name(admin_client: SupabaseClient, company_name: str) -> 
         bound_log.debug("Looking up company ID by name...")
         response = admin_client.table("companies").select("id").eq("name", company_name).limit(1).maybe_single().execute()
 
+        # Revisar errores PostgREST primero
+        postgrest_error = getattr(response, 'error', None)
+        if postgrest_error:
+             bound_log.error("PostgREST error during company lookup.", response_error=postgrest_error)
+             return None # Falló la búsqueda
+
         if response and response.data:
             company_id = response.data.get("id")
             if company_id:
@@ -1004,19 +1012,15 @@ def _get_company_id_by_name(admin_client: SupabaseClient, company_name: str) -> 
              bound_log.warning("Company not found by name.")
              return None
         else:
-            # Añadir chequeo de error Postgrest explícito
-            postgrest_error = getattr(response, 'error', None)
-            if postgrest_error:
-                 bound_log.error("PostgREST error during company lookup.", response_error=postgrest_error)
-            else:
-                 bound_log.error("Unexpected response (None or no data/error) during company lookup.", response_details=response)
+            # Caso inesperado si no hay error ni datos
+            bound_log.error("Unexpected response (None or no data/error) during company lookup.", response_details=response)
             return None
 
     except Exception as e:
         bound_log.exception("Error looking up company ID.")
         return None
 
-# --- Endpoint de Registro (Modificado para llamar a RPC) ---
+# --- Endpoint de Registro (Modificado para llamar a RPC y mejorar logging) ---
 @router.post(
     "/register",
     status_code=status.HTTP_201_CREATED,
@@ -1075,7 +1079,7 @@ async def register_user_endpoint(
             bound_log.error("Supabase Auth create_user succeeded but returned no user or ID.", response=create_user_response)
             raise HTTPException(status_code=500, detail="Failed to retrieve user details after creation.")
 
-        new_user_id = new_user.id # Guardar el ID
+        new_user_id = new_user.id
         bound_log.info("User successfully created in Supabase Auth.", user_id=new_user_id)
 
     except AuthApiError as e:
@@ -1091,28 +1095,48 @@ async def register_user_endpoint(
 
     # 4. Llamar a la función SQL para crear/actualizar el perfil público (llamada SÍNCRONA)
     if new_user_id:
+        rpc_success = False
+        rpc_error_details = None
         try:
             bound_log.debug("Calling RPC public.create_public_profile_for_user...", user_id=new_user_id)
-            # .execute() es síncrono para RPC también en supabase-py v1/v2
             rpc_response = admin_client.rpc(
-                "create_public_profile_for_user", # Nombre de la función SQL
-                {"user_id": str(new_user_id)}      # Parámetros como diccionario
+                "create_public_profile_for_user",
+                {"user_id": str(new_user_id)}
             ).execute()
 
-            # Verificar si la RPC devolvió un error PostgREST
             rpc_error = getattr(rpc_response, 'error', None)
             if rpc_error:
+                 # Captura errores estructurados de PostgREST devueltos por RPC
+                 rpc_error_details = str(rpc_error)
                  bound_log.error("PostgREST error calling create_public_profile_for_user RPC.",
-                                 status_code=rpc_response.status_code, error_details=rpc_error, user_id=new_user_id)
-                 # Loguear como crítico, pero no fallar la solicitud de registro
-                 log.error("CRITICAL: Failed to sync public profile via RPC after auth user creation.", user_id=new_user_id)
+                                 status_code=getattr(rpc_response,'status_code','N/A'),
+                                 error_details=rpc_error_details, user_id=new_user_id)
+            # (+) Verificar si la respuesta en sí indica un problema (aunque no tenga .error)
+            elif rpc_response is None or getattr(rpc_response, 'data', 'NOT_PRESENT') == 'NOT_PRESENT':
+                 # Si la respuesta es None o no tiene el atributo 'data' (inesperado para .execute())
+                 rpc_error_details = f"RPC call returned unexpected response object: {type(rpc_response)}"
+                 bound_log.error(rpc_error_details, user_id=new_user_id, rpc_response_obj=rpc_response)
             else:
+                 # Asumimos éxito si no hubo error explícito y la respuesta parece válida
+                 rpc_success = True
                  bound_log.info("Successfully called RPC to sync public profile.", user_id=new_user_id)
 
+        except PostgrestError as pg_error:
+             # Capturar excepciones levantadas por la librería postgrest-py
+             rpc_error_details = f"PostgrestError Exception: {pg_error}"
+             bound_log.exception("PostgrestError exception calling RPC.", user_id=new_user_id, error=pg_error)
         except Exception as e:
-            bound_log.exception("Unexpected error calling create_public_profile_for_user RPC.", user_id=new_user_id)
-            log.error("CRITICAL: Unexpected error calling RPC to sync public profile.", user_id=new_user_id)
-            # No fallar la solicitud principal
+             # Capturar cualquier otro error durante la llamada RPC
+             rpc_error_details = f"Unexpected Exception: {e}"
+             bound_log.exception("Unexpected error calling create_public_profile_for_user RPC.", user_id=new_user_id)
+
+        # Loguear críticamente si la RPC no fue exitosa
+        if not rpc_success:
+            log.error("CRITICAL: Failed to sync public profile via RPC after auth user creation.",
+                      user_id=new_user_id,
+                      rpc_error_reason=rpc_error_details or "Unknown RPC failure reason")
+            # NOTA: Decidimos NO lanzar HTTPException aquí para permitir que el registro en Auth se complete.
+            # El usuario existe pero su perfil público podría estar incompleto.
 
     # 5. Devolver éxito (incluso si la RPC falló, el usuario auth existe)
     return RegisterResponse(
