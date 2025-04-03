@@ -620,195 +620,329 @@ import structlog
 import uvicorn
 import time
 import uuid
-import logging # <-- Importar logging
+import logging # <-- Importar logging estándar
 from supabase.client import Client as SupabaseClient
 
-# ... (resto de imports y código inicial sin cambios) ...
 from app.core.config import settings
 from app.core.logging_config import setup_logging
+# Configurar logging ANTES de importar otros módulos que puedan loguear
 setup_logging()
+# Ahora importar el resto
 from app.utils.supabase_admin import get_supabase_admin_client
 from app.routers import gateway_router, user_router
+# Importar dependencias de autenticación para verificar su carga
+from app.auth.auth_middleware import StrictAuth, InitialAuth
 
-log = structlog.get_logger("api_gateway.main")
+log = structlog.get_logger("api_gateway.main") # Logger para el módulo main
+
+# Clientes globales que se inicializarán en el lifespan
 proxy_http_client: Optional[httpx.AsyncClient] = None
 supabase_admin_client: Optional[SupabaseClient] = None
 
-# --- Lifespan (Sin cambios) ---
+# --- Lifespan para inicializar/cerrar clientes ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global proxy_http_client, supabase_admin_client
     log.info("Application startup: Initializing global clients...")
+
+    # Inicializar cliente HTTPX para proxy
     try:
+        # Configurar límites y timeouts desde settings
         limits = httpx.Limits(
             max_keepalive_connections=settings.HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS,
             max_connections=settings.HTTP_CLIENT_MAX_CONNECTIONS
         )
+        # Usar timeout general, se puede sobreescribir por request si es necesario
+        # Añadir connect timeout más corto
         timeout = httpx.Timeout(
-            settings.HTTP_CLIENT_TIMEOUT, connect=10.0,
-            write=settings.HTTP_CLIENT_TIMEOUT, pool=settings.HTTP_CLIENT_TIMEOUT
+            settings.HTTP_CLIENT_TIMEOUT, connect=10.0, # Timeout de conexión más corto
+            # read, write, pool usan el general
         )
         proxy_http_client = httpx.AsyncClient(
-             limits=limits, timeout=timeout, follow_redirects=False, http2=True
+             limits=limits,
+             timeout=timeout,
+             follow_redirects=False, # No seguir redirects automáticamente en el proxy
+             http2=True # Habilitar HTTP/2 si los servicios backend lo soportan
         )
+        # Inyectar el cliente en el módulo del router (alternativa a pasarlo en cada request)
         gateway_router.http_client = proxy_http_client
         log.info("HTTP Client initialized successfully.", limits=str(limits), timeout=str(timeout))
     except Exception as e:
-        log.exception("Failed to initialize HTTP client during startup!", error=str(e))
+        log.exception("CRITICAL: Failed to initialize HTTP client during startup!", error=str(e))
+        # Podríamos decidir si la app puede arrancar sin cliente HTTP
+        # sys.exit("Failed to initialize HTTP client.") # Opcional: Salir si es crítico
         proxy_http_client = None
-        gateway_router.http_client = None
+        gateway_router.http_client = None # Asegurar que el router lo vea como None
 
+    # Inicializar cliente Supabase Admin
     log.info("Initializing Supabase Admin Client...")
     try:
+        # get_supabase_admin_client usa lru_cache y maneja errores internos
         supabase_admin_client = get_supabase_admin_client()
-        user_router.supabase_admin = supabase_admin_client # Inyección menos ideal
+        # Inyectar en el router de usuario (menos ideal, mejor usar Depends en la ruta)
+        user_router.supabase_admin = supabase_admin_client
         log.info("Supabase Admin Client reference obtained (initialized via get_supabase_admin_client).")
+        # Podríamos hacer un test rápido aquí si fuera necesario, pero get_client lo hace al primer uso
     except Exception as e:
-        log.exception("Failed to get Supabase Admin Client during startup!", error=str(e))
+        # get_supabase_admin_client ya loguea el error crítico
+        log.exception("CRITICAL: Failed to get Supabase Admin Client during startup!", error=str(e))
+        # Podríamos decidir si salir o continuar sin cliente admin
+        # sys.exit("Failed to initialize Supabase Admin client.") # Opcional
         supabase_admin_client = None
+        user_router.supabase_admin = None # Asegurar que el router lo vea como None
 
-    yield # Application runs here
-
+    # Punto donde la aplicación está lista para recibir requests
+    yield
+    # --- Shutdown ---
     log.info("Application shutdown: Closing clients...")
+
+    # Cerrar cliente HTTPX
     if proxy_http_client and not proxy_http_client.is_closed:
         try:
             await proxy_http_client.aclose()
             log.info("HTTP Client closed successfully.")
         except Exception as e:
             log.exception("Error closing HTTP client during shutdown.", error=str(e))
-    else:
-        log.warning("HTTP Client was not available or already closed during shutdown.")
+    elif proxy_http_client is None:
+        log.warning("HTTP Client was not initialized during startup.")
+    else: # Estaba inicializado pero ya cerrado
+        log.info("HTTP Client was already closed.")
+
+    # Cliente Supabase (supabase-py) no requiere cierre explícito عادةً
     log.info("Supabase Admin Client shutdown check complete (no explicit close needed).")
 
 
-# --- FastAPI App Creation (Sin cambios) ---
+# --- Creación de la App FastAPI ---
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    description="Punto de entrada único y seguro para los microservicios de Nyro.",
+    description="Punto de entrada único y seguro para los microservicios de Nyro. Valida JWTs de Supabase, gestiona asociación inicial de compañía y reenvía tráfico a servicios backend.",
     version="1.0.0",
-    lifespan=lifespan,
+    lifespan=lifespan, # Usar el lifespan definido arriba
+    # Se pueden añadir otros parámetros como openapi_url, docs_url, redoc_url
 )
 
-# --- Middlewares (CORS y Request ID/Timing - Sin cambios respecto a la versión anterior) ---
-# ... (Código de configuración CORS y middleware add_request_id_timing_logging sin cambios) ...
+# --- Middlewares ---
+
+# 1. CORS Middleware (Configuración más robusta)
 allowed_origins = []
-# ... (lógica para añadir Vercel, localhost, Ngrok a allowed_origins) ...
-vercel_url = os.getenv("VERCEL_FRONTEND_URL")
-if vercel_url:
-    log.info(f"Adding Vercel frontend URL from env var to allowed origins: {vercel_url}")
-    allowed_origins.append(vercel_url)
-else:
-    vercel_fallback_url = "https://atenex-frontend.vercel.app"
-    log.warning(f"VERCEL_FRONTEND_URL env var not set. Using fallback: {vercel_fallback_url}")
-    allowed_origins.append(vercel_fallback_url)
-localhost_url = "http://localhost:3000"
+# Orígenes desde variables de entorno o configuración
+vercel_url = os.getenv("VERCEL_FRONTEND_URL", "https://atenex-frontend.vercel.app") # Usar fallback
+log.info(f"Adding Vercel frontend URL to allowed origins: {vercel_url}")
+allowed_origins.append(vercel_url)
+
+localhost_url = "http://localhost:3000" # Frontend local estándar
 log.info(f"Adding localhost frontend URL to allowed origins: {localhost_url}")
 allowed_origins.append(localhost_url)
-ngrok_url_from_frontend_logs = "https://1942-2001-1388-53a1-a7c9-241c-4a44-2b12-938f.ngrok-free.app"
-log.info(f"Adding specific Ngrok URL observed in frontend logs: {ngrok_url_from_frontend_logs}")
-allowed_origins.append(ngrok_url_from_frontend_logs)
+
+# Añadir Ngrok URL de forma dinámica o desde env var
 ngrok_url_env = os.getenv("NGROK_URL")
-if ngrok_url_env and ngrok_url_env not in allowed_origins:
-    if ngrok_url_env.startswith("https://") or ngrok_url_env.startswith("http://"):
-        log.info(f"Adding Ngrok URL from NGROK_URL env var to allowed origins: {ngrok_url_env}")
+if ngrok_url_env:
+    if ngrok_url_env.startswith("https://") and ".ngrok" in ngrok_url_env:
+        log.info(f"Adding Ngrok URL from NGROK_URL env var: {ngrok_url_env}")
         allowed_origins.append(ngrok_url_env)
     else:
-        log.warning(f"NGROK_URL environment variable has an unexpected format: {ngrok_url_env}. Ignoring.")
+        log.warning(f"NGROK_URL environment variable ('{ngrok_url_env}') doesn't look like a valid https Ngrok URL. Ignoring.")
+# También añadir la URL específica observada en logs si es diferente y no estaba en env
+ngrok_url_from_logs = "https://1942-2001-1388-53a1-a7c9-241c-4a44-2b12-938f.ngrok-free.app"
+if ngrok_url_from_logs not in allowed_origins:
+    log.info(f"Adding specific Ngrok URL observed in logs: {ngrok_url_from_logs}")
+    allowed_origins.append(ngrok_url_from_logs)
+
+# Eliminar duplicados y None
 allowed_origins = list(set(filter(None, allowed_origins)))
-if not allowed_origins: log.critical("CRITICAL: No allowed origins configured for CORS.")
-else: log.info("Final CORS Allowed Origins:", origins=allowed_origins)
-allowed_headers = ["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With", "ngrok-skip-browser-warning"]
+if not allowed_origins:
+    log.critical("CRITICAL: No allowed origins configured for CORS. Frontend requests will likely fail.")
+else:
+    log.info("Final CORS Allowed Origins:", origins=allowed_origins)
+
+# Headers permitidos (incluir estándar y específicos como ngrok)
+allowed_headers = [
+    "Authorization", "Content-Type", "Accept", "Origin",
+    "X-Requested-With", "ngrok-skip-browser-warning", "X-Request-ID" # Permitir pasar X-Request-ID
+]
 log.info("CORS Allowed Headers:", headers=allowed_headers)
+
+# Métodos permitidos
 allowed_methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
 log.info("CORS Allowed Methods:", methods=allowed_methods)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins, allow_credentials=True, allow_methods=allowed_methods,
-    allow_headers=allowed_headers, expose_headers=["X-Request-ID", "X-Process-Time"], max_age=600,
+    allow_origins=allowed_origins,
+    allow_credentials=True, # Importante para pasar cookies/auth headers
+    allow_methods=allowed_methods,
+    allow_headers=allowed_headers,
+    expose_headers=["X-Request-ID", "X-Process-Time"], # Exponer headers custom
+    max_age=600, # Cachear respuesta preflight OPTIONS por 10 mins
 )
+
+# 2. Middleware para Request ID, Timing y Logging Estructurado
 @app.middleware("http")
 async def add_request_id_timing_logging(request: Request, call_next):
     start_time = time.time()
+    # Usar X-Request-ID del header si existe, sino generar uno nuevo
     request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    # Guardar en el estado para acceso posterior
     request.state.request_id = request_id
+
+    # Vincular request_id al contexto de structlog para todos los logs de esta request
     with structlog.contextvars.bound_contextvars(request_id=request_id):
+        # Logger específico para requests entrantes/salientes
         bound_log = structlog.get_logger("api_gateway.requests")
-        bound_log.info("Request received", method=request.method, path=request.url.path, client_ip=request.client.host if request.client else "N/A", user_agent=request.headers.get("user-agent", "N/A")[:100])
+        # Loggear inicio de request
+        bound_log.info("Request received",
+                       method=request.method,
+                       path=request.url.path,
+                       client_ip=request.client.host if request.client else "N/A",
+                       user_agent=request.headers.get("user-agent", "N/A")[:100]) # Limitar longitud UA
+
+        response = None
         try:
             response = await call_next(request)
+            # Calcular duración después de obtener la respuesta
             process_time = time.time() - start_time
+            # Añadir headers custom a la respuesta
             response.headers["X-Process-Time"] = f"{process_time:.4f}"
             response.headers["X-Request-ID"] = request_id
-            bound_log.info("Request processed successfully", status_code=response.status_code, duration=round(process_time, 4))
+            # Loggear fin de request exitosa
+            bound_log.info("Request processed successfully",
+                           status_code=response.status_code,
+                           duration=round(process_time, 4))
         except Exception as e:
+            # Loggear excepción no manejada ANTES de re-lanzarla
             process_time = time.time() - start_time
-            bound_log.exception("Unhandled exception during request processing", duration=round(process_time, 4), error_type=type(e).__name__, error=str(e))
+            # Usar logger del middleware para excepciones no capturadas por handlers específicos
+            bound_log.exception("Unhandled exception during request processing",
+                                duration=round(process_time, 4),
+                                error_type=type(e).__name__,
+                                error=str(e))
+            # Re-lanzar para que los exception_handlers de FastAPI la capturen
             raise e
+        finally:
+            # Este bloque se ejecuta siempre, incluso si hay return o raise
+            # Asegurar que el contexto de structlog se limpie (aunque contextvars debería hacerlo)
+            pass
+
         return response
 
-# --- Routers (Sin cambios) ---
+# --- Routers ---
+# Incluir los routers definidos en otros módulos
 app.include_router(gateway_router.router)
 app.include_router(user_router.router)
 
-# --- Endpoints Básicos (Sin cambios) ---
+# --- Endpoints Básicos ---
 @app.get("/", tags=["Gateway Status"], summary="Root endpoint", include_in_schema=False)
 async def root():
+    """Endpoint raíz simple para verificar que el gateway está corriendo."""
     return {"message": f"{settings.PROJECT_NAME} is running!"}
 
-@app.get("/health", tags=["Gateway Status"], summary="Kubernetes Health Check", status_code=status.HTTP_200_OK)
+@app.get("/health",
+         tags=["Gateway Status"],
+         summary="Kubernetes Health Check",
+         status_code=status.HTTP_200_OK,
+         response_description="Indicates if the gateway and its core dependencies are healthy.",
+         responses={
+             status.HTTP_200_OK: {"description": "Gateway is healthy."},
+             status.HTTP_503_SERVICE_UNAVAILABLE: {"description": "Gateway is unhealthy due to dependency issues."}
+         })
 async def health_check():
+     """
+     Verifica el estado del gateway y sus dependencias críticas (Cliente HTTP, Cliente Supabase Admin).
+     Usado por Kubernetes Liveness/Readiness Probes.
+     """
      admin_client_status = "available" if supabase_admin_client else "unavailable"
      http_client_status = "available" if proxy_http_client and not proxy_http_client.is_closed else "unavailable"
+
+     # Considerar la app saludable sólo si AMBOS clientes están listos
      is_healthy = admin_client_status == "available" and http_client_status == "available"
-     health_details = {"status": "healthy" if is_healthy else "unhealthy", "service": settings.PROJECT_NAME,"dependencies": {"supabase_admin_client": admin_client_status,"proxy_http_client": http_client_status}}
+
+     health_details = {
+         "status": "healthy" if is_healthy else "unhealthy",
+         "service": settings.PROJECT_NAME,
+         "dependencies": {
+             "supabase_admin_client": admin_client_status,
+             "proxy_http_client": http_client_status
+         }
+     }
+
      if not is_healthy:
          log.error("Health check failed", details=health_details)
-         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=health_details)
+         # Levantar 503 si no está saludable
+         raise HTTPException(
+             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+             detail=health_details
+         )
+
      log.debug("Health check passed.", details=health_details)
      return health_details
 
-# --- Manejadores de Excepciones (CORREGIDO) ---
+# --- Manejadores de Excepciones Globales ---
+# Captura excepciones HTTP que ocurren en las rutas o dependencias
 @app.exception_handler(HTTPException)
 async def custom_http_exception_handler(request: Request, exc: HTTPException):
     req_id = getattr(request.state, 'request_id', 'N/A')
+    # Usar el logger principal o uno específico para excepciones
     bound_log = log.bind(request_id=req_id)
 
-    # *** CORRECCIÓN: Usar niveles numéricos de logging ***
-    log_level_int = logging.WARNING if 400 <= exc.status_code < 500 else logging.ERROR
-    log_level_name = logging.getLevelName(log_level_int).lower() # Obtener nombre ('warning', 'error')
+    # Determinar nivel de log basado en status code
+    # Errores de cliente (4xx) son WARNING, errores de servidor (5xx) son ERROR
+    log_level_name = "warning" if 400 <= exc.status_code < 500 else "error"
+    # *** CORRECCIÓN: Usar getattr para llamar al método de log correcto ***
+    log_method = getattr(bound_log, log_level_name, bound_log.info) # Fallback a info si es un nivel desconocido
 
-    # Usar el método específico (warning, error) en lugar de .log() para evitar KeyError
-    log_method = getattr(bound_log, log_level_name, bound_log.info) # Fallback a info si el nivel no existe
     log_method("HTTP Exception occurred",
                status_code=exc.status_code,
                detail=exc.detail,
-               path=request.url.path)
+               path=request.url.path,
+               # Incluir headers de la excepción si existen (ej. WWW-Authenticate)
+               exception_headers=exc.headers)
 
-    headers = getattr(exc, "headers", None)
+    # Devolver respuesta JSON estándar para HTTPExceptions
     return JSONResponse(
         status_code=exc.status_code,
         content={"detail": exc.detail},
-        headers=headers
+        headers=exc.headers # Pasar headers de la excepción a la respuesta
     )
 
-# Handler genérico para errores 500 no esperados (Sin cambios, ya usaba exception)
+# Captura cualquier otra excepción no manejada (errores 500 inesperados)
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
     req_id = getattr(request.state, 'request_id', 'N/A')
     bound_log = log.bind(request_id=req_id)
+
+    # Loguear la excepción completa para diagnóstico
     bound_log.exception("Unhandled internal server error occurred in gateway",
                         path=request.url.path,
-                        error_type=type(exc).__name__)
+                        error_type=type(exc).__name__) # Incluir tipo de error
+
+    # Devolver respuesta 500 genérica al cliente
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"detail": "An unexpected internal server error occurred."}
     )
 
-# Log final (Sin cambios)
+# --- Log final de configuración (opcional) ---
+# Este log se ejecutará sólo una vez cuando el módulo se cargue
 log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start.",
-         allowed_origins=allowed_origins,
-         allowed_methods=allowed_methods,
-         allowed_headers=allowed_headers)
+         log_level=settings.LOG_LEVEL,
+         ingest_service=str(settings.INGEST_SERVICE_URL),
+         query_service=str(settings.QUERY_SERVICE_URL),
+         auth_proxy_enabled=bool(settings.AUTH_SERVICE_URL),
+         supabase_url=str(settings.SUPABASE_URL),
+         default_company_id_set=bool(settings.DEFAULT_COMPANY_ID)
+         )
+
+# --- Ejecución con Uvicorn (para desarrollo local) ---
+# Esto normalmente no se incluye si usas Gunicorn en producción
+# if __name__ == "__main__":
+#     uvicorn.run(
+#         "app.main:app",
+#         host="0.0.0.0",
+#         port=8080, # Puerto estándar interno
+#         log_level=settings.LOG_LEVEL.lower(), # Pasar nivel de log a uvicorn
+#         reload=True # Habilitar reload para desarrollo
+#         # Añadir --log-config app/logging.yaml si usas config de logging externa
+#     )
 ```
 
 ## File: `app\routers\__init__.py`
@@ -841,7 +975,9 @@ http_client: Optional[httpx.AsyncClient] = None
 HOP_BY_HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
-    # Considerar si quitar 'content-encoding' es necesario en tu caso
+    # 'content-encoding' a veces se quita, pero puede ser necesario si el backend responde comprimido y el cliente espera eso.
+    # Lo dejaremos pasar por defecto a menos que cause problemas.
+    # "content-encoding",
 }
 
 def get_client() -> httpx.AsyncClient:
@@ -858,7 +994,7 @@ async def _proxy_request(
     request: Request,
     target_url_str: str, # URL completa del servicio destino
     client: httpx.AsyncClient,
-    user_payload: Optional[Dict[str, Any]]
+    user_payload: Optional[Dict[str, Any]] # Payload del token validado (si aplica)
 ):
     """Función interna reutilizable para realizar el proxy de la petición HTTP."""
     method = request.method
@@ -867,29 +1003,34 @@ async def _proxy_request(
     # 1. Preparar Headers para reenviar
     headers_to_forward = {}
     client_host = request.client.host if request.client else "unknown"
+    # Usar X-Forwarded-For existente o el IP del cliente directo
     x_forwarded_for = request.headers.get("x-forwarded-for", client_host)
 
     for name, value in request.headers.items():
         if name.lower() not in HOP_BY_HOP_HEADERS:
             headers_to_forward[name] = value
 
+    # Añadir/Actualizar cabeceras X-Forwarded-*
     headers_to_forward["X-Forwarded-For"] = x_forwarded_for
     headers_to_forward["X-Forwarded-Proto"] = request.url.scheme
+    # X-Forwarded-Host debe ser el host original solicitado al gateway
     headers_to_forward["X-Forwarded-Host"] = request.headers.get("host", "")
-    # Añadir X-Request-ID para tracing downstream si está disponible
+
+    # Añadir X-Request-ID para tracing downstream si está disponible en el estado
     request_id = getattr(request.state, 'request_id', None)
     if request_id:
         headers_to_forward["X-Request-ID"] = request_id
 
-
-    # 2. Inyectar Headers de Autenticación/Contexto (SI HAY PAYLOAD)
+    # 2. Inyectar Headers de Autenticación/Contexto (SI HAY PAYLOAD y NO es OPTIONS)
+    # No inyectar en OPTIONS ya que no llevan contexto de usuario usualmente
     log_context = {'request_id': request_id} if request_id else {}
-    if user_payload:
+    if user_payload and method.upper() != 'OPTIONS':
         user_id = user_payload.get('sub')
-        company_id = user_payload.get('company_id') # Asegurado por StrictAuth
+        company_id = user_payload.get('company_id') # Asegurado por StrictAuth que existe
         user_email = user_payload.get('email')
 
-        if not user_id or not company_id: # Doble chequeo por seguridad
+        # Doble chequeo por si acaso, aunque StrictAuth debería garantizarlo
+        if not user_id or not company_id:
              log.critical("CRITICAL: Payload missing required fields (sub/company_id) after StrictAuth!",
                           payload_keys=list(user_payload.keys()), user_id=user_id, company_id=company_id)
              raise HTTPException(status_code=500, detail="Internal authentication context error.")
@@ -901,49 +1042,52 @@ async def _proxy_request(
         if user_email:
              headers_to_forward['X-User-Email'] = str(user_email)
 
-    # Vincular contexto al logger
+    # Vincular contexto al logger para esta operación de proxy
     bound_log = log.bind(**log_context)
 
     # 3. Preparar Query Params y Body
     query_params = request.query_params
+    # Usar request.stream() para eficiencia, evita cargar todo el body en memoria
     request_body_stream = request.stream()
-    # Detectar si el body ya fue consumido (puede pasar con algunos middlewares/frameworks)
-    # body_bytes = await request.body() # Alternativa si stream() da problemas, menos eficiente
 
     # 4. Realizar la petición downstream
     bound_log.info(f"Proxying request", method=method, from_path=request.url.path, to_target=str(target_url))
 
     rp: Optional[httpx.Response] = None
     try:
+        # Construir la solicitud httpx
         req = client.build_request(
             method=method,
             url=target_url,
             headers=headers_to_forward,
             params=query_params,
-            content=request_body_stream # Stream body
-            # content=body_bytes # Usar si se leyó con request.body()
+            # Pasar el stream directamente como contenido
+            content=request_body_stream
         )
-        # Aumentar timeout si es necesario para rutas específicas
-        rp = await client.send(req, stream=True) # Stream response
+        # Enviar la solicitud y obtener la respuesta como stream
+        # Aumentar timeout aquí si es necesario para rutas específicas, ej. con timeout=httpx.Timeout(120.0)
+        rp = await client.send(req, stream=True)
 
-        # 5. Procesar y devolver la respuesta
+        # 5. Procesar y devolver la respuesta del servicio backend
         bound_log.info(f"Received response from downstream", status_code=rp.status_code, target=str(target_url))
 
+        # Filtrar cabeceras hop-by-hop de la respuesta del backend
         response_headers = {
             k: v for k, v in rp.headers.items() if k.lower() not in HOP_BY_HOP_HEADERS
         }
-        # Mantener Content-Length si el backend lo envía y no usamos chunked encoding
-        if 'content-length' in rp.headers and rp.headers.get('transfer-encoding') != 'chunked':
-            response_headers['content-length'] = rp.headers['content-length']
 
+        # Preservar Content-Length si el backend lo envió y no usa chunked encoding
+        # StreamingResponse maneja esto bien, pero es bueno ser explícito si es necesario
+        # if 'content-length' in rp.headers and rp.headers.get('transfer-encoding') != 'chunked':
+        #     response_headers['content-length'] = rp.headers['content-length']
 
-        # Devolver StreamingResponse
+        # Devolver StreamingResponse para eficiencia de memoria
         return StreamingResponse(
             rp.aiter_raw(), # Iterador asíncrono del cuerpo de la respuesta
             status_code=rp.status_code,
             headers=response_headers,
-            media_type=rp.headers.get("content-type"),
-            background=rp.aclose # Asegurar que se cierra la respuesta httpx
+            media_type=rp.headers.get("content-type"), # Preservar content-type original
+            background=rp.aclose # Tarea para cerrar la respuesta httpx cuando FastAPI termine
         )
 
     except httpx.TimeoutException as exc:
@@ -953,71 +1097,86 @@ async def _proxy_request(
          bound_log.error(f"Connection error to downstream service", target=str(target_url), error=str(exc))
          raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Could not connect to upstream service.")
     except httpx.RequestError as exc:
+         # Otros errores de httpx (ej. SSL, problemas de proxy interno, etc.)
          bound_log.error(f"HTTPX request error during proxy", target=str(target_url), error=str(exc))
          raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Error communicating with upstream service.")
     except Exception as exc:
+        # Capturar cualquier otro error inesperado
         bound_log.exception(f"Unexpected error during proxy operation", target=str(target_url))
-        # Cerrar respuesta si ya se había abierto antes de la excepción
+        # Intentar cerrar la respuesta httpx si se abrió antes de la excepción
         if rp and hasattr(rp, 'aclose') and callable(rp.aclose):
             try: await rp.aclose()
             except Exception: pass # Ignorar errores al cerrar en medio de otra excepción
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal gateway error during proxy.")
-    # No necesitamos finally si usamos background task en StreamingResponse o context manager
 
-# --- Rutas Proxy Específicas (AÑADIR 'OPTIONS') ---
+# --- Rutas Proxy Específicas ---
 
 @router.api_route(
     "/api/v1/ingest/{path:path}",
-    # *** AÑADIDO OPTIONS ***
+    # *** CORRECCIÓN: Añadido OPTIONS ***
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     dependencies=[Depends(StrictAuth)], # Requiere token válido CON company_id
     tags=["Proxy - Ingest"],
     summary="Proxy to Ingest Service (Authentication Required)",
+    response_description="Response proxied directly from the Ingest Service.",
     name="proxy_ingest_service",
 )
 async def proxy_ingest_service(
     request: Request,
     path: str,
     client: Annotated[httpx.AsyncClient, Depends(get_client)],
-    user_payload: StrictAuth # Payload validado
+    # La dependencia StrictAuth ya validó y puso el payload en request.state.user
+    # Aquí la recibimos para pasarla a _proxy_request
+    user_payload: StrictAuth
 ):
-    """Reenvía peticiones a /api/v1/ingest/* al Ingest Service."""
-    base_url = str(settings.INGEST_SERVICE_URL).rstrip('/') # Convertir HttpUrl a string
+    """Reenvía peticiones a /api/v1/ingest/* al Ingest Service configurado.
+       Requiere autenticación JWT válida con `company_id`. Inyecta headers
+       `X-User-ID`, `X-Company-ID`, `X-User-Email`.
+    """
+    base_url = str(settings.INGEST_SERVICE_URL).rstrip('/') # Convertir HttpUrl a string y quitar / final
+    # Construir URL completa, preservando path y query params
     target_url = f"{base_url}/api/v1/ingest/{path}"
-    if request.url.query: target_url += f"?{request.url.query}"
+    if request.url.query:
+        target_url += f"?{request.url.query}"
     return await _proxy_request(request, target_url, client, user_payload)
 
 @router.api_route(
     "/api/v1/query/{path:path}",
-    # *** AÑADIDO OPTIONS ***
+    # *** CORRECCIÓN: Añadido OPTIONS ***
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     dependencies=[Depends(StrictAuth)], # Requiere token válido CON company_id
     tags=["Proxy - Query"],
     summary="Proxy to Query Service (Authentication Required)",
+    response_description="Response proxied directly from the Query Service.",
     name="proxy_query_service",
 )
 async def proxy_query_service(
     request: Request,
     path: str,
     client: Annotated[httpx.AsyncClient, Depends(get_client)],
-    user_payload: StrictAuth # Payload validado
+    user_payload: StrictAuth # Payload validado por la dependencia
 ):
-    """Reenvía peticiones a /api/v1/query/* al Query Service."""
-    base_url = str(settings.QUERY_SERVICE_URL).rstrip('/') # Convertir HttpUrl a string
+    """Reenvía peticiones a /api/v1/query/* al Query Service configurado.
+       Requiere autenticación JWT válida con `company_id`. Inyecta headers
+       `X-User-ID`, `X-Company-ID`, `X-User-Email`.
+    """
+    base_url = str(settings.QUERY_SERVICE_URL).rstrip('/') # Convertir HttpUrl a string y quitar / final
     target_url = f"{base_url}/api/v1/query/{path}"
-    if request.url.query: target_url += f"?{request.url.query}"
+    if request.url.query:
+        target_url += f"?{request.url.query}"
     return await _proxy_request(request, target_url, client, user_payload)
 
 
-# --- Proxy Opcional para Auth Service (AÑADIR 'OPTIONS') ---
+# --- Proxy Opcional para Auth Service ---
 if settings.AUTH_SERVICE_URL:
     log.info(f"Auth service proxy enabled for base URL: {settings.AUTH_SERVICE_URL}")
     @router.api_route(
         "/api/v1/auth/{path:path}",
-        # *** AÑADIDO OPTIONS ***
+        # *** CORRECCIÓN: Añadido OPTIONS ***
         methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
         tags=["Proxy - Auth"],
         summary="Proxy to Authentication Service (No Gateway Authentication)",
+        response_description="Response proxied directly from the Auth Service.",
         name="proxy_auth_service",
     )
     async def proxy_auth_service(
@@ -1025,27 +1184,34 @@ if settings.AUTH_SERVICE_URL:
         path: str,
         client: Annotated[httpx.AsyncClient, Depends(get_client)],
         # NO hay dependencia StrictAuth o InitialAuth aquí.
+        # El token (si existe) pasará tal cual al servicio de auth.
     ):
         """
-        Proxy genérico para el servicio de autenticación. No valida token en gateway.
+        Proxy genérico para el servicio de autenticación (si está configurado).
+        No realiza validación de token en el gateway. Reenvía la solicitud
+        tal cual al servicio de autenticación backend.
         """
         base_url = str(settings.AUTH_SERVICE_URL).rstrip('/') # Convertir HttpUrl a string
         target_url = f"{base_url}/api/v1/auth/{path}"
-        if request.url.query: target_url += f"?{request.url.query}"
-        # Llamar a _proxy_request sin user_payload
+        if request.url.query:
+            target_url += f"?{request.url.query}"
+        # Llamar a _proxy_request sin user_payload (None)
         return await _proxy_request(request, target_url, client, user_payload=None)
 else:
+     # Loguear sólo una vez al inicio si no está configurado
      log.warning("Auth service proxy is not configured (GATEWAY_AUTH_SERVICE_URL not set). "
                  "Requests to /api/v1/auth/* will result in 501 Not Implemented.")
      @router.api_route(
          "/api/v1/auth/{path:path}",
-         # *** AÑADIDO OPTIONS ***
+         # *** CORRECCIÓN: Añadido OPTIONS ***
          methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
          tags=["Proxy - Auth"],
          summary="Auth Proxy (Not Configured)",
-         include_in_schema=False
+         response_description="Error indicating the auth proxy is not configured.",
+         include_in_schema=False # Ocultar de la documentación si no está activo
      )
      async def auth_not_configured(request: Request, path: str):
+         # Devuelve 501 si se intenta acceder a la ruta no configurada
          raise HTTPException(
              status_code=status.HTTP_501_NOT_IMPLEMENTED,
              detail="Authentication endpoint proxy is not configured in this gateway instance."
@@ -1059,6 +1225,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Request
 from typing import Annotated, Dict, Any, Optional
 import structlog
 import traceback
+import inspect # <--- Importar inspect para diagnóstico
 
 # Dependencias
 from app.auth.auth_middleware import InitialAuth
@@ -1067,8 +1234,6 @@ from supabase import Client as SupabaseClient
 from gotrue.errors import AuthApiError
 from gotrue.types import UserResponse, User
 from postgrest import APIResponse as PostgrestAPIResponse
-# *** CORRECCIÓN: Eliminar la siguiente línea ***
-# from postgrest.utils import SyncFilterRequestBuilder # Para tipado del select
 
 from app.core.config import settings
 
@@ -1090,30 +1255,31 @@ async def _create_public_user_profile(
     user_profile_data = {
         "id": user_id,
         "email": email,
-        "full_name": name or "User",
-        "role": "user",
+        "full_name": name or "User", # Usar un valor por defecto si no hay nombre
+        "role": "user", # Rol por defecto
         "is_active": True,
-        # Añadir otros valores por defecto necesarios
+        # Añadir otros valores por defecto necesarios para tu tabla 'public.users'
     }
     try:
-        # *** CORRECCIÓN: Eliminar type hint ***
-        # insert_builder: SyncFilterRequestBuilder = ...
         insert_builder = admin_client.table("users").insert(user_profile_data, returning="representation")
+        # .execute() es SÍNCRONO, NO usar await aquí
         insert_response: PostgrestAPIResponse = insert_builder.execute()
 
         postgrest_error = getattr(insert_response, 'error', None)
         if postgrest_error:
              bound_log.error("PostgREST error during public profile insert.", status_code=insert_response.status_code, error_details=postgrest_error)
-             raise HTTPException(status_code=500, detail=f"Database error creating profile: {postgrest_error.get('message', 'Unknown DB error')}")
+             status_code = insert_response.status_code if 400 <= insert_response.status_code < 600 else 500
+             raise HTTPException(status_code=status_code, detail=f"Database error creating profile: {postgrest_error.get('message', 'Unknown DB error')}")
 
         if insert_response.data and len(insert_response.data) > 0:
             bound_log.info("Successfully created public user profile.", profile_data=insert_response.data[0])
-            return insert_response.data[0]
+            return insert_response.data[0] # Devolver el perfil creado
         else:
-            bound_log.error("Profile insert succeeded but no data returned.", response_status=insert_response.status_code)
+            bound_log.error("Profile insert reported success but no data returned.", response_status=insert_response.status_code, response_data=insert_response.data)
             raise HTTPException(status_code=500, detail="Failed to retrieve profile after creation.")
 
-    except HTTPException as e: raise e
+    except HTTPException as e:
+        raise e
     except Exception as e:
         bound_log.exception("Unexpected error creating public user profile.")
         return None
@@ -1121,10 +1287,10 @@ async def _create_public_user_profile(
 
 @router.post(
     "/me/ensure-company",
-    # ... (metadata sin cambios) ...
     status_code=status.HTTP_200_OK,
     summary="Ensure User Profile and Company Association",
-    # ... (resto de metadata sin cambios) ...
+    description="Checks if the authenticated user has a profile in public.users and an associated company ID in auth.users. If not, creates the profile (if missing) and associates the default company ID.",
+    response_description="Success message indicating profile and company status.",
     responses={
         status.HTTP_200_OK: {"description": "Profile verified/created and company association successful or already existed."},
         status.HTTP_400_BAD_REQUEST: {"description": "Default Company ID not configured on server."},
@@ -1140,9 +1306,10 @@ async def ensure_company_association(
     user_id = user_payload.get("sub")
     email_from_token = user_payload.get("email")
     name_from_token: Optional[str] = None
-    user_metadata_token = user_payload.get('user_metadata')
+    raw_user_metadata_token = user_payload.get('raw_user_meta_data')
+    user_metadata_token = user_payload.get('user_metadata', raw_user_metadata_token)
     if isinstance(user_metadata_token, dict):
-        name_from_token = user_metadata_token.get('name') or user_metadata_token.get('full_name')
+        name_from_token = user_metadata_token.get('name') or user_metadata_token.get('full_name') or user_metadata_token.get('user_name')
 
     bound_log = log.bind(user_id=user_id)
     bound_log.info("Ensure profile and company association endpoint called.")
@@ -1150,11 +1317,9 @@ async def ensure_company_association(
     public_profile: Optional[Dict] = None
     auth_user: Optional[User] = None
 
-    # --- Paso 1: Verificar/Crear perfil público ---
+    # --- Paso 1: Verificar/Crear perfil público en 'public.users' ---
     try:
         bound_log.debug("Checking for existing public user profile...")
-        # *** CORRECCIÓN: Eliminar type hint ***
-        # select_builder: SyncFilterRequestBuilder = ...
         select_builder = admin_client.table("users").select("id, email, full_name, role, company_id").eq("id", user_id).limit(1)
         select_response: PostgrestAPIResponse = select_builder.execute()
 
@@ -1165,67 +1330,125 @@ async def ensure_company_association(
         postgrest_error = getattr(select_response, 'error', None)
         if postgrest_error:
              bound_log.error("PostgREST error checking public profile.", status_code=select_response.status_code, error_details=postgrest_error)
-             raise HTTPException(status_code=select_response.status_code if select_response.status_code >= 400 else 500,
-                                 detail=f"Database error checking profile: {postgrest_error.get('message', 'Unknown PostgREST error')}")
+             status_code = select_response.status_code if select_response.status_code >= 400 else 500
+             raise HTTPException(status_code=status_code, detail=f"Database error checking profile: {postgrest_error.get('message', 'Unknown PostgREST error')}")
 
         if select_response.data and len(select_response.data) > 0:
             public_profile = select_response.data[0]
             bound_log.info("Public user profile found.")
         else:
-            bound_log.info("Public profile not found. Fetching auth user data.")
+            bound_log.info("Public profile not found. Fetching auth user data to create profile.")
             try:
-                auth_user_response: UserResponse = await admin_client.auth.admin.get_user_by_id(user_id)
-                auth_user = auth_user_response.user if auth_user_response else None
-                if not auth_user: raise HTTPException(status_code=500, detail="User data inconsistency.")
-                email_for_profile = auth_user.email or email_from_token
-                name_for_profile = (auth_user.user_metadata.get('name') or auth_user.user_metadata.get('full_name')) if auth_user.user_metadata else name_from_token
-                public_profile = await _create_public_user_profile(admin_client, user_id, email_for_profile, name_for_profile)
-                if public_profile is None: raise HTTPException(status_code=500, detail="Failed during profile creation process.")
-            except Exception as creation_e:
-                 bound_log.exception("Error during profile creation steps.")
-                 if isinstance(creation_e, HTTPException): raise creation_e
-                 raise HTTPException(status_code=500, detail=f"Failed during profile creation: {creation_e}")
+                # *** INICIO DIAGNÓSTICO ***
+                get_user_method = admin_client.auth.admin.get_user_by_id
+                bound_log.debug("Inspecting admin_client.auth.admin.get_user_by_id",
+                                method_type=str(type(get_user_method)),
+                                is_coroutine_function=inspect.iscoroutinefunction(get_user_method),
+                                is_async_gen_function=inspect.isasyncgenfunction(get_user_method),
+                                is_function=inspect.isfunction(get_user_method),
+                                is_method=inspect.ismethod(get_user_method)
+                               )
+                # *** FIN DIAGNÓSTICO ***
 
-    except HTTPException as e: raise e
+                # Llamada original que causa el error
+                auth_user_response: UserResponse = await get_user_method(user_id) # Usar la variable para asegurar que es lo que inspeccionamos
+                # auth_user_response: UserResponse = await admin_client.auth.admin.get_user_by_id(user_id) # Línea original comentada
+
+                auth_user = auth_user_response.user if auth_user_response else None
+
+                if not auth_user:
+                    bound_log.error("User data inconsistency: Auth user not found via admin API despite valid token.", user_id=user_id)
+                    raise HTTPException(status_code=500, detail="User data inconsistency found.")
+
+                email_for_profile = auth_user.email or email_from_token
+                name_for_profile = None
+                if auth_user.user_metadata:
+                     name_for_profile = auth_user.user_metadata.get('name') or auth_user.user_metadata.get('full_name') or auth_user.user_metadata.get('user_name')
+                name_for_profile = name_for_profile or name_from_token
+
+                public_profile = await _create_public_user_profile(admin_client, user_id, email_for_profile, name_for_profile)
+
+                if public_profile is None:
+                    raise HTTPException(status_code=500, detail="Failed during profile creation process after fetching auth data.")
+
+            except HTTPException as http_exc:
+                 raise http_exc
+            except Exception as creation_e:
+                 # Aquí es donde se captura y loguea el TypeError
+                 bound_log.exception("Error during profile creation steps.", error_type=type(creation_e).__name__)
+                 # Relanzar la excepción original para mantener el detalle del error
+                 raise HTTPException(status_code=500, detail=f"Failed during profile creation: {creation_e}") from creation_e
+
+
+    except HTTPException as e:
+        raise e
     except Exception as e:
         error_details = traceback.format_exc()
         bound_log.exception("Unexpected error checking/creating public user profile.", error_message=str(e), traceback=error_details)
         raise HTTPException(status_code=500, detail=f"Error accessing user profile data: {e}")
 
-    # --- Paso 2: Verificar/Asociar Company ID ---
-    # ... (resto de la lógica sin cambios, ya que las llamadas a auth.admin sí usan await
-    # y las llamadas a table().update() ya no usaban await incorrectamente) ...
-
+    # --- Paso 2: Verificar/Asociar Company ID en 'auth.users.app_metadata' ---
     if not auth_user: # Re-fetch si el perfil ya existía
         try:
-            bound_log.debug("Re-fetching auth user data for company check.")
-            auth_user_response = await admin_client.auth.admin.get_user_by_id(user_id)
-            auth_user = auth_user_response.user if auth_user_response else None
-            if not auth_user: raise HTTPException(status_code=500, detail="User data inconsistency.")
-        except Exception as e:
-            bound_log.exception("Failed to re-fetch auth user data.")
-            raise HTTPException(status_code=500, detail="Failed to get user data for company check.")
+            bound_log.debug("Re-fetching auth user data for company check (profile existed).")
 
+            # *** INICIO DIAGNÓSTICO (Repetido por si acaso el flujo llega aquí) ***
+            get_user_method_refetch = admin_client.auth.admin.get_user_by_id
+            bound_log.debug("Inspecting admin_client.auth.admin.get_user_by_id (re-fetch)",
+                            method_type=str(type(get_user_method_refetch)),
+                            is_coroutine_function=inspect.iscoroutinefunction(get_user_method_refetch),
+                           )
+            # *** FIN DIAGNÓSTICO ***
+
+            auth_user_response = await get_user_method_refetch(user_id)
+            # auth_user_response = await admin_client.auth.admin.get_user_by_id(user_id) # Línea original comentada
+            auth_user = auth_user_response.user if auth_user_response else None
+            if not auth_user:
+                bound_log.error("User data inconsistency: Auth user not found via admin API on second fetch.", user_id=user_id)
+                raise HTTPException(status_code=500, detail="User data inconsistency.")
+        except HTTPException as http_exc: raise http_exc
+        except Exception as e:
+             # *** INICIO DIAGNÓSTICO (Error en re-fetch) ***
+             bound_log.exception("Failed to re-fetch auth user data for company check.", error_type=type(e).__name__)
+             # Si el error aquí es el mismo TypeError, loguearlo específicamente
+             if isinstance(e, TypeError) and "can't be used in 'await' expression" in str(e):
+                  bound_log.error("TypeError encountered again during auth user re-fetch.")
+             # *** FIN DIAGNÓSTICO ***
+             raise HTTPException(status_code=500, detail="Failed to get user data for company check.")
+
+
+    # ... (resto del código para asociar company_id permanece igual) ...
+    # Verificar si ya existe company_id en app_metadata de auth.users
     app_metadata = getattr(auth_user, 'app_metadata', {}) if auth_user else {}
-    company_id_from_auth = app_metadata.get("company_id") if isinstance(app_metadata, dict) else None
+    if not isinstance(app_metadata, dict):
+        bound_log.warning("User app_metadata is not a dictionary.", received_metadata=app_metadata)
+        app_metadata = {}
+
+    company_id_from_auth = app_metadata.get("company_id")
     company_id_from_auth = str(company_id_from_auth) if company_id_from_auth else None
 
     if company_id_from_auth:
         bound_log.info("User already has company ID in auth.users metadata.", company_id=company_id_from_auth)
         public_company_id = public_profile.get('company_id') if public_profile else None
         if str(public_company_id) != company_id_from_auth:
-             bound_log.warning("Mismatch company ID. Updating profile.", auth_cid=company_id_from_auth, profile_cid=public_company_id)
+             bound_log.warning("Mismatch company ID between auth.users and public.users. Updating profile.",
+                               auth_cid=company_id_from_auth, profile_cid=public_company_id)
              try:
-                 admin_client.table("users").update({"company_id": company_id_from_auth}).eq("id", user_id).execute()
-             except Exception:
-                 bound_log.exception("Failed to sync existing company ID to public profile.")
+                 update_builder = admin_client.table("users").update({"company_id": company_id_from_auth}).eq("id", user_id)
+                 update_response = update_builder.execute()
+                 update_error = getattr(update_response, 'error', None)
+                 if update_error:
+                      bound_log.error("Failed to sync existing company ID to public profile.", error_details=update_error)
+                 else:
+                      bound_log.info("Successfully synced company ID to public profile.")
+             except Exception as sync_e:
+                 bound_log.exception("Error syncing existing company ID to public profile.", error=sync_e)
         return {"message": "Company association already exists.", "company_id": company_id_from_auth}
 
-    # --- Asociar Compañía ---
     bound_log.info("User lacks company ID in auth metadata. Attempting association.")
     company_id_to_assign = settings.DEFAULT_COMPANY_ID
     if not company_id_to_assign:
-        bound_log.critical("CONFIGURATION ERROR: GATEWAY_DEFAULT_COMPANY_ID is not set.")
+        bound_log.critical("CONFIGURATION ERROR: GATEWAY_DEFAULT_COMPANY_ID is not set, cannot associate company.")
         raise HTTPException(status_code=400, detail="Server configuration error: Default company ID is not set.")
 
     bound_log.info("Associating user with Default Company ID.", default_company_id=company_id_to_assign)
@@ -1236,29 +1459,34 @@ async def ensure_company_association(
         update_auth_response: UserResponse = await admin_client.auth.admin.update_user_by_id(
             user_id, attributes={'app_metadata': new_app_metadata}
         )
-        updated_user_auth = update_auth_response.user if update_auth_response else None
-        if not (updated_user_auth and getattr(updated_user_auth, 'app_metadata', {}).get("company_id") == company_id_to_assign):
-             bound_log.error("Failed to confirm company ID update in auth.users metadata response.", update_response=updated_user_auth)
-             raise HTTPException(status_code=500, detail="Failed to confirm company ID update in auth system.")
-        bound_log.info("Successfully updated auth.users app_metadata.")
 
-        # Actualizar public.users
+        updated_user_auth = update_auth_response.user if update_auth_response else None
+        updated_metadata = getattr(updated_user_auth, 'app_metadata', {}) if updated_user_auth else {}
+        if not (updated_metadata and updated_metadata.get("company_id") == company_id_to_assign):
+             bound_log.error("Failed to confirm company ID update in auth.users metadata response.",
+                           response_metadata=updated_metadata, expected_company_id=company_id_to_assign)
+             raise HTTPException(status_code=500, detail="Failed to confirm company ID update in authentication system.")
+
+        bound_log.info("Successfully updated auth.users app_metadata with company ID.")
+
         try:
             bound_log.debug("Updating public.users company_id column.")
-            update_public_response = admin_client.table("users").update({"company_id": company_id_to_assign}).eq("id", user_id).execute()
+            update_public_builder = admin_client.table("users").update({"company_id": company_id_to_assign}).eq("id", user_id)
+            update_public_response = update_public_builder.execute()
             public_update_error = getattr(update_public_response, 'error', None)
             if public_update_error:
                  bound_log.error("PostgREST error updating company_id in public.users.", error_details=public_update_error)
             else:
                  bound_log.info("Successfully updated public.users company_id.")
         except Exception as pub_e:
-             bound_log.exception("Failed to update company_id in public.users table.")
+             bound_log.exception("Failed to update company_id in public.users table after auth update.")
 
         return {"message": "Company association successful.", "company_id": company_id_to_assign}
 
     except AuthApiError as e:
         bound_log.error("Supabase Admin API error during user metadata update", status_code=e.status, error_message=e.message)
-        raise HTTPException(status_code=500, detail=f"Failed to associate company in auth system: {e.message}")
+        status_code = e.status if 400 <= e.status < 600 else 500
+        raise HTTPException(status_code=status_code, detail=f"Failed to associate company in auth system: {e.message}")
     except HTTPException as e: raise e
     except Exception as e:
         bound_log.exception("Unexpected error during company association update.")
