@@ -16,7 +16,7 @@ setup_logging()
 log = structlog.get_logger(__name__)
 
 # Importar routers y otros módulos
-from app.api.v1.endpoints import query
+from app.api.v1.endpoints import query as query_router
 from app.api.v1.endpoints import chat as chat_router
 from app.db import postgres_client
 from app.pipelines.rag_pipeline import build_rag_pipeline, check_pipeline_dependencies
@@ -100,8 +100,8 @@ async def generic_exception_handler(request, exc):
 
 
 # --- Routers ---
-app.include_router(query_router.router, prefix=settings.API_V1_STR + "/query", tags=["Query & Chat Interaction"])
-app.include_router(chat_router.router, prefix=settings.API_V1_STR + "/query", tags=["Chat Management"]) # Chat usa el mismo prefijo base
+app.include_router(query_router.router, prefix=settings.API_V1_STR + "/query", tags=["Query Interaction"])
+app.include_router(chat_router.router, prefix=settings.API_V1_STR + "/chat", tags=["Chat Management"]) # Chat uses a distinct prefix
 
 # --- Root Endpoint / Health Check (Sin cambios) ---
 @app.get("/", tags=["Health Check"], summary="Service Liveness/Readiness Check", description="Basic Kubernetes probe endpoint. Returns 200 OK with 'OK' text if the service started successfully, otherwise 503.")

@@ -117,7 +117,13 @@ async def get_ingestion_status(
     try: response_data = schemas.StatusResponse.model_validate(doc_data)
     except Exception as p_err: status_log.error("Schema validation error", e=p_err); raise HTTPException(status_code=500)
     # --- Mensaje descriptivo (sin cambios) ---
-    status_messages = { ... }; response_data.message = status_messages.get(response_data.status, "...")
+    status_messages = {
+        DocumentStatus.UPLOADED: "The document has been successfully uploaded.",
+        DocumentStatus.PROCESSING: "The document is currently being processed.",
+        DocumentStatus.COMPLETED: "The document has been processed successfully.",
+        DocumentStatus.ERROR: "An error occurred during document processing.",
+    }
+    response_data.message = status_messages.get(response_data.status, "Unknown status.")
     status_log.info("Returning document status", status=response_data.status)
     return response_data
 
@@ -143,9 +149,7 @@ async def list_ingestion_statuses(
         # Pasar limit y offset a la función DB si la soporta
         # documents_data = await postgres_client.list_documents_by_company(company_id, limit=limit, offset=offset)
         # Si no, obtener todos y paginar aquí (menos eficiente)
-        documents_data = await postgres_client.list_documents_by_company(company_id) # Asumiendo que no pagina
-        # Aplicar paginación manual si es necesario
-        paginated_data = documents_data[offset : offset + limit]
+        documents_data = await postgres_client.list_documents_by_company(company_id, limit=limit, offset=offset) # Implementar paginación en la consulta DB
 
     except Exception as e: list_log.error("DB error listing statuses", e=e); raise HTTPException(status_code=500)
 
