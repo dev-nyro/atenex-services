@@ -16,7 +16,7 @@ router = APIRouter()
 
 # --- Endpoint para Listar Chats ---
 @router.get(
-    "/chats",
+    "/query/chats",
     response_model=List[schemas.ChatSummary],
     status_code=status.HTTP_200_OK,
     summary="List User Chats",
@@ -42,7 +42,7 @@ async def list_chats(
 
 # --- Endpoint para Obtener Mensajes de un Chat ---
 @router.get(
-    "/chats/{chat_id}/messages",
+    "/query/chats/{chat_id}/messages",
     response_model=List[schemas.ChatMessage],
     status_code=status.HTTP_200_OK,
     summary="Get Chat Messages",
@@ -90,7 +90,7 @@ async def get_chat_messages(
 
 # --- Endpoint para Borrar un Chat ---
 @router.delete(
-    "/chats/{chat_id}",
+    "/query/chats/{chat_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete Chat",
     description="Deletes a specific chat and all its associated messages, verifying user ownership.",

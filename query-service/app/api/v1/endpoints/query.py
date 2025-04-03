@@ -64,7 +64,7 @@ async def get_current_user_id(authorization: Optional[str] = Header(None)) -> Op
 
 # --- Endpoint /query Modificado ---
 @router.post(
-    "/query",
+    "/query/ask",
     # --- Actualizar response_model ---
     response_model=schemas.QueryResponse,
     status_code=status.HTTP_200_OK,

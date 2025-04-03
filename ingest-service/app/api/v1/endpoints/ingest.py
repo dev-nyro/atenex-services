@@ -36,7 +36,7 @@ async def get_current_company_id(x_company_id: Optional[str] = Header(None)) -> 
 # --- Endpoints ---
 
 @router.post(
-    "/ingest", # Ruta relativa al prefijo /api/v1/ingest añadido en main.py
+    "/ingest/upload", # Ruta relativa al prefijo /api/v1/ingest añadido en main.py
     response_model=schemas.IngestResponse,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Ingestar un nuevo documento",
@@ -94,7 +94,7 @@ async def ingest_document_haystack(
     finally: await file.close()
 
 @router.get(
-    "/status/{document_id}", # Ruta relativa correcta
+    "/ingest/status/{document_id}", # Ruta relativa correcta
     response_model=schemas.StatusResponse,
     status_code=status.HTTP_200_OK,
     summary="Consultar estado de ingesta de un documento",
@@ -129,7 +129,7 @@ async def get_ingestion_status(
 
 
 @router.get(
-    "/status", # Ruta relativa correcta
+    "/ingest/status", # Ruta relativa correcta
     response_model=List[schemas.StatusResponse],
     status_code=status.HTTP_200_OK,
     summary="Listar estados de ingesta para la compañía",

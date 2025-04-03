@@ -63,7 +63,7 @@ async def generic_exception_handler(request, exc): log.exception("Unhandled Exce
 
 # --- Router ---
 # *** CORRECCIÓN: Usar el prefijo correcto ***
-app.include_router(ingest.router, prefix=settings.API_V1_STR + "/ingest", tags=["Ingestion"])
+app.include_router(ingest.router, prefix=settings.API_V1_STR, tags=["Ingestion"])
 # Asegúrate que el prefijo aquí + la ruta en el endpoint coincidan con lo que llama el gateway
 # Gateway llama a /api/v1/ingest/status -> Debe mapear a GET /status aquí
 # Gateway llama a /api/v1/ingest/status/{id} -> Debe mapear a GET /status/{id} aquí
