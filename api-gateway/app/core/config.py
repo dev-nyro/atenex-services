@@ -1,112 +1,110 @@
-# api-gateway/app/core/config.py
-import os
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from functools import lru_cache
-import sys
+# File: app/core/logging_config.py
+# api-gateway/app/core/logging_config.py
 import logging
-from typing import Optional
+import sys
+import structlog
+import os
+from app.core.config import settings # Importar settings ya parseadas y validadas
 
-K8S_INGEST_SVC_URL_DEFAULT = "http://ingest-api-service.nyro-develop.svc.cluster.local:80"
-K8S_QUERY_SVC_URL_DEFAULT = "http://query-service.nyro-develop.svc.cluster.local:80"
+def setup_logging():
+    """Configura el logging estructurado con structlog para salida JSON."""
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        # Lee variables con el prefijo GATEWAY_ desde .env o el entorno
-        env_file='.env',
-        env_prefix='GATEWAY_',
-        case_sensitive=False,
-        env_file_encoding='utf-8',
-        extra='ignore'
+    # Procesadores compartidos por structlog y logging stdlib
+    shared_processors: list[structlog.types.Processor] = [
+        structlog.contextvars.merge_contextvars, # Añadir contexto de structlog.contextvars
+        structlog.stdlib.add_logger_name, # Añadir nombre del logger
+        structlog.stdlib.add_log_level, # Añadir nivel del log (info, warning, etc.)
+        structlog.processors.TimeStamper(fmt="iso", utc=True), # Timestamp ISO 8601 en UTC
+        structlog.processors.StackInfoRenderer(), # Renderizar info de stack si está presente
+        # structlog.processors.format_exc_info, # Formatear excepciones (JSONRenderer lo hace bien)
+        # Añadir info de proceso/thread si es útil para depurar concurrencia
+        # structlog.processors.ProcessInfoProcessor(),
+    ]
+
+    # Añadir información del llamador (fichero, línea) SOLO en modo DEBUG por rendimiento
+    if settings.LOG_LEVEL.upper() == "DEBUG":
+         # Usar CallsiteParameterAdder para añadir selectivamente
+         shared_processors.append(structlog.processors.CallsiteParameterAdder(
+             parameters={
+                 structlog.processors.CallsiteParameter.FILENAME,
+                 structlog.processors.CallsiteParameter.LINENO,
+                 # structlog.processors.CallsiteParameter.FUNC_NAME, # Opcional
+             }
+         ))
+
+    # Configurar structlog para usar el sistema de logging estándar de Python
+    structlog.configure(
+        processors=shared_processors + [
+            # Prepara el diccionario de eventos para el formateador de stdlib logging
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+        ],
+        logger_factory=structlog.stdlib.LoggerFactory(), # Usar logger factory de stdlib
+        wrapper_class=structlog.stdlib.BoundLogger, # Clase wrapper estándar
+        cache_logger_on_first_use=True, # Cachear loggers para rendimiento
     )
 
-    PROJECT_NAME: str = "Nyro API Gateway"
-    API_V1_STR: str = "/api/v1"
+    # Configurar el formateador que usará el handler de stdlib logging
+    # Este formateador tomará el diccionario preparado por structlog y lo renderizará
+    formatter = structlog.stdlib.ProcessorFormatter(
+        # Procesador final que renderiza el diccionario de eventos
+        # Usar JSONRenderer para salida estructurada compatible con agregadores de logs
+        processor=structlog.processors.JSONRenderer(),
+        # Alternativa para desarrollo local (logs más legibles en consola):
+        # processor=structlog.dev.ConsoleRenderer(colors=True), # Requiere 'pip install colorama'
 
-    INGEST_SERVICE_URL: str # Se leerá como GATEWAY_INGEST_SERVICE_URL
-    QUERY_SERVICE_URL: str  # Se leerá como GATEWAY_QUERY_SERVICE_URL
-    AUTH_SERVICE_URL: Optional[str] = None # Se leerá como GATEWAY_AUTH_SERVICE_URL
+        # Procesadores que se ejecutan ANTES del renderizador final (JSONRenderer/ConsoleRenderer)
+        # foreign_pre_chain se aplica a logs de librerías que usan logging directamente
+        foreign_pre_chain=shared_processors + [
+             structlog.stdlib.ProcessorFormatter.remove_processors_meta, # Limpiar metadatos internos
+        ],
+    )
 
-    # JWT settings
-    JWT_SECRET: str # Se leerá como GATEWAY_JWT_SECRET (desde Secret)
-    JWT_ALGORITHM: str = "HS256" # Se leerá como GATEWAY_JWT_ALGORITHM
+    # Configurar el handler raíz de logging (salida a stdout)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(formatter) # Usar el formateador de structlog
 
-    # Supabase Admin settings
-    # --- MODIFICACIÓN: Leer variable específica del backend ---
-    # Leerá la variable de entorno GATEWAY_SUPABASE_URL
-    SUPABASE_URL: str
-    # Leerá la variable de entorno GATEWAY_SUPABASE_SERVICE_ROLE_KEY (desde Secret)
-    SUPABASE_SERVICE_ROLE_KEY: str
-    # -------------------------------------------------------
+    root_logger = logging.getLogger() # Obtener el logger raíz
 
-    # Leerá la variable de entorno GATEWAY_DEFAULT_COMPANY_ID
-    DEFAULT_COMPANY_ID: Optional[str] = None
+    # Evitar añadir handlers duplicados si esta función se llama accidentalmente más de una vez
+    # Comprobar si ya existe un handler con nuestro formateador específico
+    has_structlog_handler = any(
+        isinstance(h, logging.StreamHandler) and isinstance(h.formatter, structlog.stdlib.ProcessorFormatter)
+        for h in root_logger.handlers
+    )
 
-    LOG_LEVEL: str = "INFO"
-    HTTP_CLIENT_TIMEOUT: int = 60
-    HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS: int = 20
-    HTTP_CLIENT_MAX_CONNECTIONS: int = 100
+    if not has_structlog_handler:
+        # Limpiar handlers existentes (opcional, puede ser destructivo si otros módulos configuran logging)
+        # root_logger.handlers.clear()
+        root_logger.addHandler(handler)
+    else:
+        # Si ya existe, al menos asegurar que el formateador esté actualizado (por si acaso)
+        for h in root_logger.handlers:
+            if isinstance(h, logging.StreamHandler) and isinstance(h.formatter, structlog.stdlib.ProcessorFormatter):
+                h.setFormatter(formatter)
+                break
 
-@lru_cache()
-def get_settings() -> Settings:
-    log = logging.getLogger(__name__)
-    if not log.handlers:
-        log.setLevel(logging.INFO)
-        log.addHandler(logging.StreamHandler(sys.stdout))
-
-    log.info("Loading Gateway settings...")
+    # Establecer el nivel de log en el logger raíz basado en la configuración
     try:
-        # Pydantic-settings leerá las variables de entorno correspondientes
-        # (GATEWAY_SUPABASE_URL, GATEWAY_JWT_SECRET, etc.)
-        settings_instance = Settings()
+        root_logger.setLevel(settings.LOG_LEVEL.upper())
+    except ValueError:
+        # Esto no debería ocurrir si el validador en config.py funciona
+        root_logger.setLevel(logging.INFO)
+        logging.warning(f"Invalid LOG_LEVEL '{settings.LOG_LEVEL}' detected after validation. Defaulting to INFO.")
 
-        log.info("Gateway Settings Loaded:")
-        log.info(f"  PROJECT_NAME: {settings_instance.PROJECT_NAME}")
-        log.info(f"  INGEST_SERVICE_URL: {settings_instance.INGEST_SERVICE_URL}")
-        log.info(f"  QUERY_SERVICE_URL: {settings_instance.QUERY_SERVICE_URL}")
-        log.info(f"  AUTH_SERVICE_URL: {settings_instance.AUTH_SERVICE_URL or 'Not Set'}")
 
-        # Verificación JWT Secret (Placeholder)
-        if settings_instance.JWT_SECRET == "YOUR_DEFAULT_JWT_SECRET_KEY_CHANGE_ME_IN_ENV_OR_SECRET":
-            log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-            log.critical("! FATAL: GATEWAY_JWT_SECRET is using the default insecure value!")
-            log.critical("! Set GATEWAY_JWT_SECRET via env var or K8s Secret.")
-            log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        else:
-            log.info(f"  JWT_SECRET: *** SET (Loaded from Secret/Env) ***")
-        log.info(f"  JWT_ALGORITHM: {settings_instance.JWT_ALGORITHM}")
+    # Ajustar niveles de log para librerías de terceros verbosas
+    # Poner en WARNING o ERROR para reducir ruido, INFO/DEBUG si necesitas sus logs
+    logging.getLogger("uvicorn").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.error").setLevel(logging.INFO) # Errores de uvicorn sí son importantes
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING) # Logs de acceso pueden ser muy ruidosos
+    logging.getLogger("gunicorn.error").setLevel(logging.INFO)
+    logging.getLogger("gunicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING) # Logs de httpx suelen ser verbosos
+    logging.getLogger("jose").setLevel(logging.INFO) # JWTs fallidos pueden ser INFO/WARNING
+    logging.getLogger("asyncio").setLevel(logging.WARNING) # Evitar logs internos de asyncio
+    logging.getLogger("watchfiles").setLevel(logging.WARNING) # Si usas --reload
 
-        # Verificaciones Supabase URL y Service Key
-        # --- MODIFICACIÓN: Usar el nombre correcto de la variable ---
-        if not settings_instance.SUPABASE_URL:
-             # Esto no debería pasar si es obligatorio y no tiene default, pydantic fallaría antes.
-             # Pero mantenemos la verificación por si acaso.
-             log.critical("! FATAL: GATEWAY_SUPABASE_URL is not configured.")
-             sys.exit("FATAL: GATEWAY_SUPABASE_URL not configured.")
-        else:
-             log.info(f"  SUPABASE_URL: {settings_instance.SUPABASE_URL}")
-        # -----------------------------------------------------------
-
-        # Verificación Service Key (Placeholder)
-        if settings_instance.SUPABASE_SERVICE_ROLE_KEY == "YOUR_SUPABASE_SERVICE_ROLE_KEY_HERE":
-            log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-            log.critical("! FATAL: GATEWAY_SUPABASE_SERVICE_ROLE_KEY is using the default placeholder!")
-            log.critical("! Set GATEWAY_SUPABASE_SERVICE_ROLE_KEY via env var or K8s Secret.")
-            log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        else:
-            log.info("  SUPABASE_SERVICE_ROLE_KEY: *** SET (Loaded from Secret/Env) ***")
-
-        # Verificación Default Company ID
-        if not settings_instance.DEFAULT_COMPANY_ID:
-            log.warning("! WARNING: GATEWAY_DEFAULT_COMPANY_ID is not set. Company association might fail.")
-        else:
-            log.info(f"  DEFAULT_COMPANY_ID: {settings_instance.DEFAULT_COMPANY_ID}")
-
-        log.info(f"  LOG_LEVEL: {settings_instance.LOG_LEVEL}")
-        log.info(f"  HTTP_CLIENT_TIMEOUT: {settings_instance.HTTP_CLIENT_TIMEOUT}")
-        return settings_instance
-    except Exception as e:
-        # Captura errores de validación de Pydantic o cualquier otro error al cargar
-        log.exception(f"FATAL: Error loading/validating Gateway settings: {e}")
-        sys.exit(f"FATAL: Error loading/validating Gateway settings: {e}")
-
-settings = get_settings()
+    # Log inicial para confirmar que la configuración se aplicó
+    # Usar un logger específico para la configuración del logging
+    log_config_logger = structlog.get_logger("api_gateway.logging_config")
+    log_config_logger.info("Structlog logging configured", log_level=settings.LOG_LEVEL.upper(), output_format="JSON") # O Console si se usa ConsoleRenderer

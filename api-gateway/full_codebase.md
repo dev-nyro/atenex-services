@@ -557,18 +557,26 @@ async def lifespan(app: FastAPI):
              http2=True
         )
         gateway_router.http_client = proxy_http_client
-        log.info("HTTP Client initialized successfully.", limits=limits, timeout=timeout)
+        log.info("HTTP Client initialized successfully.", limits=str(limits), timeout=str(timeout)) # Log como string para evitar problemas de serialización
     except Exception as e:
-        log.exception("Failed to initialize HTTP client during startup!", error=e)
+        log.exception("Failed to initialize HTTP client during startup!", error=str(e))
         proxy_http_client = None
         gateway_router.http_client = None
 
     log.info("Initializing Supabase Admin Client...")
     try:
         supabase_admin_client = get_supabase_admin_client()
+        # Añadir una pequeña verificación si es posible
+        # try:
+        #     # Intenta una operación simple y segura, como listar usuarios con límite 1
+        #     # Nota: Esto requiere permisos adecuados para la service key
+        #     await supabase_admin_client.auth.admin.list_users(limit=1)
+        #     log.info("Supabase Admin Client connection verified.")
+        # except Exception as admin_test_e:
+        #     log.warning("Supabase Admin Client initialized, but test query failed.", error=str(admin_test_e))
         log.info("Supabase Admin Client initialized successfully.")
     except Exception as e:
-        log.exception("Failed to initialize Supabase Admin Client during startup!", error=e)
+        log.exception("Failed to initialize Supabase Admin Client during startup!", error=str(e))
         supabase_admin_client = None
 
     yield
@@ -579,11 +587,12 @@ async def lifespan(app: FastAPI):
             await proxy_http_client.aclose()
             log.info("HTTP Client closed successfully.")
         except Exception as e:
-            log.exception("Error closing HTTP client during shutdown.", error=e)
+            log.exception("Error closing HTTP client during shutdown.", error=str(e))
     else:
-        log.warning("HTTP Client was not available or already closed.")
+        log.warning("HTTP Client was not available or already closed during shutdown.")
     if supabase_admin_client:
-        log.info("Supabase Admin Client shutdown.")
+        # No hay método aclose() explícito para el cliente supabase-py estándar
+        log.info("Supabase Admin Client shutdown (no explicit close needed).")
 
 # --- Creación de la aplicación FastAPI (Sin cambios) ---
 app = FastAPI(
@@ -608,9 +617,11 @@ else:
 localhost_url = "http://localhost:3000"
 log.info(f"Adding localhost frontend URL to allowed origins: {localhost_url}")
 allowed_origins.append(localhost_url)
+# Añadir la URL específica de Ngrok vista en los logs
 ngrok_url_from_log = "https://5158-2001-1388-53a1-a7c9-fd46-ef87-59cf-a7f7.ngrok-free.app"
 log.info(f"Adding specific Ngrok URL from logs to allowed origins: {ngrok_url_from_log}")
 allowed_origins.append(ngrok_url_from_log)
+# Añadir también desde variable de entorno si existe y es diferente
 ngrok_url_env = os.getenv("NGROK_URL")
 if ngrok_url_env and ngrok_url_env not in allowed_origins:
     if ngrok_url_env.startswith("https://") or ngrok_url_env.startswith("http://"):
@@ -618,23 +629,27 @@ if ngrok_url_env and ngrok_url_env not in allowed_origins:
         allowed_origins.append(ngrok_url_env)
     else:
         log.warning(f"NGROK_URL environment variable has an unexpected format: {ngrok_url_env}")
+# Limpiar duplicados y None
 allowed_origins = list(set(filter(None, allowed_origins)))
 if not allowed_origins:
     log.critical("CRITICAL: No allowed origins configured for CORS.")
 else:
     log.info("Final CORS Allowed Origins:", origins=allowed_origins)
+# Cabeceras permitidas: Asegurarse que 'Authorization' y 'Content-Type' están presentes
+# Añadir 'ngrok-skip-browser-warning' si se usa Ngrok
 allowed_headers = ["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With", "ngrok-skip-browser-warning"]
 log.info("CORS Allowed Headers:", headers=allowed_headers)
+# Métodos permitidos: Asegurarse que 'OPTIONS' y 'POST' están presentes
 allowed_methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
 log.info("CORS Allowed Methods:", methods=allowed_methods)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=allowed_methods,
-    allow_headers=allowed_headers,
-    expose_headers=["X-Request-ID", "X-Process-Time"],
-    max_age=600,
+    allow_origins=allowed_origins, # Lista de orígenes permitidos
+    allow_credentials=True, # Permite cookies/auth headers
+    allow_methods=allowed_methods, # Métodos HTTP permitidos
+    allow_headers=allowed_headers, # Cabeceras HTTP permitidas
+    expose_headers=["X-Request-ID", "X-Process-Time"], # Cabeceras expuestas al frontend
+    max_age=600, # Tiempo en segundos que el navegador puede cachear la respuesta preflight
 )
 # --- Fin CORSMiddleware ---
 
@@ -644,26 +659,36 @@ app.add_middleware(
 @app.middleware("http")
 async def add_process_time_header_and_request_id(request: Request, call_next):
     start_time = time.time()
+    # Generar request_id si no viene en la cabecera
     request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    # Guardar request_id en el estado para posible uso en exception handlers
     request.state.request_id = request_id
 
+    # --- !!! CORRECCIÓN DE INDENTACIÓN AQUÍ !!! ---
+    # El 'with' debe envolver la llamada a 'call_next' para que el contexto
+    # esté activo durante todo el procesamiento de la solicitud.
     with structlog.contextvars.bind_contextvars(request_id=request_id):
-        # --- !!! CORRECCIÓN DE INDENTACIÓN AQUÍ !!! ---
-        # El log.info y el bloque try/except deben estar indentados UN NIVEL dentro del 'with'
         log.info("Request received", method=request.method, path=request.url.path, client_ip=request.client.host if request.client else "N/A")
 
         try:
+            # Procesar la solicitud
             response = await call_next(request)
+            # Calcular tiempo después de obtener la respuesta
             process_time = time.time() - start_time
+            # Añadir cabeceras a la respuesta
             response.headers["X-Process-Time"] = str(process_time)
             response.headers["X-Request-ID"] = request_id
             log.info("Request processed successfully", status_code=response.status_code, duration=round(process_time, 4))
         except Exception as e:
+            # Loggear excepción no manejada ANTES de relanzarla
             process_time = time.time() - start_time
+            # Usar logger ya vinculado con request_id
             log.exception("Unhandled exception during request processing", duration=round(process_time, 4), error=str(e))
+            # Relanzar la excepción para que los exception_handlers de FastAPI la capturen
             raise e
+        # Devolver la respuesta
         return response
-        # --- !!! FIN CORRECCIÓN DE INDENTACIÓN !!! ---
+    # --- !!! FIN CORRECCIÓN DE INDENTACIÓN !!! ---
 # --- Fin otros Middlewares ---
 
 
@@ -681,37 +706,50 @@ async def health_check():
      admin_client: Optional[SupabaseClient] = supabase_admin_client
      if not admin_client:
          log.error("Health check failed: Supabase Admin Client not available.")
-         raise HTTPException(status_code=503, detail="Gateway service dependency unavailable (Admin Client).")
+         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Gateway service dependency unavailable (Admin Client).")
      http_client_check: Optional[httpx.AsyncClient] = proxy_http_client
      if not http_client_check or http_client_check.is_closed:
          log.error("Health check failed: HTTP Client not available or closed.")
-         raise HTTPException(status_code=503, detail="Gateway service dependency unavailable (HTTP Client).")
-     log.debug("Health check passed.")
+         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Gateway service dependency unavailable (HTTP Client).")
+     # Podrías añadir una verificación más profunda del cliente admin si es necesario
+     log.debug("Health check passed (basic client availability).")
      return {"status": "healthy", "service": settings.PROJECT_NAME}
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     req_id = getattr(request.state, 'request_id', 'N/A')
-    bound_log = log.bind(request_id=req_id)
+    # Usar un logger vinculado si es posible
+    bound_log = structlog.get_logger("api_gateway.main").bind(request_id=req_id)
     bound_log.warning("HTTP Exception occurred", status_code=exc.status_code, detail=exc.detail, path=request.url.path)
-    headers = exc.headers if exc.status_code == 401 else None
+    # Incluir cabeceras WWW-Authenticate si son relevantes (ej. 401)
+    headers = getattr(exc, "headers", None)
     return JSONResponse(
         status_code=exc.status_code,
         content={"detail": exc.detail},
-        headers=headers
+        headers=headers # Pasar las cabeceras de la excepción original si existen
     )
 
+# Handler genérico para errores 500 no esperados
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
     req_id = getattr(request.state, 'request_id', 'N/A')
-    bound_log = log.bind(request_id=req_id)
-    bound_log.exception("Unhandled internal server error occurred in gateway", path=request.url.path)
+    # Usar un logger vinculado
+    bound_log = structlog.get_logger("api_gateway.main").bind(request_id=req_id)
+    # Loggear con traceback completo
+    bound_log.exception("Unhandled internal server error occurred in gateway", path=request.url.path, error_type=type(exc).__name__)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"detail": "An internal server error occurred."}
     )
 
-log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start.", allowed_origins=allowed_origins, allowed_methods=allowed_methods, allowed_headers=allowed_headers)
+# Log final antes de iniciar Uvicorn (si se ejecuta directamente)
+log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start.",
+         allowed_origins=allowed_origins,
+         allowed_methods=allowed_methods,
+         allowed_headers=allowed_headers)
+
+# --- Punto de entrada para ejecución directa (ej. uvicorn app.main:app) ---
+# No se necesita código adicional aquí si se usa Gunicorn/Uvicorn como en los logs
 ```
 
 ## File: `app\routers\__init__.py`
@@ -936,16 +974,16 @@ else:
 ## File: `app\routers\user_router.py`
 ```py
 # api-gateway/app/routers/user_router.py
-from fastapi import APIRouter, Depends, HTTPException, status, Body, Request # Añadir Request
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from typing import Annotated, Dict, Any, Optional
 import structlog
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field # Importado pero no usado, podría quitarse si no hay body
 
-# Comentar temporalmente las dependencias problemáticas para probar OPTIONS
-# from app.auth.auth_middleware import InitialAuth
-# from app.utils.supabase_admin import get_supabase_admin_client
-# from supabase import Client as SupabaseClient
-# from gotrue.errors import AuthApiError
+# --- RESTAURAR DEPENDENCIAS ---
+from app.auth.auth_middleware import InitialAuth # Usar la dependencia que NO requiere company_id
+from app.utils.supabase_admin import get_supabase_admin_client
+from supabase import Client as SupabaseClient
+from gotrue.errors import AuthApiError # Para capturar errores específicos de Supabase Auth
 
 from app.core.config import settings # Necesitamos settings para el default company id
 
@@ -955,69 +993,98 @@ router = APIRouter(prefix="/api/v1/users", tags=["Users"])
 @router.post(
     "/me/ensure-company",
     status_code=status.HTTP_200_OK,
-    summary="Ensure User Company Association (Dependencies Temporarily Disabled for OPTIONS Test)", # Modificar summary
-    description="Checks if the authenticated user has a company ID associated... (Dependencies Temporarily Disabled)",
+    # --- RESTAURAR DESCRIPCIÓN ORIGINAL ---
+    summary="Ensure User Company Association",
+    description="Checks if the authenticated user (valid JWT required) already has a company ID associated in their app_metadata. If not, associates the default company ID configured in the gateway using admin privileges. Returns success message or indicates if association already existed.",
     responses={
-        status.HTTP_400_BAD_REQUEST: {"description": "Default Company ID not configured"},
-        status.HTTP_401_UNAUTHORIZED: {"description": "Authentication token missing or invalid"},
-        status.HTTP_500_INTERNAL_SERVER_ERROR: {"description": "Failed to update user metadata / Dependencies disabled"},
-        status.HTTP_503_SERVICE_UNAVAILABLE: {"description": "Dependencies temporarily disabled for testing"}, # Añadir 503
+        status.HTTP_200_OK: {"description": "Company association successful or already existed."},
+        status.HTTP_400_BAD_REQUEST: {"description": "Default Company ID not configured on server."},
+        status.HTTP_401_UNAUTHORIZED: {"description": "Authentication token missing or invalid (signature, expiration, audience)."},
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {"description": "Server configuration error or failed to update user metadata."},
+        status.HTTP_503_SERVICE_UNAVAILABLE: {"description": "Supabase Admin client not available."},
     }
 )
 async def ensure_company_association(
-    # --- DEPENDENCIAS COMENTADAS TEMPORALMENTE ---
-    request: Request # Inyectar Request para acceder a headers si fuera necesario (aunque no lo usaremos ahora)
-    # user_payload: InitialAuth,
-    # supabase_admin: Annotated[SupabaseClient, Depends(get_supabase_admin_client)],
-    # --- FIN DEPENDENCIAS COMENTADAS ---
+    # --- RESTAURAR DEPENDENCIAS ---
+    user_payload: InitialAuth, # Valida token SIN requerir company_id
+    supabase_admin: Annotated[Optional[SupabaseClient], Depends(get_supabase_admin_client)], # Hacer opcional y verificar
 ):
-    # --- LÓGICA TEMPORAL DE PRUEBA ---
-    # Devolver un error 503 para indicar que la lógica real está desactivada,
-    # pero si llegamos aquí, significa que el OPTIONS (y el POST inicial) pasaron.
-    log.warning("ensure_company_association endpoint called, but dependencies are disabled for testing OPTIONS request.")
-    raise HTTPException(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        detail="Endpoint logic temporarily disabled for CORS testing. OPTIONS request seems to be passing."
-    )
-    # --- FIN LÓGICA TEMPORAL ---
+    # --- RESTAURAR LÓGICA ORIGINAL CON MEJORAS ---
+    if not supabase_admin:
+        log.error("Supabase Admin client dependency failed.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Admin client is not available."
+        )
 
-    """
-    # --- LÓGICA ORIGINAL (COMENTADA) ---
     user_id = user_payload.get("sub")
-    current_company_id = user_payload.get("company_id")
+    # company_id puede o no estar en el payload de InitialAuth
+    current_company_id_from_token = user_payload.get("company_id")
 
-    log_ctx = structlog.contextvars.get_contextvars()
-    log_ctx["user_id"] = user_id
-    bound_log = log.bind(**log_ctx)
+    # Vincular contexto de structlog para esta petición específica
+    bound_log = log.bind(user_id=user_id)
 
     bound_log.info("Ensure company association endpoint called.")
 
-    if current_company_id:
-        bound_log.info("User already has company ID associated.", company_id=current_company_id)
-        return {"message": "Company association already exists."}
+    if current_company_id_from_token:
+        bound_log.info("User token already contains company ID.", company_id=current_company_id_from_token)
+        # Podríamos verificar si coincide con el default, pero por ahora asumimos que si existe, está bien.
+        return {"message": "Company association already exists.", "company_id": current_company_id_from_token}
+
+    # Si el token no lo tiene, verificar directamente en Supabase (más seguro)
+    # Esto evita problemas si el token está desactualizado
+    try:
+        bound_log.debug("Fetching current user data from Supabase Admin to double-check app_metadata...")
+        get_user_response = await supabase_admin.auth.admin.get_user_by_id(user_id)
+        user_data = get_user_response.user
+        existing_app_metadata = user_data.app_metadata if user_data else {}
+        current_company_id_from_db = existing_app_metadata.get("company_id") if existing_app_metadata else None
+
+        if current_company_id_from_db:
+             bound_log.info("User already has company ID associated in database.", company_id=current_company_id_from_db)
+             # Devolver el ID de la DB que es el más actualizado
+             return {"message": "Company association already exists.", "company_id": current_company_id_from_db}
+
+    except AuthApiError as e:
+        bound_log.error(f"Supabase Admin API error fetching user data: {e}", status_code=e.status)
+        # Podría ser un 404 si el user_id es inválido, aunque no debería si el token era válido
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch user data from authentication system: {e.message}"
+        )
+    except Exception as e:
+        bound_log.exception("Unexpected error fetching user data for company check.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while checking user data."
+        )
+
+    # Si llegamos aquí, el usuario NO tiene company_id ni en token ni en DB
+    bound_log.info("User lacks company ID. Proceeding with association.")
 
     company_id_to_assign = settings.DEFAULT_COMPANY_ID
     if not company_id_to_assign:
         bound_log.error("Cannot associate company: GATEWAY_DEFAULT_COMPANY_ID is not configured.")
+        # Devolver 400 Bad Request porque es un problema de configuración que impide la operación
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Server configuration error: Default company ID not set."
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Server configuration error: Default company ID for association is not set."
         )
 
-    bound_log.info(f"Attempting to associate user with Company ID: {company_id_to_assign}")
+    bound_log.info(f"Attempting to associate user with Default Company ID.", default_company_id=company_id_to_assign)
+
+    # Usar los metadatos existentes recuperados antes si es posible
+    new_app_metadata = {**(existing_app_metadata or {}), "company_id": company_id_to_assign}
 
     try:
-        bound_log.debug("Fetching existing user data from Supabase Admin...")
-        get_user_response = await supabase_admin.auth.admin.get_user_by_id(user_id)
-        existing_app_metadata = get_user_response.user.app_metadata or {}
-        new_app_metadata = {**existing_app_metadata, "company_id": company_id_to_assign}
-        bound_log.debug("Updating user with new app_metadata", new_metadata=new_app_metadata)
-
+        bound_log.debug("Updating user with new app_metadata via Supabase Admin", new_metadata=new_app_metadata)
         update_response = await supabase_admin.auth.admin.update_user_by_id(
             user_id,
             attributes={'app_metadata': new_app_metadata}
         )
-        bound_log.info("Successfully updated user app_metadata with company ID.", company_id=company_id_to_assign)
+        # Verificar si la respuesta indica éxito (puede variar según la librería)
+        # En supabase-py v2+, la ausencia de error suele indicar éxito.
+        bound_log.info("Successfully updated user app_metadata with company ID.", assigned_company_id=company_id_to_assign)
         return {"message": "Company association successful.", "company_id": company_id_to_assign}
 
     except AuthApiError as e:
@@ -1027,13 +1094,12 @@ async def ensure_company_association(
             detail=f"Failed to update user data in authentication system: {e.message}"
         )
     except Exception as e:
-        bound_log.exception("Unexpected error during company association.")
+        bound_log.exception("Unexpected error during company association update.")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An unexpected error occurred while associating company."
         )
-    # --- FIN LÓGICA ORIGINAL ---
-    """
+    # --- FIN LÓGICA ORIGINAL RESTAURADA ---
 ```
 
 ## File: `app\utils\supabase_admin.py`
