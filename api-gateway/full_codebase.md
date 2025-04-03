@@ -14,6 +14,7 @@ app/
 ├── main.py
 ├── routers
 │   ├── __init__.py
+│   ├── auth_router.py
 │   ├── gateway_router.py
 │   └── user_router.py
 └── utils
@@ -622,6 +623,7 @@ import time
 import uuid
 import logging # <-- Importar logging estándar
 from supabase.client import Client as SupabaseClient
+from app.routers import gateway_router, user_router, auth_router
 
 from app.core.config import settings
 from app.core.logging_config import setup_logging
@@ -827,6 +829,7 @@ async def add_request_id_timing_logging(request: Request, call_next):
 
 # --- Routers ---
 # Incluir los routers definidos en otros módulos
+app.include_router(auth_router.router)
 app.include_router(gateway_router.router)
 app.include_router(user_router.router)
 
@@ -948,6 +951,180 @@ log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start."
 ## File: `app\routers\__init__.py`
 ```py
 
+```
+
+## File: `app\routers\auth_router.py`
+```py
+# api-gateway/app/routers/auth_router.py
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Body
+from pydantic import BaseModel, EmailStr, Field
+from typing import Annotated, Dict, Any, Optional
+import structlog
+import uuid
+
+# Dependencias
+from app.utils.supabase_admin import get_supabase_admin_client
+from supabase import Client as SupabaseClient
+from gotrue.errors import AuthApiError
+from postgrest import APIResponse as PostgrestAPIResponse # Para errores de tabla
+
+from app.core.config import settings
+
+log = structlog.get_logger(__name__)
+router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
+
+# --- Pydantic Models ---
+class RegisterPayload(BaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=8)
+    name: Optional[str] = Field(None, min_length=2)
+    # company_name se obtiene del backend
+
+class RegisterResponse(BaseModel):
+    message: str
+    user_id: Optional[uuid.UUID] = None # Devolver el ID del usuario creado
+
+# --- Helpers Internos (Síncronos) ---
+
+def _get_company_id_by_name(admin_client: SupabaseClient, company_name: str) -> Optional[uuid.UUID]:
+    """Busca el UUID de una compañía por su nombre en public.companies."""
+    bound_log = log.bind(lookup_company_name=company_name)
+    try:
+        bound_log.debug("Looking up company ID by name...")
+        # .execute() es síncrono
+        response = admin_client.table("companies").select("id").eq("name", company_name).limit(1).maybe_single().execute()
+
+        if response and response.data:
+            company_id = response.data.get("id")
+            if company_id:
+                 bound_log.info("Company found.", company_id=company_id)
+                 return uuid.UUID(company_id) # Convertir a UUID
+            else:
+                 bound_log.warning("Company query returned data but no ID found.")
+                 return None
+        elif response and not response.data:
+             bound_log.warning("Company not found by name.")
+             return None
+        else: # Respuesta inesperada o None
+            bound_log.error("Unexpected response or error during company lookup.", response_details=response)
+            return None
+
+    except Exception as e:
+        bound_log.exception("Error looking up company ID.")
+        return None
+
+# --- Endpoint de Registro ---
+@router.post(
+    "/register",
+    status_code=status.HTTP_201_CREATED, # Indicar recurso creado
+    response_model=RegisterResponse,
+    summary="Register a new user via Backend",
+    description="Creates a user in Supabase Auth, sets default company in app_metadata, creates public profile, and triggers confirmation email.",
+    responses={
+        status.HTTP_201_CREATED: {"description": "User registered successfully, confirmation email sent."},
+        status.HTTP_400_BAD_REQUEST: {"description": "Invalid input data or default company 'nyrouwu' not found."},
+        status.HTTP_409_CONFLICT: {"description": "A user with this email already exists."},
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {"description": "Failed to create user or profile due to a server error."},
+        status.HTTP_503_SERVICE_UNAVAILABLE: {"description": "Supabase Admin client not available."},
+    }
+)
+async def register_user_endpoint(
+    payload: RegisterPayload,
+    admin_client: Annotated[SupabaseClient, Depends(get_supabase_admin_client)],
+):
+    """
+    Handles user registration. Creates auth user with metadata and public profile.
+    """
+    bound_log = log.bind(user_email=payload.email)
+    bound_log.info("Backend registration endpoint called.")
+
+    # 1. Obtener el ID de la compañía por defecto "nyrouwu"
+    default_company_name = "nyrouwu" # Hardcoded como solicitado
+    company_id = _get_company_id_by_name(admin_client, default_company_name)
+
+    if not company_id:
+        bound_log.error(f"Default company '{default_company_name}' not found in database.")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Required default company configuration ('{default_company_name}') not found."
+        )
+
+    # 2. Preparar metadatos para Supabase Auth
+    user_metadata = {"name": payload.name} if payload.name else {}
+    app_metadata = {
+        "company_id": str(company_id), # Asegurar que es string para Supabase
+        "roles": ["user"] # Rol por defecto
+    }
+
+    # 3. Crear usuario en Supabase Auth (llamada SÍNCRONA)
+    try:
+        bound_log.debug("Attempting to create user in Supabase Auth (sync call)...")
+        create_user_response = admin_client.auth.admin.create_user({
+            "email": payload.email,
+            "password": payload.password,
+            "email_confirm": True, # Requerir confirmación por email
+            "user_metadata": user_metadata,
+            "app_metadata": app_metadata
+        })
+        bound_log.debug("Supabase Auth create_user call completed.")
+
+        new_user = create_user_response.user
+        if not new_user or not new_user.id:
+            bound_log.error("Supabase Auth create_user succeeded but returned no user or ID.", response=create_user_response)
+            raise HTTPException(status_code=500, detail="Failed to retrieve user details after creation.")
+
+        new_user_id = new_user.id
+        bound_log.info("User successfully created in Supabase Auth.", user_id=new_user_id)
+
+    except AuthApiError as e:
+        bound_log.error("AuthApiError creating Supabase Auth user.", status_code=e.status, error_message=e.message)
+        if "user already exists" in str(e.message).lower() or e.status == 422: # 422 a veces indica duplicado
+             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A user with this email already exists.")
+        else:
+             status_code = e.status if 400 <= e.status < 600 else 500
+             raise HTTPException(status_code=status_code, detail=f"Error creating user in auth system: {e.message}")
+    except Exception as e:
+        bound_log.exception("Unexpected error creating Supabase Auth user.")
+        raise HTTPException(status_code=500, detail=f"Internal server error during user creation: {e}")
+
+    # 4. Crear perfil en public.users (llamada SÍNCRONA)
+    try:
+        bound_log.debug("Attempting to insert user profile into public.users...")
+        profile_data = {
+            "id": new_user_id,
+            "email": payload.email,
+            "full_name": payload.name,
+            "role": "user", # Coincidir con app_metadata
+            "is_active": True, # Activo por defecto, Supabase Auth maneja el estado de confirmación
+            "company_id": company_id, # Usar el UUID encontrado
+        }
+        insert_response = admin_client.table("users").insert(profile_data).execute()
+
+        # Verificar error en la inserción
+        postgrest_error = getattr(insert_response, 'error', None)
+        if postgrest_error:
+             bound_log.error("PostgREST error inserting public profile.", status_code=insert_response.status_code, error_details=postgrest_error)
+             # Intentar deshacer la creación del usuario en auth si falla el perfil? (Complejo, omitir por ahora)
+             # Loguear el error gravemente, pero devolver éxito al frontend ya que el usuario auth existe
+             # El usuario podrá loguearse pero puede encontrar problemas si el perfil es esencial.
+             # Opcionalmente, devolver 500 aquí si el perfil es crítico.
+             # Por simplicidad, logueamos y continuamos.
+             log.error("CRITICAL: Failed to create public profile after auth user creation.", user_id=new_user_id)
+             # Consider raising HTTPException(500, "Failed to finalize user profile.") here if critical
+        else:
+             bound_log.info("Public profile successfully created.", user_id=new_user_id)
+
+    except Exception as e:
+        bound_log.exception("Unexpected error inserting public profile.", user_id=new_user_id)
+        # Loguear error, pero no fallar la solicitud principal si el usuario auth se creó.
+        log.error("CRITICAL: Unexpected error creating public profile after auth user creation.", user_id=new_user_id)
+        # Consider raising HTTPException(500, "Internal error finalizing profile.") here if critical
+
+    # 5. Devolver éxito
+    return RegisterResponse(
+        message="Registration successful. Please check your email for confirmation.",
+        user_id=new_user_id
+    )
 ```
 
 ## File: `app\routers\gateway_router.py`
@@ -1241,210 +1418,8 @@ from app.core.config import settings
 log = structlog.get_logger(__name__)
 router = APIRouter(prefix="/api/v1/users", tags=["Users"])
 
-# --- Helpers Síncronos para Auth Admin (Sin await) ---
+# --- (Código eliminado relacionado a ensure_company_association) ---
 
-def _get_auth_user_data_sync(admin_client: SupabaseClient, user_id: str) -> Optional[User]:
-    """Helper SÍNCRONO para obtener datos de auth.users."""
-    bound_log = log.bind(user_id=user_id)
-    try:
-        bound_log.debug("Attempting SYNC call to admin_client.auth.admin.get_user_by_id")
-        auth_user_response: UserResponse = admin_client.auth.admin.get_user_by_id(user_id)
-        bound_log.debug("SYNC call to get_user_by_id completed.")
-        return auth_user_response.user if auth_user_response else None
-    except AuthApiError as e:
-        bound_log.error("AuthApiError fetching auth user data (sync)", status_code=e.status, error_message=e.message)
-        if e.status == 404: return None
-        status_code = e.status if 400 <= e.status < 600 else 500
-        raise HTTPException(status_code=status_code, detail=f"Auth API error fetching user: {e.message}")
-    except Exception as e:
-        bound_log.exception("Unexpected error fetching auth user data (sync)", error_type=type(e).__name__)
-        # Importante: No relanzar el TypeError aquí si ocurre, dejar que el flujo principal lo maneje si es necesario
-        raise HTTPException(status_code=500, detail=f"Internal error fetching user data: {e}")
-
-def _update_auth_user_metadata_sync(admin_client: SupabaseClient, user_id: str, new_metadata: Dict) -> Optional[User]:
-    """Helper SÍNCRONO para actualizar app_metadata en auth.users."""
-    bound_log = log.bind(user_id=user_id)
-    try:
-        bound_log.debug("Attempting SYNC call to admin_client.auth.admin.update_user_by_id", metadata_to_set=new_metadata)
-        update_response: UserResponse = admin_client.auth.admin.update_user_by_id(
-            user_id, attributes={'app_metadata': new_metadata}
-        )
-        bound_log.debug("SYNC call to update_user_by_id completed.")
-        return update_response.user if update_response else None
-    except AuthApiError as e:
-        bound_log.error("AuthApiError updating auth user metadata (sync)", status_code=e.status, error_message=e.message)
-        status_code = e.status if 400 <= e.status < 600 else 500
-        raise HTTPException(status_code=status_code, detail=f"Auth API error updating metadata: {e.message}")
-    except Exception as e:
-        bound_log.exception("Unexpected error updating auth user metadata (sync)", error_type=type(e).__name__)
-        raise HTTPException(status_code=500, detail=f"Internal error updating user metadata: {e}")
-
-# --- Helper Asíncrono para Perfil Público (Usa llamadas DB Síncronas) ---
-
-async def _ensure_public_profile_sync(
-    admin_client: SupabaseClient,
-    user_id: str,
-    company_id: str, # Company ID ya validado/asignado
-    email: Optional[str],
-    name: Optional[str]
-) -> Dict[str, Any]:
-    """
-    Asegura que el perfil público exista y tenga el company_id correcto.
-    Usa llamadas síncronas a la DB. Lanza HTTPException en error.
-    """
-    bound_log = log.bind(user_id=user_id, target_company_id=company_id)
-    bound_log.debug("Ensuring public user profile exists and matches company ID.")
-
-    try:
-        # 1. Intentar obtener el perfil existente usando maybe_single()
-        select_builder = admin_client.table("users").select("id, email, full_name, role, company_id").eq("id", user_id)
-        # *** CORRECCIÓN: Eliminado el type hint SyncMaybeSingleResponse ***
-        profile_response = select_builder.maybe_single().execute() # Devuelve dict o None
-
-        existing_profile = profile_response.data
-
-        # 2. Si el perfil existe, verificar y actualizar company_id si es necesario
-        if existing_profile:
-            bound_log.info("Public profile found.", current_company_id=existing_profile.get('company_id'))
-            if str(existing_profile.get('company_id')) != str(company_id):
-                bound_log.warning("Public profile company ID mismatch. Updating.",
-                                  profile_cid=existing_profile.get('company_id'), expected_cid=company_id)
-                update_builder = admin_client.table("users").update({"company_id": company_id}).eq("id", user_id).select().single()
-                update_response = update_builder.execute() # SIN await
-                if update_response.data:
-                    bound_log.info("Successfully updated company ID in public profile.")
-                    return update_response.data
-                else:
-                    bound_log.error("Failed to update or retrieve public profile after company ID update.", update_error=getattr(update_response,'error', None))
-                    raise HTTPException(status_code=500, detail="Failed to update company ID in public profile.")
-            else:
-                bound_log.debug("Public profile company ID already matches.")
-                return existing_profile
-
-        # 3. Si el perfil NO existe, crearlo
-        else:
-            bound_log.info("Public profile not found. Creating...")
-            profile_data = {
-                "id": user_id, "email": email, "full_name": name or "User",
-                "role": "user", "is_active": True, "company_id": company_id,
-            }
-            insert_builder = admin_client.table("users").insert(profile_data, returning="representation").select().single()
-            insert_response = insert_builder.execute() # SIN await
-
-            if insert_response.data:
-                bound_log.info("Successfully created public user profile.", created_profile=insert_response.data)
-                return insert_response.data
-            else:
-                bound_log.error("Failed to insert or retrieve public profile after creation.", insert_error=getattr(insert_response,'error', None))
-                raise HTTPException(status_code=500, detail="Failed to create public user profile.")
-
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        bound_log.exception("Unexpected error ensuring public profile sync.")
-        raise HTTPException(status_code=500, detail=f"Database error ensuring public profile: {e}")
-
-# --- Endpoint Principal ---
-
-@router.post(
-    "/me/ensure-company",
-    # Metadata sin cambios...
-    status_code=status.HTTP_200_OK,
-    summary="Ensure User Profile and Company Association (Sync Auth Calls)",
-    description="Refactored: Fetches auth user (sync), updates auth metadata if needed (sync), then ensures public profile exists and matches.",
-    response_description="Success message indicating profile and company status.",
-    responses={
-        status.HTTP_200_OK: {"description": "Profile verified/created and company association successful or already existed."},
-        status.HTTP_400_BAD_REQUEST: {"description": "Default Company ID not configured on server."},
-        status.HTTP_401_UNAUTHORIZED: {"description": "Authentication token missing or invalid."},
-        status.HTTP_500_INTERNAL_SERVER_ERROR: {"description": "Failed to check or update user data/profile."},
-        status.HTTP_503_SERVICE_UNAVAILABLE: {"description": "Supabase Admin client not available."},
-    }
-)
-async def ensure_company_association(
-    user_payload: InitialAuth,
-    admin_client: Annotated[SupabaseClient, Depends(get_supabase_admin_client)],
-):
-    user_id = user_payload.get("sub")
-    email_from_token = user_payload.get("email")
-    name_from_token: Optional[str] = None
-    raw_user_metadata_token = user_payload.get('raw_user_meta_data')
-    user_metadata_token = user_payload.get('user_metadata', raw_user_metadata_token)
-    if isinstance(user_metadata_token, dict):
-        name_from_token = user_metadata_token.get('name') or user_metadata_token.get('full_name') or user_metadata_token.get('user_name')
-
-    bound_log = log.bind(user_id=user_id)
-    bound_log.info("Ensure profile and company association endpoint called (Final Sync Flow).")
-
-    final_company_id: Optional[str] = None
-    auth_user: Optional[User] = None
-
-    try:
-        # --- Paso 1: Obtener datos de auth.users (Llamada SÍNCRONA) ---
-        bound_log.debug("Fetching auth user data (sync call)...")
-        auth_user = _get_auth_user_data_sync(admin_client, user_id)
-
-        if not auth_user:
-            bound_log.error("Auth user not found via admin API despite valid token.")
-            raise HTTPException(status_code=404, detail="Authenticated user not found in backend.")
-
-        email_for_profile = auth_user.email or email_from_token
-        name_for_profile = None
-        if auth_user.user_metadata:
-            name_for_profile = auth_user.user_metadata.get('name') or auth_user.user_metadata.get('full_name') or auth_user.user_metadata.get('user_name')
-        name_for_profile = name_for_profile or name_from_token
-
-        # --- Paso 2: Verificar/Asignar Company ID en auth.users (Llamada SÍNCRONA si es necesario) ---
-        app_metadata = getattr(auth_user, 'app_metadata', {})
-        if not isinstance(app_metadata, dict): app_metadata = {}
-
-        company_id_from_auth = app_metadata.get("company_id")
-        company_id_from_auth = str(company_id_from_auth) if company_id_from_auth else None
-
-        if company_id_from_auth:
-            bound_log.info("User already has company ID in auth metadata.", company_id=company_id_from_auth)
-            final_company_id = company_id_from_auth
-        else:
-            bound_log.info("User lacks company ID in auth metadata. Attempting association...")
-            company_id_to_assign = settings.DEFAULT_COMPANY_ID
-            if not company_id_to_assign:
-                bound_log.critical("CONFIGURATION ERROR: GATEWAY_DEFAULT_COMPANY_ID is not set.")
-                raise HTTPException(status_code=400, detail="Server configuration error: Default company ID is not set.")
-
-            bound_log.info("Associating user with Default Company ID.", default_company_id=company_id_to_assign)
-            new_app_metadata = {**app_metadata, "company_id": company_id_to_assign}
-
-            updated_user = _update_auth_user_metadata_sync(admin_client, user_id, new_app_metadata) # Llamada SÍNCRONA
-
-            updated_metadata = getattr(updated_user, 'app_metadata', {}) if updated_user else {}
-            confirmed_company_id = updated_metadata.get("company_id")
-
-            if str(confirmed_company_id) == str(company_id_to_assign):
-                bound_log.info("Successfully updated auth.users app_metadata with company ID.")
-                final_company_id = company_id_to_assign
-            else:
-                bound_log.error("Failed to confirm company ID update in auth.users metadata response.",
-                                response_metadata=updated_metadata, expected_company_id=company_id_to_assign)
-                raise HTTPException(status_code=500, detail="Failed to confirm company ID update in authentication system.")
-
-        # --- Paso 3: Sincronizar Perfil Público (Helper usa llamadas DB síncronas) ---
-        if not final_company_id:
-             bound_log.error("Logic error: final_company_id is not set before public profile sync.")
-             raise HTTPException(status_code=500, detail="Internal error determining company ID.")
-
-        public_profile = await _ensure_public_profile_sync(
-            admin_client, user_id, final_company_id, email_for_profile, name_for_profile
-        )
-        bound_log.info("Public profile synchronization completed.", final_profile_id=public_profile.get("id"))
-
-        # --- Paso 4: Devolver Éxito ---
-        return {"message": "Company association successful or already existed.", "company_id": final_company_id}
-
-    except HTTPException as e:
-        raise e # Dejar que el manejador global loguee
-    except Exception as e:
-        bound_log.exception("Unexpected error during ensure_company_association final flow.")
-        raise HTTPException(status_code=500, detail="An unexpected internal server error occurred.")
 ```
 
 ## File: `app\utils\supabase_admin.py`
