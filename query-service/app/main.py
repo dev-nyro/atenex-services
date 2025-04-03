@@ -100,8 +100,8 @@ async def generic_exception_handler(request, exc):
 
 
 # --- Routers ---
-app.include_router(query_router.router, prefix=settings.API_V1_STR, tags=["Query Interaction"])
-app.include_router(chat_router.router, prefix=settings.API_V1_STR, tags=["Chat Management"]) # Chat uses a distinct prefix
+app.include_router(query_router.router, prefix="/api/v1/query", tags=["Query Interaction"])
+app.include_router(chat_router.router, prefix="/api/v1/query", tags=["Chat Management"]) # Chat uses a distinct prefix
 
 # --- Root Endpoint / Health Check (Sin cambios) ---
 @app.get("/", tags=["Health Check"], summary="Service Liveness/Readiness Check", description="Basic Kubernetes probe endpoint. Returns 200 OK with 'OK' text if the service started successfully, otherwise 503.")
@@ -116,7 +116,7 @@ async def read_root():
         raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service is not ready or failed during startup.")
 
 
-# --- Main execution (for local development) (Sin cambios) ---
+# --- Main execution (for local development) (Sin cambios)  ---
 if __name__ == "__main__":
     log.info(f"Starting Uvicorn server for {settings.PROJECT_NAME} local development...")
     log_level_str = settings.LOG_LEVEL.lower()

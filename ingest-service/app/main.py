@@ -63,7 +63,7 @@ async def generic_exception_handler(request, exc): log.exception("Unhandled Exce
 
 # --- Router ---
 # *** CORRECCIÓN: Usar el prefijo correcto ***
-app.include_router(ingest.router, prefix=settings.API_V1_STR, tags=["Ingestion"])
+app.include_router(ingest.router, prefix="/api/v1/ingest", tags=["Ingestion"])
 # Asegúrate que el prefijo aquí + la ruta en el endpoint coincidan con lo que llama el gateway
 # Gateway llama a /api/v1/ingest/status -> Debe mapear a GET /status aquí
 # Gateway llama a /api/v1/ingest/status/{id} -> Debe mapear a GET /status/{id} aquí
@@ -81,4 +81,4 @@ async def read_root():
             await asyncio.wait_for(conn.execute("SELECT 1"), timeout=5.0)
         health_log.debug("Health check: DB ping successful.")
     except Exception as db_ping_err: health_log.error("Health check failed: DB ping error", e=db_ping_err); SERVICE_READY = False; raise HTTPException(status_code=503, detail="DB connection error")
-    return Response(content="OK", status_code=fastapi_status.HTTP_200_OK, media_type="text/plain") # Cambiado a respuesta simple OK
+    return Response(content="OK", status_code=fastapi_status.HTTP_200_OK, media_type="text/plain") # Cambiado a  respuesta simple OK

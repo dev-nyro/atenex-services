@@ -45,7 +45,7 @@ import uuid
 from typing import List, Optional
 import structlog
 
-from fastapi import APIRouter, Depends, HTTPException, status, Path
+from fastapi import APIRouter, Depends, HTTPException, status, Path, Query
 
 from app.api.v1 import schemas
 from app.db import postgres_client
@@ -58,7 +58,7 @@ router = APIRouter()
 
 # --- Endpoint para Listar Chats ---
 @router.get(
-    "/chats",
+    "/query/chats",
     response_model=List[schemas.ChatSummary],
     status_code=status.HTTP_200_OK,
     summary="List User Chats",
@@ -84,7 +84,7 @@ async def list_chats(
 
 # --- Endpoint para Obtener Mensajes de un Chat ---
 @router.get(
-    "/chats/{chat_id}/messages",
+    "/query/chats/{chat_id}/messages",
     response_model=List[schemas.ChatMessage],
     status_code=status.HTTP_200_OK,
     summary="Get Chat Messages",
@@ -132,7 +132,7 @@ async def get_chat_messages(
 
 # --- Endpoint para Borrar un Chat ---
 @router.delete(
-    "/chats/{chat_id}",
+    "/query/chats/{chat_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete Chat",
     description="Deletes a specific chat and all its associated messages, verifying user ownership.",
@@ -243,7 +243,7 @@ async def get_current_user_id(authorization: Optional[str] = Header(None)) -> Op
 
 # --- Endpoint /query Modificado ---
 @router.post(
-    "/query",
+    "/query/ask",
     # --- Actualizar response_model ---
     response_model=schemas.QueryResponse,
     status_code=status.HTTP_200_OK,
@@ -740,6 +740,9 @@ async def get_db_pool() -> asyncpg.Pool:
                 port=settings.POSTGRES_PORT,
                 min_size=5,
                 max_size=20,
+                # --- FIX: Add statement_cache_size=0 for PgBouncer compatibility ---
+                statement_cache_size=0,
+                # -----------------------------------------------------------------
                 # Setup to automatically encode/decode JSONB
                 init=lambda conn: conn.set_type_codec(
                     'jsonb',
@@ -756,6 +759,11 @@ async def get_db_pool() -> asyncpg.Pool:
         except asyncpg.exceptions.InvalidPasswordError:
              log.error("Invalid password for Supabase/PostgreSQL connection", user=settings.POSTGRES_USER)
              raise
+        # --- Catch the specific error causing the issue ---
+        except asyncpg.exceptions.DuplicatePreparedStatementError as e:
+             log.error("Failed to create Supabase/PostgreSQL connection pool due to prepared statement conflict (likely PgBouncer issue). Check statement_cache_size setting.", error=str(e), exc_info=True)
+             raise
+        # --- Generic catch-all ---
         except Exception as e:
             log.error("Failed to create Supabase/PostgreSQL connection pool", error=str(e), exc_info=True)
             raise
@@ -837,9 +845,11 @@ async def check_db_connection() -> bool:
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
+            # Usar una consulta simple que no dependa de prepared statements por defecto
             await conn.execute("SELECT 1")
         return True
     except Exception:
+        log.error("Database connection check failed", exc_info=True) # Loguear el error
         return False
 
 # --- Funciones para CHATS ---
@@ -904,13 +914,15 @@ async def delete_chat(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.U
 
                 # 2. Borrar mensajes asociados (ON DELETE CASCADE podría manejar esto también si está configurado)
                 # Es más explícito borrar primero los mensajes si no hay CASCADE.
-                deleted_messages = await connection.execute("DELETE FROM messages WHERE chat_id = $1", chat_id)
-                log.debug("Deleted messages associated with chat", chat_id=str(chat_id), count=deleted_messages)
+                # Usamos execute que devuelve el status tag (e.g., "DELETE 5")
+                deleted_messages_status = await connection.execute("DELETE FROM messages WHERE chat_id = $1", chat_id)
+                log.debug("Executed delete for associated messages", chat_id=str(chat_id), status=deleted_messages_status)
 
                 # 3. Borrar el chat
                 result = await connection.execute("DELETE FROM chats WHERE id = $1", chat_id)
 
-                deleted_count = int(result.split(" ")[1]) if result else 0
+                # El status devuelto es como "DELETE 1" o "DELETE 0"
+                deleted_count = int(result.split(" ")[1]) if result and result.startswith("DELETE") else 0
                 if deleted_count > 0:
                     log.info("Chat deleted successfully", chat_id=str(chat_id), user_id=str(user_id), company_id=str(company_id))
                     return True
@@ -929,7 +941,7 @@ async def check_chat_ownership(chat_id: uuid.UUID, user_id: uuid.UUID, company_i
     try:
         async with pool.acquire() as connection:
             exists = await connection.fetchval(query, chat_id, user_id, company_id)
-        return exists or False
+        return bool(exists) # Asegurarse de devolver un booleano
     except Exception as e:
         log.error("Error checking chat ownership", error=str(e), chat_id=str(chat_id), user_id=str(user_id), exc_info=True)
         return False # Asumir que no si hay error
@@ -963,7 +975,8 @@ async def add_message_to_chat(
 
                 if not created_id:
                     log.error("Failed to insert message, no ID returned", attempted_id=str(message_id), chat_id=str(chat_id))
-                    raise RuntimeError("Failed to insert message")
+                    # Forzar rollback de la transacción lanzando error
+                    raise RuntimeError("Failed to insert message, transaction rolled back")
 
                 # 2. Actualizar el timestamp 'updated_at' del chat
                 update_query = """
@@ -971,14 +984,20 @@ async def add_message_to_chat(
                     SET updated_at = NOW() AT TIME ZONE 'UTC'
                     WHERE id = $1;
                 """
-                await connection.execute(update_query, chat_id)
+                update_status = await connection.execute(update_query, chat_id)
+                # Verificar si la actualización afectó alguna fila (el chat existe)
+                if not update_status or not update_status.startswith("UPDATE 1"):
+                    log.error("Failed to update chat timestamp after adding message, chat ID might be invalid", chat_id=str(chat_id), update_status=update_status)
+                    # Forzar rollback de la transacción lanzando error
+                    raise RuntimeError(f"Failed to update timestamp for chat {chat_id}, transaction rolled back")
+
 
         log.info("Message added to chat successfully", message_id=str(created_id), chat_id=str(chat_id), role=role)
         return created_id
     except asyncpg.exceptions.ForeignKeyViolationError:
          log.error("Error adding message: Chat ID does not exist", chat_id=str(chat_id), role=role)
          # Lanzar un error específico o devolver None/False podría ser mejor aquí
-         raise ValueError(f"Chat with ID {chat_id} not found.")
+         raise ValueError(f"Chat with ID {chat_id} not found.") from None # from None para evitar chain de excepciones innecesario
     except Exception as e:
         log.error("Error adding message to chat", error=str(e), chat_id=str(chat_id), role=role, exc_info=True)
         raise
@@ -991,7 +1010,7 @@ async def get_messages_for_chat(chat_id: uuid.UUID, user_id: uuid.UUID, company_
     if not await check_chat_ownership(chat_id, user_id, company_id):
         log.warning("Attempt to access messages for chat not owned or non-existent", chat_id=str(chat_id), user_id=str(user_id), company_id=str(company_id))
         # Podríamos lanzar una excepción aquí (403 Forbidden o 404 Not Found)
-        # O simplemente devolver una lista vacía. Devolver vacío es más simple.
+        # O simplemente devolver una lista vacía. Devolver vacío es más simple para el endpoint.
         return []
 
     # Si tiene acceso, obtener los mensajes
@@ -1040,7 +1059,7 @@ setup_logging()
 log = structlog.get_logger(__name__)
 
 # Importar routers y otros módulos
-from app.api.v1.endpoints import query
+from app.api.v1.endpoints import query as query_router
 from app.api.v1.endpoints import chat as chat_router
 from app.db import postgres_client
 from app.pipelines.rag_pipeline import build_rag_pipeline, check_pipeline_dependencies
@@ -1124,9 +1143,8 @@ async def generic_exception_handler(request, exc):
 
 
 # --- Routers ---
-app.include_router(query.router, prefix=settings.API_V1_STR, tags=["Query & Chat Interaction"])
-app.include_router(chat_router.router, prefix=settings.API_V1_STR, tags=["Chat Management"])
-
+app.include_router(query_router.router, prefix=settings.API_V1_STR, tags=["Query Interaction"])
+app.include_router(chat_router.router, prefix=settings.API_V1_STR, tags=["Chat Management"]) # Chat uses a distinct prefix
 
 # --- Root Endpoint / Health Check (Sin cambios) ---
 @app.get("/", tags=["Health Check"], summary="Service Liveness/Readiness Check", description="Basic Kubernetes probe endpoint. Returns 200 OK with 'OK' text if the service started successfully, otherwise 503.")
@@ -1141,7 +1159,7 @@ async def read_root():
         raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service is not ready or failed during startup.")
 
 
-# --- Main execution (for local development) (Sin cambios) ---
+# --- Main execution (for local development) (Sin cambios)  ---
 if __name__ == "__main__":
     log.info(f"Starting Uvicorn server for {settings.PROJECT_NAME} local development...")
     log_level_str = settings.LOG_LEVEL.lower()
