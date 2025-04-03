@@ -511,14 +511,14 @@ import os
 from fastapi import FastAPI, Request, Depends, HTTPException, status
 from typing import Optional
 from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware # Asegúrate que está importado
 from contextlib import asynccontextmanager
 import httpx
 import structlog
 import uvicorn
 import time
 import uuid
-from supabase.client import Client as SupabaseClient # Importar tipo
+from supabase.client import Client as SupabaseClient
 
 # Configuración y Settings
 from app.core.config import settings
@@ -539,40 +539,39 @@ log = structlog.get_logger("api_gateway.main")
 proxy_http_client: Optional[httpx.AsyncClient] = None
 supabase_admin_client: Optional[SupabaseClient] = None
 
+# --- Lifespan (Sin cambios respecto a la versión anterior) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global proxy_http_client, supabase_admin_client
     log.info("Application startup: Initializing global clients...")
     try:
-        proxy_http_client = httpx.AsyncClient(
-             limits = httpx.Limits(
-                max_keepalive_connections=settings.HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS,
-                max_connections=settings.HTTP_CLIENT_MAX_CONNECTIONS
-             ),
-             timeout = httpx.Timeout(settings.HTTP_CLIENT_TIMEOUT, connect=10.0),
-             follow_redirects=False,
-             http2=True # Habilitar HTTP/2 si los servicios downstream lo soportan
+        # Usar límites definidos en settings
+        limits = httpx.Limits(
+            max_keepalive_connections=settings.HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS,
+            max_connections=settings.HTTP_CLIENT_MAX_CONNECTIONS
         )
-        # Asignar al router si es necesario (aunque es mejor usar Depends)
-        gateway_router.http_client = proxy_http_client
-        log.info("HTTP Client initialized successfully.")
+        timeout = httpx.Timeout(settings.HTTP_CLIENT_TIMEOUT, connect=10.0)
+
+        proxy_http_client = httpx.AsyncClient(
+             limits=limits,
+             timeout=timeout,
+             follow_redirects=False,
+             http2=True
+        )
+        gateway_router.http_client = proxy_http_client # Asignar al router si es necesario
+        log.info("HTTP Client initialized successfully.", limits=limits, timeout=timeout)
     except Exception as e:
         log.exception("Failed to initialize HTTP client during startup!", error=e)
         proxy_http_client = None
-        gateway_router.http_client = None # Asegurar que esté None si falla
+        gateway_router.http_client = None
 
     log.info("Initializing Supabase Admin Client...")
     try:
-        supabase_admin_client = get_supabase_admin_client() # Obtener instancia cacheada
-        # Opcional: Ping simple para verificar conectividad
-        # await supabase_admin_client.table('users').select('id', head=True, count='exact').execute() # Ejemplo
+        supabase_admin_client = get_supabase_admin_client()
         log.info("Supabase Admin Client initialized successfully.")
     except Exception as e:
         log.exception("Failed to initialize Supabase Admin Client during startup!", error=e)
         supabase_admin_client = None
-        # Considerar si la app debe fallar al iniciar si el cliente admin es crítico
-        # import sys
-        # sys.exit("FATAL: Failed to initialize Supabase Admin Client")
 
     yield # La aplicación se ejecuta aquí
 
@@ -587,9 +586,9 @@ async def lifespan(app: FastAPI):
         log.warning("HTTP Client was not available or already closed.")
 
     if supabase_admin_client:
-        log.info("Supabase Admin Client shutdown.") # No hay método aclose() explícito
+        log.info("Supabase Admin Client shutdown.")
 
-# Creación de la aplicación FastAPI
+# --- Creación de la aplicación FastAPI ---
 app = FastAPI(
     title=settings.PROJECT_NAME,
     description="Punto de entrada único y seguro para los microservicios de Nyro.",
@@ -599,120 +598,131 @@ app = FastAPI(
 
 # --- Middlewares ---
 
-# Request ID y Timing (Sin cambios)
-@app.middleware("http")
-async def add_process_time_header_and_request_id(request: Request, call_next):
-    start_time = time.time()
-    request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
-    request.state.request_id = request_id # Store request_id in state
-    with structlog.contextvars.bind_contextvars(request_id=request_id):
-        log.info("Request received", method=request.method, path=request.url.path, client_ip=request.client.host if request.client else "N/A")
-        try:
-            response = await call_next(request)
-            process_time = time.time() - start_time
-            response.headers["X-Process-Time"] = str(process_time)
-            response.headers["X-Request-ID"] = request_id # Ensure it's always added
-            log.info("Request processed successfully", status_code=response.status_code, duration=round(process_time, 4))
-        except Exception as e:
-            process_time = time.time() - start_time
-            log.exception("Unhandled exception during request processing", duration=round(process_time, 4), error=str(e))
-            # Re-raise para que los exception handlers de FastAPI actúen
-            raise e
-        return response
+# --- !!! CORRECCIÓN: Añadir CORSMiddleware PRIMERO !!! ---
 
-# --- Configuración CORS (CORREGIDA) ---
-# Leer las URLs permitidas desde variables de entorno.
-# Es CRÍTICO que estas variables estén configuradas en el entorno de despliegue (Kubernetes).
-# Usar los nombres de variable definidos en config.py (que tienen prefijo GATEWAY_)
-# Pydantic-settings ya las habrá cargado en el objeto `settings`.
-
-# Leer URLs desde las settings (que a su vez leen de env vars con prefijo GATEWAY_)
-# Usaremos VERCEL_FRONTEND_URL y NGROK_URL directamente si están en `settings`,
-# o las leeremos del entorno si no están definidas explícitamente en `settings`.
-
-# Define los orígenes permitidos. Prioriza las variables de entorno específicas.
+# Configuración CORS (Lógica de construcción de orígenes sin cambios)
 allowed_origins = []
-
-# 1. Frontend en Vercel (¡LA MÁS IMPORTANTE!)
-#    Asegúrate de tener GATEWAY_VERCEL_FRONTEND_URL="https://atenex-frontend.vercel.app" en tu ConfigMap/Secrets.
-vercel_url = os.getenv("GATEWAY_VERCEL_FRONTEND_URL") # Leer directamente del entorno
+vercel_url = os.getenv("VERCEL_FRONTEND_URL") # <-- Asegúrate que esta variable esté en tu K8s ConfigMap/Secret
 if vercel_url:
     log.info(f"Adding Vercel frontend URL to allowed origins: {vercel_url}")
     allowed_origins.append(vercel_url)
 else:
-    log.warning("GATEWAY_VERCEL_FRONTEND_URL environment variable not set. CORS might block Vercel frontend.")
+    # Añadir la URL de Vercel directamente si la variable no está, como fallback
+    vercel_fallback_url = "https://atenex-frontend.vercel.app"
+    log.warning(f"VERCEL_FRONTEND_URL env var not set. Using fallback: {vercel_fallback_url}")
+    allowed_origins.append(vercel_fallback_url)
 
-# 2. Frontend Localhost (para desarrollo)
 localhost_url = "http://localhost:3000"
 log.info(f"Adding localhost frontend URL to allowed origins: {localhost_url}")
 allowed_origins.append(localhost_url)
 
-# 3. Ngrok URL (para pruebas/desarrollo con túnel)
-#    Asegúrate de tener GATEWAY_NGROK_URL="https://tú-url.ngrok-free.app" si la usas.
-ngrok_url = os.getenv("GATEWAY_NGROK_URL") # Leer directamente del entorno
-if ngrok_url:
-    if ngrok_url.startswith("https://") or ngrok_url.startswith("http://"):
-        log.info(f"Adding Ngrok URL to allowed origins: {ngrok_url}")
-        allowed_origins.append(ngrok_url)
-    else:
-        log.warning(f"GATEWAY_NGROK_URL has an unexpected format: {ngrok_url}")
+ngrok_url_from_log = "https://5158-2001-1388-53a1-a7c9-fd46-ef87-59cf-a7f7.ngrok-free.app"
+log.info(f"Adding specific Ngrok URL from logs to allowed origins: {ngrok_url_from_log}")
+allowed_origins.append(ngrok_url_from_log)
 
-# Eliminar duplicados y asegurar que no haya orígenes vacíos
+# Leer NGROK_URL opcional del entorno
+ngrok_url_env = os.getenv("NGROK_URL")
+if ngrok_url_env and ngrok_url_env not in allowed_origins:
+    if ngrok_url_env.startswith("https://") or ngrok_url_env.startswith("http://"):
+        log.info(f"Adding Ngrok URL from NGROK_URL env var to allowed origins: {ngrok_url_env}")
+        allowed_origins.append(ngrok_url_env)
+    else:
+        log.warning(f"NGROK_URL environment variable has an unexpected format: {ngrok_url_env}")
+
 allowed_origins = list(set(filter(None, allowed_origins)))
 
 if not allowed_origins:
-    log.critical("CRITICAL: No allowed origins configured for CORS. Frontend will likely be blocked.")
-    # Podrías decidir salir si no hay orígenes configurados
-    # import sys
-    # sys.exit("FATAL: No CORS origins configured.")
+    log.critical("CRITICAL: No allowed origins configured for CORS.")
 else:
     log.info("Final CORS Allowed Origins:", origins=allowed_origins)
 
+allowed_headers = ["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With", "ngrok-skip-browser-warning"]
+log.info("CORS Allowed Headers:", headers=allowed_headers)
+allowed_methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
+log.info("CORS Allowed Methods:", methods=allowed_methods)
+
+# Añadir CORSMiddleware ANTES que otros middlewares
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins, # Usar la lista construida
-    allow_credentials=True, # Necesario para enviar cookies o headers de Auth
-    allow_methods=["*"], # Permitir todos los métodos estándar
-    allow_headers=["*", "Authorization", "Content-Type", "X-Requested-With", "ngrok-skip-browser-warning"], # Permitir headers comunes + Auth + ngrok bypass
-    expose_headers=["X-Request-ID", "X-Process-Time"], # Exponer headers custom si es necesario
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=allowed_methods,
+    allow_headers=allowed_headers,
+    expose_headers=["X-Request-ID", "X-Process-Time"],
+    max_age=600,
 )
-# --- FIN Configuración CORS ---
+# --- Fin CORSMiddleware ---
+
+
+# --- Otros Middlewares (Request ID, Timing) ---
+# Estos se añaden DESPUÉS de CORS
+@app.middleware("http")
+async def add_process_time_header_and_request_id(request: Request, call_next):
+    # Verificar si es una solicitud OPTIONS preflight
+    # Si es OPTIONS y tiene las cabeceras de preflight, CORSMiddleware ya debería haberla manejado.
+    # Si CORSMiddleware no la manejó (porque el origen no coincidía, etc.),
+    # este middleware se ejecutará, pero no debería causar un 400 por sí mismo.
+    # if request.method == "OPTIONS" and "access-control-request-method" in request.headers:
+    #     # Dejar que la cadena continúe (FastAPI/Starlette devolverá la respuesta OPTIONS adecuada si CORS no la manejó)
+    #     # Opcionalmente, podrías loguear que una preflight no fue manejada por CORS
+    #     log.debug("Processing non-CORS OPTIONS request", path=request.url.path)
+    #     # No añadir request_id/timing a estas respuestas OPTIONS simples
+    #     return await call_next(request)
+
+    start_time = time.time()
+    request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    request.state.request_id = request_id
+
+    with structlog.contextvars.bind_contextvars(request_id=request_id):
+        # No loguear "Request received" para OPTIONS preflight manejadas por CORS, ya que no llegan aquí
+        # if request.method != "OPTIONS" or "access-control-request-method" not in request.headers:
+         log.info("Request received", method=request.method, path=request.url.path, client_ip=request.client.host if request.client else "N/A")
+
+        try:
+            response = await call_next(request)
+            process_time = time.time() - start_time
+            response.headers["X-Process-Time"] = str(process_time)
+            response.headers["X-Request-ID"] = request_id
+            # No loguear "Request processed" para OPTIONS preflight manejadas por CORS
+            # if request.method != "OPTIONS" or "access-control-request-method" not in request.headers:
+            log.info("Request processed successfully", status_code=response.status_code, duration=round(process_time, 4))
+        except Exception as e:
+            process_time = time.time() - start_time
+            log.exception("Unhandled exception during request processing", duration=round(process_time, 4), error=str(e))
+            raise e
+        return response
+# --- Fin otros Middlewares ---
 
 
 # --- Routers ---
+# Se incluyen DESPUÉS de los middlewares
 app.include_router(gateway_router.router)
 app.include_router(user_router.router)
 
-# --- Endpoints Básicos del Propio Gateway ---
+# --- Endpoints Básicos y Manejadores de Excepciones (Sin cambios) ---
 @app.get("/", tags=["Gateway Status"], summary="Root endpoint")
 async def root():
     return {"message": f"{settings.PROJECT_NAME} is running!"}
 
 @app.get("/health", tags=["Gateway Status"], summary="Kubernetes Health Check", status_code=status.HTTP_200_OK)
-async def health_check(): # No necesita el cliente HTTP aquí si solo chequea el admin
+async def health_check():
      admin_client: Optional[SupabaseClient] = supabase_admin_client
      if not admin_client:
          log.error("Health check failed: Supabase Admin Client not available.")
          raise HTTPException(status_code=503, detail="Gateway service dependency unavailable (Admin Client).")
-
-     # Opcional: Añadir chequeo del cliente HTTP si es necesario
      http_client_check: Optional[httpx.AsyncClient] = proxy_http_client
      if not http_client_check or http_client_check.is_closed:
          log.error("Health check failed: HTTP Client not available or closed.")
          raise HTTPException(status_code=503, detail="Gateway service dependency unavailable (HTTP Client).")
-
      log.debug("Health check passed.")
      return {"status": "healthy", "service": settings.PROJECT_NAME}
 
-
-# --- Manejadores de Excepciones Globales ---
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    req_id = getattr(request.state, 'request_id', 'N/A') # Get from state if available
+    req_id = getattr(request.state, 'request_id', 'N/A')
     bound_log = log.bind(request_id=req_id)
     bound_log.warning("HTTP Exception occurred", status_code=exc.status_code, detail=exc.detail, path=request.url.path)
-    # Evitar devolver headers WWW-Authenticate por defecto en algunos errores para no confundir al browser
-    headers = exc.headers if exc.status_code == 401 else None # Solo para 401
+    headers = exc.headers if exc.status_code == 401 else None
     return JSONResponse(
         status_code=exc.status_code,
         content={"detail": exc.detail},
@@ -729,11 +739,9 @@ async def generic_exception_handler(request: Request, exc: Exception):
         content={"detail": "An internal server error occurred."}
     )
 
-log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start.")
+log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start.", allowed_origins=allowed_origins, allowed_methods=allowed_methods, allowed_headers=allowed_headers) 
 
-# --- Para ejecución local (opcional) ---
-# if __name__ == "__main__":
-#     uvicorn.run(app, host="0.0.0.0", port=8080, log_level=settings.LOG_LEVEL.lower())
+# V
 ```
 
 ## File: `app\routers\__init__.py`

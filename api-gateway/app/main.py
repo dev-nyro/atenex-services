@@ -3,7 +3,7 @@ import os
 from fastapi import FastAPI, Request, Depends, HTTPException, status
 from typing import Optional
 from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware # Asegúrate que está importado
+from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import httpx
 import structlog
@@ -31,26 +31,24 @@ log = structlog.get_logger("api_gateway.main")
 proxy_http_client: Optional[httpx.AsyncClient] = None
 supabase_admin_client: Optional[SupabaseClient] = None
 
-# --- Lifespan (Sin cambios respecto a la versión anterior) ---
+# --- Lifespan (Sin cambios) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global proxy_http_client, supabase_admin_client
     log.info("Application startup: Initializing global clients...")
     try:
-        # Usar límites definidos en settings
         limits = httpx.Limits(
             max_keepalive_connections=settings.HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS,
             max_connections=settings.HTTP_CLIENT_MAX_CONNECTIONS
         )
         timeout = httpx.Timeout(settings.HTTP_CLIENT_TIMEOUT, connect=10.0)
-
         proxy_http_client = httpx.AsyncClient(
              limits=limits,
              timeout=timeout,
              follow_redirects=False,
              http2=True
         )
-        gateway_router.http_client = proxy_http_client # Asignar al router si es necesario
+        gateway_router.http_client = proxy_http_client
         log.info("HTTP Client initialized successfully.", limits=limits, timeout=timeout)
     except Exception as e:
         log.exception("Failed to initialize HTTP client during startup!", error=e)
@@ -65,7 +63,7 @@ async def lifespan(app: FastAPI):
         log.exception("Failed to initialize Supabase Admin Client during startup!", error=e)
         supabase_admin_client = None
 
-    yield # La aplicación se ejecuta aquí
+    yield
 
     log.info("Application shutdown: Closing clients...")
     if proxy_http_client and not proxy_http_client.is_closed:
@@ -76,11 +74,10 @@ async def lifespan(app: FastAPI):
             log.exception("Error closing HTTP client during shutdown.", error=e)
     else:
         log.warning("HTTP Client was not available or already closed.")
-
     if supabase_admin_client:
         log.info("Supabase Admin Client shutdown.")
 
-# --- Creación de la aplicación FastAPI ---
+# --- Creación de la aplicación FastAPI (Sin cambios) ---
 app = FastAPI(
     title=settings.PROJECT_NAME,
     description="Punto de entrada único y seguro para los microservicios de Nyro.",
@@ -90,29 +87,22 @@ app = FastAPI(
 
 # --- Middlewares ---
 
-# --- !!! CORRECCIÓN: Añadir CORSMiddleware PRIMERO !!! ---
-
-# Configuración CORS (Lógica de construcción de orígenes sin cambios)
+# --- CORSMiddleware PRIMERO (Sin cambios respecto a la versión anterior) ---
 allowed_origins = []
-vercel_url = os.getenv("VERCEL_FRONTEND_URL") # <-- Asegúrate que esta variable esté en tu K8s ConfigMap/Secret
+vercel_url = os.getenv("VERCEL_FRONTEND_URL")
 if vercel_url:
     log.info(f"Adding Vercel frontend URL to allowed origins: {vercel_url}")
     allowed_origins.append(vercel_url)
 else:
-    # Añadir la URL de Vercel directamente si la variable no está, como fallback
     vercel_fallback_url = "https://atenex-frontend.vercel.app"
     log.warning(f"VERCEL_FRONTEND_URL env var not set. Using fallback: {vercel_fallback_url}")
     allowed_origins.append(vercel_fallback_url)
-
 localhost_url = "http://localhost:3000"
 log.info(f"Adding localhost frontend URL to allowed origins: {localhost_url}")
 allowed_origins.append(localhost_url)
-
 ngrok_url_from_log = "https://5158-2001-1388-53a1-a7c9-fd46-ef87-59cf-a7f7.ngrok-free.app"
 log.info(f"Adding specific Ngrok URL from logs to allowed origins: {ngrok_url_from_log}")
 allowed_origins.append(ngrok_url_from_log)
-
-# Leer NGROK_URL opcional del entorno
 ngrok_url_env = os.getenv("NGROK_URL")
 if ngrok_url_env and ngrok_url_env not in allowed_origins:
     if ngrok_url_env.startswith("https://") or ngrok_url_env.startswith("http://"):
@@ -120,20 +110,15 @@ if ngrok_url_env and ngrok_url_env not in allowed_origins:
         allowed_origins.append(ngrok_url_env)
     else:
         log.warning(f"NGROK_URL environment variable has an unexpected format: {ngrok_url_env}")
-
 allowed_origins = list(set(filter(None, allowed_origins)))
-
 if not allowed_origins:
     log.critical("CRITICAL: No allowed origins configured for CORS.")
 else:
     log.info("Final CORS Allowed Origins:", origins=allowed_origins)
-
 allowed_headers = ["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With", "ngrok-skip-browser-warning"]
 log.info("CORS Allowed Headers:", headers=allowed_headers)
 allowed_methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
 log.info("CORS Allowed Methods:", methods=allowed_methods)
-
-# Añadir CORSMiddleware ANTES que otros middlewares
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -147,47 +132,34 @@ app.add_middleware(
 
 
 # --- Otros Middlewares (Request ID, Timing) ---
-# Estos se añaden DESPUÉS de CORS
+# Añadido DESPUÉS de CORS
 @app.middleware("http")
 async def add_process_time_header_and_request_id(request: Request, call_next):
-    # Verificar si es una solicitud OPTIONS preflight
-    # Si es OPTIONS y tiene las cabeceras de preflight, CORSMiddleware ya debería haberla manejado.
-    # Si CORSMiddleware no la manejó (porque el origen no coincidía, etc.),
-    # este middleware se ejecutará, pero no debería causar un 400 por sí mismo.
-    # if request.method == "OPTIONS" and "access-control-request-method" in request.headers:
-    #     # Dejar que la cadena continúe (FastAPI/Starlette devolverá la respuesta OPTIONS adecuada si CORS no la manejó)
-    #     # Opcionalmente, podrías loguear que una preflight no fue manejada por CORS
-    #     log.debug("Processing non-CORS OPTIONS request", path=request.url.path)
-    #     # No añadir request_id/timing a estas respuestas OPTIONS simples
-    #     return await call_next(request)
-
     start_time = time.time()
     request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
     request.state.request_id = request_id
 
     with structlog.contextvars.bind_contextvars(request_id=request_id):
-        # No loguear "Request received" para OPTIONS preflight manejadas por CORS, ya que no llegan aquí
-        # if request.method != "OPTIONS" or "access-control-request-method" not in request.headers:
-         log.info("Request received", method=request.method, path=request.url.path, client_ip=request.client.host if request.client else "N/A")
+        # --- !!! CORRECCIÓN DE INDENTACIÓN AQUÍ !!! ---
+        # El log.info y el bloque try/except deben estar indentados UN NIVEL dentro del 'with'
+        log.info("Request received", method=request.method, path=request.url.path, client_ip=request.client.host if request.client else "N/A")
 
         try:
             response = await call_next(request)
             process_time = time.time() - start_time
             response.headers["X-Process-Time"] = str(process_time)
             response.headers["X-Request-ID"] = request_id
-            # No loguear "Request processed" para OPTIONS preflight manejadas por CORS
-            # if request.method != "OPTIONS" or "access-control-request-method" not in request.headers:
             log.info("Request processed successfully", status_code=response.status_code, duration=round(process_time, 4))
         except Exception as e:
             process_time = time.time() - start_time
             log.exception("Unhandled exception during request processing", duration=round(process_time, 4), error=str(e))
             raise e
         return response
+        # --- !!! FIN CORRECCIÓN DE INDENTACIÓN !!! ---
 # --- Fin otros Middlewares ---
 
 
-# --- Routers ---
-# Se incluyen DESPUÉS de los middlewares
+# --- Routers (Sin cambios) ---
 app.include_router(gateway_router.router)
 app.include_router(user_router.router)
 
@@ -231,6 +203,4 @@ async def generic_exception_handler(request: Request, exc: Exception):
         content={"detail": "An internal server error occurred."}
     )
 
-log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start.", allowed_origins=allowed_origins, allowed_methods=allowed_methods, allowed_headers=allowed_headers) 
-
-# V
+log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start.", allowed_origins=allowed_origins, allowed_methods=allowed_methods, allowed_headers=allowed_headers)
