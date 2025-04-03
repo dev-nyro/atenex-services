@@ -49,18 +49,26 @@ async def lifespan(app: FastAPI):
              http2=True
         )
         gateway_router.http_client = proxy_http_client
-        log.info("HTTP Client initialized successfully.", limits=limits, timeout=timeout)
+        log.info("HTTP Client initialized successfully.", limits=str(limits), timeout=str(timeout)) # Log como string para evitar problemas de serialización
     except Exception as e:
-        log.exception("Failed to initialize HTTP client during startup!", error=e)
+        log.exception("Failed to initialize HTTP client during startup!", error=str(e))
         proxy_http_client = None
         gateway_router.http_client = None
 
     log.info("Initializing Supabase Admin Client...")
     try:
         supabase_admin_client = get_supabase_admin_client()
+        # Añadir una pequeña verificación si es posible
+        # try:
+        #     # Intenta una operación simple y segura, como listar usuarios con límite 1
+        #     # Nota: Esto requiere permisos adecuados para la service key
+        #     await supabase_admin_client.auth.admin.list_users(limit=1)
+        #     log.info("Supabase Admin Client connection verified.")
+        # except Exception as admin_test_e:
+        #     log.warning("Supabase Admin Client initialized, but test query failed.", error=str(admin_test_e))
         log.info("Supabase Admin Client initialized successfully.")
     except Exception as e:
-        log.exception("Failed to initialize Supabase Admin Client during startup!", error=e)
+        log.exception("Failed to initialize Supabase Admin Client during startup!", error=str(e))
         supabase_admin_client = None
 
     yield
@@ -71,11 +79,12 @@ async def lifespan(app: FastAPI):
             await proxy_http_client.aclose()
             log.info("HTTP Client closed successfully.")
         except Exception as e:
-            log.exception("Error closing HTTP client during shutdown.", error=e)
+            log.exception("Error closing HTTP client during shutdown.", error=str(e))
     else:
-        log.warning("HTTP Client was not available or already closed.")
+        log.warning("HTTP Client was not available or already closed during shutdown.")
     if supabase_admin_client:
-        log.info("Supabase Admin Client shutdown.")
+        # No hay método aclose() explícito para el cliente supabase-py estándar
+        log.info("Supabase Admin Client shutdown (no explicit close needed).")
 
 # --- Creación de la aplicación FastAPI (Sin cambios) ---
 app = FastAPI(
@@ -100,9 +109,11 @@ else:
 localhost_url = "http://localhost:3000"
 log.info(f"Adding localhost frontend URL to allowed origins: {localhost_url}")
 allowed_origins.append(localhost_url)
+# Añadir la URL específica de Ngrok vista en los logs
 ngrok_url_from_log = "https://5158-2001-1388-53a1-a7c9-fd46-ef87-59cf-a7f7.ngrok-free.app"
 log.info(f"Adding specific Ngrok URL from logs to allowed origins: {ngrok_url_from_log}")
 allowed_origins.append(ngrok_url_from_log)
+# Añadir también desde variable de entorno si existe y es diferente
 ngrok_url_env = os.getenv("NGROK_URL")
 if ngrok_url_env and ngrok_url_env not in allowed_origins:
     if ngrok_url_env.startswith("https://") or ngrok_url_env.startswith("http://"):
@@ -110,23 +121,27 @@ if ngrok_url_env and ngrok_url_env not in allowed_origins:
         allowed_origins.append(ngrok_url_env)
     else:
         log.warning(f"NGROK_URL environment variable has an unexpected format: {ngrok_url_env}")
+# Limpiar duplicados y None
 allowed_origins = list(set(filter(None, allowed_origins)))
 if not allowed_origins:
     log.critical("CRITICAL: No allowed origins configured for CORS.")
 else:
     log.info("Final CORS Allowed Origins:", origins=allowed_origins)
+# Cabeceras permitidas: Asegurarse que 'Authorization' y 'Content-Type' están presentes
+# Añadir 'ngrok-skip-browser-warning' si se usa Ngrok
 allowed_headers = ["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With", "ngrok-skip-browser-warning"]
 log.info("CORS Allowed Headers:", headers=allowed_headers)
+# Métodos permitidos: Asegurarse que 'OPTIONS' y 'POST' están presentes
 allowed_methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
 log.info("CORS Allowed Methods:", methods=allowed_methods)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=allowed_methods,
-    allow_headers=allowed_headers,
-    expose_headers=["X-Request-ID", "X-Process-Time"],
-    max_age=600,
+    allow_origins=allowed_origins, # Lista de orígenes permitidos
+    allow_credentials=True, # Permite cookies/auth headers
+    allow_methods=allowed_methods, # Métodos HTTP permitidos
+    allow_headers=allowed_headers, # Cabeceras HTTP permitidas
+    expose_headers=["X-Request-ID", "X-Process-Time"], # Cabeceras expuestas al frontend
+    max_age=600, # Tiempo en segundos que el navegador puede cachear la respuesta preflight
 )
 # --- Fin CORSMiddleware ---
 
@@ -136,26 +151,36 @@ app.add_middleware(
 @app.middleware("http")
 async def add_process_time_header_and_request_id(request: Request, call_next):
     start_time = time.time()
+    # Generar request_id si no viene en la cabecera
     request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    # Guardar request_id en el estado para posible uso en exception handlers
     request.state.request_id = request_id
 
+    # --- !!! CORRECCIÓN DE INDENTACIÓN AQUÍ !!! ---
+    # El 'with' debe envolver la llamada a 'call_next' para que el contexto
+    # esté activo durante todo el procesamiento de la solicitud.
     with structlog.contextvars.bind_contextvars(request_id=request_id):
-        # --- !!! CORRECCIÓN DE INDENTACIÓN AQUÍ !!! ---
-        # El log.info y el bloque try/except deben estar indentados UN NIVEL dentro del 'with'
         log.info("Request received", method=request.method, path=request.url.path, client_ip=request.client.host if request.client else "N/A")
 
         try:
+            # Procesar la solicitud
             response = await call_next(request)
+            # Calcular tiempo después de obtener la respuesta
             process_time = time.time() - start_time
+            # Añadir cabeceras a la respuesta
             response.headers["X-Process-Time"] = str(process_time)
             response.headers["X-Request-ID"] = request_id
             log.info("Request processed successfully", status_code=response.status_code, duration=round(process_time, 4))
         except Exception as e:
+            # Loggear excepción no manejada ANTES de relanzarla
             process_time = time.time() - start_time
+            # Usar logger ya vinculado con request_id
             log.exception("Unhandled exception during request processing", duration=round(process_time, 4), error=str(e))
+            # Relanzar la excepción para que los exception_handlers de FastAPI la capturen
             raise e
+        # Devolver la respuesta
         return response
-        # --- !!! FIN CORRECCIÓN DE INDENTACIÓN !!! ---
+    # --- !!! FIN CORRECCIÓN DE INDENTACIÓN !!! ---
 # --- Fin otros Middlewares ---
 
 
@@ -173,34 +198,47 @@ async def health_check():
      admin_client: Optional[SupabaseClient] = supabase_admin_client
      if not admin_client:
          log.error("Health check failed: Supabase Admin Client not available.")
-         raise HTTPException(status_code=503, detail="Gateway service dependency unavailable (Admin Client).")
+         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Gateway service dependency unavailable (Admin Client).")
      http_client_check: Optional[httpx.AsyncClient] = proxy_http_client
      if not http_client_check or http_client_check.is_closed:
          log.error("Health check failed: HTTP Client not available or closed.")
-         raise HTTPException(status_code=503, detail="Gateway service dependency unavailable (HTTP Client).")
-     log.debug("Health check passed.")
+         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Gateway service dependency unavailable (HTTP Client).")
+     # Podrías añadir una verificación más profunda del cliente admin si es necesario
+     log.debug("Health check passed (basic client availability).")
      return {"status": "healthy", "service": settings.PROJECT_NAME}
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     req_id = getattr(request.state, 'request_id', 'N/A')
-    bound_log = log.bind(request_id=req_id)
+    # Usar un logger vinculado si es posible
+    bound_log = structlog.get_logger("api_gateway.main").bind(request_id=req_id)
     bound_log.warning("HTTP Exception occurred", status_code=exc.status_code, detail=exc.detail, path=request.url.path)
-    headers = exc.headers if exc.status_code == 401 else None
+    # Incluir cabeceras WWW-Authenticate si son relevantes (ej. 401)
+    headers = getattr(exc, "headers", None)
     return JSONResponse(
         status_code=exc.status_code,
         content={"detail": exc.detail},
-        headers=headers
+        headers=headers # Pasar las cabeceras de la excepción original si existen
     )
 
+# Handler genérico para errores 500 no esperados
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
     req_id = getattr(request.state, 'request_id', 'N/A')
-    bound_log = log.bind(request_id=req_id)
-    bound_log.exception("Unhandled internal server error occurred in gateway", path=request.url.path)
+    # Usar un logger vinculado
+    bound_log = structlog.get_logger("api_gateway.main").bind(request_id=req_id)
+    # Loggear con traceback completo
+    bound_log.exception("Unhandled internal server error occurred in gateway", path=request.url.path, error_type=type(exc).__name__)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"detail": "An internal server error occurred."}
     )
 
-log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start.", allowed_origins=allowed_origins, allowed_methods=allowed_methods, allowed_headers=allowed_headers)
+# Log final antes de iniciar Uvicorn (si se ejecuta directamente)
+log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start.",
+         allowed_origins=allowed_origins,
+         allowed_methods=allowed_methods,
+         allowed_headers=allowed_headers)
+
+# --- Punto de entrada para ejecución directa (ej. uvicorn app.main:app) ---
+# No se necesita código adicional aquí si se usa Gunicorn/Uvicorn como en los logs
