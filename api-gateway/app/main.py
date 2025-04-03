@@ -231,4 +231,6 @@ async def generic_exception_handler(request: Request, exc: Exception):
         content={"detail": "An internal server error occurred."}
     )
 
-log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start.", allowed_origins=allowed_origins, allowed_methods=allowed_methods, allowed_headers=allowed_headers)
+log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start.", allowed_origins=allowed_origins, allowed_methods=allowed_methods, allowed_headers=allowed_headers) 
+
+# V
