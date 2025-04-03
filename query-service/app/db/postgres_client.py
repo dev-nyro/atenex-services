@@ -33,6 +33,9 @@ async def get_db_pool() -> asyncpg.Pool:
                 port=settings.POSTGRES_PORT,
                 min_size=5,
                 max_size=20,
+                # --- FIX: Add statement_cache_size=0 for PgBouncer compatibility ---
+                statement_cache_size=0,
+                # -----------------------------------------------------------------
                 # Setup to automatically encode/decode JSONB
                 init=lambda conn: conn.set_type_codec(
                     'jsonb',
@@ -49,6 +52,11 @@ async def get_db_pool() -> asyncpg.Pool:
         except asyncpg.exceptions.InvalidPasswordError:
              log.error("Invalid password for Supabase/PostgreSQL connection", user=settings.POSTGRES_USER)
              raise
+        # --- Catch the specific error causing the issue ---
+        except asyncpg.exceptions.DuplicatePreparedStatementError as e:
+             log.error("Failed to create Supabase/PostgreSQL connection pool due to prepared statement conflict (likely PgBouncer issue). Check statement_cache_size setting.", error=str(e), exc_info=True)
+             raise
+        # --- Generic catch-all ---
         except Exception as e:
             log.error("Failed to create Supabase/PostgreSQL connection pool", error=str(e), exc_info=True)
             raise
@@ -130,9 +138,11 @@ async def check_db_connection() -> bool:
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
+            # Usar una consulta simple que no dependa de prepared statements por defecto
             await conn.execute("SELECT 1")
         return True
     except Exception:
+        log.error("Database connection check failed", exc_info=True) # Loguear el error
         return False
 
 # --- Funciones para CHATS ---
@@ -197,13 +207,15 @@ async def delete_chat(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.U
 
                 # 2. Borrar mensajes asociados (ON DELETE CASCADE podría manejar esto también si está configurado)
                 # Es más explícito borrar primero los mensajes si no hay CASCADE.
-                deleted_messages = await connection.execute("DELETE FROM messages WHERE chat_id = $1", chat_id)
-                log.debug("Deleted messages associated with chat", chat_id=str(chat_id), count=deleted_messages)
+                # Usamos execute que devuelve el status tag (e.g., "DELETE 5")
+                deleted_messages_status = await connection.execute("DELETE FROM messages WHERE chat_id = $1", chat_id)
+                log.debug("Executed delete for associated messages", chat_id=str(chat_id), status=deleted_messages_status)
 
                 # 3. Borrar el chat
                 result = await connection.execute("DELETE FROM chats WHERE id = $1", chat_id)
 
-                deleted_count = int(result.split(" ")[1]) if result else 0
+                # El status devuelto es como "DELETE 1" o "DELETE 0"
+                deleted_count = int(result.split(" ")[1]) if result and result.startswith("DELETE") else 0
                 if deleted_count > 0:
                     log.info("Chat deleted successfully", chat_id=str(chat_id), user_id=str(user_id), company_id=str(company_id))
                     return True
@@ -222,7 +234,7 @@ async def check_chat_ownership(chat_id: uuid.UUID, user_id: uuid.UUID, company_i
     try:
         async with pool.acquire() as connection:
             exists = await connection.fetchval(query, chat_id, user_id, company_id)
-        return exists or False
+        return bool(exists) # Asegurarse de devolver un booleano
     except Exception as e:
         log.error("Error checking chat ownership", error=str(e), chat_id=str(chat_id), user_id=str(user_id), exc_info=True)
         return False # Asumir que no si hay error
@@ -256,7 +268,8 @@ async def add_message_to_chat(
 
                 if not created_id:
                     log.error("Failed to insert message, no ID returned", attempted_id=str(message_id), chat_id=str(chat_id))
-                    raise RuntimeError("Failed to insert message")
+                    # Forzar rollback de la transacción lanzando error
+                    raise RuntimeError("Failed to insert message, transaction rolled back")
 
                 # 2. Actualizar el timestamp 'updated_at' del chat
                 update_query = """
@@ -264,14 +277,20 @@ async def add_message_to_chat(
                     SET updated_at = NOW() AT TIME ZONE 'UTC'
                     WHERE id = $1;
                 """
-                await connection.execute(update_query, chat_id)
+                update_status = await connection.execute(update_query, chat_id)
+                # Verificar si la actualización afectó alguna fila (el chat existe)
+                if not update_status or not update_status.startswith("UPDATE 1"):
+                    log.error("Failed to update chat timestamp after adding message, chat ID might be invalid", chat_id=str(chat_id), update_status=update_status)
+                    # Forzar rollback de la transacción lanzando error
+                    raise RuntimeError(f"Failed to update timestamp for chat {chat_id}, transaction rolled back")
+
 
         log.info("Message added to chat successfully", message_id=str(created_id), chat_id=str(chat_id), role=role)
         return created_id
     except asyncpg.exceptions.ForeignKeyViolationError:
          log.error("Error adding message: Chat ID does not exist", chat_id=str(chat_id), role=role)
          # Lanzar un error específico o devolver None/False podría ser mejor aquí
-         raise ValueError(f"Chat with ID {chat_id} not found.")
+         raise ValueError(f"Chat with ID {chat_id} not found.") from None # from None para evitar chain de excepciones innecesario
     except Exception as e:
         log.error("Error adding message to chat", error=str(e), chat_id=str(chat_id), role=role, exc_info=True)
         raise
@@ -284,7 +303,7 @@ async def get_messages_for_chat(chat_id: uuid.UUID, user_id: uuid.UUID, company_
     if not await check_chat_ownership(chat_id, user_id, company_id):
         log.warning("Attempt to access messages for chat not owned or non-existent", chat_id=str(chat_id), user_id=str(user_id), company_id=str(company_id))
         # Podríamos lanzar una excepción aquí (403 Forbidden o 404 Not Found)
-        # O simplemente devolver una lista vacía. Devolver vacío es más simple.
+        # O simplemente devolver una lista vacía. Devolver vacío es más simple para el endpoint.
         return []
 
     # Si tiene acceso, obtener los mensajes
