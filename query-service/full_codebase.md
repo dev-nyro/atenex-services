@@ -58,7 +58,7 @@ router = APIRouter()
 
 # --- Endpoint para Listar Chats ---
 @router.get(
-    "/query/chats",
+    "/chats",
     response_model=List[schemas.ChatSummary],
     status_code=status.HTTP_200_OK,
     summary="List User Chats",
@@ -84,7 +84,7 @@ async def list_chats(
 
 # --- Endpoint para Obtener Mensajes de un Chat ---
 @router.get(
-    "/query/chats/{chat_id}/messages",
+    "/chats/{chat_id}/messages",
     response_model=List[schemas.ChatMessage],
     status_code=status.HTTP_200_OK,
     summary="Get Chat Messages",
@@ -132,7 +132,7 @@ async def get_chat_messages(
 
 # --- Endpoint para Borrar un Chat ---
 @router.delete(
-    "/query/chats/{chat_id}",
+    "/chats/{chat_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete Chat",
     description="Deletes a specific chat and all its associated messages, verifying user ownership.",
@@ -243,7 +243,7 @@ async def get_current_user_id(authorization: Optional[str] = Header(None)) -> Op
 
 # --- Endpoint /query Modificado ---
 @router.post(
-    "/query/ask",
+    "/ask",
     # --- Actualizar response_model ---
     response_model=schemas.QueryResponse,
     status_code=status.HTTP_200_OK,
@@ -1143,8 +1143,8 @@ async def generic_exception_handler(request, exc):
 
 
 # --- Routers ---
-app.include_router(query_router.router, prefix=settings.API_V1_STR, tags=["Query Interaction"])
-app.include_router(chat_router.router, prefix=settings.API_V1_STR, tags=["Chat Management"]) # Chat uses a distinct prefix
+app.include_router(query_router.router, prefix="/api/v1/query", tags=["Query Interaction"])
+app.include_router(chat_router.router, prefix="/api/v1/query", tags=["Chat Management"]) # Chat uses a distinct prefix
 
 # --- Root Endpoint / Health Check (Sin cambios) ---
 @app.get("/", tags=["Health Check"], summary="Service Liveness/Readiness Check", description="Basic Kubernetes probe endpoint. Returns 200 OK with 'OK' text if the service started successfully, otherwise 503.")

@@ -98,7 +98,7 @@ async def get_current_company_id(x_company_id: Optional[str] = Header(None)) -> 
 # --- Endpoints ---
 
 @router.post(
-    "/ingest/upload", # Ruta relativa al prefijo /api/v1/ingest añadido en main.py
+    "/upload", # Ruta relativa al prefijo /api/v1/ingest añadido en main.py
     response_model=schemas.IngestResponse,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Ingestar un nuevo documento",
@@ -156,7 +156,7 @@ async def ingest_document_haystack(
     finally: await file.close()
 
 @router.get(
-    "/ingest/status/{document_id}", # Ruta relativa correcta
+    "/status/{document_id}", # Ruta relativa correcta
     response_model=schemas.StatusResponse,
     status_code=status.HTTP_200_OK,
     summary="Consultar estado de ingesta de un documento",
@@ -191,7 +191,7 @@ async def get_ingestion_status(
 
 
 @router.get(
-    "/ingest/status", # Ruta relativa correcta
+    "/status", # Ruta relativa correcta
     response_model=List[schemas.StatusResponse],
     status_code=status.HTTP_200_OK,
     summary="Listar estados de ingesta para la compañía",
@@ -822,7 +822,7 @@ async def generic_exception_handler(request, exc): log.exception("Unhandled Exce
 
 # --- Router ---
 # *** CORRECCIÓN: Usar el prefijo correcto ***
-app.include_router(ingest.router, prefix=settings.API_V1_STR, tags=["Ingestion"])
+app.include_router(ingest.router, prefix="/api/v1/ingest", tags=["Ingestion"])
 # Asegúrate que el prefijo aquí + la ruta en el endpoint coincidan con lo que llama el gateway
 # Gateway llama a /api/v1/ingest/status -> Debe mapear a GET /status aquí
 # Gateway llama a /api/v1/ingest/status/{id} -> Debe mapear a GET /status/{id} aquí
