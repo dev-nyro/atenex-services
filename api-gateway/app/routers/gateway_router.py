@@ -109,44 +109,126 @@ async def _proxy_request(
         if rp: await rp.aclose()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal gateway error during proxy.")
 
-# --- Rutas Proxy Específicas (sin cambios desde la versión anterior) ---
+
+# --- Rutas Proxy Específicas ---
 
 # 1. Proxy para Query Service
-@router.get("/api/v1/query/chats", dependencies=[Depends(StrictAuth)], tags=["Proxy - Query"], summary="List user chats via Query Service", response_description="Proxied response from Query Service.")
-async def proxy_get_chats(request: Request, client: Annotated[httpx.AsyncClient, Depends(get_client)], user_payload: StrictAuth ):
+@router.get(
+    "/api/v1/query/chats",
+    dependencies=[Depends(StrictAuth)],
+    tags=["Proxy - Query"],
+    summary="List user chats via Query Service",
+    response_description="Proxied response from Query Service.",
+)
+async def proxy_get_chats(
+    request: Request,
+    client: Annotated[httpx.AsyncClient, Depends(get_client)],
+    user_payload: StrictAuth
+):
+    # Path relativo al servicio Query Service
     backend_path = "/api/v1/chats"
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
-@router.post("/api/v1/query/ask", dependencies=[Depends(StrictAuth)], tags=["Proxy - Query"], summary="Send a query via Query Service", response_description="Proxied response from Query Service.")
-async def proxy_post_ask(request: Request, client: Annotated[httpx.AsyncClient, Depends(get_client)], user_payload: StrictAuth):
-    backend_path = "/api/v1/ask" # Ajustar si cambia en Query Service
+@router.post(
+    "/api/v1/query/ask",
+    dependencies=[Depends(StrictAuth)],
+    tags=["Proxy - Query"],
+    summary="Send a query via Query Service",
+    response_description="Proxied response from Query Service.",
+)
+async def proxy_post_ask(
+    request: Request,
+    client: Annotated[httpx.AsyncClient, Depends(get_client)],
+    user_payload: StrictAuth
+):
+    # Path relativo al servicio Query Service
+    backend_path = "/api/v1/ask" # O "/api/v1/query/ask" si así es en query-service
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
-@router.get("/api/v1/query/chats/{chat_id}/messages", dependencies=[Depends(StrictAuth)], tags=["Proxy - Query"], summary="Get chat messages via Query Service", response_description="Proxied response from Query Service.")
-async def proxy_get_chat_messages(request: Request, client: Annotated[httpx.AsyncClient, Depends(get_client)], user_payload: StrictAuth, chat_id: uuid.UUID = Path(..., title="The ID of the chat to fetch messages for")):
+@router.get(
+    "/api/v1/query/chats/{chat_id}/messages",
+    dependencies=[Depends(StrictAuth)],
+    tags=["Proxy - Query"],
+    summary="Get chat messages via Query Service",
+    response_description="Proxied response from Query Service.",
+)
+async def proxy_get_chat_messages(
+    request: Request,
+    client: Annotated[httpx.AsyncClient, Depends(get_client)],
+    user_payload: StrictAuth,
+    chat_id: uuid.UUID = Path(..., title="The ID of the chat to fetch messages for")
+):
+    # Path relativo al servicio Query Service
     backend_path = f"/api/v1/chats/{chat_id}/messages"
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
-@router.delete("/api/v1/query/chats/{chat_id}", dependencies=[Depends(StrictAuth)], tags=["Proxy - Query"], summary="Delete a chat via Query Service", response_description="Proxied response from Query Service (likely 204 No Content).")
-async def proxy_delete_chat(request: Request, client: Annotated[httpx.AsyncClient, Depends(get_client)], user_payload: StrictAuth, chat_id: uuid.UUID = Path(..., title="The ID of the chat to delete")):
+@router.delete(
+    "/api/v1/query/chats/{chat_id}",
+    dependencies=[Depends(StrictAuth)],
+    tags=["Proxy - Query"],
+    summary="Delete a chat via Query Service",
+    response_description="Proxied response from Query Service (likely 204 No Content).",
+)
+async def proxy_delete_chat(
+    request: Request,
+    client: Annotated[httpx.AsyncClient, Depends(get_client)],
+    user_payload: StrictAuth,
+    chat_id: uuid.UUID = Path(..., title="The ID of the chat to delete")
+):
+    # Path relativo al servicio Query Service
     backend_path = f"/api/v1/chats/{chat_id}"
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
-@router.options("/api/v1/query/chats/{chat_id}/messages", tags=["Proxy - Query"], include_in_schema=False)
-async def options_get_chat_messages(): return Response(status_code=200)
-@router.options("/api/v1/query/chats/{chat_id}", tags=["Proxy - Query"], include_in_schema=False)
-async def options_delete_chat(): return Response(status_code=200)
+# Rutas OPTIONS explícitas (generalmente no necesarias, pero por seguridad)
+@router.options( "/api/v1/query/chats", tags=["Proxy - Query"], include_in_schema=False)
+async def options_get_chats(): return Response(status_code=200)
+@router.options( "/api/v1/query/ask", tags=["Proxy - Query"], include_in_schema=False)
+async def options_post_ask(): return Response(status_code=200)
+@router.options( "/api/v1/query/chats/{chat_id}/messages", tags=["Proxy - Query"], include_in_schema=False)
+async def options_get_chat_messages(chat_id: uuid.UUID = Path(...)): return Response(status_code=200)
+@router.options( "/api/v1/query/chats/{chat_id}", tags=["Proxy - Query"], include_in_schema=False)
+async def options_delete_chat(chat_id: uuid.UUID = Path(...)): return Response(status_code=200)
 
 # 2. Proxy para Ingest Service (genérico)
-@router.api_route("/api/v1/ingest/{endpoint_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"], dependencies=[Depends(StrictAuth)], tags=["Proxy - Ingest"], summary="Proxy to Ingest Service (Authentication Required)", response_description="Response proxied directly from the Ingest Service.", name="proxy_ingest_service")
-async def proxy_ingest_service_generic(request: Request, endpoint_path: str, client: Annotated[httpx.AsyncClient, Depends(get_client)], user_payload: StrictAuth):
+@router.api_route(
+    "/api/v1/ingest/{endpoint_path:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    dependencies=[Depends(StrictAuth)],
+    tags=["Proxy - Ingest"],
+    summary="Proxy to Ingest Service (Authentication Required)",
+    response_description="Response proxied directly from the Ingest Service.",
+    name="proxy_ingest_service",
+)
+async def proxy_ingest_service_generic(
+    request: Request,
+    endpoint_path: str,
+    client: Annotated[httpx.AsyncClient, Depends(get_client)],
+    user_payload: StrictAuth
+):
+    # El path relativo incluye la barra inicial
     backend_path = f"/{endpoint_path}"
+    # IMPORTANTE: El servicio ingest DEBE tener sus rutas mapeadas al path después de /api/v1/ingest
+    # Ejemplo: Si llamas a /api/v1/ingest/status, backend_path será '/status', y el endpoint
+    # en Ingest debe ser @router.get("/status"). Si es @router.get("/api/v1/ingest/status")
+    # en ingest-service, ¡entonces tendrías un doble prefijo!
+    # Verifica que las rutas en ingest.py NO incluyan "/api/v1/ingest".
     return await _proxy_request(request, str(settings.INGEST_SERVICE_URL), client, user_payload, backend_service_path=backend_path)
 
-# 3. Proxy para Auth Service (opcional, genérico)
+# 3. Proxy para Auth Service (Opcional y genérico)
 if settings.AUTH_SERVICE_URL:
     log.info(f"Auth service proxy enabled for base URL: {settings.AUTH_SERVICE_URL}")
-    @router.api_route("/api/v1/auth/{endpoint_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"], tags=["Proxy - Auth"], summary="Proxy to Authentication Service (No Gateway Authentication)", response_description="Response proxied directly from the Auth Service.", name="proxy_auth_service")
-    async def proxy_auth_service_generic(request: Request, endpoint_path: str, client: Annotated[httpx.AsyncClient, Depends(get_client)]):
+    @router.api_route(
+        "/api/v1/auth/{endpoint_path:path}",
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+        tags=["Proxy - Auth"],
+        summary="Proxy to Authentication Service (No Gateway Authentication)",
+        response_description="Response proxied directly from the Auth Service.",
+        name="proxy_auth_service",
+    )
+    async def proxy_auth_service_generic(
+        request: Request,
+        endpoint_path: str,
+        client: Annotated[httpx.AsyncClient, Depends(get_client)],
+    ):
         backend_path = f"/{endpoint_path}"
         return await _proxy_request(request, str(settings.AUTH_SERVICE_URL), client, user_payload=None, backend_service_path=backend_path)
