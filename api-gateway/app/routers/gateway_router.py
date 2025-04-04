@@ -19,7 +19,7 @@ http_client: Optional[httpx.AsyncClient] = None
 # Cabeceras HTTP que son "hop-by-hop" y no deben ser reenviadas
 HOP_BY_HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
+    "te", "trailers", "transfer-encoding", "upgrade", "host",
     # 'content-encoding' a veces se quita, pero puede ser necesario si el backend responde comprimido y el cliente espera eso.
     # Lo dejaremos pasar por defecto a menos que cause problemas.
     # "content-encoding",
@@ -37,20 +37,32 @@ def get_client() -> httpx.AsyncClient:
 
 async def _proxy_request(
     request: Request,
-    target_url_str: str, # URL completa del servicio destino
+    target_url_str: str,
     client: httpx.AsyncClient,
-    user_payload: Optional[Dict[str, Any]] # Payload del token validado (si aplica)
+    user_payload: Optional[Dict[str, Any]]
 ):
-    """Función interna reutilizable para realizar el proxy de la petición HTTP."""
     method = request.method
-    # --- CORRECCIÓN: Asegurar que target_url_str NO tenga doble '//' ---
-    # Esto puede pasar si base_url termina en '/' y path empieza con '/'
-    # Construir URL cuidadosamente
-    base_url_obj = httpx.URL(str(request.url).split(request.url.path)[0]) # Obtener base URL de la request original
-    target_url_obj = httpx.URL(target_url_str) # Target base
-    # Reconstruir path y query
-    full_target_path = target_url_obj.path + (request.url.path.split(settings.API_V1_STR, 1)[1] if settings.API_V1_STR in request.url.path else request.url.path)
-    target_url = target_url_obj.copy_with(path=full_target_path, query=request.url.query.encode("utf-8"))
+    # Construcción de URL (sin cambios, parece correcta)
+    base_url_obj = httpx.URL(str(request.url).split(request.url.path)[0])
+    target_url_obj = httpx.URL(target_url_str)
+    # Construir path relativo al gateway
+    relative_path = request.url.path
+    # Si el path del gateway base está en la request, quitarlo para obtener el path del servicio
+    if relative_path.startswith(settings.API_V1_STR):
+         # Encuentra el segmento después de /api/v1/service_prefix/
+         path_parts = relative_path.split('/')
+         # Ejemplo: /api/v1/ingest/upload -> ['', 'api', 'v1', 'ingest', 'upload']
+         # Ejemplo: /api/v1/query/chats -> ['', 'api', 'v1', 'query', 'chats']
+         if len(path_parts) > 3:
+              # Unir las partes después del prefijo del servicio
+              service_path = "/" + "/".join(path_parts[4:])
+         else:
+              service_path = "/" # Si solo es /api/v1/ingest o /api/v1/query
+    else:
+        service_path = relative_path # Si no empieza con el prefijo esperado (¿rutas públicas?)
+
+    # Construir la URL final para el backend
+    target_url = target_url_obj.copy_with(path=service_path, query=request.url.query.encode("utf-8"))
 
 
     # 1. Preparar Headers para reenviar
@@ -97,9 +109,25 @@ async def _proxy_request(
     # Vincular contexto al logger para esta operación de proxy
     bound_log = log.bind(**log_context)
 
-    # 3. Preparar Query Params (ya están en la target_url) y Body
-    # Usar request.stream() para eficiencia, evita cargar todo el body en memoria
-    request_body_stream = request.stream()
+    # 3. Preparar Body
+    # *** CORRECCIÓN: Leer el body completo con await request.body() ***
+    request_body: Optional[bytes] = None
+    # Solo leer el body si es un método que puede tenerlo (POST, PUT, PATCH)
+    # Y NO es una petición OPTIONS (que no tiene body)
+    # Y NO es una petición GET o DELETE (que tampoco deberían tener body significativo)
+    if method.upper() in ["POST", "PUT", "PATCH"]:
+        request_body = await request.body()
+        if request_body:
+            # Añadir Content-Length basado en el body leído
+            headers_to_forward['content-length'] = str(len(request_body))
+        else:
+            # Si no hay body, asegurar que content-length no esté o sea 0
+             headers_to_forward.pop('content-length', None) # Quitar si existe
+             # Opcionalmente: headers_to_forward['content-length'] = '0'
+        bound_log.debug(f"Read request body for {method}", body_length=len(request_body) if request_body else 0)
+    else:
+         # Para GET, DELETE, OPTIONS, etc., no esperamos body
+         headers_to_forward.pop('content-length', None) # Asegurar que no haya content-length
 
     # 4. Realizar la petición downstream
     bound_log.info(f"Proxying request", method=method, from_path=request.url.path, to_target=str(target_url))
@@ -113,7 +141,7 @@ async def _proxy_request(
             headers=headers_to_forward,
             # params=query_params, # Query params ya están en la URL
             # Pasar el stream directamente como contenido
-            content=request_body_stream
+            content=request_body
         )
         # Enviar la solicitud y obtener la respuesta como stream
         rp = await client.send(req, stream=True)
