@@ -814,253 +814,267 @@ log.info("Auth router loaded (registration endpoint removed/disabled).")
 ## File: `app\routers\gateway_router.py`
 ```py
 # api-gateway/app/routers/gateway_router.py
-from fastapi import APIRouter, Request, Response, Depends, HTTPException, status
+from fastapi import APIRouter, Request, Response, Depends, HTTPException, status, Path
 from fastapi.responses import StreamingResponse
 from typing import Optional, Annotated, Dict, Any
 import httpx
 import structlog
-import asyncio # Para timeouts específicos si fueran necesarios
+import asyncio
+import uuid # Importar uuid
 
 from app.core.config import settings
-# Importar la dependencia correcta para rutas protegidas
-from app.auth.auth_middleware import StrictAuth # Alias para require_user
+from app.auth.auth_middleware import StrictAuth # Dependencia estándar
 
 log = structlog.get_logger(__name__)
 router = APIRouter()
 
-# Cliente HTTP global reutilizable (se inyecta/cierra en main.py lifespan)
+# Cliente HTTP global (inyectado desde lifespan)
 http_client: Optional[httpx.AsyncClient] = None
 
-# Cabeceras HTTP que son "hop-by-hop" y no deben ser reenviadas
+# Cabeceras Hop-by-Hop (sin cambios)
 HOP_BY_HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "host",
-    # "content-encoding", # Considerar quitar si causa problemas con compresión
-    "content-length", # Content-Length debe ser recalculado por httpx
+    "content-length",
 }
 
+# Dependencia para obtener el cliente (sin cambios)
 def get_client() -> httpx.AsyncClient:
-    """Dependencia FastAPI para obtener el cliente HTTP global inicializado."""
     if http_client is None or http_client.is_closed:
-        log.error("Gateway HTTP client is not available or closed. Cannot proxy request.")
+        log.error("Gateway HTTP client is not available or closed.")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Gateway service dependency unavailable (HTTP Client)."
         )
-    return http_client
+    return client
 
+# Función interna _proxy_request (sin cambios funcionales mayores, sólo añadimos log detallado)
 async def _proxy_request(
     request: Request,
     target_url_str: str,
     client: httpx.AsyncClient,
     user_payload: Optional[Dict[str, Any]],
-    # Añadido endpoint_path capturado para loguear mejor
-    gateway_endpoint_path: str
+    # Aceptamos el path específico del backend para construir la URL
+    backend_service_path: str
 ):
     method = request.method
-    # Construcción de URL: Determinar el path real para el backend
-    base_url_obj = httpx.URL(str(request.url).split(request.url.path)[0]) # URL base del gateway
-    target_service_base_url = httpx.URL(target_url_str) # URL base del servicio destino
+    target_service_base_url = httpx.URL(target_url_str)
 
-    # El path relativo para el servicio destino es el que capturamos en el gateway
-    # después del prefijo de servicio (ej. '/upload', '/chats', '/ask')
-    # gateway_endpoint_path ya contendrá esto (ej. 'upload', 'chats', 'ask')
-    # Añadir el '/' inicial si no está
-    service_path = gateway_endpoint_path if gateway_endpoint_path.startswith('/') else f"/{gateway_endpoint_path}"
+    # Construir la URL final para el backend usando el path específico
+    target_url = target_service_base_url.copy_with(path=backend_service_path, query=request.url.query.encode("utf-8"))
 
-    # Construir la URL final para el backend
-    target_url = target_service_base_url.copy_with(path=service_path, query=request.url.query.encode("utf-8"))
-
-
-    # 1. Preparar Headers para reenviar
+    # 1. Preparar Headers (sin cambios)
     headers_to_forward = {}
     client_host = request.client.host if request.client else "unknown"
     x_forwarded_for = request.headers.get("x-forwarded-for", client_host)
-
     for name, value in request.headers.items():
-        # Excluir hop-by-hop y host explícitamente
         lower_name = name.lower()
         if lower_name not in HOP_BY_HOP_HEADERS and lower_name != "host":
             headers_to_forward[name] = value
-
-    # Añadir/Actualizar cabeceras X-Forwarded-*
     headers_to_forward["X-Forwarded-For"] = x_forwarded_for
     headers_to_forward["X-Forwarded-Proto"] = request.url.scheme
-    headers_to_forward["X-Forwarded-Host"] = request.headers.get("host", "") # Host original pedido al gateway
-
-    # Añadir X-Request-ID para tracing downstream si está disponible
+    headers_to_forward["X-Forwarded-Host"] = request.headers.get("host", "")
     request_id = getattr(request.state, 'request_id', None)
-    if request_id:
-        headers_to_forward["X-Request-ID"] = request_id
+    if request_id: headers_to_forward["X-Request-ID"] = request_id
 
-    # 2. Inyectar Headers de Autenticación/Contexto (SI HAY PAYLOAD y NO es OPTIONS)
+    # 2. Inyectar Headers de Contexto (sin cambios)
     log_context = {'request_id': request_id} if request_id else {}
     if user_payload and method.upper() != 'OPTIONS':
         user_id = user_payload.get('sub')
-        company_id = user_payload.get('company_id') # Asegurado por StrictAuth
+        company_id = user_payload.get('company_id')
         user_email = user_payload.get('email')
-
         if not user_id or not company_id:
-             log.critical("CRITICAL: Payload missing required fields (sub/company_id) after StrictAuth!",
-                          payload_keys=list(user_payload.keys()), user_id=user_id, company_id=company_id)
+             log.critical("Payload missing required fields after StrictAuth!", payload_keys=list(user_payload.keys()))
              raise HTTPException(status_code=500, detail="Internal authentication context error.")
-
         headers_to_forward['X-User-ID'] = str(user_id)
         headers_to_forward['X-Company-ID'] = str(company_id)
-        log_context['user_id'] = str(user_id)
-        log_context['company_id'] = str(company_id)
-        if user_email:
-             headers_to_forward['X-User-Email'] = str(user_email)
-
+        log_context['user_id'] = str(user_id); log_context['company_id'] = str(company_id)
+        if user_email: headers_to_forward['X-User-Email'] = str(user_email)
     bound_log = log.bind(**log_context)
 
-    # 3. Preparar Body (stream body si es posible/necesario)
-    # body_iterator = request.stream() # Alternativa para streaming
-    # content=body_iterator -> para streaming puro
-    # Mejor leer el cuerpo completo para métodos comunes, ya que httpx puede manejarlo.
-    # Esto asegura que Content-Length se envíe correctamente al backend si es necesario.
+    # 3. Preparar Body (sin cambios)
     request_body_bytes: Optional[bytes] = None
     if method.upper() in ["POST", "PUT", "PATCH"]:
         request_body_bytes = await request.body()
         bound_log.debug(f"Read request body for {method}", body_length=len(request_body_bytes) if request_body_bytes else 0)
-    # Para otros métodos (GET, DELETE, OPTIONS), body es None por defecto
 
-    # 4. Realizar la petición downstream
-    bound_log.info(f"Proxying request", method=method, from_path=request.url.path, to_target=str(target_url))
+    # 4. Realizar petición downstream (log mejorado)
+    bound_log.info(f"Proxying request '{method} {request.url.path}' to backend", backend_target=str(target_url))
 
     rp: Optional[httpx.Response] = None
     try:
-        # Construir la solicitud httpx
-        req = client.build_request(
-            method=method,
-            url=target_url,
-            headers=headers_to_forward,
-            content=request_body_bytes # Pasar el cuerpo leído (o None)
-            # cookies=request.cookies, # Pasar cookies si es necesario
-        )
-        # Enviar la solicitud y obtener la respuesta como stream
+        req = client.build_request(method=method, url=target_url, headers=headers_to_forward, content=request_body_bytes)
         rp = await client.send(req, stream=True)
 
-        # 5. Procesar y devolver la respuesta del servicio backend
-        bound_log.info(f"Received response from downstream", status_code=rp.status_code, target=str(target_url))
+        # 5. Procesar respuesta (log mejorado)
+        bound_log.info(f"Received response from backend for '{method} {request.url.path}'", status_code=rp.status_code, backend_target=str(target_url))
+        response_headers = {k: v for k, v in rp.headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
+        return StreamingResponse(rp.aiter_raw(), status_code=rp.status_code, headers=response_headers, media_type=rp.headers.get("content-type"), background=rp.aclose)
 
-        # Filtrar cabeceras hop-by-hop de la respuesta del backend
-        response_headers = {
-            k: v for k, v in rp.headers.items() if k.lower() not in HOP_BY_HOP_HEADERS
-        }
-
-        # Devolver StreamingResponse
-        return StreamingResponse(
-            rp.aiter_raw(), # Iterador asíncrono del cuerpo de la respuesta
-            status_code=rp.status_code,
-            headers=response_headers,
-            media_type=rp.headers.get("content-type"), # Preservar content-type
-            background=rp.aclose # Cerrar la respuesta httpx al terminar
-        )
-
+    # Manejo de errores (sin cambios)
     except httpx.TimeoutException as exc:
-         bound_log.error(f"Request timed out to downstream service", target=str(target_url), error=str(exc))
-         raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=f"Upstream service timed out.")
+         bound_log.error(f"Proxy timeout", target=str(target_url), error=str(exc))
+         raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Upstream service timed out.")
     except httpx.ConnectError as exc:
-         bound_log.error(f"Connection error to downstream service", target=str(target_url), error=str(exc))
-         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Could not connect to upstream service.")
+         bound_log.error(f"Proxy connection error", target=str(target_url), error=str(exc))
+         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Could not connect to upstream service.")
     except httpx.RequestError as exc:
-         bound_log.error(f"HTTPX request error during proxy", target=str(target_url), error=str(exc))
+         bound_log.error(f"Proxy request error", target=str(target_url), error=str(exc))
          raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Error communicating with upstream service.")
     except Exception as exc:
-        bound_log.exception(f"Unexpected error during proxy operation", target=str(target_url))
-        if rp and hasattr(rp, 'aclose') and callable(rp.aclose):
-            try: await rp.aclose()
-            except Exception: pass
+        bound_log.exception(f"Proxy unexpected error", target=str(target_url))
+        if rp: await rp.aclose()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal gateway error during proxy.")
 
-# --- Rutas Proxy Específicas (MODIFICADAS) ---
 
+# --- Rutas Proxy Específicas ---
+
+# 1. Proxy para Query Service
+
+# GET /api/v1/query/chats
+@router.get(
+    "/api/v1/query/chats",
+    dependencies=[Depends(StrictAuth)],
+    tags=["Proxy - Query"],
+    summary="List user chats via Query Service",
+    response_description="Proxied response from Query Service.",
+)
+async def proxy_get_chats(
+    request: Request,
+    client: Annotated[httpx.AsyncClient, Depends(get_client)],
+    user_payload: StrictAuth # Inyecta el payload validado
+):
+    """Proxies GET /chats request to the Query Service."""
+    # El path en el backend es simplemente "/api/v1/chats" o similar, según el Query Service
+    # El README del Query Service indica que sus endpoints empiezan con /api/v1
+    backend_path = "/api/v1/chats"
+    return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
+
+# POST /api/v1/query/ask
+@router.post(
+    "/api/v1/query/ask",
+    dependencies=[Depends(StrictAuth)],
+    tags=["Proxy - Query"],
+    summary="Send a query via Query Service",
+    response_description="Proxied response from Query Service.",
+)
+async def proxy_post_ask(
+    request: Request,
+    client: Annotated[httpx.AsyncClient, Depends(get_client)],
+    user_payload: StrictAuth
+):
+    """Proxies POST /ask request to the Query Service."""
+    # Path en el Query Service
+    backend_path = "/api/v1/ask" # Ajustar si el endpoint es diferente en Query Service
+    return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
+
+# GET /api/v1/query/chats/{chat_id}/messages
+@router.get(
+    "/api/v1/query/chats/{chat_id}/messages",
+    dependencies=[Depends(StrictAuth)],
+    tags=["Proxy - Query"],
+    summary="Get chat messages via Query Service",
+    response_description="Proxied response from Query Service.",
+)
+async def proxy_get_chat_messages(
+    request: Request,
+    client: Annotated[httpx.AsyncClient, Depends(get_client)],
+    user_payload: StrictAuth,
+    chat_id: uuid.UUID = Path(..., title="The ID of the chat to fetch messages for")
+):
+    """Proxies GET /chats/{chat_id}/messages request to the Query Service."""
+    backend_path = f"/api/v1/chats/{chat_id}/messages" # Path en el Query Service
+    return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
+
+# DELETE /api/v1/query/chats/{chat_id}
+@router.delete(
+    "/api/v1/query/chats/{chat_id}",
+    dependencies=[Depends(StrictAuth)],
+    tags=["Proxy - Query"],
+    summary="Delete a chat via Query Service",
+    response_description="Proxied response from Query Service (likely 204 No Content).",
+)
+async def proxy_delete_chat(
+    request: Request,
+    client: Annotated[httpx.AsyncClient, Depends(get_client)],
+    user_payload: StrictAuth,
+    chat_id: uuid.UUID = Path(..., title="The ID of the chat to delete")
+):
+    """Proxies DELETE /chats/{chat_id} request to the Query Service."""
+    backend_path = f"/api/v1/chats/{chat_id}" # Path en el Query Service
+    return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
+
+# Añadir ruta OPTIONS explícita para las rutas con path parameters si CORS lo requiere
+# FastAPI suele manejarlas, pero por si acaso:
+@router.options(
+    "/api/v1/query/chats/{chat_id}/messages",
+    tags=["Proxy - Query"], include_in_schema=False
+)
+async def options_get_chat_messages(): return Response(status_code=200)
+@router.options(
+    "/api/v1/query/chats/{chat_id}",
+    tags=["Proxy - Query"], include_in_schema=False
+)
+async def options_delete_chat(): return Response(status_code=200)
+
+
+# 2. Proxy para Ingest Service (requiere ruta genérica por flexibilidad)
+
+# *** Mantenemos la ruta genérica para ingest ya que sus endpoints pueden variar más ***
+# Podrías hacerla específica si solo usas /upload, etc.
 @router.api_route(
-    # ----- CAMBIO AQUÍ: Renombrar parámetro de 'path' a 'endpoint_path' -----
     "/api/v1/ingest/{endpoint_path:path}",
-    # Asegurar que OPTIONS está incluido
-    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"], # OPTIONS aquí también
     dependencies=[Depends(StrictAuth)],
     tags=["Proxy - Ingest"],
     summary="Proxy to Ingest Service (Authentication Required)",
     response_description="Response proxied directly from the Ingest Service.",
     name="proxy_ingest_service",
 )
-async def proxy_ingest_service(
+async def proxy_ingest_service_generic(
     request: Request,
-    # ----- CAMBIO AQUÍ: Usar el nuevo nombre del parámetro -----
     endpoint_path: str,
     client: Annotated[httpx.AsyncClient, Depends(get_client)],
     user_payload: StrictAuth
 ):
     """Reenvía peticiones a /api/v1/ingest/* al Ingest Service."""
+    # El backend_path es lo que viene después de /api/v1/ingest/
+    backend_path = f"/{endpoint_path}"
     return await _proxy_request(
         request,
         str(settings.INGEST_SERVICE_URL),
         client,
         user_payload,
-        gateway_endpoint_path=endpoint_path # Pasar el path capturado
+        backend_service_path=backend_path # Pasar el path específico
     )
 
-@router.api_route(
-    # ----- CAMBIO AQUÍ: Renombrar parámetro de 'path' a 'endpoint_path' -----
-    "/api/v1/query/{endpoint_path:path}",
-    # Asegurar que OPTIONS está incluido
-    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    dependencies=[Depends(StrictAuth)],
-    tags=["Proxy - Query"],
-    summary="Proxy to Query Service (Authentication Required)",
-    response_description="Response proxied directly from the Query Service.",
-    name="proxy_query_service",
-)
-async def proxy_query_service(
-    request: Request,
-    # ----- CAMBIO AQUÍ: Usar el nuevo nombre del parámetro -----
-    endpoint_path: str,
-    client: Annotated[httpx.AsyncClient, Depends(get_client)],
-    user_payload: StrictAuth
-):
-    """Reenvía peticiones a /api/v1/query/* al Query Service."""
-    return await _proxy_request(
-        request,
-        str(settings.QUERY_SERVICE_URL),
-        client,
-        user_payload,
-        gateway_endpoint_path=endpoint_path # Pasar el path capturado
-    )
-
-
-# --- Proxy Opcional para Auth Service ---
+# 3. Proxy para Auth Service (Opcional y genérico)
 if settings.AUTH_SERVICE_URL:
     log.info(f"Auth service proxy enabled for base URL: {settings.AUTH_SERVICE_URL}")
     @router.api_route(
-        # ----- CAMBIO AQUÍ: Renombrar parámetro de 'path' a 'endpoint_path' -----
         "/api/v1/auth/{endpoint_path:path}",
-        # Asegurar que OPTIONS está incluido
-        methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"], # OPTIONS
         tags=["Proxy - Auth"],
         summary="Proxy to Authentication Service (No Gateway Authentication)",
         response_description="Response proxied directly from the Auth Service.",
         name="proxy_auth_service",
     )
-    async def proxy_auth_service(
+    async def proxy_auth_service_generic(
         request: Request,
-        # ----- CAMBIO AQUÍ: Usar el nuevo nombre del parámetro -----
         endpoint_path: str,
         client: Annotated[httpx.AsyncClient, Depends(get_client)],
     ):
-        """Proxy genérico para el servicio de autenticación (si está configurado)."""
+        """Proxy genérico para el servicio de autenticación."""
+        backend_path = f"/{endpoint_path}"
         return await _proxy_request(
             request,
             str(settings.AUTH_SERVICE_URL),
             client,
-            user_payload=None, # Sin payload porque no hay autenticación aquí
-            gateway_endpoint_path=endpoint_path # Pasar el path capturado
+            user_payload=None, # Sin autenticación aquí
+            backend_service_path=backend_path
         )
-else:
-     # Solo se loguea una vez al inicio si no está configurado
-     pass # El log ya se hace en main.py al cargar
+# else: ya no es necesario el log aquí
+
 ```
 
 ## File: `app\routers\user_router.py`
