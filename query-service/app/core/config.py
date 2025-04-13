@@ -6,14 +6,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import AnyHttpUrl, SecretStr, Field, validator, ValidationError, HttpUrl
 import sys
 
-# --- Supabase Connection Defaults (Usando Session Pooler) ---
-SUPABASE_SESSION_POOLER_HOST = "aws-0-sa-east-1.pooler.supabase.com"
-SUPABASE_SESSION_POOLER_PORT_INT = 5432
-SUPABASE_SESSION_POOLER_USER_TEMPLATE = "postgres.{project_ref}"
-SUPABASE_DEFAULT_DB = "postgres"
+# --- PostgreSQL Kubernetes Defaults ---
+POSTGRES_K8S_HOST_DEFAULT = "postgres-postgresql.nyro-develop.svc.cluster.local"
+POSTGRES_K8S_PORT_DEFAULT = 5432
+POSTGRES_K8S_DB_DEFAULT = "nyro"
+POSTGRES_K8S_USER_DEFAULT = "postgres"
 
 # --- Milvus Kubernetes Defaults ---
-# *** CORRECCIÓN: Usar el nombre y namespace correctos del servicio Milvus ***
 MILVUS_K8S_DEFAULT_URI = "http://milvus-milvus.default.svc.cluster.local:19530"
 
 # --- RAG Defaults ---
@@ -49,20 +48,17 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
 
     # --- Database ---
-    POSTGRES_USER: str = Field(default_factory=lambda: SUPABASE_SESSION_POOLER_USER_TEMPLATE.format(project_ref=os.getenv("SUPABASE_PROJECT_REF", "YOUR_PROJECT_REF_HERE")))
+    POSTGRES_USER: str = POSTGRES_K8S_USER_DEFAULT
     POSTGRES_PASSWORD: SecretStr
-    POSTGRES_SERVER: str = SUPABASE_SESSION_POOLER_HOST
-    POSTGRES_PORT: int = SUPABASE_SESSION_POOLER_PORT_INT
-    POSTGRES_DB: str = SUPABASE_DEFAULT_DB
+    POSTGRES_SERVER: str = POSTGRES_K8S_HOST_DEFAULT
+    POSTGRES_PORT: int = POSTGRES_K8S_PORT_DEFAULT
+    POSTGRES_DB: str = POSTGRES_K8S_DB_DEFAULT
 
     # --- Milvus ---
-    # Usar el default corregido
     MILVUS_URI: AnyHttpUrl = AnyHttpUrl(MILVUS_K8S_DEFAULT_URI)
     MILVUS_COLLECTION_NAME: str = "document_chunks_haystack"
-    # *** CORRECCIÓN: Asegurar que estos nombres coincidan con cómo ingest-service los guardó en Milvus ***
-    # (Los nombres por defecto de milvus-haystack suelen ser 'content' y 'embedding')
-    MILVUS_EMBEDDING_FIELD: str = "embedding" # Mantener si ingest usó este nombre
-    MILVUS_CONTENT_FIELD: str = "content"     # Mantener si ingest usó este nombre
+    MILVUS_EMBEDDING_FIELD: str = "embedding"
+    MILVUS_CONTENT_FIELD: str = "content"
     MILVUS_METADATA_FIELDS: List[str] = Field(default=[
         "company_id", "document_id", "file_name", "file_type",
     ])
@@ -91,7 +87,6 @@ class Settings(BaseSettings):
     HTTP_CLIENT_BACKOFF_FACTOR: float = 1.0
 
     # --- Validators ---
-    # (Sin cambios en validadores)
     @validator("EMBEDDING_DIMENSION", pre=True, always=True)
     def set_embedding_dimension(cls, v: Optional[int], values: dict[str, Any]) -> int:
         model = values.get("OPENAI_EMBEDDING_MODEL")
@@ -101,32 +96,18 @@ class Settings(BaseSettings):
             return 1536
         return v
 
-    @validator("POSTGRES_USER", pre=True, always=True)
-    def check_postgres_user(cls, v: str) -> str:
-        if "YOUR_PROJECT_REF_HERE" in v:
-            print("WARNING: SUPABASE_PROJECT_REF environment variable not set. Using placeholder for POSTGRES_USER.")
-        return v
-
 # --- Instancia Global ---
-# (Sin cambios en la lógica de instanciación)
 try:
     settings = Settings()
-    print("DEBUG: Query Service Settings loaded successfully.")
+    # Mensajes de debug
+    print("DEBUG: Settings loaded successfully.")
     print(f"DEBUG: Using Postgres Server: {settings.POSTGRES_SERVER}:{settings.POSTGRES_PORT}")
     print(f"DEBUG: Using Postgres User: {settings.POSTGRES_USER}")
-    print(f"DEBUG: Using Milvus URI: {settings.MILVUS_URI}") # Ahora mostrará la URI corregida
-    print(f"DEBUG: Using Milvus Collection: {settings.MILVUS_COLLECTION_NAME}")
-    print(f"DEBUG: Using OpenAI Embedding Model: {settings.OPENAI_EMBEDDING_MODEL} (Dim: {settings.EMBEDDING_DIMENSION})")
+    print(f"DEBUG: Using Milvus URI: {settings.MILVUS_URI}")
+    print(f"DEBUG: Using OpenAI Model: {settings.OPENAI_EMBEDDING_MODEL}")
     print(f"DEBUG: Using Gemini Model: {settings.GEMINI_MODEL_NAME}")
-
-except (ValidationError, ValueError) as e:
-    error_details = ""
-    if isinstance(e, ValidationError):
-        try: error_details = f"\nValidation Errors:\n{e.json(indent=2)}"
-        except Exception: error_details = f"\nRaw Errors: {e.errors()}"
-    print(f"FATAL: Configuration validation failed:{error_details}\nOriginal Error: {e}")
-    sys.exit(1)
 except Exception as e:
-    print(f"FATAL: Unexpected error during Settings instantiation:\n{e}")
-    import traceback; traceback.print_exc()
+    print(f"FATAL: Error loading settings: {e}")
+    import traceback
+    traceback.print_exc()
     sys.exit(1)

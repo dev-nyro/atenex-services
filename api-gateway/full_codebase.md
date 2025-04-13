@@ -6,11 +6,13 @@ app/
 ├── auth
 │   ├── __init__.py
 │   ├── auth_middleware.py
-│   └── jwt_handler.py
+│   └── auth_service.py
 ├── core
 │   ├── __init__.py
 │   ├── config.py
 │   └── logging_config.py
+├── db
+│   └── postgres_client.py
 ├── main.py
 ├── routers
 │   ├── __init__.py
@@ -18,7 +20,6 @@ app/
 │   ├── gateway_router.py
 │   └── user_router.py
 └── utils
-    └── supabase_admin.py
 ```
 
 # Codebase: `app`
@@ -43,11 +44,12 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Optional, Annotated, Dict, Any
 import structlog
 
-# Importar verify_token CON el parámetro require_company_id
-from .jwt_handler import verify_token
+# Importar verify_token del nuevo servicio de autenticación
+from app.auth.auth_service import verify_token # <-- Asegúrate que la importación es correcta
 
 log = structlog.get_logger(__name__)
-# Crear instancia del scheme. auto_error=False para manejar manualmente la ausencia de token
+
+# Instancia del scheme HTTPBearer. auto_error=False para manejar manualmente la ausencia de token.
 bearer_scheme = HTTPBearer(bearerFormat="JWT", auto_error=False)
 
 async def _get_user_payload_internal(
@@ -57,36 +59,54 @@ async def _get_user_payload_internal(
     require_company_id: bool # Parámetro interno para controlar la verificación
 ) -> Optional[Dict[str, Any]]:
     """
-    Función interna para obtener y validar el payload, controlando si se requiere company_id.
-    Devuelve el payload si es válido según los criterios, None si no hay token,
-    y lanza HTTPException si el token existe pero es inválido.
+    Función interna para obtener y validar el payload JWT.
+    Controla si se requiere company_id según el parámetro.
+    Devuelve el payload si el token es válido y cumple el requisito de company_id.
+    Devuelve None si no se proporciona token (cabecera Authorization ausente).
+    Lanza HTTPException si el token existe pero es inválido (firma, exp, usuario no existe)
+    o si falta company_id cuando es requerido (403).
     """
-    # Limpiar estado previo si existiera
-    request.state.user = None
+    # Limpiar estado previo si existiera para evitar contaminación entre requests
+    if hasattr(request.state, 'user'):
+        del request.state.user
 
     if authorization is None:
         # No hay cabecera Authorization: Bearer
         log.debug("No Authorization Bearer header found.")
-        # No es un error aún, la ruta decidirá si lo requiere
+        # No es un error aún, la dependencia que lo use decidirá si lo requiere
         return None
 
     token = authorization.credentials
     try:
-        # Pasar require_company_id a verify_token
-        payload = verify_token(token, require_company_id=require_company_id)
-        # Guardar payload en el estado de la request para posible uso posterior
+        # Llamar a la función de verificación centralizada
+        # Esta función ya maneja las excepciones 401 y 403 internamente
+        payload = await verify_token(token, require_company_id=require_company_id)
+
+        # Guardar payload en el estado de la request para posible uso posterior (ej. logging middleware)
         request.state.user = payload
-        log_msg = "Token verified" + (" (company_id required and present)" if require_company_id and 'company_id' in payload else " (company_id check passed/not required)")
+
+        # Log de éxito más descriptivo
+        log_msg = "Token verified successfully via internal getter"
+        if require_company_id:
+            log_msg += " (company_id required and present)"
+        else:
+            log_msg += " (company_id check passed or not required)"
         log.debug(log_msg, subject=payload.get('sub'), company_id=payload.get('company_id'))
+
         return payload
     except HTTPException as e:
         # verify_token lanza 401 (inválido) o 403 (falta company_id requerido)
-        log.info(f"Token verification failed in dependency: {e.detail}", status_code=e.status_code, user_id=getattr(e, 'user_id', None)) # Loggear detalle
-        # Re-lanzar la excepción para que FastAPI la maneje
+        # Loguear el error específico antes de relanzar
+        log_detail = getattr(e, 'detail', 'No detail provided')
+        log.info(f"Token verification failed in dependency: {log_detail}",
+                 status_code=e.status_code,
+                 user_id=getattr(e, 'user_id', None)) # Loguear user_id si está disponible
+        # Re-lanzar la excepción para que FastAPI la maneje y devuelva la respuesta HTTP correcta
         raise e
     except Exception as e:
-        # Capturar errores inesperados de verify_token
+        # Capturar errores inesperados *dentro* de verify_token que no sean HTTPException
         log.exception("Unexpected error during internal payload retrieval", error=str(e))
+        # Devolver un error 500 genérico para no exponer detalles internos
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal error during authentication check."
@@ -98,270 +118,336 @@ async def get_current_user_payload(
     authorization: Annotated[Optional[HTTPAuthorizationCredentials], Depends(bearer_scheme)]
 ) -> Optional[Dict[str, Any]]:
     """
-    Dependencia FastAPI para intentar validar el token JWT (requiriendo company_id).
-    Devuelve el payload si es válido Y tiene company_id.
-    Devuelve None si no hay token.
-    Lanza 401/403 si el token es inválido o falta company_id.
+    Dependencia FastAPI para intentar validar el token JWT requiriendo company_id.
+    - Devuelve el payload si el token es válido Y tiene company_id.
+    - Devuelve None si no se proporciona token.
+    - Lanza 401 si el token es inválido (firma, exp, usuario no existe).
+    - Lanza 403 si el token es válido pero falta company_id.
     """
     try:
         # Llama a la función interna requiriendo company_id
         return await _get_user_payload_internal(request, authorization, require_company_id=True)
     except HTTPException as e:
-        # Si _get_user_payload_internal lanza 401/403, lo relanzamos
+        # Si _get_user_payload_internal lanza 401 o 403, simplemente relanzamos
         raise e
     except Exception as e:
          # Manejar cualquier otro error inesperado aquí también
          log.exception("Unexpected error in get_current_user_payload wrapper", error=str(e))
          raise HTTPException(status_code=500, detail="Internal Server Error in auth wrapper")
 
+# --- Dependencia para la Asociación Inicial (NO requiere company_id) ---
+async def get_initial_user_payload(
+    request: Request,
+    authorization: Annotated[Optional[HTTPAuthorizationCredentials], Depends(bearer_scheme)]
+) -> Optional[Dict[str, Any]]:
+    """
+    Dependencia FastAPI para validar el token JWT sin requerir company_id.
+    Útil para la ruta de asociación inicial de company_id.
+    - Devuelve el payload si el token es válido (firma, exp, usuario existe), incluso sin company_id.
+    - Devuelve None si no se proporciona token.
+    - Lanza 401 si el token es inválido (firma, exp, usuario no existe).
+    """
+    try:
+        # Llama a la función interna sin requerir company_id
+        return await _get_user_payload_internal(request, authorization, require_company_id=False)
+    except HTTPException as e:
+        # Si _get_user_payload_internal lanza 401 (o 403, aunque no debería aquí), lo relanzamos
+        raise e
+    except Exception as e:
+         # Manejar cualquier otro error inesperado aquí también
+         log.exception("Unexpected error in get_initial_user_payload wrapper", error=str(e))
+         raise HTTPException(status_code=500, detail="Internal Server Error in auth wrapper")
 
 # --- Dependencia que Requiere Usuario Estricto (Falla si no hay token válido CON company_id) ---
 async def require_user(
-    # Depende de la función anterior. Si esa función lanza excepción, esta no se ejecuta.
-    # Si devuelve None (sin token), esta dependencia lanzará 401.
+    # Depende de la función anterior (get_current_user_payload).
+    # Si esa función devuelve None (sin token) o lanza una excepción (401/403),
+    # esta dependencia manejará el caso o no se ejecutará.
     user_payload: Annotated[Optional[Dict[str, Any]], Depends(get_current_user_payload)]
 ) -> Dict[str, Any]:
     """
     Dependencia FastAPI que *asegura* que una ruta requiere un usuario autenticado
     con un token válido Y con company_id asociado.
-    Lanza 401 si no hay token o es inválido.
-    Lanza 403 si el token es válido pero falta company_id.
+    - Lanza 401 si no hay token o es inválido (lo hace la dependencia `get_current_user_payload`).
+    - Lanza 403 si el token es válido pero falta company_id (lo hace la dependencia `get_current_user_payload`).
+    - Si `get_current_user_payload` devuelve `None` (porque no se envió token), esta función lanzará 401.
     """
     if user_payload is None:
-        # Esto ocurre si get_current_user_payload devolvió None (sin token)
-        # o si _get_user_payload_internal devolvió None (sin token)
-        log.info("Access denied by require_user: Authentication required but no valid token was found or provided.")
+        # Esto ocurre si get_current_user_payload devolvió None (sin cabecera Authorization)
+        log.info("Access denied by require_user: Authentication required but no token was provided.")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated",
             headers={"WWW-Authenticate": "Bearer"}, # Indica al cliente cómo autenticarse
         )
-    # Si get_current_user_payload lanzó 403 (falta company_id), la ejecución ya se detuvo allí.
-    # Si llegamos aquí, user_payload es un diccionario válido con company_id.
-    log.debug("User requirement met (StrictAuth: token valid with company_id).", subject=user_payload.get('sub'), company_id=user_payload.get('company_id'))
-    return user_payload # Devolver el payload para uso en la ruta
+    # Si user_payload no es None, significa que get_current_user_payload tuvo éxito
+    # (el token era válido y tenía company_id), así que simplemente lo devolvemos.
+    # Las excepciones 401/403 ya habrían sido lanzadas por la dependencia anterior.
+    return user_payload
 
-# --- Dependencia que Requiere Autenticación pero NO company_id ---
-async def require_authenticated_user_no_company_check(
-    request: Request,
-    authorization: Annotated[Optional[HTTPAuthorizationCredentials], Depends(bearer_scheme)]
+# --- Dependencia que Requiere Usuario Inicial (Falla si no hay token válido, pero NO requiere company_id) ---
+async def require_initial_user(
+    # Depende de get_initial_user_payload.
+    # Si esa función devuelve None (sin token) o lanza una excepción (401),
+    # esta dependencia manejará el caso o no se ejecutará.
+    user_payload: Annotated[Optional[Dict[str, Any]], Depends(get_initial_user_payload)]
 ) -> Dict[str, Any]:
     """
-    Dependencia FastAPI que asegura que el usuario está autenticado (token válido:
-    firma, exp, aud) pero NO requiere que el company_id esté presente en el token.
-    Útil para endpoints como el de asociación inicial de compañía.
-    Lanza 401 si no hay token o es inválido.
+    Dependencia FastAPI que *asegura* que una ruta requiere un usuario autenticado
+    con un token válido (firma, exp, usuario existe), pero NO requiere company_id.
+    Útil para la ruta de asociación inicial de company_id.
+    - Lanza 401 si no hay token o es inválido (lo hace la dependencia `get_initial_user_payload`).
+    - Si `get_initial_user_payload` devuelve `None` (sin token), esta función lanzará 401.
     """
-    try:
-        # Llama a la función interna SIN requerir company_id
-        payload = await _get_user_payload_internal(request, authorization, require_company_id=False)
+    if user_payload is None:
+        # Esto ocurre si get_initial_user_payload devolvió None (sin cabecera Authorization)
+        log.info("Access denied by require_initial_user: Authentication required but no token was provided.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    # Si user_payload no es None, significa que get_initial_user_payload tuvo éxito
+    # (el token era válido), así que simplemente lo devolvemos.
+    return user_payload
 
-        if payload is None:
-            # Si no hay token, lanzar 401
-            log.info("Access denied by require_authenticated_user_no_company_check: Authentication required but no token provided.")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Authentication required",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        # Si había token pero era inválido (firma, exp, aud), _get_user_payload_internal ya lanzó 401.
-        # Si llegamos aquí, el token es válido según los criterios básicos.
-        log.debug("User requirement met (InitialAuth: token valid, company_id not checked).", subject=payload.get('sub'), company_id=payload.get('company_id', 'N/A'))
-        return payload
-    except HTTPException as e:
-        # Re-lanzar 401 si el token era inválido
-        raise e
-    except Exception as e:
-        log.exception("Unexpected error in require_authenticated_user_no_company_check", error=str(e))
-        raise HTTPException(status_code=500, detail="Internal Server Error during initial auth check")
-
-# Alias para claridad en las dependencias de las rutas
-InitialAuth = Annotated[Dict[str, Any], Depends(require_authenticated_user_no_company_check)]
+# --- Tipos anotados para usar en las rutas y mejorar la legibilidad ---
+# StrictAuth: Requiere token válido con company_id
 StrictAuth = Annotated[Dict[str, Any], Depends(require_user)]
+
+# InitialAuth: Requiere token válido, pero company_id no es obligatorio
+InitialAuth = Annotated[Dict[str, Any], Depends(require_initial_user)]
 ```
 
-## File: `app\auth\jwt_handler.py`
+## File: `app\auth\auth_service.py`
 ```py
-# File: app/auth/jwt_handler.py
-# api-gateway/app/auth/jwt_handler.py
-from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
-from jose import JWTError, jwt
-from fastapi import HTTPException, status
+# File: app/auth/auth_service.py
+# api-gateway/app/auth/auth_service.py
+import uuid
+import time
+from typing import Dict, Any, Optional
+from datetime import datetime, timezone, timedelta
+from jose import jwt, JWTError, ExpiredSignatureError, JOSEError
 import structlog
-import uuid # Para validar UUID
+from passlib.context import CryptContext
+from fastapi import HTTPException, status
 
 from app.core.config import settings
+from app.db import postgres_client # Importar cliente DB
 
 log = structlog.get_logger(__name__)
 
-SECRET_KEY = settings.JWT_SECRET
-ALGORITHM = settings.JWT_ALGORITHM
-REQUIRED_CLAIMS = ['sub', 'aud', 'exp'] # Claims esenciales según Supabase/JWT estándar
-EXPECTED_AUDIENCE = 'authenticated' # Audiencia esperada para usuarios logueados en Supabase
+# Contexto Passlib para Bcrypt (recomendado)
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-def _validate_uuid(uuid_string: Optional[str]) -> Optional[str]:
-    """Intenta validar si un string es un UUID válido. Devuelve el string o None."""
-    if not uuid_string:
-        return None
+# --- Verificación y Hashing de Contraseñas ---
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verifica una contraseña en texto plano contra un hash almacenado."""
     try:
-        uuid.UUID(uuid_string)
-        return uuid_string
-    except ValueError:
-        log.warning("Invalid UUID format found in token metadata.", provided_uuid=uuid_string)
+        return pwd_context.verify(plain_password, hashed_password)
+    except Exception as e:
+        # Podría haber errores si el hash no es válido o tiene un formato inesperado
+        log.error("Password verification failed", error=str(e), hash_used=hashed_password[:10]+"...") # No loguear hash completo
+        return False
+
+def get_password_hash(password: str) -> str:
+    """Genera un hash bcrypt para una contraseña en texto plano."""
+    return pwd_context.hash(password)
+
+# --- Autenticación de Usuario ---
+
+async def authenticate_user(email: str, password: str) -> Optional[Dict[str, Any]]:
+    """
+    Autentica un usuario por email y contraseña contra la base de datos.
+    Retorna el diccionario del usuario si es válido y activo, None en caso contrario.
+    """
+    log.debug("Attempting to authenticate user", email=email)
+    user_data = await postgres_client.get_user_by_email(email)
+
+    if not user_data:
+        log.info("Authentication failed: User not found", email=email)
         return None
 
-# Añadir parámetro require_company_id
-def verify_token(token: str, require_company_id: bool = True) -> Dict[str, Any]:
-    """
-    Verifica el token JWT usando el secreto y algoritmo de Supabase.
-    Valida la firma, expiración, audiencia ('authenticated') y claims requeridos ('sub', 'aud', 'exp').
-    Extrae 'email' y 'company_id' de 'app_metadata' si existen.
-    Opcionalmente requiere la presencia de un 'company_id' válido en app_metadata.
+    if not user_data.get('is_active', False): # Verificar si el usuario está activo
+        log.warning("Authentication failed: User is inactive", email=email, user_id=str(user_data.get('id')))
+        return None
 
-    Args:
-        token: El string del token JWT.
-        require_company_id: Si es True (default), falla con 403 si 'company_id'
-                            no se encuentra o no es un UUID válido en app_metadata.
-                            Si es False, permite tokens válidos sin company_id.
+    hashed_password = user_data.get('hashed_password')
+    if not hashed_password or not verify_password(password, hashed_password):
+        log.warning("Authentication failed: Invalid password", email=email, user_id=str(user_data.get('id')))
+        return None
+
+    # Autenticación exitosa
+    log.info("User authenticated successfully", email=email, user_id=str(user_data.get('id')))
+    # Eliminar hash de contraseña antes de devolver los datos
+    user_data.pop('hashed_password', None)
+    return user_data
+
+# --- Creación de Tokens JWT ---
+
+def create_access_token(
+    user_id: uuid.UUID,
+    email: str,
+    company_id: Optional[uuid.UUID] = None,
+    # full_name: Optional[str] = None, # Podrías añadir más claims si los necesitas
+    # role: Optional[str] = None,
+    expires_delta: timedelta = timedelta(days=1) # Tiempo de expiración configurable
+) -> str:
+    """
+    Crea un token JWT para el usuario autenticado.
+    Incluye 'sub' (user_id), 'exp', 'iat', 'email' y opcionalmente 'company_id'.
+    """
+    expire = datetime.now(timezone.utc) + expires_delta
+    # Usar datetime.now(timezone.utc) para iat también
+    issued_at = datetime.now(timezone.utc)
+
+    to_encode: Dict[str, Any] = {
+        "sub": str(user_id),         # Subject (ID de usuario)
+        "exp": expire,               # Expiration Time
+        "iat": issued_at,            # Issued At
+        "email": email,              # Email del usuario
+        # "aud": "authenticated",    # Audiencia (opcional, si tus servicios la verifican)
+        # "iss": "AtenexAuth",       # Emisor (opcional)
+    }
+
+    # Añadir company_id si está presente
+    if company_id:
+        to_encode["company_id"] = str(company_id)
+
+    # Codificar el token usando el secreto y algoritmo de la configuración
+    try:
+        encoded_jwt = jwt.encode(
+            to_encode,
+            settings.JWT_SECRET.get_secret_value(), # Obtener valor del SecretStr
+            algorithm=settings.JWT_ALGORITHM
+        )
+        log.debug("Access token created", user_id=str(user_id), expires_at=expire.isoformat())
+        return encoded_jwt
+    except JOSEError as e:
+        log.exception("Failed to encode JWT", error=str(e), user_id=str(user_id))
+        # En un caso real, esto es un error interno grave
+        raise HTTPException(status_code=500, detail="Could not create access token")
+
+
+# --- Verificación de Tokens JWT ---
+
+async def verify_token(token: str, require_company_id: bool = True) -> Dict[str, Any]:
+    """
+    Verifica la validez de un token JWT (firma, expiración, claims básicos).
+    Opcionalmente requiere la presencia de un 'company_id' válido en el payload.
+    Verifica que el usuario ('sub') exista en la base de datos.
 
     Returns:
-        El payload decodificado (diccionario) si el token es válido según los criterios.
-        El payload devuelto incluirá 'company_id' y 'email' en el nivel superior si se encontraron.
+        El payload decodificado si el token es válido.
 
     Raises:
-        HTTPException(401): Si el token es inválido (firma, exp, aud, formato, claims faltantes) o no se proporciona.
-        HTTPException(403): Si require_company_id es True y falta un company_id válido.
-        HTTPException(500): Si ocurre un error inesperado o de configuración (ej. JWT_SECRET por defecto).
+        HTTPException(401): Si el token es inválido (firma, exp, formato) o el usuario no existe.
+        HTTPException(403): Si 'require_company_id' es True y falta un 'company_id' válido.
+        HTTPException(500): Error interno.
     """
-    # Excepción base para errores 401
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""}, # Header estándar para 401
+        headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""},
     )
-    # Excepción para error 403 (prohibido por falta de company_id)
     forbidden_exception = HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
-        detail="User authenticated, but company association is missing or invalid in token.",
+        detail="User authenticated, but required company association is missing or invalid in token.",
+        headers={"WWW-Authenticate": "Bearer error=\"insufficient_scope\""}, # Indica falta de permisos/scope
     )
-    # Excepción para errores internos del servidor
     internal_error_exception = HTTPException(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail="An internal error occurred during token verification.",
     )
 
-    if not token:
-        log.warning("Attempted verification with empty token string.")
-        credentials_exception.detail = "Authentication token was not provided."
-        raise credentials_exception
-
-    # Verificación crítica de seguridad: NUNCA usar el secreto por defecto
-    if SECRET_KEY == "YOUR_DEFAULT_JWT_SECRET_KEY_CHANGE_ME_IN_ENV_OR_SECRET" or not SECRET_KEY:
+    # Verificación de seguridad del secreto (ya hecha en config, pero doble check no daña)
+    if not settings.JWT_SECRET or settings.JWT_SECRET.get_secret_value() == "YOUR_DEFAULT_JWT_SECRET_KEY_CHANGE_ME_IN_ENV_OR_SECRET":
          log.critical("FATAL: Attempting JWT verification with default or missing GATEWAY_JWT_SECRET!")
-         # No dar detalles al cliente, es un error interno grave
          raise internal_error_exception
 
     try:
-        # Decodificar y validar firma, expiración y audiencia todo en uno
+        # Decodificar el token (valida firma, exp)
         payload = jwt.decode(
             token,
-            SECRET_KEY,
-            algorithms=[ALGORITHM],
-            audience=EXPECTED_AUDIENCE, # Validar que el token es para 'authenticated'
+            settings.JWT_SECRET.get_secret_value(),
+            algorithms=[settings.JWT_ALGORITHM],
             options={
                 "verify_signature": True,
-                "verify_aud": True,
                 "verify_exp": True,
-                "verify_iat": True, # Verificar 'issued at' si está presente
-                "verify_nbf": True, # Verificar 'not before' si está presente
+                "verify_iat": True,
+                "verify_nbf": True, # Si usas 'not before'
+                # "verify_aud": False # No verificamos audiencia específica por defecto
             }
         )
+        log.debug("Token decoded successfully", payload_keys=list(payload.keys()))
 
-        # Verificar presencia de claims requeridos
-        missing_claims = [claim for claim in REQUIRED_CLAIMS if claim not in payload]
-        if missing_claims:
-            log.warning("Token verification failed: Missing required claims.",
-                        missing_claims=missing_claims,
-                        token_subject=payload.get('sub')) # Loguear sub si existe
-            credentials_exception.detail = f"Token missing required claims: {', '.join(missing_claims)}"
+        # Validar 'sub' (user_id)
+        user_id_str = payload.get("sub")
+        if not user_id_str:
+            log.warning("Token verification failed: 'sub' claim missing.")
+            credentials_exception.detail = "Token missing 'sub' (user ID) claim."
             raise credentials_exception
 
-        # Extraer información relevante y añadirla al nivel superior del payload para conveniencia
-        user_id = payload.get('sub') # User ID de Supabase
-        email = payload.get('email') # Email del usuario
-        app_metadata = payload.get('app_metadata')
-        company_id: Optional[str] = None
+        try:
+            user_id = uuid.UUID(user_id_str)
+        except ValueError:
+            log.warning("Token verification failed: 'sub' claim is not a valid UUID.", sub_value=user_id_str)
+            credentials_exception.detail = "Invalid user ID format in token."
+            raise credentials_exception
 
-        if isinstance(app_metadata, dict):
-            company_id_raw = app_metadata.get('company_id')
-            if company_id_raw is not None:
-                 # Validar que el company_id parece un UUID antes de usarlo
-                 company_id = _validate_uuid(str(company_id_raw))
-                 if company_id:
-                     payload['company_id'] = company_id # Añadir al payload principal
-                 else:
-                     # Si require_company_id es True, fallaremos más abajo.
-                     # Si es False, simplemente no estará disponible.
-                     log.warning("Found company_id in app_metadata, but it's not a valid UUID.",
-                                 provided_value=company_id_raw, subject=user_id)
+        # Verificar que el usuario existe y está activo en la DB
+        # Esto previene usar tokens de usuarios eliminados o desactivados
+        user_db_data = await postgres_client.get_user_by_id(user_id)
+        if not user_db_data:
+            log.warning("Token verification failed: User specified in 'sub' not found in DB.", user_id=user_id_str)
+            credentials_exception.detail = "User associated with token not found."
+            raise credentials_exception
+        if not user_db_data.get('is_active', False):
+            log.warning("Token verification failed: User specified in 'sub' is inactive.", user_id=user_id_str)
+            credentials_exception.detail = "User associated with token is inactive."
+            raise credentials_exception
 
-            # Podríamos extraer otros datos de app_metadata si fuera necesario
-            # roles = app_metadata.get('roles')
-            # if roles: payload['roles'] = roles
+        # Validar 'company_id' si es requerido
+        company_id_str: Optional[str] = payload.get("company_id")
+        valid_company_id_present = False
+        if company_id_str:
+            try:
+                uuid.UUID(company_id_str) # Validar formato UUID
+                valid_company_id_present = True
+            except ValueError:
+                log.warning("Token verification: 'company_id' claim present but not a valid UUID.",
+                           company_id_value=company_id_str, user_id=user_id_str)
+                # Considerar si un company_id inválido debe ser 401 o 403
+                # Vamos a tratarlo como inválido (401), ya que el token está malformado en ese aspecto
+                credentials_exception.detail = "Invalid company ID format in token."
+                raise credentials_exception
 
-        # Añadir email al payload principal si existe
-        if email:
-            payload['email'] = email
+        if require_company_id and not valid_company_id_present:
+            log.info("Token verification failed: Required 'company_id' is missing.", user_id=user_id_str)
+            raise forbidden_exception # Falla porque se requiere y no está
 
-        # Aplicar requerimiento de company_id (si aplica)
-        if require_company_id and company_id is None:
-             # Si se requiere company_id pero no se encontró uno válido
-             log.error("Token lacks required and valid 'company_id' in app_metadata.",
-                       token_subject=user_id,
-                       app_metadata_keys=list(app_metadata.keys()) if isinstance(app_metadata, dict) else None)
-             raise forbidden_exception # Lanzar 403 Forbidden
+        # Si pasa todas las verificaciones, el token es válido
+        log.info("Token verified successfully", user_id=user_id_str, company_id=company_id_str or "N/A")
+        return payload # Devolver el payload completo
 
-        # Log final de éxito
-        log_status = "verified" + (", company_id present" if company_id else ", company_id absent/not required")
-        log.debug(f"Token {log_status}", subject=user_id, company_id=company_id, email=email)
-
-        # Asegurarnos de que 'sub' existe antes de devolver (aunque ya lo comprobamos)
-        if 'sub' not in payload:
-             log.error("Critical consistency error: 'sub' claim missing after validation.", payload_keys=list(payload.keys()))
-             raise credentials_exception
-
-        return payload # Devolver el payload enriquecido
-
+    except ExpiredSignatureError:
+        log.info("Token verification failed: Token has expired.")
+        credentials_exception.detail = "Token has expired."
+        credentials_exception.headers["WWW-Authenticate"] = 'Bearer error="invalid_token", error_description="The token has expired"'
+        raise credentials_exception
     except JWTError as e:
-        # Capturar errores específicos de la librería jose
-        log.warning(f"JWT Verification Error: {e}", token_provided=True, algorithm=ALGORITHM, audience=EXPECTED_AUDIENCE)
-        error_desc = str(e).lower()
-        if "signature verification failed" in error_desc:
-            credentials_exception.detail = "Invalid token signature."
-            credentials_exception.headers["WWW-Authenticate"] = 'Bearer error="invalid_token", error_description="Invalid signature"'
-        elif "token is expired" in error_desc:
-            credentials_exception.detail = "Token has expired."
-            credentials_exception.headers["WWW-Authenticate"] = 'Bearer error="invalid_token", error_description="The token has expired"'
-        elif "audience verification failed" in error_desc:
-             credentials_exception.detail = f"Invalid token audience. Expected '{EXPECTED_AUDIENCE}'."
-             credentials_exception.headers["WWW-Authenticate"] = f'Bearer error="invalid_token", error_description="Invalid audience"'
-        elif "invalid header string" in error_desc or "invalid crypto padding" in error_desc or "malformed" in error_desc:
-             credentials_exception.detail = "Invalid token format or structure."
-             credentials_exception.headers["WWW-Authenticate"] = 'Bearer error="invalid_token", error_description="Malformed token"'
-        else:
-            # Error genérico de JWT
-            credentials_exception.detail = f"Token validation failed: {e}"
-            credentials_exception.headers["WWW-Authenticate"] = 'Bearer error="invalid_token"'
-        raise credentials_exception from e # Relanzar como 401
-
+        # Otros errores de JWT (firma inválida, formato incorrecto, etc.)
+        log.warning(f"JWT Verification Error: {e}", token_provided=True)
+        credentials_exception.detail = f"Token validation failed: {e}"
+        raise credentials_exception
     except HTTPException as e:
-        # Re-lanzar 403 (forbidden_exception) u otras HTTPExceptions que puedan surgir
+        # Re-lanzar excepciones HTTP ya manejadas (como 403 por company_id)
         raise e
     except Exception as e:
-        # Capturar cualquier otro error inesperado
-        log.exception(f"Unexpected error during token verification: {e}")
-        raise internal_error_exception from e # Relanzar como 500
+        # Capturar cualquier otro error inesperado (ej. error de DB en get_user_by_id)
+        log.exception(f"Unexpected error during token verification: {e}", user_id=payload.get('sub') if 'payload' in locals() else 'unknown')
+        raise internal_error_exception
 ```
 
 ## File: `app\core\__init__.py`
@@ -375,79 +461,83 @@ def verify_token(token: str, require_company_id: bool = True) -> Dict[str, Any]:
 # api-gateway/app/core/config.py
 import os
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field, validator, ValidationError, HttpUrl # Importar validator, ValidationError, HttpUrl
+from pydantic import Field, validator, ValidationError, HttpUrl, SecretStr
 from functools import lru_cache
 import sys
 import logging
-from typing import Optional, List # Añadir List
+from typing import Optional, List
 import uuid # Para validar UUID
 
-# URLs por defecto si no se especifican en el entorno (típico para K8s)
-K8S_INGEST_SVC_URL_DEFAULT = "http://ingest-api-service.nyro-develop.svc.cluster.local:80"
-K8S_QUERY_SVC_URL_DEFAULT = "http://query-service.nyro-develop.svc.cluster.local:80"
+# URLs por defecto si no se especifican en el entorno (usando el namespace 'atenex-develop')
+K8S_INGEST_SVC_URL_DEFAULT = "http://ingest-api-service.atenex-develop.svc.cluster.local:80"
+K8S_QUERY_SVC_URL_DEFAULT = "http://query-service.atenex-develop.svc.cluster.local:80"
+K8S_AUTH_SVC_URL_DEFAULT = None # No hay auth service por defecto
+
+# PostgreSQL Kubernetes Default (usando el namespace 'atenex-develop')
+POSTGRES_K8S_HOST_DEFAULT = "postgresql.atenex-develop.svc.cluster.local" # <-- K8s Service Name
+POSTGRES_K8S_PORT_DEFAULT = 5432
+POSTGRES_K8S_DB_DEFAULT = "atenex" # <-- Nombre de DB (asegúrate que coincida)
+POSTGRES_K8S_USER_DEFAULT = "postgres" # <-- Usuario DB (asegúrate que coincida)
 
 class Settings(BaseSettings):
     # Configuración de Pydantic-Settings
     model_config = SettingsConfigDict(
-        env_file='.env', # Buscar archivo .env
-        env_prefix='GATEWAY_', # Buscar variables de entorno con prefijo GATEWAY_
-        case_sensitive=False, # Insensible a mayúsculas/minúsculas
+        env_file='.env',
+        env_prefix='GATEWAY_',
+        case_sensitive=False,
         env_file_encoding='utf-8',
-        extra='ignore' # Ignorar variables extra en el entorno/archivo .env
+        extra='ignore'
     )
 
     # Información del Proyecto
-    PROJECT_NAME: str = "Nyro API Gateway"
+    PROJECT_NAME: str = "Atenex API Gateway" # <-- Nombre actualizado
     API_V1_STR: str = "/api/v1"
 
-    # URLs de Servicios Backend (Obligatorias)
-    INGEST_SERVICE_URL: HttpUrl = K8S_INGEST_SVC_URL_DEFAULT # Usar HttpUrl para validación básica
-    QUERY_SERVICE_URL: HttpUrl = K8S_QUERY_SVC_URL_DEFAULT  # Usar HttpUrl
-    AUTH_SERVICE_URL: Optional[HttpUrl] = None # Opcional (GATEWAY_AUTH_SERVICE_URL)
+    # URLs de Servicios Backend
+    INGEST_SERVICE_URL: HttpUrl = K8S_INGEST_SVC_URL_DEFAULT
+    QUERY_SERVICE_URL: HttpUrl = K8S_QUERY_SVC_URL_DEFAULT
+    AUTH_SERVICE_URL: Optional[HttpUrl] = K8S_AUTH_SVC_URL_DEFAULT
 
     # Configuración JWT (Obligatoria)
-    JWT_SECRET: str # Obligatorio, sin valor por defecto inseguro
-    JWT_ALGORITHM: str = "HS256" # Valor por defecto común para Supabase
+    JWT_SECRET: SecretStr # Obligatorio, usar SecretStr para seguridad
+    JWT_ALGORITHM: str = "HS256"
 
-    # Configuración Supabase Admin (Obligatoria)
-    SUPABASE_URL: HttpUrl # Obligatorio, usar HttpUrl
-    SUPABASE_SERVICE_ROLE_KEY: str # Obligatorio, sin valor por defecto inseguro
+    # Configuración PostgreSQL (Obligatoria)
+    POSTGRES_USER: str = POSTGRES_K8S_USER_DEFAULT
+    POSTGRES_PASSWORD: SecretStr # Obligatorio desde Secrets
+    POSTGRES_SERVER: str = POSTGRES_K8S_HOST_DEFAULT
+    POSTGRES_PORT: int = POSTGRES_K8S_PORT_DEFAULT
+    POSTGRES_DB: str = POSTGRES_K8S_DB_DEFAULT
 
     # Configuración de Asociación de Compañía
-    DEFAULT_COMPANY_ID: Optional[str] = None # Opcional, pero necesario para la asociación
+    DEFAULT_COMPANY_ID: Optional[str] = None # UUID de compañía por defecto
 
     # Configuración General
     LOG_LEVEL: str = "INFO"
-    HTTP_CLIENT_TIMEOUT: int = 60 # Timeout en segundos para llamadas downstream
-    # Nombre de Pydantic (KEEPALIAS) vs httpx (keepalive) - Mantener el de Pydantic si la variable de entorno se llama así.
-    HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS: int = 100 # Máximo conexiones keep-alive
-    HTTP_CLIENT_MAX_CONNECTIONS: int = 200 # Máximo conexiones totales
+    HTTP_CLIENT_TIMEOUT: int = 60
+    # Corregido: KEEPALIVE en lugar de KEEPALIAS
+    HTTP_CLIENT_MAX_KEEPALIVE_CONNECTIONS: int = 100
+    HTTP_CLIENT_MAX_CONNECTIONS: int = 200
+
+    # CORS (Opcional - URLs de ejemplo, ajusta según necesites)
+    VERCEL_FRONTEND_URL: Optional[str] = "https://atenex-frontend.vercel.app"
+    # NGROK_URL: Optional[str] = None
 
     # Validadores Pydantic
     @validator('JWT_SECRET')
     def check_jwt_secret(cls, v):
-        if not v or v == "YOUR_DEFAULT_JWT_SECRET_KEY_CHANGE_ME_IN_ENV_OR_SECRET":
-            raise ValueError("GATEWAY_JWT_SECRET is not set or uses the insecure default value.")
-        # Podría añadirse una validación de longitud mínima si se desea
+        # get_secret_value() se usa al *usar* el secreto, aquí solo verificamos que no esté vacío
+        if not v or v.get_secret_value() == "YOUR_DEFAULT_JWT_SECRET_KEY_CHANGE_ME_IN_ENV_OR_SECRET":
+            raise ValueError("GATEWAY_JWT_SECRET is not set or uses an insecure default value.")
         return v
 
-    @validator('SUPABASE_SERVICE_ROLE_KEY')
-    def check_supabase_service_key(cls, v):
-        if not v or v == "YOUR_SUPABASE_SERVICE_ROLE_KEY_HERE":
-            raise ValueError("GATEWAY_SUPABASE_SERVICE_ROLE_KEY is not set or uses the insecure default value.")
-        # Podría añadirse validación de formato si Supabase tiene uno específico (ej. longitud)
-        return v
-
-    # La validación de URL ahora la hace Pydantic con HttpUrl, no se necesita check_supabase_url
-
-    @validator('DEFAULT_COMPANY_ID', always=True) # always=True para que se ejecute incluso si es None
-    def check_default_company_id_format(cls, v): # Renombrado para claridad
-        if v is not None: # Solo validar si se proporciona un valor
+    @validator('DEFAULT_COMPANY_ID', always=True)
+    def check_default_company_id_format(cls, v):
+        if v is not None:
             try:
-                uuid.UUID(str(v)) # Convertir a string por si acaso
+                uuid.UUID(str(v))
             except ValueError:
                 raise ValueError(f"GATEWAY_DEFAULT_COMPANY_ID ('{v}') is not a valid UUID.")
-        # Si es None, es válido (aunque la lógica de asociación fallará si se necesita)
         return v
 
     @validator('LOG_LEVEL')
@@ -456,64 +546,61 @@ class Settings(BaseSettings):
         normalized_v = v.upper()
         if normalized_v not in valid_levels:
             raise ValueError(f"Invalid LOG_LEVEL '{v}'. Must be one of {valid_levels}")
-        return normalized_v # Normalizar a mayúsculas
+        return normalized_v
 
 # Usar lru_cache para asegurar que las settings se cargan una sola vez
 @lru_cache()
 def get_settings() -> Settings:
-    # Configurar un logger temporal BÁSICO para la carga de settings
-    # Esto evita problemas si el logging completo aún no está configurado
-    temp_log = logging.getLogger("api_gateway.config.loader") # Nombre más específico
+    temp_log = logging.getLogger("atenex_api_gateway.config.loader")
     if not temp_log.handlers:
         handler = logging.StreamHandler(sys.stdout)
-        # Formato simple para logs de carga
         formatter = logging.Formatter('%(levelname)s: %(message)s')
         handler.setFormatter(formatter)
         temp_log.addHandler(handler)
-        temp_log.setLevel(logging.INFO) # Usar INFO para ver mensajes de carga
+        temp_log.setLevel(logging.INFO)
 
-    temp_log.info("Loading Gateway settings...")
+    temp_log.info("Loading Atenex Gateway settings...")
     try:
-        # Pydantic-settings leerá las variables de entorno/archivo .env
-        # y ejecutará los validadores
         settings_instance = Settings()
 
-        # Loguear valores cargados (excepto secretos) - Convertir HttpUrl a string para loggear
-        temp_log.info("Gateway Settings Loaded Successfully:")
+        # Loguear valores cargados (excepto secretos)
+        temp_log.info("Atenex Gateway Settings Loaded Successfully:")
         temp_log.info(f"  PROJECT_NAME: {settings_instance.PROJECT_NAME}")
         temp_log.info(f"  INGEST_SERVICE_URL: {str(settings_instance.INGEST_SERVICE_URL)}")
         temp_log.info(f"  QUERY_SERVICE_URL: {str(settings_instance.QUERY_SERVICE_URL)}")
         temp_log.info(f"  AUTH_SERVICE_URL: {str(settings_instance.AUTH_SERVICE_URL) if settings_instance.AUTH_SERVICE_URL else 'Not Set'}")
         temp_log.info(f"  JWT_SECRET: *** SET (Validated) ***")
         temp_log.info(f"  JWT_ALGORITHM: {settings_instance.JWT_ALGORITHM}")
-        temp_log.info(f"  SUPABASE_URL: {str(settings_instance.SUPABASE_URL)}")
-        temp_log.info(f"  SUPABASE_SERVICE_ROLE_KEY: *** SET (Validated) ***")
+        temp_log.info(f"  POSTGRES_SERVER: {settings_instance.POSTGRES_SERVER}")
+        temp_log.info(f"  POSTGRES_PORT: {settings_instance.POSTGRES_PORT}")
+        temp_log.info(f"  POSTGRES_DB: {settings_instance.POSTGRES_DB}")
+        temp_log.info(f"  POSTGRES_USER: {settings_instance.POSTGRES_USER}")
+        temp_log.info(f"  POSTGRES_PASSWORD: *** SET ***")
         if settings_instance.DEFAULT_COMPANY_ID:
             temp_log.info(f"  DEFAULT_COMPANY_ID: {settings_instance.DEFAULT_COMPANY_ID} (Validated as UUID if set)")
         else:
-            # Es una advertencia porque el endpoint de asociación fallará si se llama
             temp_log.warning("  DEFAULT_COMPANY_ID: Not Set (Ensure-company endpoint requires this)")
         temp_log.info(f"  LOG_LEVEL: {settings_instance.LOG_LEVEL}")
         temp_log.info(f"  HTTP_CLIENT_TIMEOUT: {settings_instance.HTTP_CLIENT_TIMEOUT}")
         temp_log.info(f"  HTTP_CLIENT_MAX_CONNECTIONS: {settings_instance.HTTP_CLIENT_MAX_CONNECTIONS}")
-        temp_log.info(f"  HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS: {settings_instance.HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS}")
+        temp_log.info(f"  HTTP_CLIENT_MAX_KEEPALIVE_CONNECTIONS: {settings_instance.HTTP_CLIENT_MAX_KEEPALIVE_CONNECTIONS}")
+        temp_log.info(f"  VERCEL_FRONTEND_URL: {settings_instance.VERCEL_FRONTEND_URL or 'Not Set'}")
+        # temp_log.info(f"  NGROK_URL: {settings_instance.NGROK_URL or 'Not Set'}")
 
         return settings_instance
 
     except ValidationError as e:
-        # Captura errores de validación de Pydantic (incluyendo los validadores personalizados)
         temp_log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        temp_log.critical("! FATAL: Error validating Gateway settings:")
+        temp_log.critical("! FATAL: Error validating Atenex Gateway settings:")
         for error in e.errors():
             loc = " -> ".join(map(str, error['loc'])) if error.get('loc') else 'N/A'
             temp_log.critical(f"!  - {loc}: {error['msg']}")
-        temp_log.critical("! Check your .env file or environment variables.")
+        temp_log.critical("! Check your Kubernetes ConfigMap/Secrets or .env file.")
         temp_log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        sys.exit("FATAL: Invalid Gateway configuration. Check logs.")
+        sys.exit("FATAL: Invalid Atenex Gateway configuration. Check logs.")
     except Exception as e:
-        # Captura cualquier otro error durante la carga
-        temp_log.exception(f"FATAL: Unexpected error loading Gateway settings: {e}")
-        sys.exit(f"FATAL: Unexpected error loading Gateway settings: {e}")
+        temp_log.exception(f"FATAL: Unexpected error loading Atenex Gateway settings: {e}")
+        sys.exit(f"FATAL: Unexpected error loading Atenex Gateway settings: {e}")
 
 # Crear instancia global de settings
 settings = get_settings()
@@ -607,12 +694,200 @@ def setup_logging():
     log.info("Structlog logging configured", log_level=settings.LOG_LEVEL.upper())
 ```
 
+## File: `app\db\postgres_client.py`
+```py
+# File: app/db/postgres_client.py
+# api-gateway/app/db/postgres_client.py
+import uuid
+from typing import Any, Optional, Dict, List
+import asyncpg
+import structlog
+import json
+
+from app.core.config import settings
+
+log = structlog.get_logger(__name__)
+
+_pool: Optional[asyncpg.Pool] = None
+
+async def get_db_pool() -> asyncpg.Pool:
+    """
+    Obtiene o crea el pool de conexiones a la base de datos PostgreSQL.
+    """
+    global _pool
+    if _pool is None or _pool._closed: # Recrea el pool si está cerrado
+        try:
+            log.info("Creating PostgreSQL connection pool...",
+                     host=settings.POSTGRES_SERVER,
+                     port=settings.POSTGRES_PORT,
+                     user=settings.POSTGRES_USER,
+                     database=settings.POSTGRES_DB)
+
+            # Asegúrate de que el codec jsonb esté registrado si usas JSONB
+            def _json_encoder(value):
+                return json.dumps(value)
+            def _json_decoder(value):
+                return json.loads(value)
+
+            async def init_connection(conn):
+                 await conn.set_type_codec(
+                     'jsonb',
+                     encoder=_json_encoder,
+                     decoder=_json_decoder,
+                     schema='pg_catalog'
+                 )
+                 await conn.set_type_codec(
+                      'json',
+                      encoder=_json_encoder,
+                      decoder=_json_decoder,
+                      schema='pg_catalog'
+                  )
+
+            _pool = await asyncpg.create_pool(
+                user=settings.POSTGRES_USER,
+                password=settings.POSTGRES_PASSWORD.get_secret_value(), # Obtener valor del SecretStr
+                database=settings.POSTGRES_DB,
+                host=settings.POSTGRES_SERVER,
+                port=settings.POSTGRES_PORT,
+                min_size=5,   # Ajusta según necesidad
+                max_size=20,  # Ajusta según necesidad
+                statement_cache_size=0, # Deshabilitar caché para evitar problemas con tipos dinámicos
+                init=init_connection # Añadir inicializador para codecs JSON/JSONB
+            )
+            log.info("PostgreSQL connection pool created successfully.")
+        except Exception as e:
+            log.error("Failed to create PostgreSQL connection pool",
+                      error=str(e), error_type=type(e).__name__,
+                      host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT,
+                      db=settings.POSTGRES_DB, user=settings.POSTGRES_USER,
+                      exc_info=True)
+            _pool = None # Asegurar que el pool es None si falla la creación
+            raise # Relanzar para que el inicio de la app falle si no hay DB
+    return _pool
+
+async def close_db_pool():
+    """Cierra el pool de conexiones a la base de datos."""
+    global _pool
+    if _pool and not _pool._closed:
+        log.info("Closing PostgreSQL connection pool...")
+        await _pool.close()
+        _pool = None # Resetear la variable global
+        log.info("PostgreSQL connection pool closed successfully.")
+    elif _pool and _pool._closed:
+        log.warning("Attempted to close an already closed PostgreSQL pool.")
+        _pool = None
+    else:
+        log.info("No active PostgreSQL connection pool to close.")
+
+
+async def check_db_connection() -> bool:
+    """Verifica que la conexión a la base de datos esté funcionando."""
+    pool = None # Asegurar inicialización
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            result = await conn.fetchval("SELECT 1")
+        return result == 1
+    except Exception as e:
+        log.error("Database connection check failed", error=str(e))
+        return False
+    # No cerrar el pool aquí, solo verificar
+
+# --- Métodos específicos para la tabla USERS ---
+
+async def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
+    """
+    Recupera un usuario por su email.
+    Devuelve un diccionario con los datos del usuario o None si no se encuentra.
+    Alineado con el esquema USERS.
+    """
+    pool = await get_db_pool()
+    query = """
+        SELECT id, company_id, email, hashed_password, full_name, role,
+               created_at, last_login, is_active
+        FROM users
+        WHERE lower(email) = lower($1)
+    """
+    # No filtramos por is_active aquí, la lógica de autenticación puede decidir
+    log.debug("Executing get_user_by_email query", email=email)
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(query, email)
+        if row:
+            log.debug("User found by email", user_id=str(row['id']))
+            return dict(row) # Convertir asyncpg.Record a dict
+        else:
+            log.debug("User not found by email", email=email)
+            return None
+    except Exception as e:
+        log.error("Error getting user by email", error=str(e), email=email, exc_info=True)
+        raise # Relanzar para manejo de errores superior
+
+async def get_user_by_id(user_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+    """
+    Recupera un usuario por su ID (UUID).
+    Devuelve un diccionario con los datos del usuario o None si no se encuentra.
+    Alineado con el esquema USERS. Excluye la contraseña hash por seguridad.
+    """
+    pool = await get_db_pool()
+    query = """
+        SELECT id, company_id, email, full_name, role,
+               created_at, last_login, is_active
+        FROM users
+        WHERE id = $1
+    """
+    log.debug("Executing get_user_by_id query", user_id=str(user_id))
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(query, user_id)
+        if row:
+            log.debug("User found by ID", user_id=str(user_id))
+            return dict(row)
+        else:
+            log.debug("User not found by ID", user_id=str(user_id))
+            return None
+    except Exception as e:
+        log.error("Error getting user by ID", error=str(e), user_id=str(user_id), exc_info=True)
+        raise
+
+async def update_user_company(user_id: uuid.UUID, company_id: uuid.UUID) -> bool:
+    """
+    Actualiza el company_id para un usuario específico y actualiza last_login.
+    Devuelve True si la actualización fue exitosa (al menos una fila afectada), False en caso contrario.
+    Alineado con el esquema USERS.
+    """
+    pool = await get_db_pool()
+    query = """
+        UPDATE users
+        SET company_id = $2, updated_at = NOW()
+        WHERE id = $1
+        RETURNING id -- Devolvemos el ID para confirmar la actualización
+    """
+    log.debug("Executing update_user_company query", user_id=str(user_id), company_id=str(company_id))
+    try:
+        async with pool.acquire() as conn:
+            # Usar fetchval para obtener el ID devuelto o None
+            result = await conn.fetchval(query, user_id, company_id)
+        if result is not None:
+            log.info("User company updated successfully", user_id=str(user_id), new_company_id=str(company_id))
+            return True
+        else:
+            # Esto podría suceder si el user_id no existe
+            log.warning("Update user company command executed but no rows were affected.", user_id=str(user_id))
+            return False
+    except Exception as e:
+        log.error("Error updating user company", error=str(e), user_id=str(user_id), company_id=str(company_id), exc_info=True)
+        raise
+
+```
+
 ## File: `app\main.py`
 ```py
+# File: app/main.py
 # api-gateway/app/main.py
 import os
 from fastapi import FastAPI, Request, Depends, HTTPException, status
-from typing import Optional
+from typing import Optional, List, Set
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -621,144 +896,282 @@ import structlog
 import uvicorn
 import time
 import uuid
-import logging # <-- Importar logging estándar
-from supabase.client import Client as SupabaseClient
+import logging # Importar logging estándar para configuración inicial
 
-# Configurar logging ANTES de importar otros módulos que puedan loguear
+# --- Configuración de Logging PRIMERO ---
+# Asegura que el logging esté listo antes de importar otros módulos
 from app.core.logging_config import setup_logging
 setup_logging()
-# Ahora importar el resto
+
+# --- Importaciones Post-Logging ---
 from app.core.config import settings
-from app.utils.supabase_admin import get_supabase_admin_client
-from app.routers import gateway_router, user_router
-# *** CORRECCIÓN: Comentar o eliminar importación de auth_router si ya no se usa ***
-# from app.routers import auth_router
-# Importar dependencias de autenticación para verificar su carga
-from app.auth.auth_middleware import StrictAuth, InitialAuth
+from app.db import postgres_client # Importar cliente DB
+from app.routers import gateway_router, user_router # Importar routers
+# (Opcional) Importar dependencias para verificar carga si es necesario
+# from app.auth.auth_middleware import StrictAuth, InitialAuth
 
-log = structlog.get_logger("api_gateway.main") # Logger para el módulo main
+# Logger principal para este módulo
+log = structlog.get_logger("atenex_api_gateway.main")
 
-# Clientes globales que se inicializarán en el lifespan
+# --- Clientes Globales (Inicializados en Lifespan) ---
 proxy_http_client: Optional[httpx.AsyncClient] = None
-supabase_admin_client: Optional[SupabaseClient] = None
+# No necesitamos una variable global para el pool de DB, usamos postgres_client.get_db_pool()
 
-# --- Lifespan para inicializar/cerrar clientes (Sin cambios) ---
+# --- Lifespan Manager (Startup y Shutdown) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global proxy_http_client, supabase_admin_client
-    log.info("Application startup: Initializing global clients...")
+    global proxy_http_client
+    log.info("Application startup sequence initiated...")
+
+    # 1. Inicializar Cliente HTTP para Proxying
     try:
+        log.info("Initializing global HTTPX client for proxying...")
         limits = httpx.Limits(
-            max_keepalive_connections=settings.HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS,
+            max_keepalive_connections=settings.HTTP_CLIENT_MAX_KEEPALIVE_CONNECTIONS,
             max_connections=settings.HTTP_CLIENT_MAX_CONNECTIONS
         )
-        timeout = httpx.Timeout(settings.HTTP_CLIENT_TIMEOUT, connect=10.0)
-        proxy_http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=False, http2=True)
+        timeout = httpx.Timeout(settings.HTTP_CLIENT_TIMEOUT, connect=10.0) # Timeout global
+        proxy_http_client = httpx.AsyncClient(
+            limits=limits,
+            timeout=timeout,
+            follow_redirects=False, # El gateway no debe seguir redirecciones
+            http2=True # Habilitar HTTP/2 si los backends lo soportan
+        )
+        # Inyectar el cliente en el router del gateway para que lo use
         gateway_router.http_client = proxy_http_client
-        log.info("HTTP Client initialized successfully.", limits=str(limits), timeout=str(timeout))
+        log.info("HTTPX client initialized successfully.", limits=str(limits), timeout=str(timeout))
     except Exception as e:
-        log.exception("CRITICAL: Failed to initialize HTTP client during startup!", error=str(e))
-        proxy_http_client = None; gateway_router.http_client = None
-    log.info("Initializing Supabase Admin Client...")
+        log.exception("CRITICAL: Failed to initialize HTTPX client during startup!", error=str(e))
+        # Si el cliente HTTP falla, el proxy no funcionará. Podríamos decidir salir.
+        proxy_http_client = None
+        gateway_router.http_client = None
+        # raise RuntimeError("Failed to initialize HTTP client, cannot start gateway.") from e
+
+    # 2. Inicializar y Verificar Conexión a PostgreSQL
+    log.info("Initializing and verifying PostgreSQL connection pool...")
+    db_pool_ok = False
     try:
-        supabase_admin_client = get_supabase_admin_client()
-        user_router.supabase_admin = supabase_admin_client # Inyección simple, mejor Depends
-        log.info("Supabase Admin Client reference obtained (initialized via get_supabase_admin_client).")
+        # get_db_pool() creará el pool si no existe
+        pool = await postgres_client.get_db_pool()
+        if pool:
+             # Verificar conexión real
+             db_pool_ok = await postgres_client.check_db_connection()
+             if db_pool_ok:
+                 log.info("PostgreSQL connection pool initialized and connection verified.")
+             else:
+                  log.critical("PostgreSQL pool initialized BUT connection check failed!")
+                  # Podríamos cerrar el pool recién creado si la verificación falla
+                  await postgres_client.close_db_pool()
+        else:
+             log.critical("PostgreSQL connection pool initialization returned None!")
+
     except Exception as e:
-        log.exception("CRITICAL: Failed to get Supabase Admin Client during startup!", error=str(e))
-        supabase_admin_client = None; user_router.supabase_admin = None
-    yield
-    log.info("Application shutdown: Closing clients...")
+        log.exception("CRITICAL: Failed to initialize or verify PostgreSQL connection during startup!", error=str(e))
+        # La app puede seguir, pero las funciones DB fallarán. get_db_pool relanzará si hay error.
+
+    # Si alguna dependencia crítica falló, podríamos loguearlo de nuevo aquí
+    if not proxy_http_client:
+        log.warning("Startup warning: HTTP client is not available.")
+    if not db_pool_ok:
+        log.warning("Startup warning: PostgreSQL connection is not available.")
+
+    # --- Aplicación Lista para Recibir Tráfico ---
+    log.info("Application startup sequence complete. Ready to serve requests.")
+    yield # <--- La aplicación se ejecuta aquí
+
+    # --- Shutdown Sequence ---
+    log.info("Application shutdown sequence initiated...")
+
+    # 1. Cerrar Cliente HTTP
     if proxy_http_client and not proxy_http_client.is_closed:
-        try: await proxy_http_client.aclose(); log.info("HTTP Client closed successfully.")
-        except Exception as e: log.exception("Error closing HTTP client during shutdown.", error=str(e))
-    log.info("Supabase Admin Client shutdown check complete (no explicit close needed).")
+        log.info("Closing global HTTPX client...")
+        try:
+            await proxy_http_client.aclose()
+            log.info("HTTPX client closed successfully.")
+        except Exception as e:
+            log.exception("Error closing HTTPX client during shutdown.", error=str(e))
+
+    # 2. Cerrar Pool de PostgreSQL
+    log.info("Closing PostgreSQL connection pool...")
+    try:
+        await postgres_client.close_db_pool()
+        # El log de éxito/info ya está en close_db_pool()
+    except Exception as e:
+        log.exception("Error closing PostgreSQL connection pool during shutdown.", error=str(e))
+
+    log.info("Application shutdown sequence complete.")
 
 
 # --- Creación de la App FastAPI ---
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    description="Punto de entrada único y seguro para los microservicios de Nyro. Valida JWTs de Supabase, gestiona asociación inicial de compañía y reenvía tráfico a servicios backend.",
-    version="1.0.0",
-    lifespan=lifespan,
+    description="Atenex API Gateway: Punto de entrada único, autenticación JWT, enrutamiento a microservicios backend (Ingest, Query).",
+    version="1.0.1", # O la versión que uses
+    lifespan=lifespan, # Usar el gestor de contexto lifespan
+    # openapi_url=f"{settings.API_V1_STR}/openapi.json" # Opcional: ruta para spec OpenAPI
 )
 
 # --- Middlewares ---
 
-# 1. CORS Middleware (Configuración robusta - Sin cambios respecto a tu código)
-allowed_origins = []
-vercel_url = os.getenv("VERCEL_FRONTEND_URL", "https://atenex-frontend.vercel.app")
-allowed_origins.append(vercel_url)
-localhost_url = "http://localhost:3000"
-allowed_origins.append(localhost_url)
-ngrok_url_env = os.getenv("NGROK_URL")
-if ngrok_url_env:
-    if ngrok_url_env.startswith("https://") and ".ngrok" in ngrok_url_env:
-        allowed_origins.append(ngrok_url_env)
-ngrok_url_from_logs = "https://1942-2001-1388-53a1-a7c9-241c-4a44-2b12-938f.ngrok-free.app"
-if ngrok_url_from_logs not in allowed_origins:
-    allowed_origins.append(ngrok_url_from_logs)
-allowed_origins = list(set(filter(None, allowed_origins)))
-allowed_headers = ["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With", "ngrok-skip-browser-warning", "X-Request-ID"]
-allowed_methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
-log.info("Final CORS Allowed Origins:", origins=allowed_origins)
-log.info("CORS Allowed Headers:", headers=allowed_headers)
-log.info("CORS Allowed Methods:", methods=allowed_methods)
-app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_credentials=True, allow_methods=allowed_methods, allow_headers=allowed_headers, expose_headers=["X-Request-ID", "X-Process-Time"], max_age=600)
+# 1. CORS Middleware
+# Construir lista de orígenes permitidos dinámicamente
+allowed_origins: List[str] = []
+if settings.VERCEL_FRONTEND_URL:
+    allowed_origins.append(settings.VERCEL_FRONTEND_URL)
+# Añadir localhost para desarrollo local del frontend
+allowed_origins.append("http://localhost:3000")
+allowed_origins.append("http://localhost:3001") # Puerto alternativo común
 
-# 2. Middleware Request ID, Timing, Logging (Sin cambios respecto a tu código)
+# Permitir NGROK si está configurado (útil para demos/webhooks)
+# ngrok_url = os.getenv("NGROK_URL") # Leer directamente de env o desde settings
+# if ngrok_url and ngrok_url.startswith("https://") and ".ngrok" in ngrok_url:
+#     allowed_origins.append(ngrok_url)
+
+# Eliminar duplicados y None/empty strings
+allowed_origins = list(filter(None, set(allowed_origins)))
+
+log.info("Configuring CORS middleware", allowed_origins=allowed_origins)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins if allowed_origins else ["*"], # Permitir todo si no hay orígenes específicos
+    allow_credentials=True, # Importante para cookies/auth headers
+    allow_methods=["*"],   # Permitir todos los métodos estándar
+    allow_headers=["*"],   # Permitir todos los headers (incluye Authorization, Content-Type, X-Request-ID, etc.)
+    expose_headers=["X-Request-ID", "X-Process-Time"], # Headers que el frontend puede leer
+    max_age=600, # Tiempo en segundos que el navegador cachea la respuesta preflight OPTIONS
+)
+
+# 2. Middleware para Request ID, Timing y Logging Estructurado
 @app.middleware("http")
-async def add_request_id_timing_logging(request: Request, call_next):
-    start_time = time.time(); request_id = request.headers.get("x-request-id", str(uuid.uuid4())); request.state.request_id = request_id
-    with structlog.contextvars.bound_contextvars(request_id=request_id):
-        bound_log = structlog.get_logger("api_gateway.requests")
-        bound_log.info("Request received", method=request.method, path=request.url.path, client_ip=request.client.host if request.client else "N/A", user_agent=request.headers.get("user-agent", "N/A")[:100])
-        response = None
-        try:
-            response = await call_next(request)
-            process_time = time.time() - start_time
-            response.headers["X-Process-Time"] = f"{process_time:.4f}"; response.headers["X-Request-ID"] = request_id
-            bound_log.info("Request processed successfully", status_code=response.status_code, duration=round(process_time, 4))
-        except Exception as e:
-            process_time = time.time() - start_time
-            bound_log.exception("Unhandled exception during request processing", duration=round(process_time, 4), error_type=type(e).__name__, error=str(e))
-            raise e
-        finally: pass
+async def add_request_context_timing_logging(request: Request, call_next):
+    start_time = time.perf_counter() # Usar perf_counter para mejor precisión
+    # Obtener o generar Request ID
+    request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    # Poner request_id en el estado para acceso fácil en otros lugares
+    request.state.request_id = request_id
+
+    # Crear un logger contextual para esta request
+    request_log = log.bind(
+        request_id=request_id,
+        method=request.method,
+        path=request.url.path,
+        client_ip=request.client.host if request.client else "unknown"
+    )
+
+    request_log.info("Request received")
+
+    response = None
+    status_code = 500 # Default en caso de error no manejado antes de la respuesta
+    process_time_ms = 0
+
+    try:
+        # Llamar al siguiente middleware o a la ruta
+        response = await call_next(request)
+        status_code = response.status_code
+
+    except Exception as e:
+        # Capturar excepciones no manejadas por los handlers de FastAPI o rutas
+        process_time_ms = (time.perf_counter() - start_time) * 1000
+        request_log.exception("Unhandled exception during request processing",
+                              error=str(e), status_code=status_code, # status_code puede ser 500 aquí
+                              process_time_ms=round(process_time_ms, 2))
+
+        # Crear una respuesta de error genérica 500
+        response = JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": "Internal Server Error"}
+        )
+        # Añadir request ID al header de error también
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Process-Time"] = f"{process_time_ms:.2f}ms"
+        # Devolver la respuesta de error
         return response
+    finally:
+        # Calcular tiempo de procesamiento final (incluso si hubo excepción antes de la respuesta)
+        # Si la respuesta se creó en el 'except', este cálculo es redundante, pero inofensivo
+        if response: # Asegurar que response existe
+            process_time_ms = (time.perf_counter() - start_time) * 1000
+            # Añadir headers de Request ID y Timing a la respuesta final
+            response.headers["X-Request-ID"] = request_id
+            response.headers["X-Process-Time"] = f"{process_time_ms:.2f}ms"
 
-# --- Routers ---
-# *** CORRECCIÓN: Comentar o eliminar inclusión de auth_router si ya no se usa o está vacío ***
-# app.include_router(auth_router.router) # Ya no necesario si no hay rutas auth en gateway
-app.include_router(gateway_router.router) # Proxy principal
-app.include_router(user_router.router) # Rutas relacionadas con usuario (si las hay)
+            # Log final con estado y tiempo
+            # No loguear health checks en INFO para no llenar logs
+            log_level = "debug" if request.url.path == "/health" else "info"
+            log_func = getattr(request_log, log_level)
+            log_func("Request completed",
+                     status_code=status_code,
+                     process_time_ms=round(process_time_ms, 2))
 
-# --- Endpoints Básicos (Sin cambios) ---
-@app.get("/", tags=["Gateway Status"], summary="Root endpoint", include_in_schema=False)
-async def root(): return {"message": f"{settings.PROJECT_NAME} is running!"}
-@app.get("/health", tags=["Gateway Status"], summary="Kubernetes Health Check", status_code=status.HTTP_200_OK, response_description="Indicates if the gateway and its core dependencies are healthy.")
+    return response
+
+
+# --- Incluir Routers ---
+log.info("Including application routers...")
+# Rutas de usuario (login, ensure-company)
+app.include_router(user_router.router, tags=["Users & Authentication"])
+# Rutas de gateway (proxy)
+app.include_router(gateway_router.router) # Tags definidos dentro del router
+# El router de auth (/api/v1/auth/*) está deshabilitado o manejado por gateway_router si AUTH_SERVICE_URL está seteado
+# app.include_router(auth_router.router) # Comentado/Eliminado
+
+log.info("Routers included successfully.")
+
+# --- Endpoint Raíz y Health Check ---
+@app.get("/", tags=["General"], summary="Root endpoint indicating service is running")
+async def read_root():
+    """Endpoint raíz simple para indicar que el gateway está activo."""
+    return {"message": f"{settings.PROJECT_NAME} is running!"}
+
+@app.get("/health", tags=["Health"], summary="Basic health check endpoint")
 async def health_check():
-    admin_client_status = "available" if supabase_admin_client else "unavailable"
-    http_client_status = "available" if proxy_http_client and not proxy_http_client.is_closed else "unavailable"
-    is_healthy = admin_client_status == "available" and http_client_status == "available"
-    health_details = {"status": "healthy" if is_healthy else "unhealthy", "service": settings.PROJECT_NAME, "dependencies": {"supabase_admin_client": admin_client_status, "proxy_http_client": http_client_status}}
-    if not is_healthy: log.error("Health check failed", details=health_details); raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=health_details)
-    log.debug("Health check passed.", details=health_details); return health_details
+    """
+    Verifica la salud básica del servicio.
+    Podría extenderse para verificar dependencias (DB, HTTP Client).
+    """
+    # Estado básico
+    health_status = {"status": "healthy", "service": settings.PROJECT_NAME}
+    # Opcional: Verificar dependencias (puede añadir latencia)
+    # http_ok = gateway_router.http_client and not gateway_router.http_client.is_closed
+    # db_ok = await postgres_client.check_db_connection()
+    # if not http_ok or not db_ok:
+    #     health_status["status"] = "unhealthy"
+    #     health_status["checks"] = {"http_client": http_ok, "database": db_ok}
+    #     return JSONResponse(content=health_status, status_code=503)
 
-# --- Manejadores de Excepciones Globales (Sin cambios) ---
-@app.exception_handler(HTTPException)
-async def custom_http_exception_handler(request: Request, exc: HTTPException):
-    req_id = getattr(request.state, 'request_id', 'N/A'); bound_log = log.bind(request_id=req_id)
-    log_level_name = "warning" if 400 <= exc.status_code < 500 else "error"; log_method = getattr(bound_log, log_level_name, bound_log.info)
-    log_method("HTTP Exception occurred", status_code=exc.status_code, detail=exc.detail, path=request.url.path, exception_headers=exc.headers)
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
-@app.exception_handler(Exception)
-async def generic_exception_handler(request: Request, exc: Exception):
-    req_id = getattr(request.state, 'request_id', 'N/A'); bound_log = log.bind(request_id=req_id)
-    bound_log.exception("Unhandled internal server error occurred in gateway", path=request.url.path, error_type=type(exc).__name__)
-    return JSONResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content={"detail": "An unexpected internal server error occurred."})
+    return health_status
 
-# --- Log final de configuración (Sin cambios) ---
-log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start.", log_level=settings.LOG_LEVEL, ingest_service=str(settings.INGEST_SERVICE_URL), query_service=str(settings.QUERY_SERVICE_URL), auth_proxy_enabled=bool(settings.AUTH_SERVICE_URL), supabase_url=str(settings.SUPABASE_URL), default_company_id_set=bool(settings.DEFAULT_COMPANY_ID))
+# --- Verificación de Dependencias en Startup (Opcional pero útil) ---
+# Se ejecuta después de que el lifespan 'yield' ha ocurrido pero antes de aceptar tráfico.
+# @app.on_event("startup")
+# async def verify_lifespan_dependencies_post_yield():
+#     """Verificación adicional de dependencias críticas después de la inicialización."""
+#     log.info("Performing post-lifespan dependency verification...")
+#     if not gateway_router.http_client:
+#         log.critical("POST-STARTUP CHECK FAILED: HTTP Client is not available!")
+#     # Verificar conexión a PostgreSQL de nuevo
+#     try:
+#         db_connected = await postgres_client.check_db_connection()
+#         if not db_connected:
+#             log.critical("POST-STARTUP CHECK FAILED: PostgreSQL connection check failed!")
+#     except Exception as e:
+#         log.critical("POST-STARTUP CHECK FAILED: PostgreSQL connection check error!", error=str(e))
+#     log.info("Post-lifespan dependency verification complete.")
+
+
+# --- Ejecución (para desarrollo local o si no se usa Gunicorn/Uvicorn directo) ---
+if __name__ == "__main__":
+    # Esto se usa generalmente para desarrollo local con --reload
+    # En producción, Gunicorn + Uvicorn workers se encargan de ejecutar la app
+    print(f"Starting {settings.PROJECT_NAME} using Uvicorn...")
+    uvicorn.run(
+        "app.main:app",
+        host="0.0.0.0",
+        port=8080, # Puerto estándar para contenedores
+        reload=True, # Habilitar reload solo para desarrollo local
+        log_level=settings.LOG_LEVEL.lower(), # Usar nivel de log de config
+        # workers=1 # Uvicorn en modo reload usualmente usa 1 worker
+    )
 ```
 
 ## File: `app\routers\__init__.py`
@@ -768,51 +1181,28 @@ log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start."
 
 ## File: `app\routers\auth_router.py`
 ```py
+# File: app/routers/auth_router.py
 # api-gateway/app/routers/auth_router.py
-from fastapi import APIRouter, Depends, HTTPException, status, Request, Body
-from pydantic import BaseModel, EmailStr, Field
-from typing import Annotated, Dict, Any, Optional
+from fastapi import APIRouter
 import structlog
-import uuid
-
-# Dependencias (Aunque no se usen ahora, las dejamos por si se añaden otras rutas)
-from app.utils.supabase_admin import get_supabase_admin_client
-from supabase import Client as SupabaseClient
-from gotrue.errors import AuthApiError
-from postgrest.exceptions import APIError as PostgrestError
-
-from app.core.config import settings
 
 log = structlog.get_logger(__name__)
-# Cambiado el prefijo o eliminarlo si ya no hay rutas de auth manejadas aquí
-# router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
-router = APIRouter() # Sin prefijo, o comenta la inclusión en main.py
 
-# --- Pydantic Models (Ya no se usan para registro) ---
-# class RegisterPayload(BaseModel):
-#    email: EmailStr
-#    password: str = Field(..., min_length=8)
-#    name: Optional[str] = Field(None, min_length=2)
-#
-# class RegisterResponse(BaseModel):
-#    message: str
-#    user_id: Optional[uuid.UUID] = None
+# Este router ya no define rutas activas.
+# El login está en user_router.
+# El proxy /api/v1/auth/* se define en gateway_router si settings.AUTH_SERVICE_URL está configurado.
+router = APIRouter()
 
+log.info("Auth router loaded (currently defines no active endpoints).")
 
-# --- Endpoint de Registro ELIMINADO ---
-# La ruta POST /api/v1/auth/register ya no existirá o devolverá 404/501
-# si el router está montado pero la ruta no está definida,
-# o si el Auth Service Proxy (si estaba habilitado) ya no se usa.
-
-# Puedes añadir aquí otros endpoints de auth si los gestiona el gateway
-# (ej: refrescar token, obtener perfil propio), pero si no, este
-# archivo puede quedar vacío o eliminarse junto con su inclusión en main.py.
-
-log.info("Auth router loaded (registration endpoint removed/disabled).")
+# Puedes eliminar este archivo si no planeas añadir rutas específicas bajo /api/v1/auth
+# que NO sean proxy al AUTH_SERVICE_URL. Si lo eliminas, asegúrate de quitar
+# la línea 'app.include_router(auth_router.router)' en app/main.py.
 ```
 
 ## File: `app\routers\gateway_router.py`
 ```py
+# File: app/routers/gateway_router.py
 # api-gateway/app/routers/gateway_router.py
 from fastapi import APIRouter, Request, Response, Depends, HTTPException, status, Path
 from fastapi.responses import StreamingResponse
@@ -823,30 +1213,38 @@ import asyncio
 import uuid
 
 from app.core.config import settings
-from app.auth.auth_middleware import StrictAuth # Dependencia estándar
+# Importar dependencias de autenticación y tipo anotado
+from app.auth.auth_middleware import StrictAuth, InitialAuth # Se necesitan ambos aquí si alguna ruta usa InitialAuth
 
-# Logs más específicos para este router
-log = structlog.get_logger("api_gateway.router.gateway")
-# Log específico para la dependencia (para ver si se resuelve)
-dep_log = structlog.get_logger("api_gateway.dependency.client")
-auth_dep_log = structlog.get_logger("api_gateway.dependency.auth")
+# --- Definición del Router y Loggers PRIMERO ---
+log = structlog.get_logger("atenex_api_gateway.router.gateway")
+dep_log = structlog.get_logger("atenex_api_gateway.dependency.client")
+auth_dep_log = structlog.get_logger("atenex_api_gateway.dependency.auth")
 
+router = APIRouter() # Router principal para las rutas proxy
+# ------------------------------------------------
 
-# Cliente HTTP global (inyectado desde lifespan)
+# Cliente HTTP global (inyectado desde lifespan en main.py)
 http_client: Optional[httpx.AsyncClient] = None
 
-# Cabeceras Hop-by-Hop
+# Cabeceras Hop-by-Hop a excluir al hacer proxy
 HOP_BY_HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers", "transfer-encoding", "upgrade", "host",
-    "content-length",
+    "te", "trailers", "transfer-encoding", "upgrade",
+    # 'host' se maneja por separado
+    # 'content-length' se recalcula o elimina para streaming/chunked
+    "content-encoding", # El backend debe manejar la descompresión si acepta gzip/deflate
 }
 
-# Dependencia para obtener el cliente CON LOGGING
+# --- Dependencias con Logging ---
+
+# Dependencia para obtener el cliente HTTP inyectado
 def get_client() -> httpx.AsyncClient:
-    dep_log.debug("Attempting to get HTTP client via dependency...")
+    # Loguear intento de obtención del cliente
+    dep_log.debug("Attempting to resolve HTTP client dependency...")
     if http_client is None or http_client.is_closed:
         dep_log.error("Gateway HTTP client dependency check failed: Client not available or closed.")
+        # Fallar rápido si el cliente no está listo (problema de inicialización)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Gateway service dependency unavailable (HTTP Client)."
@@ -854,276 +1252,563 @@ def get_client() -> httpx.AsyncClient:
     dep_log.info("HTTP client dependency resolved successfully.")
     return http_client
 
-# LOGGING PARA DEPENDENCIA StrictAuth (Envolvemos la original para loggear)
+# Wrapper para loguear el éxito de la dependencia StrictAuth
 async def logged_strict_auth(
-    user_payload: StrictAuth # Dependemos de la dependencia original
+    # Dependemos de la dependencia original 'require_user' que está detrás de StrictAuth
+    user_payload: StrictAuth # StrictAuth ya es Annotated[Dict[str, Any], Depends(require_user)]
 ) -> Dict[str, Any]:
+     # Si llega aquí, require_user tuvo éxito (token válido con company_id)
      auth_dep_log.info("StrictAuth dependency successfully resolved in wrapper.",
                      user_id=user_payload.get('sub'),
                      company_id=user_payload.get('company_id'))
+     # Devolvemos el payload para que la ruta lo pueda usar
      return user_payload
 
-# Alias para usar en las rutas
+# Alias para usar en las rutas proxy protegidas
 LoggedStrictAuth = Annotated[Dict[str, Any], Depends(logged_strict_auth)]
 
-# --- Función interna _proxy_request ---
-# Añadimos logs justo al inicio y antes de enviar la petición
+# --- Función Principal de Proxy ---
+
 async def _proxy_request(
     request: Request,
-    target_url_str: str,
+    target_service_base_url_str: str,
     client: httpx.AsyncClient,
+    # El payload del usuario validado (viene de LoggedStrictAuth o es None para rutas públicas)
     user_payload: Optional[Dict[str, Any]],
+    # El path específico dentro del servicio backend (ej: "/api/v1/chats")
     backend_service_path: str
 ):
     method = request.method
-    # Bind request_id al log aquí también para contexto consistente
-    request_id = getattr(request.state, 'request_id', None)
-    proxy_log = log.bind(request_id=request_id)
+    request_id = getattr(request.state, 'request_id', str(uuid.uuid4())) # Asegurar un request_id
+    # Crear un logger contextual para esta solicitud proxy
+    proxy_log = log.bind(
+        request_id=request_id,
+        method=method,
+        original_path=request.url.path,
+        target_service=target_service_base_url_str,
+        target_path=backend_service_path
+    )
 
-    proxy_log.info(f"Entered _proxy_request for '{method} {request.url.path}'") # Log de entrada
+    proxy_log.info("Initiating proxy request")
 
-    target_service_base_url = httpx.URL(target_url_str)
-    target_url = target_service_base_url.copy_with(path=backend_service_path, query=request.url.query.encode("utf-8"))
+    # Construir la URL completa de destino
+    try:
+        target_base_url = httpx.URL(target_service_base_url_str)
+        # Usar copy_with para combinar base, path y query params originales
+        target_url = target_base_url.copy_with(
+            path=backend_service_path,
+            query=request.url.query.encode("utf-8") # Pasar query params tal cual
+        )
+    except Exception as e:
+        proxy_log.error("Failed to construct target URL", error=str(e))
+        raise HTTPException(status_code=500, detail="Internal gateway configuration error.")
 
-    # 1. Preparar Headers
+    # 1. Preparar Headers a reenviar
     headers_to_forward = {}
     client_host = request.client.host if request.client else "unknown"
+    # Mantener o añadir X-Forwarded-For
     x_forwarded_for = request.headers.get("x-forwarded-for", client_host)
-    # Loggear headers entrantes (con precaución en producción por datos sensibles)
-    # proxy_log.debug("Incoming headers", headers=dict(request.headers))
+    headers_to_forward["X-Forwarded-For"] = x_forwarded_for
+    headers_to_forward["X-Forwarded-Proto"] = request.url.scheme
+    # Añadir X-Forwarded-Host si no está presente (algunos frameworks lo usan)
+    if "host" in request.headers:
+         headers_to_forward["X-Forwarded-Host"] = request.headers["host"]
+    # Añadir X-Request-ID para tracing
+    headers_to_forward["X-Request-ID"] = request_id
+
+    # Copiar headers del cliente, excluyendo hop-by-hop y Host
     for name, value in request.headers.items():
         lower_name = name.lower()
         if lower_name not in HOP_BY_HOP_HEADERS and lower_name != "host":
             headers_to_forward[name] = value
-    headers_to_forward["X-Forwarded-For"] = x_forwarded_for
-    headers_to_forward["X-Forwarded-Proto"] = request.url.scheme
-    headers_to_forward["X-Forwarded-Host"] = request.headers.get("host", "")
-    if request_id: headers_to_forward["X-Request-ID"] = request_id
+        elif lower_name == "content-type": # Asegurar Content-Type siempre se pasa
+             headers_to_forward[name] = value
 
-    # 2. Inyectar Headers de Contexto
-    log_context = {} # Empezar log context vacío
-    if user_payload and method.upper() != 'OPTIONS':
+    # 2. Inyectar Headers de Contexto (si hay payload)
+    log_context_headers = {}
+    if user_payload: # Solo si la ruta está protegida y el token es válido
         user_id = user_payload.get('sub')
         company_id = user_payload.get('company_id')
         user_email = user_payload.get('email')
-        if not user_id or not company_id:
-             proxy_log.critical("Payload missing required fields!", payload_keys=list(user_payload.keys()))
-             raise HTTPException(status_code=500, detail="Internal authentication context error.")
+
+        # Validar que los claims esperados están presentes (StrictAuth ya debería haberlo hecho)
+        if not user_id:
+             proxy_log.critical("Payload from StrictAuth missing 'sub'!", payload_keys=list(user_payload.keys()))
+             raise HTTPException(status_code=500, detail="Internal authentication context error (missing user ID).")
+        if not company_id: # StrictAuth requiere company_id, así que esto no debería ocurrir
+             proxy_log.critical("Payload from StrictAuth missing 'company_id'!", payload_keys=list(user_payload.keys()))
+             raise HTTPException(status_code=500, detail="Internal authentication context error (missing company ID).")
+
+        # Añadir los headers para el servicio backend
         headers_to_forward['X-User-ID'] = str(user_id)
         headers_to_forward['X-Company-ID'] = str(company_id)
-        log_context['user_id'] = str(user_id); log_context['company_id'] = str(company_id)
-        if user_email: headers_to_forward['X-User-Email'] = str(user_email)
-        proxy_log.debug("Added context headers", headers_added=list(log_context.keys()))
+        log_context_headers['user_id'] = str(user_id)
+        log_context_headers['company_id'] = str(company_id)
+        if user_email:
+            headers_to_forward['X-User-Email'] = str(user_email)
+            log_context_headers['user_email'] = str(user_email)
 
-    # Rebind con el contexto completo
-    proxy_log = proxy_log.bind(**log_context)
+        # Actualizar logger contextual
+        proxy_log = proxy_log.bind(**log_context_headers)
+        proxy_log.debug("Added context headers based on user payload.")
 
-    # 3. Preparar Body
+    # 3. Preparar Body (si existe)
     request_body_bytes: Optional[bytes] = None
+    # Métodos que pueden tener cuerpo
     if method.upper() in ["POST", "PUT", "PATCH"]:
-        proxy_log.debug("Attempting to read request body...")
-        request_body_bytes = await request.body()
-        proxy_log.info(f"Read request body for {method}", body_length=len(request_body_bytes) if request_body_bytes else 0)
+        # Leer el cuerpo de la request original
+        # Nota: request.stream() podría ser más eficiente para cuerpos grandes,
+        # pero request.body() es más simple si los cuerpos no son enormes.
+        try:
+            request_body_bytes = await request.body()
+            if request_body_bytes:
+                proxy_log.debug(f"Read request body for {method}", body_length=len(request_body_bytes))
+                # httpx manejará Content-Length basado en el body proporcionado
+            else:
+                 proxy_log.debug(f"No request body found for {method}.")
+        except Exception as e:
+            proxy_log.error("Failed to read request body", error=str(e))
+            raise HTTPException(status_code=400, detail="Could not read request body.")
 
-    # Log detallado justo antes de la llamada a httpx
-    proxy_log.debug("Preparing to send request to backend",
-                   backend_method=method,
-                   backend_url=str(target_url),
-                   backend_headers=headers_to_forward,
-                   has_body=request_body_bytes is not None)
+    # Log antes de la llamada al backend
+    proxy_log.debug("Prepared request for backend",
+                    backend_method=method,
+                    backend_url=str(target_url),
+                    backend_headers=list(headers_to_forward.keys()), # No loguear valores de headers
+                    has_body=(request_body_bytes is not None and len(request_body_bytes) > 0))
 
-    # 4. Realizar petición downstream
-    rp: Optional[httpx.Response] = None
+    # 4. Realizar la Petición al Servicio Backend usando stream=True
+    backend_response: Optional[httpx.Response] = None
     try:
-        proxy_log.info(f"Sending request '{method}' to backend target", backend_target=str(target_url))
-        req = client.build_request(method=method, url=target_url, headers=headers_to_forward, content=request_body_bytes)
-        rp = await client.send(req, stream=True)
+        proxy_log.info(f"Sending request to backend target: {method} {target_url.path}")
+        # Construir la request de httpx explícitamente
+        req = client.build_request(
+            method=method,
+            url=target_url,
+            headers=headers_to_forward,
+            content=request_body_bytes # Pasar el cuerpo leído
+            # timeout=settings.HTTP_CLIENT_TIMEOUT # Timeout ya está en el cliente
+        )
+        # Enviar la request y obtener la respuesta como stream
+        backend_response = await client.send(req, stream=True)
 
-        # 5. Procesar respuesta
-        proxy_log.info(f"Received response from backend", status_code=rp.status_code, backend_target=str(target_url))
-        response_headers = {k: v for k, v in rp.headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
-        proxy_log.debug("Returning StreamingResponse to client", headers=response_headers, media_type=rp.headers.get("content-type"))
-        return StreamingResponse(rp.aiter_raw(), status_code=rp.status_code, headers=response_headers, media_type=rp.headers.get("content-type"), background=rp.aclose)
+        # 5. Procesar y Devolver la Respuesta del Backend (Streaming)
+        proxy_log.info(f"Received response from backend", status_code=backend_response.status_code)
 
-    # Manejo de errores
+        # Preparar headers de la respuesta, excluyendo hop-by-hop
+        response_headers = {}
+        for name, value in backend_response.headers.items():
+            if name.lower() not in HOP_BY_HOP_HEADERS:
+                response_headers[name] = value
+        # Añadir X-Request-ID a la respuesta también
+        response_headers["X-Request-ID"] = request_id
+
+        # Crear una StreamingResponse para enviar los datos al cliente original
+        # a medida que llegan del backend.
+        # background=backend_response.aclose asegura que la conexión se cierre al terminar.
+        return StreamingResponse(
+            backend_response.aiter_raw(), # Iterador asíncrono del cuerpo raw
+            status_code=backend_response.status_code,
+            headers=response_headers,
+            media_type=backend_response.headers.get("content-type"),
+            background=backend_response.aclose # Tarea para cerrar la conexión backend
+        )
+
+    # --- Manejo de Errores Específicos de HTTPX ---
     except httpx.TimeoutException as exc:
-         proxy_log.error(f"Proxy timeout", target=str(target_url), error=str(exc))
-         raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Upstream service timed out.")
+        proxy_log.error(f"Proxy request timed out waiting for backend", target=str(target_url), error=str(exc))
+        # Cerrar la conexión backend si se abrió antes del timeout
+        if backend_response: await backend_response.aclose()
+        raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Upstream service timed out.")
     except httpx.ConnectError as exc:
-         proxy_log.error(f"Proxy connection error", target=str(target_url), error=str(exc))
-         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Could not connect to upstream service.")
+        proxy_log.error(f"Proxy connection error: Could not connect to backend", target=str(target_url), error=str(exc))
+        if backend_response: await backend_response.aclose()
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Could not connect to upstream service.")
     except httpx.RequestError as exc:
-         proxy_log.error(f"Proxy request error", target=str(target_url), error=str(exc))
-         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Error communicating with upstream service.")
+        # Otros errores de request (ej. SSL error, error de protocolo)
+        proxy_log.error(f"Proxy request error communicating with backend", target=str(target_url), error=str(exc))
+        if backend_response: await backend_response.aclose()
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Error communicating with upstream service: {exc}")
     except Exception as exc:
-        # Captura la excepción original aquí
-        proxy_log.exception(f"Proxy unexpected error occurred in _proxy_request", target=str(target_url))
-        if rp:
-            try:
-                await rp.aclose()
-            except Exception as close_exc:
-                proxy_log.error("Error closing downstream response during exception handling", close_error=close_exc)
-        # Re-lanza la excepción original para que el manejador de FastAPI la capture
-        raise exc
+        # Capturar cualquier otro error inesperado durante el proxy
+        proxy_log.exception(f"Unexpected error occurred during proxy request", target=str(target_url))
+        # Asegurarse de cerrar la conexión si existe
+        if backend_response: await backend_response.aclose()
+        # Relanzar como 500 internal server error
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An unexpected error occurred in the gateway.")
 
 
-# --- Rutas Proxy Específicas ---
+# --- Rutas Proxy Específicas para Query Service ---
 
-# 1. Proxy para Query Service
-@router.get( "/api/v1/query/chats", dependencies=[Depends(LoggedStrictAuth)], tags=["Proxy - Query"])
-async def proxy_get_chats(request: Request, client: Annotated[httpx.AsyncClient, Depends(get_client)], user_payload: LoggedStrictAuth):
-    # LOG INICIO HANDLER
-    log.info(f"Entering GET /api/v1/query/chats handler (before proxy call)", request_id=getattr(request.state, 'request_id', None))
-    backend_path = "/api/v1/chats"
+# Los handlers de ruta ahora llaman a _proxy_request con los parámetros correctos.
+# Usamos LoggedStrictAuth para rutas protegidas.
+
+@router.get(
+    "/api/v1/query/chats",
+    dependencies=[Depends(LoggedStrictAuth)], # Asegura autenticación estricta
+    tags=["Proxy - Query Service"],
+    summary="List user's chats (Proxied)"
+)
+async def proxy_get_chats(
+    request: Request,
+    client: Annotated[httpx.AsyncClient, Depends(get_client)],
+    user_payload: LoggedStrictAuth # El payload validado está disponible aquí
+):
+    proxy_log = log.bind(request_id=getattr(request.state, 'request_id', 'N/A'))
+    proxy_log.info("Entering proxy handler for GET /api/v1/query/chats")
+    backend_path = "/api/v1/chats" # Path en el Query Service
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
-@router.post( "/api/v1/query/ask", dependencies=[Depends(LoggedStrictAuth)], tags=["Proxy - Query"])
-async def proxy_post_ask(request: Request, client: Annotated[httpx.AsyncClient, Depends(get_client)], user_payload: LoggedStrictAuth):
-    # LOG INICIO HANDLER
-    log.info(f"Entering POST /api/v1/query/ask handler (before proxy call)", request_id=getattr(request.state, 'request_id', None))
-    backend_path = "/api/v1/ask" # Verifica este path contra query-service -> query.py
+@router.post(
+    "/api/v1/query",
+    dependencies=[Depends(LoggedStrictAuth)],
+    tags=["Proxy - Query Service"],
+    summary="Submit a query or message (Proxied)"
+)
+async def proxy_post_query(
+    request: Request,
+    client: Annotated[httpx.AsyncClient, Depends(get_client)],
+    user_payload: LoggedStrictAuth
+):
+    proxy_log = log.bind(request_id=getattr(request.state, 'request_id', 'N/A'))
+    proxy_log.info("Entering proxy handler for POST /api/v1/query")
+    backend_path = "/api/v1/query" # Path en el Query Service
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
-@router.get( "/api/v1/query/chats/{chat_id}/messages", dependencies=[Depends(LoggedStrictAuth)], tags=["Proxy - Query"])
-async def proxy_get_chat_messages(request: Request, client: Annotated[httpx.AsyncClient, Depends(get_client)], user_payload: LoggedStrictAuth, chat_id: uuid.UUID = Path(...)):
-    # LOG INICIO HANDLER
-    log.info(f"Entering GET /api/v1/query/chats/.../messages handler (before proxy call)", chat_id=str(chat_id), request_id=getattr(request.state, 'request_id', None))
-    backend_path = f"/api/v1/chats/{chat_id}/messages" # Verifica este path contra query-service -> chat.py
+@router.get(
+    "/api/v1/query/chats/{chat_id}/messages",
+    dependencies=[Depends(LoggedStrictAuth)],
+    tags=["Proxy - Query Service"],
+    summary="Get messages for a specific chat (Proxied)"
+)
+async def proxy_get_chat_messages(
+    request: Request,
+    client: Annotated[httpx.AsyncClient, Depends(get_client)],
+    user_payload: LoggedStrictAuth,
+    chat_id: uuid.UUID = Path(..., description="The UUID of the chat") # Validar UUID en path
+):
+    proxy_log = log.bind(request_id=getattr(request.state, 'request_id', 'N/A'), chat_id=str(chat_id))
+    proxy_log.info("Entering proxy handler for GET /api/v1/query/chats/{chat_id}/messages")
+    backend_path = f"/api/v1/chats/{chat_id}/messages" # Path dinámico en Query Service
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
-@router.delete( "/api/v1/query/chats/{chat_id}", dependencies=[Depends(LoggedStrictAuth)], tags=["Proxy - Query"])
-async def proxy_delete_chat(request: Request, client: Annotated[httpx.AsyncClient, Depends(get_client)], user_payload: LoggedStrictAuth, chat_id: uuid.UUID = Path(...)):
-    # LOG INICIO HANDLER
-    log.info(f"Entering DELETE /api/v1/query/chats/... handler (before proxy call)", chat_id=str(chat_id), request_id=getattr(request.state, 'request_id', None))
-    backend_path = f"/api/v1/chats/{chat_id}" # Verifica este path contra query-service -> chat.py
+@router.delete(
+    "/api/v1/query/chats/{chat_id}",
+    dependencies=[Depends(LoggedStrictAuth)],
+    tags=["Proxy - Query Service"],
+    summary="Delete a specific chat (Proxied)"
+)
+async def proxy_delete_chat(
+    request: Request,
+    client: Annotated[httpx.AsyncClient, Depends(get_client)],
+    user_payload: LoggedStrictAuth,
+    chat_id: uuid.UUID = Path(..., description="The UUID of the chat to delete")
+):
+    proxy_log = log.bind(request_id=getattr(request.state, 'request_id', 'N/A'), chat_id=str(chat_id))
+    proxy_log.info("Entering proxy handler for DELETE /api/v1/query/chats/{chat_id}")
+    backend_path = f"/api/v1/chats/{chat_id}" # Path dinámico en Query Service
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
-# Rutas OPTIONS (Sin cambios)
-@router.options( "/api/v1/query/chats", tags=["Proxy - Query"], include_in_schema=False)
-async def options_get_chats(): log.debug("Handling OPTIONS /api/v1/query/chats"); return Response(status_code=200)
-@router.options( "/api/v1/query/ask", tags=["Proxy - Query"], include_in_schema=False)
-async def options_post_ask(): log.debug("Handling OPTIONS /api/v1/query/ask"); return Response(status_code=200)
-@router.options( "/api/v1/query/chats/{chat_id}/messages", tags=["Proxy - Query"], include_in_schema=False)
-async def options_get_chat_messages(chat_id: uuid.UUID = Path(...)): log.debug("Handling OPTIONS /api/v1/query/chats/.../messages"); return Response(status_code=200)
-@router.options( "/api/v1/query/chats/{chat_id}", tags=["Proxy - Query"], include_in_schema=False)
-async def options_delete_chat(chat_id: uuid.UUID = Path(...)): log.debug("Handling OPTIONS /api/v1/query/chats/..."); return Response(status_code=200)
+# --- Rutas OPTIONS para CORS Preflight ---
+# Necesarias si el frontend hace peticiones con headers custom (Authorization) o métodos no simples (PUT/DELETE)
 
+@router.options("/api/v1/query/chats", tags=["CORS"], include_in_schema=False)
+async def options_query_chats(): return Response(status_code=200)
 
-# 2. Proxy para Ingest Service (genérico)
-@router.api_route( "/api/v1/ingest/{endpoint_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"], dependencies=[Depends(LoggedStrictAuth)], tags=["Proxy - Ingest"], name="proxy_ingest_service")
-async def proxy_ingest_service_generic(request: Request, endpoint_path: str, client: Annotated[httpx.AsyncClient, Depends(get_client)], user_payload: LoggedStrictAuth):
-    # LOG INICIO HANDLER
-    log.info(f"Entering /{endpoint_path} handler for Ingest service (before proxy call)", endpoint=endpoint_path, request_id=getattr(request.state, 'request_id', None))
-    backend_path = f"/{endpoint_path}"
-    # IMPORTANTE: Verificar que las rutas en ingest.py NO incluyen /api/v1/ingest
-    # Ejemplo: En ingest.py debe ser @router.get("/status"), no @router.get("/api/v1/ingest/status")
-    return await _proxy_request(request, str(settings.INGEST_SERVICE_URL), client, user_payload, backend_service_path=backend_path)
+@router.options("/api/v1/query", tags=["CORS"], include_in_schema=False)
+async def options_query(): return Response(status_code=200)
 
+@router.options("/api/v1/query/chats/{chat_id}/messages", tags=["CORS"], include_in_schema=False)
+async def options_chat_messages(chat_id: uuid.UUID = Path(...)): return Response(status_code=200)
 
-# 3. Proxy para Auth Service (Opcional y genérico, si está habilitado)
+@router.options("/api/v1/query/chats/{chat_id}", tags=["CORS"], include_in_schema=False)
+async def options_delete_chat(chat_id: uuid.UUID = Path(...)): return Response(status_code=200)
+
+# --- Proxy Genérico para Ingest Service ---
+# Reenvía cualquier path bajo /api/v1/ingest/* al Ingest Service
+@router.api_route(
+    "/api/v1/ingest/{endpoint_path:path}", # Captura todo el path restante
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    dependencies=[Depends(LoggedStrictAuth)], # Protegido por defecto
+    tags=["Proxy - Ingest Service"],
+    summary="Generic proxy for Ingest Service endpoints"
+)
+async def proxy_ingest_service_generic(
+    request: Request,
+    client: Annotated[httpx.AsyncClient, Depends(get_client)],
+    user_payload: LoggedStrictAuth,
+    endpoint_path: str = Path(..., description="Path within the Ingest service")
+):
+    proxy_log = log.bind(request_id=getattr(request.state, 'request_id', 'N/A'), endpoint_path=endpoint_path)
+    proxy_log.info(f"Entering generic proxy handler for Ingest service")
+    # Asumimos que Ingest Service espera las rutas sin el prefijo /api/v1/ingest
+    # Si Ingest espera el prefijo completo, ajusta backend_path
+    backend_path = f"/{endpoint_path}" # Path relativo dentro del servicio Ingest
+    return await _proxy_request(
+        request=request,
+        target_service_base_url_str=str(settings.INGEST_SERVICE_URL),
+        client=client,
+        user_payload=user_payload,
+        backend_service_path=backend_path
+    )
+
+# --- Proxy Opcional para Auth Service (Si se configura) ---
+# Reenvía cualquier path bajo /api/v1/auth/* al Auth Service, SIN autenticación en el Gateway
 if settings.AUTH_SERVICE_URL:
-    log.info(f"Auth service proxy enabled for base URL: {settings.AUTH_SERVICE_URL}")
-    @router.api_route( "/api/v1/auth/{endpoint_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"], tags=["Proxy - Auth"], name="proxy_auth_service")
-    async def proxy_auth_service_generic(request: Request, endpoint_path: str, client: Annotated[httpx.AsyncClient, Depends(get_client)]):
-        log.info(f"Entering /{endpoint_path} handler for Auth service (before proxy call)", endpoint=endpoint_path, request_id=getattr(request.state, 'request_id', None))
+    log.info(f"Auth service proxy enabled, forwarding to {settings.AUTH_SERVICE_URL}")
+    @router.api_route(
+        "/api/v1/auth/{endpoint_path:path}",
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+        # SIN Dependencia de autenticación aquí
+        tags=["Proxy - Auth Service (Optional)"],
+        summary="Generic proxy for Auth Service endpoints (No Gateway Auth)"
+    )
+    async def proxy_auth_service_generic(
+        request: Request,
+        client: Annotated[httpx.AsyncClient, Depends(get_client)],
+        endpoint_path: str = Path(..., description="Path within the Auth service")
+        # Sin user_payload aquí
+    ):
+        proxy_log = log.bind(request_id=getattr(request.state, 'request_id', 'N/A'), endpoint_path=endpoint_path)
+        proxy_log.info(f"Entering generic proxy handler for Auth service (unauthenticated at gateway)")
+        # Asumimos que Auth Service espera las rutas sin el prefijo /api/v1/auth
         backend_path = f"/{endpoint_path}"
-        return await _proxy_request(request, str(settings.AUTH_SERVICE_URL), client, user_payload=None, backend_service_path=backend_path)
+        return await _proxy_request(
+            request=request,
+            target_service_base_url_str=str(settings.AUTH_SERVICE_URL),
+            client=client,
+            user_payload=None, # Pasar None explícitamente
+            backend_service_path=backend_path
+        )
+else:
+     log.info("Auth service proxy is disabled (GATEWAY_AUTH_SERVICE_URL not set).")
 ```
 
 ## File: `app\routers\user_router.py`
 ```py
+# File: app/routers/user_router.py
 # api-gateway/app/routers/user_router.py
-from fastapi import APIRouter, Depends, HTTPException, status, Request
-from typing import Annotated, Dict, Any, Optional
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Body
+from typing import Dict, Any, Optional
 import structlog
-import traceback
+import uuid
 
-# Dependencias
-from app.auth.auth_middleware import InitialAuth
-from app.utils.supabase_admin import get_supabase_admin_client
-from supabase import Client as SupabaseClient
-from gotrue.errors import AuthApiError
-from gotrue.types import UserResponse, User
-from postgrest import APIResponse as PostgrestAPIResponse
-# *** CORRECCIÓN: Eliminada la importación problemática ***
-# from postgrest.utils import SyncMaybeSingleResponse
-
+# Importar dependencias de autenticación y DB
+from app.auth.auth_middleware import InitialAuth # Para ensure-company
+from app.auth.auth_service import authenticate_user, create_access_token
+from app.db import postgres_client
 from app.core.config import settings
 
-log = structlog.get_logger(__name__)
-router = APIRouter(prefix="/api/v1/users", tags=["Users"])
-
-# --- (Código eliminado relacionado a ensure_company_association) ---
-
-```
-
-## File: `app\utils\supabase_admin.py`
-```py
-# File: app/utils/supabase_admin.py
-# api-gateway/app/utils/supabase_admin.py
-from supabase.client import Client, create_client
-from functools import lru_cache
-import structlog
-from typing import Optional # Para el tipo de retorno
-
-from app.core.config import settings # Importar settings validadas
+# Importar modelos Pydantic para request/response
+from pydantic import BaseModel, EmailStr, Field, validator
 
 log = structlog.get_logger(__name__)
+router = APIRouter(prefix="/api/v1/users", tags=["Users & Authentication"]) # Agrupamos aquí
 
-# Usar lru_cache para crear el cliente una sola vez por proceso/worker
-# maxsize=None significa caché ilimitada (o 1 si solo hay un worker)
-@lru_cache(maxsize=None)
-def get_supabase_admin_client() -> Client: # Cambiado Optional[Client] a Client, lanzará error si falla
+# --- Modelos Pydantic para la API ---
+
+class LoginRequest(BaseModel):
+    """Payload esperado para el login."""
+    email: EmailStr
+    password: str = Field(..., min_length=6) # Ajusta min_length si es necesario
+
+class LoginResponse(BaseModel):
+    """Respuesta devuelta en un login exitoso."""
+    access_token: str
+    token_type: str = "bearer"
+    user_id: str # UUID como string
+    email: EmailStr
+    full_name: Optional[str] = None
+    role: Optional[str] = "user" # Rol por defecto
+    company_id: Optional[str] = None # UUID como string, puede ser None
+
+class EnsureCompanyRequest(BaseModel):
+    """Payload opcional para forzar una compañía específica en ensure-company."""
+    company_id: Optional[str] = None # UUID como string
+
+    @validator('company_id')
+    def validate_company_id_format(cls, v):
+        if v is not None:
+            try:
+                uuid.UUID(v)
+            except ValueError:
+                raise ValueError("Provided company_id is not a valid UUID")
+        return v
+
+class EnsureCompanyResponse(BaseModel):
+    """Respuesta devuelta al asociar/confirmar compañía."""
+    user_id: str # UUID como string
+    company_id: str # UUID como string (la que quedó asociada)
+    message: str
+    # Devolvemos el nuevo token para que el frontend lo use inmediatamente
+    new_access_token: str
+    token_type: str = "bearer"
+
+
+# --- Endpoints ---
+
+@router.post("/login", response_model=LoginResponse)
+async def login_for_access_token(login_data: LoginRequest):
     """
-    Crea y devuelve un cliente Supabase inicializado con la Service Role Key.
-    Utiliza caché (lru_cache) para devolver la misma instancia.
-    Lanza una excepción si la configuración es inválida o falla la inicialización.
-
-    Returns:
-        Instancia del cliente Supabase Admin (supabase.Client).
-
-    Raises:
-        ValueError: Si la configuración es inválida o la creación del cliente falla.
+    Autentica un usuario con email y contraseña.
+    Si es exitoso, devuelve un token JWT y datos básicos del usuario.
     """
-    supabase_url = str(settings.SUPABASE_URL) # Convertir HttpUrl a string
-    service_key = settings.SUPABASE_SERVICE_ROLE_KEY
+    log.info("Login attempt initiated", email=login_data.email)
+    user = await authenticate_user(login_data.email, login_data.password)
 
-    # Las validaciones de existencia y no-default ya se hicieron en config.py
+    if not user:
+        log.warning("Login failed: Invalid credentials or inactive user", email=login_data.email)
+        # Devolver error genérico para no dar pistas sobre si el email existe
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
-    log.info("Attempting to initialize Supabase Admin Client...")
+    # Extraer datos del usuario autenticado para el token y la respuesta
+    user_id = user.get("id")
+    company_id = user.get("company_id") # Puede ser None
+    email = user.get("email")
+    full_name = user.get("full_name")
+    role = user.get("role", "user") # Default a 'user' si no está en DB
+
+    if not user_id or not email:
+         log.error("Critical error: Authenticated user data missing ID or email", user_dict_keys=user.keys())
+         raise HTTPException(status_code=500, detail="Internal server error during login")
+
+    # Crear el token JWT
+    access_token = create_access_token(
+        user_id=user_id,
+        email=email,
+        company_id=company_id # Pasar company_id (puede ser None)
+    )
+    log.info("Login successful, token generated", user_id=str(user_id), company_id=str(company_id) if company_id else "None")
+
+    # Devolver la respuesta
+    return LoginResponse(
+        access_token=access_token,
+        user_id=str(user_id),
+        email=email,
+        full_name=full_name,
+        role=role,
+        company_id=str(company_id) if company_id else None
+    )
+
+
+@router.post("/me/ensure-company", response_model=EnsureCompanyResponse)
+async def ensure_company_association(
+    request: Request, # Necesitamos la request para el log
+    # Cuerpo opcional para especificar company_id, default a vacío si no se envía
+    ensure_request: Optional[EnsureCompanyRequest] = Body(None),
+    # Dependencia: requiere token válido, pero no necesariamente con company_id
+    user_payload: InitialAuth = Depends()
+):
+    """
+    Endpoint para que un usuario autenticado (con token válido)
+    se asocie a una compañía si aún no lo está.
+    1. Usa la company_id del body si se proporciona.
+    2. Si no, usa la company_id por defecto de la configuración.
+    3. Si ya tiene una company_id y no se especifica una nueva, no hace nada.
+    4. Si se asocia/cambia, actualiza la DB y genera un NUEVO token con la company_id.
+    """
+    user_id_str = user_payload.get("sub")
+    req_id = getattr(request.state, 'request_id', 'N/A') # Obtener request_id para logs
+    log_ctx = log.bind(request_id=req_id, user_id=user_id_str)
+
+    log_ctx.info("Ensure company association requested.")
+
+    if not user_id_str:
+        log_ctx.error("Ensure company failed: User ID ('sub') missing in token payload.")
+        raise HTTPException(status_code=400, detail="User ID not found in token payload.")
+
     try:
-        # Crear el cliente Supabase
-        supabase_admin: Client = create_client(supabase_url, service_key)
+        user_id = uuid.UUID(user_id_str)
+    except ValueError:
+        log_ctx.error("Ensure company failed: User ID ('sub') in token is not a valid UUID.", sub_value=user_id_str)
+        raise HTTPException(status_code=400, detail="Invalid user ID format in token.")
 
-        # Optional: Intenta una operación simple para verificar que la clave funciona.
-        # Esto añade una pequeña latencia al inicio pero aumenta la confianza.
-        # Ejemplo: Listar usuarios con límite 0 (solo verifica la conexión/permiso)
-        try:
-            # Nota: Esta llamada es síncrona en supabase-py v1, necesita ser async en v2
-            # Asumiendo v2+ y que estamos en un contexto async para la verificación inicial
-            # Esto realmente no puede hacerse aquí fácilmente en una función síncrona cacheada.
-            # La verificación real ocurrirá en el primer uso en una ruta async.
-            # response = await supabase_admin.auth.admin.list_users(limit=0) # Necesitaría ser async
-            # log.info(f"Supabase Admin Client connection appears valid (basic check).")
-            pass # Saltamos la verificación activa aquí
-        except Exception as test_e:
-             # Esto probablemente no se ejecute aquí. El error ocurrirá en el primer uso.
-             log.warning(f"Supabase Admin Client test query failed (will likely fail on first use): {test_e}", exc_info=False)
-             # Podrías lanzar el error aquí si quieres que falle al inicio
-             # raise ValueError(f"Supabase Admin Client test query failed: {test_e}") from test_e
+    # Obtener datos actuales del usuario desde la DB (incluye email, full_name para el nuevo token)
+    current_user_data = await postgres_client.get_user_by_id(user_id)
+    if not current_user_data:
+        # Esto no debería pasar si verify_token funciona, pero es una salvaguarda
+        log_ctx.error("Ensure company failed: User found in token but not in database.", user_id=user_id_str)
+        raise HTTPException(status_code=404, detail="User associated with token not found in database.")
 
-        log.info("Supabase Admin Client initialized successfully (pending first use validation).")
-        return supabase_admin
+    current_company_id = current_user_data.get("company_id")
+    target_company_id_str: Optional[str] = None
+    action_taken = "none"
 
-    except Exception as e:
-        # Capturar cualquier error durante create_client
-        log.exception("FATAL: Failed to initialize Supabase Admin Client", error=str(e))
-        # Lanzar una excepción explícita para notificar el fallo claramente
-        raise ValueError(f"FATAL: Failed to initialize Supabase Admin Client: {e}") from e
+    # Determinar el company_id objetivo
+    if ensure_request and ensure_request.company_id:
+        target_company_id_str = ensure_request.company_id
+        log_ctx.info("Using company_id provided in request body.", target_company=target_company_id_str)
+    elif not current_company_id and settings.DEFAULT_COMPANY_ID:
+        target_company_id_str = settings.DEFAULT_COMPANY_ID
+        log_ctx.info("User has no company_id, using default from settings.", default_company=target_company_id_str)
+    elif current_company_id:
+        # Ya tiene compañía y no se pidió cambiarla explícitamente
+        target_company_id_str = str(current_company_id) # Usar la actual
+        log_ctx.info("User already associated with a company, no change requested.", current_company=target_company_id_str)
+    else:
+        # No tiene compañía, no se proporcionó una, y no hay default configurado
+        log_ctx.error("Ensure company failed: No target company_id provided or configured.", user_id=user_id_str)
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot associate company: No company ID provided and no default is configured for the gateway."
+        )
 
-# Nota: No se crea una instancia global aquí. La instancia se crea y cachea
-# cuando get_supabase_admin_client() es llamada por primera vez (ej. como dependencia).
-# Si la función falla, la excepción se propagará a través de Depends().
+    # Validar el formato del target_company_id_str
+    try:
+        target_company_id = uuid.UUID(target_company_id_str)
+    except ValueError:
+        log_ctx.error("Ensure company failed: Target company ID is not a valid UUID.", target_value=target_company_id_str)
+        raise HTTPException(status_code=400, detail="Invalid target company ID format.")
+
+    # Actualizar la DB solo si el target_company_id es diferente del actual (o si el actual es None)
+    if target_company_id != current_company_id:
+        log_ctx.info("Attempting to update user's company in database.", new_company_id=str(target_company_id))
+        updated = await postgres_client.update_user_company(user_id, target_company_id)
+        if not updated:
+            # Podría fallar si el usuario fue eliminado entre get y update, o error DB
+            log_ctx.error("Failed to update user's company association in database.", user_id=user_id_str)
+            raise HTTPException(status_code=500, detail="Failed to update user's company association.")
+        action_taken = "updated"
+        log_ctx.info("User company association updated successfully in database.", new_company_id=str(target_company_id))
+    else:
+        action_taken = "confirmed"
+        log_ctx.info("User company association already matches target, no database update needed.", company_id=str(target_company_id))
+
+    # Generar un *nuevo* token JWT con la company_id (ya sea la actualizada o la confirmada)
+    # Usar los datos recuperados de la DB para otros claims
+    user_email = current_user_data.get("email")
+    user_full_name = current_user_data.get("full_name")
+    if not user_email:
+         log_ctx.error("Critical error: User data from DB missing email, cannot generate new token.", user_id=user_id_str)
+         raise HTTPException(status_code=500, detail="Internal server error generating updated token.")
+
+    new_access_token = create_access_token(
+        user_id=user_id,
+        email=user_email,
+        company_id=target_company_id # ¡Asegurarse de usar el target_company_id!
+        # Podrías añadir full_name, role aquí si los incluyes en create_access_token
+    )
+    log_ctx.info("New access token generated with company association.", company_id=str(target_company_id))
+
+    # Determinar mensaje de respuesta
+    if action_taken == "updated":
+        message = f"Company association successfully updated to {target_company_id}."
+    elif action_taken == "confirmed":
+        message = f"Company association confirmed as {target_company_id}."
+    else: # action_taken == "none" (no debería llegar aquí si la lógica es correcta)
+        message = f"User already associated with company {target_company_id}."
+
+
+    return EnsureCompanyResponse(
+        user_id=str(user_id),
+        company_id=str(target_company_id),
+        message=message,
+        new_access_token=new_access_token
+    )
 ```
 
 ## File: `pyproject.toml`
@@ -1131,47 +1816,49 @@ def get_supabase_admin_client() -> Client: # Cambiado Optional[Client] a Client,
 # File: pyproject.toml
 # api-gateway/pyproject.toml
 [tool.poetry]
-name = "api-gateway"
-version = "1.0.0"
-description = "API Gateway for Nyro Microservices"
-authors = ["Nyro <dev@nyro.com>"]
-readme = "README.md" # Aunque no lo modifiquemos, lo referenciamos
+name = "atenex-api-gateway" # <-- Nombre actualizado
+version = "1.0.1" # <-- Versión actualizada (opcional)
+description = "API Gateway for Atenex Microservices" # <-- Descripción actualizada
+authors = ["Atenex Team <dev@atenex.com>"] # <-- Autor actualizado
+readme = "README.md"
 
 [tool.poetry.dependencies]
 python = "^3.10"
 
 # Core FastAPI y servidor ASGI
-fastapi = "^0.110.0" # O la versión que estés usando
-uvicorn = {extras = ["standard"], version = "^0.28.0"} # Servidor ASGI con dependencias estándar (watchfiles, etc.)
-gunicorn = "^21.2.0" # Servidor WSGI/Process Manager (usado en los logs)
+fastapi = "^0.110.0"
+uvicorn = {extras = ["standard"], version = "^0.28.0"}
+gunicorn = "^21.2.0"
 
 # Configuración y validación
-pydantic = {extras = ["email"], version = "^2.6.4"} # Para validación de datos y settings
-pydantic-settings = "^2.2.1" # Para cargar settings desde .env/entorno
+pydantic = {extras = ["email"], version = "^2.6.4"}
+pydantic-settings = "^2.2.1"
 
 # Cliente HTTP asíncrono
-httpx = "^0.27.0" # Para hacer las llamadas proxy
+httpx = "^0.27.0"
 
 # Manejo de JWT
-python-jose = {extras = ["cryptography"], version = "^3.3.0"} # Para decodificar y validar JWTs
+python-jose = {extras = ["cryptography"], version = "^3.3.0"}
 
 # Logging estructurado
-structlog = "^24.1.0" # Para logging JSON estructurado
+structlog = "^24.1.0"
 
-# Cliente Supabase
-supabase = "^2.5.0" # Cliente oficial Python para Supabase (incluye gotrue-py para Auth)
+# Cliente PostgreSQL Asíncrono
+asyncpg = "^0.29.0" # <-- AÑADIDO: Cliente PostgreSQL
 
-# Utilidades (opcional, pero útil)
-tenacity = "^8.2.3" # Para reintentos (podría usarse en llamadas a Supabase o backends)
-# email-validator = "^2.1.1" # Si necesitas validación de email más estricta que la de Pydantic
+# Hashing de Contraseñas
+passlib = {extras = ["bcrypt"], version = "^1.7.4"} # <-- AÑADIDO: Para verificar hashes de contraseña
+
+# Utilidades (opcional)
+# tenacity = "^8.2.3"
 
 [tool.poetry.group.dev.dependencies]
-pytest = "^7.4.4" # Framework de testing
-pytest-asyncio = "^0.21.1" # Para testear código async con pytest
-pytest-httpx = "^0.29.0" # Para mockear respuestas HTTPX en tests
-# black = "^24.3.0" # Formateador de código (opcional)
-# ruff = "^0.3.4" # Linter rápido (opcional)
-# mypy = "^1.9.0" # Type checker (opcional)
+pytest = "^7.4.4"
+pytest-asyncio = "^0.21.1"
+pytest-httpx = "^0.29.0"
+# black = "^24.3.0"
+# ruff = "^0.3.4"
+# mypy = "^1.9.0"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

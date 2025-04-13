@@ -1,7 +1,8 @@
+# File: app/main.py
 # api-gateway/app/main.py
 import os
 from fastapi import FastAPI, Request, Depends, HTTPException, status
-from typing import Optional
+from typing import Optional, List, Set
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -10,141 +11,279 @@ import structlog
 import uvicorn
 import time
 import uuid
-import logging # <-- Importar logging estándar
-from supabase.client import Client as SupabaseClient
+import logging # Importar logging estándar para configuración inicial
 
-# Configurar logging ANTES de importar otros módulos que puedan loguear
+# --- Configuración de Logging PRIMERO ---
+# Asegura que el logging esté listo antes de importar otros módulos
 from app.core.logging_config import setup_logging
 setup_logging()
-# Ahora importar el resto
+
+# --- Importaciones Post-Logging ---
 from app.core.config import settings
-from app.utils.supabase_admin import get_supabase_admin_client
-from app.routers import gateway_router, user_router
-# *** CORRECCIÓN: Comentar o eliminar importación de auth_router si ya no se usa ***
-# from app.routers import auth_router
-# Importar dependencias de autenticación para verificar su carga
-from app.auth.auth_middleware import StrictAuth, InitialAuth
+from app.db import postgres_client # Importar cliente DB
+from app.routers import gateway_router, user_router # Importar routers
+# (Opcional) Importar dependencias para verificar carga si es necesario
+# from app.auth.auth_middleware import StrictAuth, InitialAuth
 
-log = structlog.get_logger("api_gateway.main") # Logger para el módulo main
+# Logger principal para este módulo
+log = structlog.get_logger("atenex_api_gateway.main")
 
-# Clientes globales que se inicializarán en el lifespan
+# --- Clientes Globales (Inicializados en Lifespan) ---
 proxy_http_client: Optional[httpx.AsyncClient] = None
-supabase_admin_client: Optional[SupabaseClient] = None
+# No necesitamos una variable global para el pool de DB, usamos postgres_client.get_db_pool()
 
-# --- Lifespan para inicializar/cerrar clientes (Sin cambios) ---
+# --- Lifespan Manager (Startup y Shutdown) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global proxy_http_client, supabase_admin_client
-    log.info("Application startup: Initializing global clients...")
+    global proxy_http_client
+    log.info("Application startup sequence initiated...")
+
+    # 1. Inicializar Cliente HTTP para Proxying
     try:
+        log.info("Initializing global HTTPX client for proxying...")
         limits = httpx.Limits(
-            max_keepalive_connections=settings.HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS,
+            max_keepalive_connections=settings.HTTP_CLIENT_MAX_KEEPALIVE_CONNECTIONS,
             max_connections=settings.HTTP_CLIENT_MAX_CONNECTIONS
         )
-        timeout = httpx.Timeout(settings.HTTP_CLIENT_TIMEOUT, connect=10.0)
-        proxy_http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=False, http2=True)
+        timeout = httpx.Timeout(settings.HTTP_CLIENT_TIMEOUT, connect=10.0) # Timeout global
+        proxy_http_client = httpx.AsyncClient(
+            limits=limits,
+            timeout=timeout,
+            follow_redirects=False, # El gateway no debe seguir redirecciones
+            http2=True # Habilitar HTTP/2 si los backends lo soportan
+        )
+        # Inyectar el cliente en el router del gateway para que lo use
         gateway_router.http_client = proxy_http_client
-        log.info("HTTP Client initialized successfully.", limits=str(limits), timeout=str(timeout))
+        log.info("HTTPX client initialized successfully.", limits=str(limits), timeout=str(timeout))
     except Exception as e:
-        log.exception("CRITICAL: Failed to initialize HTTP client during startup!", error=str(e))
-        proxy_http_client = None; gateway_router.http_client = None
-    log.info("Initializing Supabase Admin Client...")
+        log.exception("CRITICAL: Failed to initialize HTTPX client during startup!", error=str(e))
+        # Si el cliente HTTP falla, el proxy no funcionará. Podríamos decidir salir.
+        proxy_http_client = None
+        gateway_router.http_client = None
+        # raise RuntimeError("Failed to initialize HTTP client, cannot start gateway.") from e
+
+    # 2. Inicializar y Verificar Conexión a PostgreSQL
+    log.info("Initializing and verifying PostgreSQL connection pool...")
+    db_pool_ok = False
     try:
-        supabase_admin_client = get_supabase_admin_client()
-        user_router.supabase_admin = supabase_admin_client # Inyección simple, mejor Depends
-        log.info("Supabase Admin Client reference obtained (initialized via get_supabase_admin_client).")
+        # get_db_pool() creará el pool si no existe
+        pool = await postgres_client.get_db_pool()
+        if pool:
+             # Verificar conexión real
+             db_pool_ok = await postgres_client.check_db_connection()
+             if db_pool_ok:
+                 log.info("PostgreSQL connection pool initialized and connection verified.")
+             else:
+                  log.critical("PostgreSQL pool initialized BUT connection check failed!")
+                  # Podríamos cerrar el pool recién creado si la verificación falla
+                  await postgres_client.close_db_pool()
+        else:
+             log.critical("PostgreSQL connection pool initialization returned None!")
+
     except Exception as e:
-        log.exception("CRITICAL: Failed to get Supabase Admin Client during startup!", error=str(e))
-        supabase_admin_client = None; user_router.supabase_admin = None
-    yield
-    log.info("Application shutdown: Closing clients...")
+        log.exception("CRITICAL: Failed to initialize or verify PostgreSQL connection during startup!", error=str(e))
+        # La app puede seguir, pero las funciones DB fallarán. get_db_pool relanzará si hay error.
+
+    # Si alguna dependencia crítica falló, podríamos loguearlo de nuevo aquí
+    if not proxy_http_client:
+        log.warning("Startup warning: HTTP client is not available.")
+    if not db_pool_ok:
+        log.warning("Startup warning: PostgreSQL connection is not available.")
+
+    # --- Aplicación Lista para Recibir Tráfico ---
+    log.info("Application startup sequence complete. Ready to serve requests.")
+    yield # <--- La aplicación se ejecuta aquí
+
+    # --- Shutdown Sequence ---
+    log.info("Application shutdown sequence initiated...")
+
+    # 1. Cerrar Cliente HTTP
     if proxy_http_client and not proxy_http_client.is_closed:
-        try: await proxy_http_client.aclose(); log.info("HTTP Client closed successfully.")
-        except Exception as e: log.exception("Error closing HTTP client during shutdown.", error=str(e))
-    log.info("Supabase Admin Client shutdown check complete (no explicit close needed).")
+        log.info("Closing global HTTPX client...")
+        try:
+            await proxy_http_client.aclose()
+            log.info("HTTPX client closed successfully.")
+        except Exception as e:
+            log.exception("Error closing HTTPX client during shutdown.", error=str(e))
+
+    # 2. Cerrar Pool de PostgreSQL
+    log.info("Closing PostgreSQL connection pool...")
+    try:
+        await postgres_client.close_db_pool()
+        # El log de éxito/info ya está en close_db_pool()
+    except Exception as e:
+        log.exception("Error closing PostgreSQL connection pool during shutdown.", error=str(e))
+
+    log.info("Application shutdown sequence complete.")
 
 
 # --- Creación de la App FastAPI ---
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    description="Punto de entrada único y seguro para los microservicios de Nyro. Valida JWTs de Supabase, gestiona asociación inicial de compañía y reenvía tráfico a servicios backend.",
-    version="1.0.0",
-    lifespan=lifespan,
+    description="Atenex API Gateway: Punto de entrada único, autenticación JWT, enrutamiento a microservicios backend (Ingest, Query).",
+    version="1.0.1", # O la versión que uses
+    lifespan=lifespan, # Usar el gestor de contexto lifespan
+    # openapi_url=f"{settings.API_V1_STR}/openapi.json" # Opcional: ruta para spec OpenAPI
 )
 
 # --- Middlewares ---
 
-# 1. CORS Middleware (Configuración robusta - Sin cambios respecto a tu código)
-allowed_origins = []
-vercel_url = os.getenv("VERCEL_FRONTEND_URL", "https://atenex-frontend.vercel.app")
-allowed_origins.append(vercel_url)
-localhost_url = "http://localhost:3000"
-allowed_origins.append(localhost_url)
-ngrok_url_env = os.getenv("NGROK_URL")
-if ngrok_url_env:
-    if ngrok_url_env.startswith("https://") and ".ngrok" in ngrok_url_env:
-        allowed_origins.append(ngrok_url_env)
-ngrok_url_from_logs = "https://1942-2001-1388-53a1-a7c9-241c-4a44-2b12-938f.ngrok-free.app"
-if ngrok_url_from_logs not in allowed_origins:
-    allowed_origins.append(ngrok_url_from_logs)
-allowed_origins = list(set(filter(None, allowed_origins)))
-allowed_headers = ["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With", "ngrok-skip-browser-warning", "X-Request-ID"]
-allowed_methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
-log.info("Final CORS Allowed Origins:", origins=allowed_origins)
-log.info("CORS Allowed Headers:", headers=allowed_headers)
-log.info("CORS Allowed Methods:", methods=allowed_methods)
-app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_credentials=True, allow_methods=allowed_methods, allow_headers=allowed_headers, expose_headers=["X-Request-ID", "X-Process-Time"], max_age=600)
+# 1. CORS Middleware
+# Construir lista de orígenes permitidos dinámicamente
+allowed_origins: List[str] = []
+if settings.VERCEL_FRONTEND_URL:
+    allowed_origins.append(settings.VERCEL_FRONTEND_URL)
+# Añadir localhost para desarrollo local del frontend
+allowed_origins.append("http://localhost:3000")
+allowed_origins.append("http://localhost:3001") # Puerto alternativo común
 
-# 2. Middleware Request ID, Timing, Logging (Sin cambios respecto a tu código)
+# Permitir NGROK si está configurado (útil para demos/webhooks)
+# ngrok_url = os.getenv("NGROK_URL") # Leer directamente de env o desde settings
+# if ngrok_url and ngrok_url.startswith("https://") and ".ngrok" in ngrok_url:
+#     allowed_origins.append(ngrok_url)
+
+# Eliminar duplicados y None/empty strings
+allowed_origins = list(filter(None, set(allowed_origins)))
+
+log.info("Configuring CORS middleware", allowed_origins=allowed_origins)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins if allowed_origins else ["*"], # Permitir todo si no hay orígenes específicos
+    allow_credentials=True, # Importante para cookies/auth headers
+    allow_methods=["*"],   # Permitir todos los métodos estándar
+    allow_headers=["*"],   # Permitir todos los headers (incluye Authorization, Content-Type, X-Request-ID, etc.)
+    expose_headers=["X-Request-ID", "X-Process-Time"], # Headers que el frontend puede leer
+    max_age=600, # Tiempo en segundos que el navegador cachea la respuesta preflight OPTIONS
+)
+
+# 2. Middleware para Request ID, Timing y Logging Estructurado
 @app.middleware("http")
-async def add_request_id_timing_logging(request: Request, call_next):
-    start_time = time.time(); request_id = request.headers.get("x-request-id", str(uuid.uuid4())); request.state.request_id = request_id
-    with structlog.contextvars.bound_contextvars(request_id=request_id):
-        bound_log = structlog.get_logger("api_gateway.requests")
-        bound_log.info("Request received", method=request.method, path=request.url.path, client_ip=request.client.host if request.client else "N/A", user_agent=request.headers.get("user-agent", "N/A")[:100])
-        response = None
-        try:
-            response = await call_next(request)
-            process_time = time.time() - start_time
-            response.headers["X-Process-Time"] = f"{process_time:.4f}"; response.headers["X-Request-ID"] = request_id
-            bound_log.info("Request processed successfully", status_code=response.status_code, duration=round(process_time, 4))
-        except Exception as e:
-            process_time = time.time() - start_time
-            bound_log.exception("Unhandled exception during request processing", duration=round(process_time, 4), error_type=type(e).__name__, error=str(e))
-            raise e
-        finally: pass
+async def add_request_context_timing_logging(request: Request, call_next):
+    start_time = time.perf_counter() # Usar perf_counter para mejor precisión
+    # Obtener o generar Request ID
+    request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    # Poner request_id en el estado para acceso fácil en otros lugares
+    request.state.request_id = request_id
+
+    # Crear un logger contextual para esta request
+    request_log = log.bind(
+        request_id=request_id,
+        method=request.method,
+        path=request.url.path,
+        client_ip=request.client.host if request.client else "unknown"
+    )
+
+    request_log.info("Request received")
+
+    response = None
+    status_code = 500 # Default en caso de error no manejado antes de la respuesta
+    process_time_ms = 0
+
+    try:
+        # Llamar al siguiente middleware o a la ruta
+        response = await call_next(request)
+        status_code = response.status_code
+
+    except Exception as e:
+        # Capturar excepciones no manejadas por los handlers de FastAPI o rutas
+        process_time_ms = (time.perf_counter() - start_time) * 1000
+        request_log.exception("Unhandled exception during request processing",
+                              error=str(e), status_code=status_code, # status_code puede ser 500 aquí
+                              process_time_ms=round(process_time_ms, 2))
+
+        # Crear una respuesta de error genérica 500
+        response = JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": "Internal Server Error"}
+        )
+        # Añadir request ID al header de error también
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Process-Time"] = f"{process_time_ms:.2f}ms"
+        # Devolver la respuesta de error
         return response
+    finally:
+        # Calcular tiempo de procesamiento final (incluso si hubo excepción antes de la respuesta)
+        # Si la respuesta se creó en el 'except', este cálculo es redundante, pero inofensivo
+        if response: # Asegurar que response existe
+            process_time_ms = (time.perf_counter() - start_time) * 1000
+            # Añadir headers de Request ID y Timing a la respuesta final
+            response.headers["X-Request-ID"] = request_id
+            response.headers["X-Process-Time"] = f"{process_time_ms:.2f}ms"
 
-# --- Routers ---
-# *** CORRECCIÓN: Comentar o eliminar inclusión de auth_router si ya no se usa o está vacío ***
-# app.include_router(auth_router.router) # Ya no necesario si no hay rutas auth en gateway
-app.include_router(gateway_router.router) # Proxy principal
-app.include_router(user_router.router) # Rutas relacionadas con usuario (si las hay)
+            # Log final con estado y tiempo
+            # No loguear health checks en INFO para no llenar logs
+            log_level = "debug" if request.url.path == "/health" else "info"
+            log_func = getattr(request_log, log_level)
+            log_func("Request completed",
+                     status_code=status_code,
+                     process_time_ms=round(process_time_ms, 2))
 
-# --- Endpoints Básicos (Sin cambios) ---
-@app.get("/", tags=["Gateway Status"], summary="Root endpoint", include_in_schema=False)
-async def root(): return {"message": f"{settings.PROJECT_NAME} is running!"}
-@app.get("/health", tags=["Gateway Status"], summary="Kubernetes Health Check", status_code=status.HTTP_200_OK, response_description="Indicates if the gateway and its core dependencies are healthy.")
+    return response
+
+
+# --- Incluir Routers ---
+log.info("Including application routers...")
+# Rutas de usuario (login, ensure-company)
+app.include_router(user_router.router, tags=["Users & Authentication"])
+# Rutas de gateway (proxy)
+app.include_router(gateway_router.router) # Tags definidos dentro del router
+# El router de auth (/api/v1/auth/*) está deshabilitado o manejado por gateway_router si AUTH_SERVICE_URL está seteado
+# app.include_router(auth_router.router) # Comentado/Eliminado
+
+log.info("Routers included successfully.")
+
+# --- Endpoint Raíz y Health Check ---
+@app.get("/", tags=["General"], summary="Root endpoint indicating service is running")
+async def read_root():
+    """Endpoint raíz simple para indicar que el gateway está activo."""
+    return {"message": f"{settings.PROJECT_NAME} is running!"}
+
+@app.get("/health", tags=["Health"], summary="Basic health check endpoint")
 async def health_check():
-    admin_client_status = "available" if supabase_admin_client else "unavailable"
-    http_client_status = "available" if proxy_http_client and not proxy_http_client.is_closed else "unavailable"
-    is_healthy = admin_client_status == "available" and http_client_status == "available"
-    health_details = {"status": "healthy" if is_healthy else "unhealthy", "service": settings.PROJECT_NAME, "dependencies": {"supabase_admin_client": admin_client_status, "proxy_http_client": http_client_status}}
-    if not is_healthy: log.error("Health check failed", details=health_details); raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=health_details)
-    log.debug("Health check passed.", details=health_details); return health_details
+    """
+    Verifica la salud básica del servicio.
+    Podría extenderse para verificar dependencias (DB, HTTP Client).
+    """
+    # Estado básico
+    health_status = {"status": "healthy", "service": settings.PROJECT_NAME}
+    # Opcional: Verificar dependencias (puede añadir latencia)
+    # http_ok = gateway_router.http_client and not gateway_router.http_client.is_closed
+    # db_ok = await postgres_client.check_db_connection()
+    # if not http_ok or not db_ok:
+    #     health_status["status"] = "unhealthy"
+    #     health_status["checks"] = {"http_client": http_ok, "database": db_ok}
+    #     return JSONResponse(content=health_status, status_code=503)
 
-# --- Manejadores de Excepciones Globales (Sin cambios) ---
-@app.exception_handler(HTTPException)
-async def custom_http_exception_handler(request: Request, exc: HTTPException):
-    req_id = getattr(request.state, 'request_id', 'N/A'); bound_log = log.bind(request_id=req_id)
-    log_level_name = "warning" if 400 <= exc.status_code < 500 else "error"; log_method = getattr(bound_log, log_level_name, bound_log.info)
-    log_method("HTTP Exception occurred", status_code=exc.status_code, detail=exc.detail, path=request.url.path, exception_headers=exc.headers)
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
-@app.exception_handler(Exception)
-async def generic_exception_handler(request: Request, exc: Exception):
-    req_id = getattr(request.state, 'request_id', 'N/A'); bound_log = log.bind(request_id=req_id)
-    bound_log.exception("Unhandled internal server error occurred in gateway", path=request.url.path, error_type=type(exc).__name__)
-    return JSONResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content={"detail": "An unexpected internal server error occurred."})
+    return health_status
 
-# --- Log final de configuración (Sin cambios) ---
-log.info(f"'{settings.PROJECT_NAME}' application configured and ready to start.", log_level=settings.LOG_LEVEL, ingest_service=str(settings.INGEST_SERVICE_URL), query_service=str(settings.QUERY_SERVICE_URL), auth_proxy_enabled=bool(settings.AUTH_SERVICE_URL), supabase_url=str(settings.SUPABASE_URL), default_company_id_set=bool(settings.DEFAULT_COMPANY_ID))
+# --- Verificación de Dependencias en Startup (Opcional pero útil) ---
+# Se ejecuta después de que el lifespan 'yield' ha ocurrido pero antes de aceptar tráfico.
+# @app.on_event("startup")
+# async def verify_lifespan_dependencies_post_yield():
+#     """Verificación adicional de dependencias críticas después de la inicialización."""
+#     log.info("Performing post-lifespan dependency verification...")
+#     if not gateway_router.http_client:
+#         log.critical("POST-STARTUP CHECK FAILED: HTTP Client is not available!")
+#     # Verificar conexión a PostgreSQL de nuevo
+#     try:
+#         db_connected = await postgres_client.check_db_connection()
+#         if not db_connected:
+#             log.critical("POST-STARTUP CHECK FAILED: PostgreSQL connection check failed!")
+#     except Exception as e:
+#         log.critical("POST-STARTUP CHECK FAILED: PostgreSQL connection check error!", error=str(e))
+#     log.info("Post-lifespan dependency verification complete.")
+
+
+# --- Ejecución (para desarrollo local o si no se usa Gunicorn/Uvicorn directo) ---
+if __name__ == "__main__":
+    # Esto se usa generalmente para desarrollo local con --reload
+    # En producción, Gunicorn + Uvicorn workers se encargan de ejecutar la app
+    print(f"Starting {settings.PROJECT_NAME} using Uvicorn...")
+    uvicorn.run(
+        "app.main:app",
+        host="0.0.0.0",
+        port=8080, # Puerto estándar para contenedores
+        reload=True, # Habilitar reload solo para desarrollo local
+        log_level=settings.LOG_LEVEL.lower(), # Usar nivel de log de config
+        # workers=1 # Uvicorn en modo reload usualmente usa 1 worker
+    )

@@ -2,79 +2,83 @@
 # api-gateway/app/core/config.py
 import os
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field, validator, ValidationError, HttpUrl # Importar validator, ValidationError, HttpUrl
+from pydantic import Field, validator, ValidationError, HttpUrl, SecretStr
 from functools import lru_cache
 import sys
 import logging
-from typing import Optional, List # Añadir List
+from typing import Optional, List
 import uuid # Para validar UUID
 
-# URLs por defecto si no se especifican en el entorno (típico para K8s)
-K8S_INGEST_SVC_URL_DEFAULT = "http://ingest-api-service.nyro-develop.svc.cluster.local:80"
-K8S_QUERY_SVC_URL_DEFAULT = "http://query-service.nyro-develop.svc.cluster.local:80"
+# URLs por defecto si no se especifican en el entorno (usando el namespace 'atenex-develop')
+K8S_INGEST_SVC_URL_DEFAULT = "http://ingest-api-service.atenex-develop.svc.cluster.local:80"
+K8S_QUERY_SVC_URL_DEFAULT = "http://query-service.atenex-develop.svc.cluster.local:80"
+K8S_AUTH_SVC_URL_DEFAULT = None # No hay auth service por defecto
+
+# PostgreSQL Kubernetes Default (usando el namespace 'atenex-develop')
+POSTGRES_K8S_HOST_DEFAULT = "postgresql.atenex-develop.svc.cluster.local" # <-- K8s Service Name
+POSTGRES_K8S_PORT_DEFAULT = 5432
+POSTGRES_K8S_DB_DEFAULT = "atenex" # <-- Nombre de DB (asegúrate que coincida)
+POSTGRES_K8S_USER_DEFAULT = "postgres" # <-- Usuario DB (asegúrate que coincida)
 
 class Settings(BaseSettings):
     # Configuración de Pydantic-Settings
     model_config = SettingsConfigDict(
-        env_file='.env', # Buscar archivo .env
-        env_prefix='GATEWAY_', # Buscar variables de entorno con prefijo GATEWAY_
-        case_sensitive=False, # Insensible a mayúsculas/minúsculas
+        env_file='.env',
+        env_prefix='GATEWAY_',
+        case_sensitive=False,
         env_file_encoding='utf-8',
-        extra='ignore' # Ignorar variables extra en el entorno/archivo .env
+        extra='ignore'
     )
 
     # Información del Proyecto
-    PROJECT_NAME: str = "Nyro API Gateway"
+    PROJECT_NAME: str = "Atenex API Gateway" # <-- Nombre actualizado
     API_V1_STR: str = "/api/v1"
 
-    # URLs de Servicios Backend (Obligatorias)
-    INGEST_SERVICE_URL: HttpUrl = K8S_INGEST_SVC_URL_DEFAULT # Usar HttpUrl para validación básica
-    QUERY_SERVICE_URL: HttpUrl = K8S_QUERY_SVC_URL_DEFAULT  # Usar HttpUrl
-    AUTH_SERVICE_URL: Optional[HttpUrl] = None # Opcional (GATEWAY_AUTH_SERVICE_URL)
+    # URLs de Servicios Backend
+    INGEST_SERVICE_URL: HttpUrl = K8S_INGEST_SVC_URL_DEFAULT
+    QUERY_SERVICE_URL: HttpUrl = K8S_QUERY_SVC_URL_DEFAULT
+    AUTH_SERVICE_URL: Optional[HttpUrl] = K8S_AUTH_SVC_URL_DEFAULT
 
     # Configuración JWT (Obligatoria)
-    JWT_SECRET: str # Obligatorio, sin valor por defecto inseguro
-    JWT_ALGORITHM: str = "HS256" # Valor por defecto común para Supabase
+    JWT_SECRET: SecretStr # Obligatorio, usar SecretStr para seguridad
+    JWT_ALGORITHM: str = "HS256"
 
-    # Configuración Supabase Admin (Obligatoria)
-    SUPABASE_URL: HttpUrl # Obligatorio, usar HttpUrl
-    SUPABASE_SERVICE_ROLE_KEY: str # Obligatorio, sin valor por defecto inseguro
+    # Configuración PostgreSQL (Obligatoria)
+    POSTGRES_USER: str = POSTGRES_K8S_USER_DEFAULT
+    POSTGRES_PASSWORD: SecretStr # Obligatorio desde Secrets
+    POSTGRES_SERVER: str = POSTGRES_K8S_HOST_DEFAULT
+    POSTGRES_PORT: int = POSTGRES_K8S_PORT_DEFAULT
+    POSTGRES_DB: str = POSTGRES_K8S_DB_DEFAULT
 
     # Configuración de Asociación de Compañía
-    DEFAULT_COMPANY_ID: Optional[str] = None # Opcional, pero necesario para la asociación
+    DEFAULT_COMPANY_ID: Optional[str] = None # UUID de compañía por defecto
 
     # Configuración General
     LOG_LEVEL: str = "INFO"
-    HTTP_CLIENT_TIMEOUT: int = 60 # Timeout en segundos para llamadas downstream
-    # Nombre de Pydantic (KEEPALIAS) vs httpx (keepalive) - Mantener el de Pydantic si la variable de entorno se llama así.
-    HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS: int = 100 # Máximo conexiones keep-alive
-    HTTP_CLIENT_MAX_CONNECTIONS: int = 200 # Máximo conexiones totales
+    HTTP_CLIENT_TIMEOUT: int = 60
+    # Corregido: KEEPALIVE en lugar de KEEPALIAS
+    HTTP_CLIENT_MAX_KEEPALIVE_CONNECTIONS: int = 100
+    HTTP_CLIENT_MAX_CONNECTIONS: int = 200
+
+    # CORS (Opcional - URLs de ejemplo, ajusta según necesites)
+    VERCEL_FRONTEND_URL: Optional[str] = "https://atenex-frontend.vercel.app"
+    # NGROK_URL: Optional[str] = None
 
     # Validadores Pydantic
     @validator('JWT_SECRET')
     def check_jwt_secret(cls, v):
-        if not v or v == "YOUR_DEFAULT_JWT_SECRET_KEY_CHANGE_ME_IN_ENV_OR_SECRET":
-            raise ValueError("GATEWAY_JWT_SECRET is not set or uses the insecure default value.")
-        # Podría añadirse una validación de longitud mínima si se desea
+        # get_secret_value() se usa al *usar* el secreto, aquí solo verificamos que no esté vacío
+        if not v or v.get_secret_value() == "YOUR_DEFAULT_JWT_SECRET_KEY_CHANGE_ME_IN_ENV_OR_SECRET":
+            raise ValueError("GATEWAY_JWT_SECRET is not set or uses an insecure default value.")
         return v
 
-    @validator('SUPABASE_SERVICE_ROLE_KEY')
-    def check_supabase_service_key(cls, v):
-        if not v or v == "YOUR_SUPABASE_SERVICE_ROLE_KEY_HERE":
-            raise ValueError("GATEWAY_SUPABASE_SERVICE_ROLE_KEY is not set or uses the insecure default value.")
-        # Podría añadirse validación de formato si Supabase tiene uno específico (ej. longitud)
-        return v
-
-    # La validación de URL ahora la hace Pydantic con HttpUrl, no se necesita check_supabase_url
-
-    @validator('DEFAULT_COMPANY_ID', always=True) # always=True para que se ejecute incluso si es None
-    def check_default_company_id_format(cls, v): # Renombrado para claridad
-        if v is not None: # Solo validar si se proporciona un valor
+    @validator('DEFAULT_COMPANY_ID', always=True)
+    def check_default_company_id_format(cls, v):
+        if v is not None:
             try:
-                uuid.UUID(str(v)) # Convertir a string por si acaso
+                uuid.UUID(str(v))
             except ValueError:
                 raise ValueError(f"GATEWAY_DEFAULT_COMPANY_ID ('{v}') is not a valid UUID.")
-        # Si es None, es válido (aunque la lógica de asociación fallará si se necesita)
         return v
 
     @validator('LOG_LEVEL')
@@ -83,64 +87,61 @@ class Settings(BaseSettings):
         normalized_v = v.upper()
         if normalized_v not in valid_levels:
             raise ValueError(f"Invalid LOG_LEVEL '{v}'. Must be one of {valid_levels}")
-        return normalized_v # Normalizar a mayúsculas
+        return normalized_v
 
 # Usar lru_cache para asegurar que las settings se cargan una sola vez
 @lru_cache()
 def get_settings() -> Settings:
-    # Configurar un logger temporal BÁSICO para la carga de settings
-    # Esto evita problemas si el logging completo aún no está configurado
-    temp_log = logging.getLogger("api_gateway.config.loader") # Nombre más específico
+    temp_log = logging.getLogger("atenex_api_gateway.config.loader")
     if not temp_log.handlers:
         handler = logging.StreamHandler(sys.stdout)
-        # Formato simple para logs de carga
         formatter = logging.Formatter('%(levelname)s: %(message)s')
         handler.setFormatter(formatter)
         temp_log.addHandler(handler)
-        temp_log.setLevel(logging.INFO) # Usar INFO para ver mensajes de carga
+        temp_log.setLevel(logging.INFO)
 
-    temp_log.info("Loading Gateway settings...")
+    temp_log.info("Loading Atenex Gateway settings...")
     try:
-        # Pydantic-settings leerá las variables de entorno/archivo .env
-        # y ejecutará los validadores
         settings_instance = Settings()
 
-        # Loguear valores cargados (excepto secretos) - Convertir HttpUrl a string para loggear
-        temp_log.info("Gateway Settings Loaded Successfully:")
+        # Loguear valores cargados (excepto secretos)
+        temp_log.info("Atenex Gateway Settings Loaded Successfully:")
         temp_log.info(f"  PROJECT_NAME: {settings_instance.PROJECT_NAME}")
         temp_log.info(f"  INGEST_SERVICE_URL: {str(settings_instance.INGEST_SERVICE_URL)}")
         temp_log.info(f"  QUERY_SERVICE_URL: {str(settings_instance.QUERY_SERVICE_URL)}")
         temp_log.info(f"  AUTH_SERVICE_URL: {str(settings_instance.AUTH_SERVICE_URL) if settings_instance.AUTH_SERVICE_URL else 'Not Set'}")
         temp_log.info(f"  JWT_SECRET: *** SET (Validated) ***")
         temp_log.info(f"  JWT_ALGORITHM: {settings_instance.JWT_ALGORITHM}")
-        temp_log.info(f"  SUPABASE_URL: {str(settings_instance.SUPABASE_URL)}")
-        temp_log.info(f"  SUPABASE_SERVICE_ROLE_KEY: *** SET (Validated) ***")
+        temp_log.info(f"  POSTGRES_SERVER: {settings_instance.POSTGRES_SERVER}")
+        temp_log.info(f"  POSTGRES_PORT: {settings_instance.POSTGRES_PORT}")
+        temp_log.info(f"  POSTGRES_DB: {settings_instance.POSTGRES_DB}")
+        temp_log.info(f"  POSTGRES_USER: {settings_instance.POSTGRES_USER}")
+        temp_log.info(f"  POSTGRES_PASSWORD: *** SET ***")
         if settings_instance.DEFAULT_COMPANY_ID:
             temp_log.info(f"  DEFAULT_COMPANY_ID: {settings_instance.DEFAULT_COMPANY_ID} (Validated as UUID if set)")
         else:
-            # Es una advertencia porque el endpoint de asociación fallará si se llama
             temp_log.warning("  DEFAULT_COMPANY_ID: Not Set (Ensure-company endpoint requires this)")
         temp_log.info(f"  LOG_LEVEL: {settings_instance.LOG_LEVEL}")
         temp_log.info(f"  HTTP_CLIENT_TIMEOUT: {settings_instance.HTTP_CLIENT_TIMEOUT}")
         temp_log.info(f"  HTTP_CLIENT_MAX_CONNECTIONS: {settings_instance.HTTP_CLIENT_MAX_CONNECTIONS}")
-        temp_log.info(f"  HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS: {settings_instance.HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS}")
+        temp_log.info(f"  HTTP_CLIENT_MAX_KEEPALIVE_CONNECTIONS: {settings_instance.HTTP_CLIENT_MAX_KEEPALIVE_CONNECTIONS}")
+        temp_log.info(f"  VERCEL_FRONTEND_URL: {settings_instance.VERCEL_FRONTEND_URL or 'Not Set'}")
+        # temp_log.info(f"  NGROK_URL: {settings_instance.NGROK_URL or 'Not Set'}")
 
         return settings_instance
 
     except ValidationError as e:
-        # Captura errores de validación de Pydantic (incluyendo los validadores personalizados)
         temp_log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        temp_log.critical("! FATAL: Error validating Gateway settings:")
+        temp_log.critical("! FATAL: Error validating Atenex Gateway settings:")
         for error in e.errors():
             loc = " -> ".join(map(str, error['loc'])) if error.get('loc') else 'N/A'
             temp_log.critical(f"!  - {loc}: {error['msg']}")
-        temp_log.critical("! Check your .env file or environment variables.")
+        temp_log.critical("! Check your Kubernetes ConfigMap/Secrets or .env file.")
         temp_log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        sys.exit("FATAL: Invalid Gateway configuration. Check logs.")
+        sys.exit("FATAL: Invalid Atenex Gateway configuration. Check logs.")
     except Exception as e:
-        # Captura cualquier otro error durante la carga
-        temp_log.exception(f"FATAL: Unexpected error loading Gateway settings: {e}")
-        sys.exit(f"FATAL: Unexpected error loading Gateway settings: {e}")
+        temp_log.exception(f"FATAL: Unexpected error loading Atenex Gateway settings: {e}")
+        sys.exit(f"FATAL: Unexpected error loading Atenex Gateway settings: {e}")
 
 # Crear instancia global de settings
 settings = get_settings()

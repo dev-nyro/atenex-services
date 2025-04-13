@@ -1,9 +1,10 @@
-# ./app/db/postgres_client.py (AÑADIDA función list_documents_by_company)
+# ingest-service/app/db/postgres_client.py
 import uuid
 from typing import Any, Optional, Dict, List
 import asyncpg
 import structlog
 import json
+from datetime import datetime, timezone
 
 from app.core.config import settings
 from app.models.domain import DocumentStatus
@@ -12,20 +13,21 @@ log = structlog.get_logger(__name__)
 
 _pool: Optional[asyncpg.Pool] = None
 
+# --- Pool Management ---
 async def get_db_pool() -> asyncpg.Pool:
-    """
-    Obtiene o crea el pool de conexiones a la base de datos (Supabase).
-    Deshabilita la caché de prepared statements (statement_cache_size=0)
-    para compatibilidad con PgBouncer en modo transaction/statement (Supabase Pooler).
-    """
+    """Obtiene o crea el pool de conexiones a PostgreSQL."""
     global _pool
     if _pool is None or _pool._closed:
+        log.info("PostgreSQL pool is not initialized or closed. Creating new pool...",
+                 host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT,
+                 user=settings.POSTGRES_USER, db=settings.POSTGRES_DB)
         try:
-            log.info("Creating Supabase/PostgreSQL connection pool using arguments...",
-                     host=settings.POSTGRES_SERVER,
-                     port=settings.POSTGRES_PORT,
-                     user=settings.POSTGRES_USER,
-                     database=settings.POSTGRES_DB)
+            # Codec para manejar JSONB correctamente
+            def _json_encoder(value): return json.dumps(value)
+            def _json_decoder(value): return json.loads(value)
+            async def init_connection(conn):
+                await conn.set_type_codec('jsonb', encoder=_json_encoder, decoder=_json_decoder, schema='pg_catalog')
+                await conn.set_type_codec('json', encoder=_json_encoder, decoder=_json_decoder, schema='pg_catalog')
 
             _pool = await asyncpg.create_pool(
                 user=settings.POSTGRES_USER,
@@ -33,82 +35,51 @@ async def get_db_pool() -> asyncpg.Pool:
                 database=settings.POSTGRES_DB,
                 host=settings.POSTGRES_SERVER,
                 port=settings.POSTGRES_PORT,
-                min_size=5,
-                max_size=20,
-                # *** CORREGIDO: Deshabilitar caché de prepared statements ***
-                # Necesario para compatibilidad con PgBouncer en modo 'transaction' o 'statement'
-                # (como el Session Pooler de Supabase) que no soporta prepared statements a nivel de sesión.
-                statement_cache_size=0,
-                # command_timeout=60, # Timeout para comandos individuales
-                # timeout=300, # Timeout general? Revisar docs de asyncpg
-                init=lambda conn: conn.set_type_codec(
-                    'jsonb',
-                    encoder=json.dumps,
-                    decoder=json.loads,
-                    schema='pg_catalog',
-                    format='text'
-                )
-                # Podrías considerar añadir el codec de UUID aquí también si lo usas frecuentemente
-                # init=setup_connection_codecs # Ver ejemplo abajo si es necesario
+                min_size=2, # Ajusta según carga esperada
+                max_size=10,
+                timeout=30.0, # Timeout de conexión
+                command_timeout=60.0, # Timeout por comando
+                init=init_connection,
+                statement_cache_size=0 # Deshabilitar si causa problemas
             )
-            log.info("Supabase/PostgreSQL connection pool created successfully (statement_cache_size=0).")
-        except OSError as e:
-             log.error("Network/OS error creating Supabase/PostgreSQL connection pool",
-                      error=str(e), errno=getattr(e, 'errno', None),
-                      host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT,
-                      db=settings.POSTGRES_DB, user=settings.POSTGRES_USER,
-                      exc_info=True)
-             raise
-        except asyncpg.exceptions.InvalidPasswordError:
-             log.error("Invalid password for Supabase/PostgreSQL connection",
-                       host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT, user=settings.POSTGRES_USER)
-             raise
-        # Capturar específicamente el error de prepared statement duplicado
-        except asyncpg.exceptions.DuplicatePreparedStatementError as e:
-            log.error("Failed to create Supabase/PostgreSQL connection pool due to DuplicatePreparedStatementError "
-                      "(Confirm statement_cache_size=0 is set correctly for PgBouncer/Pooler)",
-                      error=str(e), error_type=type(e).__name__,
-                      host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT,
-                      db=settings.POSTGRES_DB, user=settings.POSTGRES_USER,
-                      exc_info=True) # Incluir traceback en este caso es útil
-            raise # Re-lanzar para que falle el startup
-        except Exception as e: # Otros errores (incluyendo TimeoutError si volviera a ocurrir)
-            log.error("Failed to create Supabase/PostgreSQL connection pool",
-                      error=str(e), error_type=type(e).__name__,
-                      host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT,
-                      db=settings.POSTGRES_DB, user=settings.POSTGRES_USER,
-                      exc_info=True)
-            raise
+            log.info("PostgreSQL connection pool created successfully.")
+        except (asyncpg.exceptions.InvalidPasswordError, OSError, ConnectionRefusedError) as conn_err:
+            log.critical("CRITICAL: Failed to connect to PostgreSQL", error=str(conn_err), exc_info=True)
+            _pool = None
+            raise ConnectionError(f"Failed to connect to PostgreSQL: {conn_err}") from conn_err
+        except Exception as e:
+            log.critical("CRITICAL: Failed to create PostgreSQL connection pool", error=str(e), exc_info=True)
+            _pool = None
+            raise RuntimeError(f"Failed to create PostgreSQL pool: {e}") from e
     return _pool
-
-# Ejemplo de función init más compleja si necesitas más codecs (opcional)
-# async def setup_connection_codecs(connection):
-#     await connection.set_type_codec(
-#         'jsonb',
-#         encoder=json.dumps,
-#         decoder=json.loads,
-#         schema='pg_catalog',
-#         format='text'
-#     )
-#     # Añadir codec para UUID si no está por defecto o quieres asegurar el manejo
-#     await connection.set_type_codec(
-#         'uuid',
-#         encoder=str,
-#         decoder=uuid.UUID,
-#         schema='pg_catalog',
-#         format='text'
-#     )
-#     log.debug("Custom type codecs (jsonb, uuid) registered for new connection.", connection=connection)
-
 
 async def close_db_pool():
     """Cierra el pool de conexiones."""
     global _pool
     if _pool and not _pool._closed:
-        log.info("Closing Supabase/PostgreSQL connection pool...")
+        log.info("Closing PostgreSQL connection pool...")
         await _pool.close()
         _pool = None
-        log.info("Supabase/PostgreSQL connection pool closed.")
+        log.info("PostgreSQL connection pool closed.")
+    elif _pool and _pool._closed:
+        log.warning("Attempted to close an already closed PostgreSQL pool.")
+        _pool = None
+    else:
+        log.info("No active PostgreSQL connection pool to close.")
+
+async def check_db_connection() -> bool:
+    """Verifica que la conexión a la base de datos esté funcionando."""
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction(): # Usa transacción para asegurar que no haya efectos secundarios
+                result = await conn.fetchval("SELECT 1")
+        return result == 1
+    except Exception as e:
+        log.error("Database connection check failed", error=str(e))
+        return False
+
+# --- Document Operations ---
 
 async def create_document(
     company_id: uuid.UUID,
@@ -116,32 +87,39 @@ async def create_document(
     file_type: str,
     metadata: Dict[str, Any]
 ) -> uuid.UUID:
-    """Crea un registro inicial para el documento en la tabla DOCUMENTS."""
+    """
+    Crea un registro inicial para el documento en la tabla DOCUMENTS.
+    Retorna el UUID del documento creado.
+    """
     pool = await get_db_pool()
     doc_id = uuid.uuid4()
+    # Usar NOW() para timestamps, status inicial UPLOADED
+    # Incluir updated_at en el INSERT inicial
     query = """
-        INSERT INTO documents (id, company_id, file_name, file_type, metadata, status, file_path, uploaded_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, '', NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC')
+        INSERT INTO documents (id, company_id, file_name, file_type, metadata, status, uploaded_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC')
         RETURNING id;
     """
+    insert_log = log.bind(company_id=str(company_id), filename=file_name, content_type=file_type, proposed_doc_id=str(doc_id))
     try:
         async with pool.acquire() as connection:
-            # Con statement_cache_size=0, asyncpg no usará prepared statements internamente aquí
-            result = await connection.fetchval(
-                query, doc_id, company_id, file_name, file_type, json.dumps(metadata), DocumentStatus.UPLOADED.value # Asegurar que metadata se guarda como JSON
+            # Usar json.dumps para el campo jsonb 'metadata'
+            result_id = await connection.fetchval(
+                query, doc_id, company_id, file_name, file_type, json.dumps(metadata), DocumentStatus.UPLOADED.value
             )
-        if result:
-            log.info("Document record created in Supabase", document_id=doc_id, company_id=company_id)
-            return result
+        if result_id and result_id == doc_id:
+            insert_log.info("Document record created in PostgreSQL", document_id=str(doc_id))
+            return result_id
         else:
-             log.error("Failed to create document record, no ID returned.", document_id=doc_id)
-             raise RuntimeError("Failed to create document record, no ID returned.")
+             insert_log.error("Failed to create document record, unexpected or no ID returned.", returned_id=result_id)
+             raise RuntimeError(f"Failed to create document record, return value mismatch ({result_id})")
     except asyncpg.exceptions.UniqueViolationError as e:
-        log.error("Failed to create document record due to unique constraint violation.", error=str(e), document_id=doc_id, company_id=company_id, constraint=e.constraint_name, exc_info=False)
-        raise ValueError(f"Document creation failed: unique constraint violated ({e.constraint_name})") from e
+        # Esto es improbable si usamos UUID v4, pero posible si hay constraints en otros campos
+        insert_log.error("Unique constraint violation creating document record.", error=str(e), constraint=e.constraint_name, exc_info=False)
+        raise ValueError(f"Document creation failed due to unique constraint ({e.constraint_name})") from e
     except Exception as e:
-        log.error("Failed to create document record in Supabase", error=str(e), document_id=doc_id, company_id=company_id, file_name=file_name, exc_info=True)
-        raise
+        insert_log.error("Failed to create document record in PostgreSQL", error=str(e), exc_info=True)
+        raise # Relanzar para manejo superior
 
 async def update_document_status(
     document_id: uuid.UUID,
@@ -150,92 +128,112 @@ async def update_document_status(
     chunk_count: Optional[int] = None,
     error_message: Optional[str] = None,
 ) -> bool:
-    """Actualiza el estado y otros campos de un documento en la tabla DOCUMENTS."""
+    """
+    Actualiza el estado y otros campos de un documento.
+    Limpia error_message si el estado no es ERROR.
+    """
     pool = await get_db_pool()
-    fields_to_update = ["status = $2", "updated_at = NOW() AT TIME ZONE 'UTC'"]
-    params: List[Any] = [document_id, status.value]
-    current_param_index = 3
-    if file_path is not None:
-        fields_to_update.append(f"file_path = ${current_param_index}")
-        params.append(file_path)
-        current_param_index += 1
-    if chunk_count is not None:
-        fields_to_update.append(f"chunk_count = ${current_param_index}")
-        params.append(chunk_count)
-        current_param_index += 1
-    if status == DocumentStatus.ERROR:
-        safe_error_message = (error_message or "Unknown processing error")[:1000] # Limitar longitud
-        fields_to_update.append(f"error_message = ${current_param_index}")
-        params.append(safe_error_message)
-        current_param_index += 1
-    else:
-        # Limpiar error_message si el estado no es ERROR
-        fields_to_update.append("error_message = NULL")
+    update_log = log.bind(document_id=str(document_id), new_status=status.value)
 
-    query = f"UPDATE documents SET {', '.join(fields_to_update)} WHERE id = $1;"
+    fields_to_set: List[str] = []
+    params: List[Any] = [document_id] # $1 será el ID
+    param_index = 2 # Empezar parámetros desde $2
+
+    # Siempre actualizar 'status' y 'updated_at'
+    fields_to_set.append(f"status = ${param_index}")
+    params.append(status.value); param_index += 1
+    fields_to_set.append(f"updated_at = NOW() AT TIME ZONE 'UTC'")
+
+    # Añadir otros campos condicionalmente
+    if file_path is not None:
+        fields_to_set.append(f"file_path = ${param_index}")
+        params.append(file_path); param_index += 1
+    if chunk_count is not None:
+        fields_to_set.append(f"chunk_count = ${param_index}")
+        params.append(chunk_count); param_index += 1
+
+    # Manejar error_message
+    if status == DocumentStatus.ERROR:
+        safe_error = (error_message or "Unknown processing error")[:2000] # Limitar longitud de error
+        fields_to_set.append(f"error_message = ${param_index}")
+        params.append(safe_error); param_index += 1
+        update_log = update_log.bind(error_message=safe_error)
+    else:
+        # Si el nuevo estado NO es ERROR, limpiar el campo error_message
+        fields_to_set.append("error_message = NULL")
+
+    query = f"UPDATE documents SET {', '.join(fields_to_set)} WHERE id = $1;"
+    update_log.debug("Executing document status update", query=query, params_count=len(params))
+
     try:
         async with pool.acquire() as connection:
-             # Con statement_cache_size=0, asyncpg no usará prepared statements internamente aquí
-             result = await connection.execute(query, *params)
-        affected_rows = 0
-        if isinstance(result, str) and result.startswith("UPDATE "):
-            try: affected_rows = int(result.split(" ")[1])
-            except (IndexError, ValueError): log.warning("Could not parse affected rows from DB result", result_string=result)
-        success = affected_rows > 0
-        if success: log.info("Document status updated in Supabase", document_id=document_id, new_status=status.value, file_path=file_path, chunk_count=chunk_count, has_error=(status == DocumentStatus.ERROR))
-        else: log.warning("Document status update did not affect any rows", document_id=document_id, new_status=status.value)
-        return success
+             result_str = await connection.execute(query, *params) # Desempaquetar params
+
+        # Verificar si se actualizó alguna fila
+        if isinstance(result_str, str) and result_str.startswith("UPDATE "):
+            affected_rows = int(result_str.split(" ")[1])
+            if affected_rows > 0:
+                update_log.info("Document status updated successfully", affected_rows=affected_rows)
+                return True
+            else:
+                update_log.warning("Document status update command executed but no rows were affected (document ID might not exist).")
+                return False
+        else:
+             update_log.error("Unexpected result from document update execution", db_result=result_str)
+             return False # Considerar esto como fallo
+
     except Exception as e:
-        log.error("Failed to update document status in Supabase", error=str(e), document_id=document_id, new_status=status.value, exc_info=True)
-        raise
+        update_log.error("Failed to update document status in PostgreSQL", error=str(e), exc_info=True)
+        raise # Relanzar para manejo superior
 
 async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]]:
-    """Obtiene el estado y otros datos de un documento de la tabla DOCUMENTS."""
+    """Obtiene datos clave de un documento por su ID."""
     pool = await get_db_pool()
-    # Asegurar que seleccionamos las columnas correctas para StatusResponse
+    # Seleccionar columnas necesarias para la API (schema StatusResponse) y validación de company_id
     query = """
         SELECT id, status, file_name, file_type, chunk_count, error_message, updated_at, company_id
         FROM documents
         WHERE id = $1;
     """
+    get_log = log.bind(document_id=str(document_id))
     try:
         async with pool.acquire() as connection:
-            # Con statement_cache_size=0, asyncpg no usará prepared statements internamente aquí
             record = await connection.fetchrow(query, document_id)
         if record:
-            log.debug("Document status retrieved from Supabase", document_id=document_id)
-            # Convertir asyncpg.Record a Dict para consistencia
-            return dict(record)
+            get_log.debug("Document status retrieved successfully")
+            return dict(record) # Convertir a dict
         else:
-            log.warning("Document status requested for non-existent ID", document_id=document_id)
+            get_log.warning("Document status requested for non-existent ID")
             return None
     except Exception as e:
-        log.error("Failed to get document status from Supabase", error=str(e), document_id=document_id, exc_info=True)
+        get_log.error("Failed to get document status from PostgreSQL", error=str(e), exc_info=True)
         raise
 
-# --- NUEVA FUNCIÓN ---
-async def list_documents_by_company(company_id: uuid.UUID) -> List[Dict[str, Any]]:
+async def list_documents_by_company(
+    company_id: uuid.UUID,
+    limit: int = 100,
+    offset: int = 0
+) -> List[Dict[str, Any]]:
     """
-    Obtiene una lista de documentos (con su estado) para una compañía específica,
-    ordenados por fecha de actualización descendente.
+    Obtiene una lista paginada de documentos para una compañía, ordenados por updated_at DESC.
     """
     pool = await get_db_pool()
-    # Seleccionar las columnas necesarias para el schema StatusResponse
+    # Seleccionar columnas para StatusResponse
     query = """
         SELECT id, status, file_name, file_type, chunk_count, error_message, updated_at
         FROM documents
         WHERE company_id = $1
-        ORDER BY updated_at DESC;
+        ORDER BY updated_at DESC
+        LIMIT $2 OFFSET $3;
     """
-    db_log = log.bind(company_id=str(company_id))
+    list_log = log.bind(company_id=str(company_id), limit=limit, offset=offset)
     try:
         async with pool.acquire() as connection:
-            # Con statement_cache_size=0, asyncpg no usará prepared statements internamente aquí
-            records = await connection.fetch(query, company_id)
+            records = await connection.fetch(query, company_id, limit, offset)
 
-        result_list = [dict(record) for record in records] # Convertir lista de Records a lista de Dicts
-        db_log.info(f"Retrieved {len(result_list)} documents for company")
+        result_list = [dict(record) for record in records] # Convertir Records a Dicts
+        list_log.info(f"Retrieved {len(result_list)} documents for company listing")
         return result_list
     except Exception as e:
-        db_log.error("Failed to list documents by company from Supabase", error=str(e), exc_info=True)
-        raise # Relanzar para que el endpoint maneje el error
+        list_log.error("Failed to list documents by company from PostgreSQL", error=str(e), exc_info=True)
+        raise

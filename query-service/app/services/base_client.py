@@ -1,65 +1,58 @@
-# ./app/services/base_client.py
+# query-service/app/services/base_client.py
 import httpx
-# Importar los objetos necesarios de tenacity
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, retry_if_exception
 import structlog
 from typing import Any, Dict, Optional
 
-# Asegurarnos de importar Settings desde la ubicación correcta
 from app.core.config import settings
 
 log = structlog.get_logger(__name__)
 
+# Define qué errores HTTP son recuperables (Server errors)
+RETRYABLE_HTTP_STATUS = (500, 502, 503, 504)
+
 class BaseServiceClient:
-    """Cliente HTTP base asíncrono con reintentos."""
+    """Cliente HTTP base asíncrono con reintentos configurables."""
 
     def __init__(self, base_url: str, service_name: str):
         self.base_url = base_url
         self.service_name = service_name
-        # Usar httpx.AsyncClient para operaciones asíncronas
-        self.client = httpx.AsyncClient(
-            base_url=self.base_url,
-            timeout=settings.HTTP_CLIENT_TIMEOUT
-        )
+        self.client = httpx.AsyncClient(base_url=self.base_url, timeout=settings.HTTP_CLIENT_TIMEOUT)
         log.debug(f"{self.service_name} client initialized", base_url=base_url)
 
     async def close(self):
-        """Cierra el cliente HTTP asíncrono."""
         await self.client.aclose()
         log.info(f"{self.service_name} client closed.")
 
-    # Decorador de reintentos usando tenacity
-    # *** SECCIÓN CORREGIDA ***
+    # Decorador de reintentos Tenacity
     @retry(
-        stop=stop_after_attempt(settings.HTTP_CLIENT_MAX_RETRIES + 1), # +1 porque el primer intento cuenta
+        stop=stop_after_attempt(settings.HTTP_CLIENT_MAX_RETRIES + 1), # Total attempts = initial + retries
         wait=wait_exponential(multiplier=1, min=settings.HTTP_CLIENT_BACKOFF_FACTOR, max=10),
-        # CORRECCIÓN: Combinar las condiciones de reintento correctamente
+        # *** CORREGIDO: Lógica de reintento explícita ***
         retry=(
-            # Reintentar en errores básicos de red/timeout
-            retry_if_exception_type((httpx.TimeoutException, httpx.NetworkError)) |
-            # Reintentar SI la excepción es HTTPStatusError Y el código es >= 500
-            retry_if_exception(
-                lambda e: isinstance(e, httpx.HTTPStatusError) and e.response.status_code >= 500
-            )
+            # Reintentar en errores de red o timeout
+            retry_if_exception_type((httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout)) |
+            # Reintentar si es un error HTTP y el status code está en la lista de recuperables
+            retry_if_exception(lambda e: isinstance(e, httpx.HTTPStatusError) and e.response.status_code in RETRYABLE_HTTP_STATUS)
         ),
-        reraise=True, # Vuelve a lanzar la excepción después de los reintentos si todos fallan
+        reraise=True, # Relanzar la última excepción si todos los reintentos fallan
         before_sleep=lambda retry_state: log.warning(
             f"Retrying {self.service_name} request",
-            # Intentar obtener detalles del request si están disponibles en args
-            method=getattr(retry_state.args[0], 'method', 'N/A') if retry_state.args else 'N/A',
-            endpoint=getattr(retry_state.args[0], 'url', 'N/A') if retry_state.args else 'N/A',
+            # Intenta obtener detalles del intento fallido
+            method=getattr(retry_state.args[0], 'method', 'N/A') if retry_state.args and isinstance(retry_state.args[0], httpx.Request) else 'N/A',
+            url=str(getattr(retry_state.args[0], 'url', 'N/A')) if retry_state.args and isinstance(retry_state.args[0], httpx.Request) else 'N/A',
             attempt=retry_state.attempt_number,
             wait_time=f"{retry_state.next_action.sleep:.2f}s",
-            error=str(retry_state.outcome.exception()) # Mostrar el error
+            error_type=type(retry_state.outcome.exception()).__name__,
+            error_details=str(retry_state.outcome.exception())
         )
     )
-    # *** FIN SECCIÓN CORREGIDA ***
     async def _request(
         self,
         method: str,
         endpoint: str,
         params: Optional[Dict[str, Any]] = None,
-        json_data: Optional[Dict[str, Any]] = None, # Renombrado para claridad
+        json_data: Optional[Dict[str, Any]] = None, # Renombrado
         data: Optional[Dict[str, Any]] = None,
         files: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
@@ -67,39 +60,26 @@ class BaseServiceClient:
         """Realiza una petición HTTP asíncrona con reintentos."""
         request_log = log.bind(service=self.service_name, method=method, endpoint=endpoint)
         request_log.debug("Sending request...")
+        request_obj = self.client.build_request( # Construir objeto request para logging
+             method, endpoint, params=params, json=json_data, data=data, files=files, headers=headers
+        )
         try:
-            response = await self.client.request(
-                method,
-                endpoint,
-                params=params,
-                json=json_data, # Usar el parámetro renombrado
-                data=data,
-                files=files,
-                headers=headers
-            )
-            # Lanzar excepción para códigos de error HTTP (4xx, 5xx)
-            response.raise_for_status()
+            response = await self.client.send(request_obj) # Usar send con el objeto request
+            response.raise_for_status() # Lanza excepción para 4xx/5xx
             request_log.debug("Request successful", status_code=response.status_code)
             return response
         except httpx.HTTPStatusError as e:
-            # Loguear error pero permitir que Tenacity decida si reintentar (para 5xx) o fallar (para 4xx)
             log_level = log.warning if e.response.status_code < 500 else log.error
             log_level(
                 "Request failed with HTTP status code",
                 status_code=e.response.status_code,
-                response_text=e.response.text[:500], # Limitar longitud del texto de respuesta
-                exc_info=False # No es necesario el traceback completo para errores HTTP esperados
+                response_preview=e.response.text[:200], # Preview de la respuesta
+                exc_info=False
             )
-            raise # Re-lanzar para que Tenacity la maneje
-        except (httpx.TimeoutException, httpx.NetworkError) as e:
-            request_log.error(
-                "Request failed due to network/timeout issue",
-                error_type=type(e).__name__,
-                error_details=str(e),
-                exc_info=False # Traceback puede ser útil aquí, pero puede ser verboso
-            )
-            raise # Re-lanzar para que Tenacity la maneje
+            raise # Re-lanzar para que Tenacity maneje reintentos (para 5xx) o falle (para 4xx)
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout) as net_err:
+            request_log.error("Request failed due to network/timeout issue", error_type=type(net_err).__name__, error_details=str(net_err))
+            raise # Re-lanzar para Tenacity
         except Exception as e:
-             # Capturar cualquier otra excepción inesperada
              request_log.exception("An unexpected error occurred during request")
-             raise # Re-lanzar la excepción inesperada
+             raise # Re-lanzar excepción inesperada

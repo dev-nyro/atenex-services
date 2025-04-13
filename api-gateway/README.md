@@ -1,95 +1,102 @@
-# API Gateway (api-gateway) - Nyro SaaS B2B
+# API Gateway (api-gateway) - Atenex
 
 ## 1. Visión General
 
-Este servicio actúa como el **API Gateway** para la plataforma SaaS B2B de Nyro. Es el punto de entrada único y seguro para todas las solicitudes externas destinadas a los microservicios backend (Ingesta, Consulta, etc.). Sus responsabilidades principales son:
+Este servicio actúa como el **API Gateway** para la plataforma SaaS B2B de Atenex. Es el punto de entrada único y seguro para todas las solicitudes externas destinadas a los microservicios backend (Ingesta, Consulta, etc.) que se ejecutan en el namespace `nyro-develop` de Kubernetes. Sus responsabilidades principales son:
 
-*   **Routing:** Dirige las solicitudes entrantes al microservicio apropiado (`ingest-service`, `query-service`) basándose en la ruta de la URL (`/api/v1/ingest/*`, `/api/v1/query/*`).
-*   **Autenticación y Autorización (Supabase JWT):**
-    *   Verifica los tokens JWT emitidos por Supabase, presentados en el header `Authorization: Bearer <token>`.
+*   **Routing:** Dirige las solicitudes entrantes al microservicio apropiado (`ingest-api-service`, `query-service`) dentro del namespace `nyro-develop`, basándose en la ruta de la URL (`/api/v1/ingest/*`, `/api/v1/query/*`).
+*   **Autenticación y Autorización (JWT):**
+    *   Verifica los tokens JWT presentados en el header `Authorization: Bearer <token>`.
     *   Valida la **firma** del token usando el secreto compartido (`GATEWAY_JWT_SECRET`).
     *   Valida la **expiración** (`exp`).
-    *   Valida la **audiencia** (`aud` debe ser `'authenticated'`).
-    *   Verifica la presencia de **claims requeridos** (`sub`, `aud`, `exp`).
-    *   **Para rutas protegidas estándar:** Extrae y **requiere** el `company_id` del claim `app_metadata` dentro del token. Si falta, la solicitud es rechazada (403 Forbidden).
-    *   **Para asociación inicial:** Proporciona un endpoint (`/api/v1/users/me/ensure-company`) que valida el token pero *no* requiere `company_id` inicialmente, permitiendo asociar uno.
-    *   Asegura que solo las solicitudes autenticadas y autorizadas lleguen a los servicios protegidos.
+    *   Verifica la presencia de **claims requeridos** (`sub`, `exp`).
+    *   **Para rutas protegidas estándar:** Extrae y **requiere** el `company_id` directamente del payload del token. Si falta o el usuario no existe/está inactivo en PostgreSQL, la solicitud es rechazada (401 Unauthorized o 403 Forbidden).
+    *   **Para asociación inicial:** Proporciona un endpoint (`/api/v1/users/me/ensure-company`) que valida el token pero *no* requiere `company_id` inicialmente, permitiendo asociar uno y generando un *nuevo token* con la asociación.
+    *   Proporciona un endpoint (`/api/v1/users/login`) para autenticar usuarios contra PostgreSQL y generar tokens JWT.
 *   **Asociación de Compañía (Inicial):**
-    *   Provee un endpoint (`POST /api/v1/users/me/ensure-company`) para que usuarios recién autenticados (sin `company_id` en su token) puedan ser asociados a una compañía.
-    *   Utiliza el cliente **Supabase Admin** (con la `Service Role Key`) para actualizar el `app_metadata` del usuario con un `company_id` (generalmente uno por defecto configurable).
+    *   Provee el endpoint (`POST /api/v1/users/me/ensure-company`) para que usuarios autenticados (sin `company_id` en su token o queriendo cambiarlo) puedan ser asociados a una compañía.
+    *   Utiliza conexión directa a **PostgreSQL** (via `asyncpg`) para actualizar el registro del usuario con un `company_id` (ya sea uno proporcionado o el `GATEWAY_DEFAULT_COMPANY_ID`).
 *   **Inyección de Headers:** Añade headers críticos a las solicitudes reenviadas a los servicios backend, basados en el payload del token validado:
-    *   `X-Company-ID`: Extraído de `app_metadata.company_id`.
-    *   `X-User-ID`: Extraído del claim `sub` (Subject/User ID de Supabase).
+    *   `X-Company-ID`: Extraído directamente del token.
+    *   `X-User-ID`: Extraído del claim `sub` (Subject/User ID).
     *   `X-User-Email`: Extraído del claim `email`.
+    *   `X-Request-ID`: Propaga el ID de la solicitud para tracing.
 *   **Proxy Inverso:** Reenvía eficientemente las solicitudes (incluyendo cuerpo y query params) a los servicios correspondientes utilizando un cliente HTTP asíncrono (`httpx`).
 *   **Centralized CORS:** Gestiona la configuración de Cross-Origin Resource Sharing (CORS) en un solo lugar.
 *   **Punto de Observabilidad:** Logging estructurado (JSON), Request ID, Timing.
 *   **Manejo de Errores:** Respuestas de error estandarizadas y logging de excepciones.
-*   **Health Check:** Endpoint `/health` para verificaciones de estado (Kubernetes probes), incluyendo chequeo del cliente Supabase Admin.
+*   **Health Check:** Endpoint `/health` para verificaciones de estado (Kubernetes probes).
 
-Este Gateway está diseñado para ser ligero y eficiente, enfocándose en la seguridad y el enrutamiento, y delegando la lógica de negocio a los microservicios correspondientes, pero también manejando la lógica crítica de asociación inicial de compañía.
+Este Gateway está diseñado para ser ligero y eficiente, enfocándose en la seguridad y el enrutamiento, y delegando la lógica de negocio a los microservicios correspondientes, pero también manejando la autenticación inicial y la lógica de asociación de compañía.
 
 ## 2. Arquitectura General del Proyecto (Posición del Gateway)
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#ADD8E6', 'edgeLabelBackground':'#fff', 'tertiaryColor': '#FFFACD'}}}%%
 flowchart TD
-    A[Usuario/Cliente Externo<br/>(e.g., Frontend Vercel)] -->|HTTPS / REST API<br/>Authorization: Bearer <supabase_token>| C["<strong>API Gateway (FastAPI)</strong><br/>(Este Servicio)"]
+    A["Usuario/Cliente Externo<br/>(e.g., Frontend Vercel)"] -->|HTTPS / REST API<br/>POST /login o<br/>Authorization: Bearer <jwt_token>| C["<strong>API Gateway (FastAPI) - Atenex</strong><br/>(Este Servicio)"]
 
     subgraph KubernetesCluster ["Kubernetes Cluster (nyro-develop ns)"]
         direction LR
         C -- Valida JWT (Requiere company_id) -->|Añade Headers:<br/>X-Company-ID,<br/>X-User-ID,<br/>X-User-Email| I["Ingest Service API"]
         C -- Valida JWT (Requiere company_id) -->|Añade Headers:<br/>X-Company-ID,<br/>X-User-ID,<br/>X-User-Email| Q["Query Service API"]
-        C -- Valida JWT (SIN company_id) -->|Llama a Supabase Admin API<br/>(Actualiza app_metadata)| SupaAdmin["Supabase Admin API<br/>(via utils/supabase_admin)"]
-        C -- Proxy Directo (Opcional) -->|Sin validación JWT en Gateway| Auth["(Opcional) Auth Service<br/>o Supabase Directo"]
+        C -- POST /login -->|Verifica credenciales| DB[(PostgreSQL<br/>Users)]
+        DB -- Devuelve datos usuario --> C
+        C -- Genera JWT --> A # Tras login exitoso
+        C -- POST /ensure-company<br/>(Valida JWT SIN company_id) -->|Actualiza User| DB
+        C -- Verifica JWT 'sub' -->|Consulta User| DB # Durante validación de token
+        C -- Proxy Directo (Opcional) -->|Sin validación JWT en Gateway| Auth["(Opcional) Auth Service"]
 
-        I --> DBi[("Supabase (Metadata)")]
-        I --> VDBi[(Milvus (Vectores)")]
-        I --> S3i[(MinIO (Archivos)")]
+        I --> DBi[(PostgreSQL<br/>(Metadata Docs?))]
+        I --> VDBi[(Milvus (Vectores))]
+        I --> S3i[(MinIO (Archivos))]
         I --> Qi([Redis (Celery Queue)])
 
-        Q --> DBq[("Supabase (Logs)")]
-        Q --> VDBq[(Milvus (Vectores)")]
-        Q --> LLM[("Google Gemini API")]
-        Q --> Emb[("OpenAI Embedding API")]
+        Q --> DBq[(PostgreSQL<br/>(Logs, Chats?))]
+        Q --> VDBq[(Milvus (Vectores))]
+        Q --> LLM[("LLM API<br/>(e.g., Gemini)")]
+        Q --> Emb[("Embedding API<br/>(e.g., OpenAI)")]
 
-        Auth --> DBa[("Supabase Auth")]
-        SupaAdmin --> DBa # El admin API modifica auth.users
+        Auth --> DB # Auth Service también usaría la misma DB
     end
 
-    Supabase[("Supabase<br/>(Auth, DB)")] -->|Emite JWT| A
-    Supabase -->|JWT Secret, Service Key| C
+    # JWT Secret gestionado por K8s Secrets
+    K8sSecrets[("K8s Secrets<br/>(JWT_SECRET, <br/>PG_PASSWORD)")] --> C
+
 ```
+*Diagrama actualizado para reflejar PostgreSQL en el clúster y el flujo de autenticación/JWT.*
 
 ## 3. Características Clave
 
-*   **Proxy Inverso Asíncrono:** Reenvía tráfico a `ingest-service` y `query-service` usando `httpx`.
-*   **Validación de Tokens JWT de Supabase:** Verifica tokens (`python-jose`). Valida firma, expiración, audiencia (`'authenticated'`), claims requeridos (`sub`, `aud`, `exp`). **Requiere `company_id` en `app_metadata` para rutas estándar.**
-*   **Asociación Inicial de Compañía:** Endpoint dedicado (`/api/v1/users/me/ensure-company`) que valida el token sin requerir `company_id` y usa la **Supabase Service Role Key** para actualizar `app_metadata` del usuario.
+*   **Proxy Inverso Asíncrono:** Reenvía tráfico a `ingest-api-service` y `query-service` usando `httpx`.
+*   **Autenticación y Generación JWT Interna:**
+    *   Endpoint `/api/v1/users/login` para autenticar usuarios contra **PostgreSQL** (`asyncpg`, `passlib`) y generar tokens JWT (`python-jose`).
+    *   Verifica tokens JWT (`python-jose`). Valida firma, expiración, claims requeridos (`sub`, `exp`). Verifica existencia/estado del usuario en **PostgreSQL**. **Requiere `company_id` en el payload del token para rutas estándar.**
+*   **Asociación Inicial de Compañía:** Endpoint dedicado (`/api/v1/users/me/ensure-company`) que valida el token *sin* requerir `company_id` preexistente y usa el cliente **PostgreSQL** para actualizar el registro del usuario. Devuelve un **nuevo token JWT** con la `company_id` actualizada.
 *   **Inyección de Headers de Contexto:** Añade `X-Company-ID`, `X-User-ID`, `X-User-Email` a las solicitudes downstream.
 *   **Routing basado en Path:** Usa FastAPI para dirigir `/api/v1/ingest/*`, `/api/v1/query/*`, y `/api/v1/users/*`.
 *   **Autenticación por Ruta:** Utiliza dependencias (`StrictAuth`, `InitialAuth`) de FastAPI para proteger rutas con diferentes requisitos.
-*   **Cliente HTTP Asíncrono Reutilizable:** Gestiona un pool de conexiones `httpx`.
-*   **Cliente Supabase Admin Reutilizable:** Gestiona una instancia del cliente Supabase (`supabase-py`) inicializada con la Service Role Key.
+*   **Cliente HTTP Asíncrono Reutilizable:** Gestiona un pool de conexiones `httpx` (inicializado en `lifespan`).
+*   **Pool de Conexiones PostgreSQL Asíncrono:** Gestiona conexiones a PostgreSQL usando `asyncpg` (inicializado en `lifespan`).
 *   **Logging Estructurado (JSON):** Logs detallados con `structlog`.
-*   **Configuración Centralizada:** Carga configuración desde variables de entorno (`pydantic-settings`), prefijo `GATEWAY_`. **Incluye verificaciones críticas para secretos (JWT y Service Key).**
-*   **Middleware:** CORS, Request ID, Timing.
-*   **Manejo de Errores:** Handlers globales.
+*   **Configuración Centralizada:** Carga configuración desde variables de entorno (`pydantic-settings`), prefijo `GATEWAY_`. **Incluye verificaciones críticas para secretos (JWT y PostgreSQL Password).**
+*   **Middleware:** CORS, Request ID, Timing, Logging.
+*   **Manejo de Errores:** Handlers globales y respuestas estandarizadas.
 *   **Despliegue Contenerizado:** Dockerfile y manifests K8s listos.
-*   **Health Check:** Endpoint `/health` verifica cliente HTTP y cliente Supabase Admin.
-*   **(Opcional) Proxy de Autenticación:** Ruta `/api/v1/auth/*`.
+*   **Health Check:** Endpoint `/health` para probes de K8s.
+*   **(Opcional) Proxy de Autenticación:** Ruta `/api/v1/auth/*` si `GATEWAY_AUTH_SERVICE_URL` está configurado.
 
 ## 4. Pila Tecnológica Principal
 
 *   **Lenguaje:** Python 3.10+
 *   **Framework API:** FastAPI
 *   **Cliente HTTP:** HTTPX
-*   **Validación JWT:** python-jose[cryptography]
-*   **Cliente Supabase Admin:** supabase-py
+*   **Validación/Generación JWT:** python-jose[cryptography]
+*   **Hashing Contraseñas:** passlib[bcrypt]
+*   **Base de datos (Cliente):** PostgreSQL (via asyncpg)
 *   **Configuración:** pydantic-settings
 *   **Logging:** structlog
 *   **Despliegue:** Docker, Kubernetes, Gunicorn + Uvicorn
-*   **Autenticación:** Supabase (emisor de JWTs, proveedor de identidad)
 
 ## 5. Estructura de la Codebase
 
@@ -97,31 +104,35 @@ flowchart TD
 api-gateway/
 ├── app/
 │   ├── __init__.py
-│   ├── auth/                 # Lógica de autenticación y validación de tokens
+│   ├── auth/                 # Lógica de autenticación y JWT
 │   │   ├── __init__.py
-│   │   ├── auth_middleware.py # Dependencias (StrictAuth, InitialAuth, etc.)
-│   │   └── jwt_handler.py     # Función verify_token (con require_company_id)
+│   │   ├── auth_middleware.py # Dependencias (StrictAuth, InitialAuth)
+│   │   └── auth_service.py    # Lógica (verify_token, create_token, authenticate_user)
 │   ├── core/                 # Configuración y Logging Core
 │   │   ├── __init__.py
-│   │   ├── config.py         # Carga de Settings (vars, secretos)
-│   │   └── logging_config.py # Configuración de structlog (JSON)
-│   ├── main.py               # Entrypoint FastAPI, lifespan (clientes), middlewares, health checks, handlers
+│   │   ├── config.py         # Settings (Pydantic)
+│   │   └── logging_config.py # Configuración structlog
+│   ├── db/                   # Lógica de acceso a Base de Datos
+│   │   └── postgres_client.py # Funciones asyncpg (get_user, update_user, pool)
+│   ├── main.py               # Entrypoint FastAPI, lifespan, middlewares, health
 │   ├── routers/              # Definición de rutas
 │   │   ├── __init__.py
-│   │   ├── gateway_router.py # Rutas proxy (/ingest, /query, /auth)
-│   │   └── user_router.py    # Rutas de usuario (/users/me/ensure-company)
-│   └── utils/                # Utilidades
-│       └── supabase_admin.py # Cliente Supabase Admin
+│   │   ├── auth_router.py    # (Inactivo/Placeholder)
+│   │   ├── gateway_router.py # Rutas proxy (/ingest, /query, /auth [opcional])
+│   │   └── user_router.py    # Rutas de usuario (/login, /users/me/ensure-company)
+│   └── utils/                # (Vacío por ahora)
 ├── k8s/                      # Manifests de Kubernetes
 │   ├── gateway-configmap.yaml
 │   ├── gateway-deployment.yaml
-│   ├── gateway-secret.yaml   # (Estructura, valores reales en gestor de secretos)
+│   ├── gateway-secret.example.yaml # Ejemplo, NO incluir valores reales
 │   └── gateway-service.yaml
+│   # (Deberías tener también los manifests de PostgreSQL aquí o en otro lugar)
 ├── Dockerfile                # Define cómo construir la imagen Docker
-├── pyproject.toml            # Define dependencias (Poetry) - ¡Incluye supabase!
+├── pyproject.toml            # Dependencias (Poetry)
 ├── poetry.lock               # Lockfile de dependencias
 └── README.md                 # Este archivo
 ```
+*(Se eliminó `app/auth/jwt_handler.py` ya que su lógica se movió a `auth_service.py`)*
 
 ## 6. Configuración
 
@@ -129,186 +140,213 @@ Configuración mediante variables de entorno (prefijo `GATEWAY_`).
 
 **Variables de Entorno Clave:**
 
-| Variable                                | Descripción                                                                      | Ejemplo (Valor Esperado en K8s)                                  | Gestionado por |
+| Variable                                | Descripción                                                                      | Ejemplo (Valor Esperado en K8s - ns: `nyro-develop`)            | Gestionado por |
 | :-------------------------------------- | :------------------------------------------------------------------------------- | :--------------------------------------------------------------- | :------------- |
 | `GATEWAY_LOG_LEVEL`                     | Nivel de logging (DEBUG, INFO, WARNING, ERROR).                                  | `INFO`                                                           | ConfigMap      |
 | `GATEWAY_INGEST_SERVICE_URL`            | URL base del Ingest Service API.                                                 | `http://ingest-api-service.nyro-develop.svc.cluster.local:80`  | ConfigMap      |
 | `GATEWAY_QUERY_SERVICE_URL`             | URL base del Query Service API.                                                  | `http://query-service.nyro-develop.svc.cluster.local:80`     | ConfigMap      |
 | `GATEWAY_AUTH_SERVICE_URL`              | (Opcional) URL base del Auth Service para proxy directo.                           | `http://auth-service.nyro-develop.svc.cluster.local:80`      | ConfigMap      |
-| **`GATEWAY_JWT_SECRET`**                | **Clave secreta JWT de tu proyecto Supabase.** (Para validar tokens de usuario)   | *Valor secreto obtenido de Supabase*                             | **Secret**     |
-| `GATEWAY_JWT_ALGORITHM`                 | Algoritmo usado para los tokens JWT (debe coincidir con Supabase).                | `HS256`                                                          | ConfigMap      |
-| **`GATEWAY_SUPABASE_URL`**              | **URL de tu proyecto Supabase.** (Necesaria para el cliente Admin)                  | `https://<tu-ref>.supabase.co`                                   | ConfigMap      |
-| **`GATEWAY_SUPABASE_SERVICE_ROLE_KEY`** | **Clave de Servicio (Admin) de Supabase.** ¡MUY SENSIBLE! (Para actualizar users) | *Valor secreto obtenido de Supabase*                             | **Secret**     |
-| **`GATEWAY_DEFAULT_COMPANY_ID`**        | **UUID de la compañía por defecto** a asignar a nuevos usuarios.                   | *UUID válido de una compañía*                                    | ConfigMap      |
+| **`GATEWAY_JWT_SECRET`**                | **Clave secreta JWT para firma y validación de tokens.**                           | *Valor secreto en el entorno*                                  | **Secret**     |
+| `GATEWAY_JWT_ALGORITHM`                 | Algoritmo usado para los tokens JWT (debe coincidir con `auth_service.py`).        | `HS256`                                                          | ConfigMap      |
+| **`GATEWAY_POSTGRES_PASSWORD`**         | **Contraseña para el usuario PostgreSQL.**                                         | *Valor secreto en el entorno*                                  | **Secret**     |
+| `GATEWAY_POSTGRES_USER`                 | Usuario para conectar a PostgreSQL.                                              | `postgres` (o el que uses)                                       | ConfigMap      |
+| `GATEWAY_POSTGRES_SERVER`               | Host/Service name del servidor PostgreSQL en K8s.                                | `postgresql.nyro-develop.svc.cluster.local`                    | ConfigMap      |
+| `GATEWAY_POSTGRES_PORT`                 | Puerto del servidor PostgreSQL.                                                  | `5432`                                                           | ConfigMap      |
+| `GATEWAY_POSTGRES_DB`                   | Nombre de la base de datos PostgreSQL.                                           | `atenex` (o la que uses)                                         | ConfigMap      |
+| `GATEWAY_DEFAULT_COMPANY_ID`            | UUID de la compañía por defecto a asignar si falta y no se especifica.           | *UUID válido de una compañía* o vacío                            | ConfigMap      |
 | `GATEWAY_HTTP_CLIENT_TIMEOUT`           | Timeout (segundos) para llamadas HTTP downstream.                                | `60`                                                             | ConfigMap      |
-| `GATEWAY_HTTP_CLIENT_MAX_CONNECTIONS`   | Máximo número total de conexiones HTTP salientes.                               | `200` (Ajustado)                                                 | ConfigMap      |
-| `GATEWAY_HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS` | Máximo número de conexiones HTTP keep-alive.                            | `100` (Ajustado)                                                 | ConfigMap      |
-| `VERCEL_FRONTEND_URL`                   | (Opcional) URL del frontend en Vercel para CORS.                                 | `https://<tu-app>.vercel.app`                                     | ConfigMap/Env  |
-| `NGROK_URL`                             | (Opcional) URL de ngrok para desarrollo/pruebas CORS.                            | `https://<tu-id>.ngrok-free.app`                                 | ConfigMap/Env  |
-| `PORT`                                  | Puerto interno del contenedor (Gunicorn).                                        | `8080`                                                           | Deployment     |
+| `GATEWAY_HTTP_CLIENT_MAX_CONNECTIONS`   | Máximo número total de conexiones HTTP salientes.                                | `200`                                                            | ConfigMap      |
+| `GATEWAY_HTTP_CLIENT_MAX_KEEPALIVE_CONNECTIONS` | Máximo número de conexiones HTTP keep-alive.                             | `100`                                                            | ConfigMap      |
+| `VERCEL_FRONTEND_URL`                   | (Opcional) URL del frontend Vercel para CORS.                                    | `https://atenex-frontend.vercel.app`                           | ConfigMap/Env  |
+| `PORT`                                  | Puerto interno del contenedor (Gunicorn/Uvicorn).                                | `8080`                                                           | Dockerfile/Deployment |
 
 **¡ADVERTENCIAS DE SEGURIDAD IMPORTANTES!**
 
-*   **`GATEWAY_JWT_SECRET`:** Debe ser el secreto JWT real de Supabase. **NUNCA** usar el valor por defecto. Gestionar vía K8s Secret.
-*   **`GATEWAY_SUPABASE_SERVICE_ROLE_KEY`:** Esta clave otorga **acceso total** a tu backend de Supabase, ¡trátala con extremo cuidado! **NUNCA** usar el valor placeholder. **DEBE** gestionarse vía K8s Secret.
-*   **`GATEWAY_SUPABASE_URL`:** Debe ser la URL correcta de tu proyecto Supabase.
-*   **`GATEWAY_DEFAULT_COMPANY_ID`:** Debe ser un UUID válido correspondiente a una compañía real en tu sistema.
+*   **`GATEWAY_JWT_SECRET`:** Debe ser una clave secreta fuerte y única. Gestionar vía K8s Secret (`atenex-api-gateway-secrets`).
+*   **`GATEWAY_POSTGRES_PASSWORD`:** Contraseña de la base de datos. Gestionar vía K8s Secret (`atenex-api-gateway-secrets`).
+*   **`GATEWAY_DEFAULT_COMPANY_ID`:** Si se establece, debe ser un UUID válido correspondiente a una compañía real en tu tabla `COMPANIES`.
 
-**Kubernetes:**
+**Kubernetes (Namespace: `nyro-develop`):**
 
-*   Configuración general (`GATEWAY_..._URL`, `...TIMEOUT`, `LOG_LEVEL`, `DEFAULT_COMPANY_ID`, `SUPABASE_URL`) -> `api-gateway-config` (ConfigMap).
-*   Secretos (`GATEWAY_JWT_SECRET`, `GATEWAY_SUPABASE_SERVICE_ROLE_KEY`) -> `api-gateway-secrets` (Secret).
+*   Configuración general -> `atenex-api-gateway-config` (ConfigMap).
+*   Secretos (`GATEWAY_JWT_SECRET`, `GATEWAY_POSTGRES_PASSWORD`) -> `atenex-api-gateway-secrets` (Secret).
 *   Ambos deben existir en el namespace `nyro-develop`.
 
 ## 7. Flujo de Autenticación y Asociación de Compañía
 
-Este Gateway implementa dos flujos principales relacionados con la autenticación:
+Este Gateway implementa flujos clave basados en JWT y PostgreSQL:
 
-**A) Validación Estándar (Rutas Protegidas como `/ingest`, `/query`):**
+**A) Login (`POST /api/v1/users/login`):**
+
+1.  **Solicitud del Cliente:** Frontend envía `email` y `password`.
+2.  **Recepción y Autenticación:** Gateway recibe la solicitud. El endpoint llama a `authenticate_user` (`auth_service.py`).
+3.  **Verificación DB:** `authenticate_user` llama a `get_user_by_email` (`postgres_client.py`) para buscar al usuario.
+4.  **Verificación Contraseña:** Si el usuario existe y está activo, `authenticate_user` usa `verify_password` (`passlib`) para comparar el hash de la contraseña.
+5.  **Generación JWT:** Si las credenciales son válidas, `login_for_access_token` llama a `create_access_token` (`auth_service.py`) para generar un JWT. El token incluye `sub` (user ID), `email`, `exp`, `iat`, y `company_id` (si el usuario ya tiene uno en la DB).
+6.  **Respuesta:** El gateway devuelve el `access_token` y datos básicos del usuario.
+
+**B) Validación Estándar (Rutas Protegidas como `/ingest`, `/query`):**
 
 1.  **Solicitud del Cliente:** Frontend envía request con `Authorization: Bearer <token_con_company_id>`.
-2.  **Recepción y Extracción:** Gateway recibe la solicitud. La dependencia `StrictAuth` (que usa `require_user`) se activa. `get_current_user_payload` extrae el token.
+2.  **Recepción y Extracción:** Gateway recibe la solicitud. La dependencia `StrictAuth` (`auth_middleware.py`) se activa.
 3.  **Validación del Token (`verify_token` con `require_company_id=True`):**
-    *   Verifica firma, expiración, audiencia (`'authenticated'`), claims (`sub`, `aud`, `exp`).
-    *   Busca y **requiere** `company_id` en `app_metadata`. Si falta -> **403 Forbidden**.
+    *   Verifica firma, expiración, claims (`sub`, `exp`).
+    *   Busca y **requiere** `company_id` directamente en el payload del token. Si falta -> **403 Forbidden**.
+    *   Verifica que el usuario (`sub`) exista y esté activo en **PostgreSQL** (llama a `get_user_by_id`). Si no existe/inactivo -> **401 Unauthorized**.
     *   Si todo OK, devuelve el payload (incluyendo `company_id`).
-4.  **Dependencia `StrictAuth`:** Confirma que se obtuvo un payload válido.
-5.  **Inyección y Proxy:** El router extrae `X-User-ID`, `X-Company-ID`, `X-User-Email` del payload y los inyecta en la solicitud antes de reenviarla al servicio backend correspondiente.
+4.  **Inyección y Proxy:** El router (`gateway_router.py`) extrae `X-User-ID`, `X-Company-ID`, `X-User-Email` del payload y los inyecta en la solicitud antes de reenviarla al servicio backend correspondiente.
 
-**B) Asociación Inicial de Compañía (Endpoint `/users/me/ensure-company`):**
+**C) Asociación/Confirmación de Compañía (`POST /api/v1/users/me/ensure-company`):**
 
-1.  **Contexto:** El frontend detecta (tras login/confirmación) que el token JWT del usuario *no* tiene `company_id` en `app_metadata`.
-2.  **Solicitud del Cliente:** Frontend envía `POST /api/v1/users/me/ensure-company` con el token JWT actual (sin `company_id`).
-3.  **Recepción y Extracción:** Gateway recibe la solicitud. La dependencia `InitialAuth` (que usa `require_authenticated_user_no_company_check`) se activa. `_get_user_payload_internal` extrae el token.
+1.  **Contexto:** El frontend (después del login) necesita asegurar que el usuario esté asociado a una compañía (o quiere cambiarla opcionalmente).
+2.  **Solicitud del Cliente:** Frontend envía `POST /api/v1/users/me/ensure-company` con el token JWT actual (puede o no tener `company_id`). Opcionalmente, puede incluir `{ "company_id": "uuid-a-asignar" }` en el body.
+3.  **Recepción y Extracción:** Gateway recibe la solicitud. La dependencia `InitialAuth` (`auth_middleware.py`) se activa.
 4.  **Validación del Token (`verify_token` con `require_company_id=False`):**
-    *   Verifica firma, expiración, audiencia, claims (`sub`, `aud`, `exp`).
-    *   **NO requiere** `company_id`. Si el token es válido por lo demás, devuelve el payload.
-5.  **Dependencia `InitialAuth`:** Confirma que se obtuvo un payload válido (aunque no tenga `company_id`).
-6.  **Lógica del Endpoint (`ensure_company_association`):**
+    *   Verifica firma, expiración, claims (`sub`, `exp`). Verifica existencia/estado del usuario en **PostgreSQL**.
+    *   **NO requiere** `company_id` en el token. Si el token es válido por lo demás, devuelve el payload.
+5.  **Lógica del Endpoint (`ensure_company_association` en `user_router.py`):**
     *   Obtiene el `user_id` (`sub`) del payload.
-    *   Determina el `company_id` a asignar (usando `GATEWAY_DEFAULT_COMPANY_ID` de la configuración).
-    *   Obtiene el cliente **Supabase Admin** (inicializado con `GATEWAY_SUPABASE_SERVICE_ROLE_KEY`).
-    *   Llama a `supabase_admin.auth.admin.update_user_by_id()` para actualizar el `app_metadata` del usuario (`user_id`) con el `company_id` asignado.
-7.  **Respuesta al Cliente:** Devuelve 200 OK si la actualización fue exitosa.
-8.  **Refresco en Frontend:** El frontend, al recibir el 200 OK, debe llamar a `supabase.auth.refreshSession()` para obtener un *nuevo* token JWT que ahora incluirá el `company_id` en `app_metadata`. Las futuras llamadas usarán este token actualizado y pasarán la validación estándar (Flujo A).
+    *   Obtiene datos actuales del usuario de PostgreSQL.
+    *   Determina el `company_id` a asignar:
+        *   Prioridad 1: El `company_id` del body (si se proporcionó).
+        *   Prioridad 2: El `GATEWAY_DEFAULT_COMPANY_ID` (si el usuario no tiene uno y no se proporcionó en el body).
+        *   Prioridad 3: La `company_id` actual del usuario (si ya tiene una y no se proporcionó otra).
+        *   Error si ninguna de las anteriores aplica.
+    *   Si el `company_id` determinado es diferente al actual del usuario, llama a `update_user_company` (`postgres_client.py`) para actualizar la base de datos.
+    *   Llama a `create_access_token` para generar un **NUEVO token JWT** que incluya la `company_id` final.
+6.  **Respuesta al Cliente:** Devuelve 200 OK con un mensaje, los IDs y el **nuevo token JWT**.
+7.  **Acción Frontend:** El frontend **debe** almacenar y usar este **nuevo token** para futuras llamadas, ya que ahora contiene la `company_id` correcta.
 
 ## 8. API Endpoints
 
 *   **`GET /`**
     *   **Descripción:** Endpoint raíz.
     *   **Autenticación:** No requerida.
-    *   **Respuesta:** `{"message": "Nyro API Gateway is running!"}`
+    *   **Respuesta:** `{"message": "Atenex API Gateway is running!"}`
 
 *   **`GET /health`**
-    *   **Descripción:** Health Check (K8s probes). Verifica cliente HTTP y cliente Supabase Admin.
+    *   **Descripción:** Health Check (K8s probes).
     *   **Autenticación:** No requerida.
-    *   **Respuesta OK (200):** `{"status": "healthy", "service": "Nyro API Gateway"}`
-    *   **Respuesta Error (503):** Si alguna dependencia (cliente HTTP, cliente Admin) no está lista.
+    *   **Respuesta OK (200):** `{"status": "healthy", "service": "Atenex API Gateway"}`
+    *   **Respuesta Error (503):** (Si se implementa chequeo de dependencias) Si alguna dependencia crítica no está lista.
 
-*   **`/api/v1/ingest/{path:path}` (Proxy)**
-    *   **Métodos:** `GET`, `POST`, `PUT`, `DELETE`, `PATCH`
-    *   **Descripción:** Reenvía al `Ingest Service`.
-    *   **Autenticación:** **Requerida (StrictAuth).** Token JWT válido con `company_id` en `app_metadata`.
-    *   **Headers Inyectados:** `X-Company-ID`, `X-User-ID`, `X-User-Email`.
-
-*   **`/api/v1/query/{path:path}` (Proxy)**
-    *   **Métodos:** `GET`, `POST`, `PUT`, `DELETE`, `PATCH`
-    *   **Descripción:** Reenvía al `Query Service`.
-    *   **Autenticación:** **Requerida (StrictAuth).** Token JWT válido con `company_id` en `app_metadata`.
-    *   **Headers Inyectados:** `X-Company-ID`, `X-User-ID`, `X-User-Email`.
+*   **`POST /api/v1/users/login`**
+    *   **Descripción:** Autentica al usuario con email/password contra PostgreSQL.
+    *   **Autenticación:** No requerida (se envían credenciales en el body).
+    *   **Cuerpo (Request):** `{ "email": "user@example.com", "password": "user_password" }`
+    *   **Respuesta OK (200):** `LoginResponse` (incluye `access_token`, `user_id`, `email`, `company_id` si existe).
+    *   **Respuesta Error:** 401 (Credenciales inválidas/usuario inactivo).
 
 *   **`POST /api/v1/users/me/ensure-company`**
-    *   **Descripción:** Asocia un `company_id` por defecto al usuario autenticado si aún no tiene uno en su `app_metadata`. Usa privilegios de administrador (Service Role Key).
-    *   **Autenticación:** **Requerida (InitialAuth).** Token JWT válido (firma, exp, aud), pero **no** requiere `company_id` preexistente.
-    *   **Headers Inyectados:** Ninguno (este endpoint actúa sobre Supabase, no hace proxy).
-    *   **Cuerpo (Request):** Vacío (el `company_id` se determina en el backend).
-    *   **Respuesta OK (200):** `{"message": "Company association successful."}` o `{"message": "Company association already exists."}`.
-    *   **Respuesta Error:** 401 (Token inválido/ausente), 500 (Error de configuración o al actualizar Supabase).
+    *   **Descripción:** Asocia/Confirma una `company_id` para el usuario autenticado. Usa `company_id` del body o la default. Actualiza la DB y genera un nuevo token.
+    *   **Autenticación:** **Requerida (InitialAuth).** Token JWT válido (firma, exp, usuario existe), pero **no** requiere `company_id` preexistente en el *token de entrada*.
+    *   **Cuerpo (Request Opcional):** `{ "company_id": "uuid-de-compania-especifica" }`
+    *   **Respuesta OK (200):** `EnsureCompanyResponse` (incluye `user_id`, `company_id` final, mensaje, y `new_access_token`).
+    *   **Respuesta Error:** 400 (Falta `company_id` si es necesario y no hay default), 401 (Token inválido/ausente), 403 (No debería ocurrir aquí), 404 (Usuario del token no en DB), 500 (Error DB o al generar token).
 
-*   **`/api/v1/auth/{path:path}` (Proxy Opcional)**
+*   **`/api/v1/ingest/{endpoint_path:path}` (Proxy)**
+    *   **Métodos:** `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS`
+    *   **Descripción:** Reenvía al `Ingest Service` (`ingest-api-service.nyro-develop...`).
+    *   **Autenticación:** **Requerida (StrictAuth).** Token JWT válido con `company_id` en el payload y usuario activo en DB.
+    *   **Headers Inyectados:** `X-Company-ID`, `X-User-ID`, `X-User-Email`, `X-Request-ID`.
+
+*   **`/api/v1/query/{path:path}` (Proxy Específico y Rutas Relacionadas)**
+    *   **Ejemplos:** `/api/v1/query/chats`, `/api/v1/query`, `/api/v1/query/chats/{chat_id}/messages`
+    *   **Métodos:** `GET`, `POST`, `DELETE`, `OPTIONS` (según ruta específica)
+    *   **Descripción:** Reenvía al `Query Service` (`query-service.nyro-develop...`).
+    *   **Autenticación:** **Requerida (StrictAuth).**
+    *   **Headers Inyectados:** `X-Company-ID`, `X-User-ID`, `X-User-Email`, `X-Request-ID`.
+
+*   **`/api/v1/auth/{endpoint_path:path}` (Proxy Opcional)**
     *   **Métodos:** Todos
-    *   **Descripción:** (Si `GATEWAY_AUTH_SERVICE_URL` está configurado) Reenvía al servicio de autenticación.
+    *   **Descripción:** (Si `GATEWAY_AUTH_SERVICE_URL` está configurado) Reenvía al servicio de autenticación externo.
     *   **Autenticación:** **No requerida por el Gateway.**
-    *   **Headers Inyectados:** Ninguno.
-    *   **Si no está configurado:** Devuelve `501 Not Implemented`.
+    *   **Headers Inyectados:** Ninguno (aparte de los `X-Forwarded-*`).
+    *   **Si no está configurado:** Devuelve `404 Not Found`.
 
 ## 9. Ejecución Local (Desarrollo)
 
 1.  Instalar Poetry.
 2.  Clonar repo, `cd api-gateway`.
 3.  `poetry install`
-4.  Crear archivo `.env` en `api-gateway/` con:
+4.  Crear archivo `.env` en `api-gateway/` con variables **locales**:
     ```dotenv
     # api-gateway/.env
 
     GATEWAY_LOG_LEVEL=DEBUG
 
-    # URLs de servicios locales (ajustar puertos)
-    GATEWAY_INGEST_SERVICE_URL="http://localhost:8001"
-    GATEWAY_QUERY_SERVICE_URL="http://localhost:8002"
-    # GATEWAY_AUTH_SERVICE_URL="http://localhost:8000"
+    # URLs de servicios locales (ajustar puertos si es necesario)
+    GATEWAY_INGEST_SERVICE_URL="http://localhost:8001" # O URL del servicio ingest local
+    GATEWAY_QUERY_SERVICE_URL="http://localhost:8002" # O URL del servicio query local
+    # GATEWAY_AUTH_SERVICE_URL="http://localhost:8000" # Si tienes un servicio de auth local
 
-    # --- Supabase Config (¡IMPORTANTE!) ---
-    # Secreto para validar tokens de usuario
-    GATEWAY_JWT_SECRET="TU_SUPABASE_JWT_SECRET_REAL_AQUI"
+    # --- Configuración JWT (¡IMPORTANTE!) ---
+    # Usa una clave secreta fuerte para desarrollo, pero NO la de producción
+    GATEWAY_JWT_SECRET="una-clave-secreta-muy-fuerte-para-desarrollo-local-1234567890"
     GATEWAY_JWT_ALGORITHM="HS256"
-    # URL del proyecto Supabase
-    GATEWAY_SUPABASE_URL="https://<tu-ref>.supabase.co" # <-- TU URL REAL
-    # Clave de Servicio (Admin) - ¡Tratar como secreto!
-    GATEWAY_SUPABASE_SERVICE_ROLE_KEY="TU_SUPABASE_SERVICE_ROLE_KEY_REAL_AQUI"
-    # ID de Compañía por defecto
-    GATEWAY_DEFAULT_COMPANY_ID="TU_UUID_DE_COMPAÑIA_POR_DEFECTO" # <-- UUID VÁLIDO
+
+    # --- Configuración PostgreSQL Local (¡IMPORTANTE!) ---
+    # Asume que tienes PostgreSQL corriendo localmente (quizás en Docker)
+    GATEWAY_POSTGRES_USER="postgres" # Usuario de tu PG local
+    GATEWAY_POSTGRES_PASSWORD="tu_password_de_pg_local" # <-- TU CONTRASEÑA LOCAL
+    GATEWAY_POSTGRES_SERVER="localhost" # O la IP/hostname de tu contenedor PG
+    GATEWAY_POSTGRES_PORT=5432
+    GATEWAY_POSTGRES_DB="atenex" # Nombre de la DB local
+
+    # ID de Compañía por defecto (Necesitas crear esta compañía en tu DB local)
+    GATEWAY_DEFAULT_COMPANY_ID="un-uuid-valido-de-compania-en-tu-db-local" # <-- UUID VÁLIDO LOCAL
 
     # HTTP Client (Opcional)
     GATEWAY_HTTP_CLIENT_TIMEOUT=60
     GATEWAY_HTTP_CLIENT_MAX_CONNECTIONS=100
-    GATEWAY_HTTP_CLIENT_MAX_KEEPALIAS_CONNECTIONS=20 # Ajusta si corregiste nombre
+    GATEWAY_HTTP_CLIENT_MAX_KEEPALIVE_CONNECTIONS=20
 
-    # CORS (Opcional)
-    # VERCEL_FRONTEND_URL="http://localhost:3000"
+    # CORS (Opcional para desarrollo local)
+    VERCEL_FRONTEND_URL="http://localhost:3000"
     # NGROK_URL="https://<id>.ngrok-free.app"
     ```
-5.  Ejecutar Uvicorn:
+5.  Asegúrate de que tu PostgreSQL local esté corriendo, tenga la base de datos `atenex`, el usuario `postgres` (o el que configures) con la contraseña correcta, y las tablas definidas en el esquema. Asegúrate de insertar al menos una compañía con el UUID que pusiste en `GATEWAY_DEFAULT_COMPANY_ID`.
+6.  Ejecutar Uvicorn con reload:
     ```bash
     poetry run uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
     ```
-6.  Gateway disponible en `http://localhost:8080`.
+7.  Gateway disponible en `http://localhost:8080`.
 
 ## 10. Despliegue
 
 *   **Docker:**
-    1.  `docker build -t <tu-imagen> .`
-    2.  `docker push <tu-imagen>`
+    1.  `docker build -t ghcr.io/tu-org/atenex-api-gateway:$(git rev-parse --short HEAD) .` (Ejemplo de tag con hash git)
+    2.  `docker push ghcr.io/tu-org/atenex-api-gateway:$(git rev-parse --short HEAD)`
 
-*   **Kubernetes:**
-    1.  Asegurar namespace `nyro-develop`.
-    2.  **Crear Secretos:** Crear `api-gateway-secrets` en `nyro-develop` con los valores reales de `GATEWAY_JWT_SECRET` y `GATEWAY_SUPABASE_SERVICE_ROLE_KEY`. **¡NO COMMITEAR VALORES REALES!**
+*   **Kubernetes (Namespace: `nyro-develop`):**
+    1.  Asegurar namespace `nyro-develop` existe: `kubectl create namespace nyro-develop` (si no existe).
+    2.  **Crear/Actualizar Secretos:** Crear `atenex-api-gateway-secrets` en `nyro-develop` con los valores **reales** de producción para `GATEWAY_JWT_SECRET` y `GATEWAY_POSTGRES_PASSWORD`. **¡NO COMMITEAR VALORES REALES!**
         ```bash
-        # Crear o actualizar el secreto
-        kubectl create secret generic api-gateway-secrets \
+        kubectl create secret generic atenex-api-gateway-secrets \
           --namespace nyro-develop \
-          --from-literal=GATEWAY_JWT_SECRET='TU_SUPABASE_JWT_SECRET_REAL_AQUI' \
-          --from-literal=GATEWAY_SUPABASE_SERVICE_ROLE_KEY='TU_SUPABASE_SERVICE_ROLE_KEY_REAL_AQUI' \
+          --from-literal=GATEWAY_JWT_SECRET='TU_CLAVE_SECRETA_JWT_DE_PRODUCCION_MUY_SEGURA' \
+          --from-literal=GATEWAY_POSTGRES_PASSWORD='LA_CONTRASEÑA_REAL_DE_POSTGRES_EN_PRODUCCION' \
           --dry-run=client -o yaml | kubectl apply -f -
         ```
         *(Reemplaza los placeholders con tus claves reales)*
     3.  **Aplicar Manifests:**
         ```bash
-        # Asegúrate que configmap.yaml tenga GATEWAY_SUPABASE_URL y GATEWAY_DEFAULT_COMPANY_ID
+        # Asegúrate que configmap.yaml tenga las URLs correctas y GATEWAY_DEFAULT_COMPANY_ID válido
         kubectl apply -f k8s/gateway-configmap.yaml -n nyro-develop
         # El secreto ya fue creado/actualizado
+        # Asegúrate que deployment.yaml tiene la imagen correcta (tu CI/CD debería hacer esto)
         kubectl apply -f k8s/gateway-deployment.yaml -n nyro-develop
         kubectl apply -f k8s/gateway-service.yaml -n nyro-develop
         ```
-    4.  Verificar pods y servicio.
+    4.  Verificar pods (`kubectl get pods -n nyro-develop`), servicio (`kubectl get svc -n nyro-develop`) y logs (`kubectl logs -f <pod-name> -n nyro-develop`).
 
 ## 11. TODO / Mejoras Futuras
 
 *   **Rate Limiting.**
 *   **Tracing Distribuido (OpenTelemetry).**
-*   **Caching.**
-*   **Tests de Integración** (incluyendo el flujo de asociación de compañía).
-*   **Manejo de Errores más Refinado.**
-*   **Configuración CORS más Granular.**
-*   **Proxy WebSockets.**
-*   **Lógica más robusta para determinar `company_id`** en lugar de usar solo `GATEWAY_DEFAULT_COMPANY_ID` (ej., basado en invitaciones, dominio de email, selección del usuario).
+*   **Caching (ej. para configuraciones o datos poco cambiantes).**
+*   **Tests de Integración** (cubriendo login, proxy, ensure-company).
+*   **Manejo de Errores más Refinado** (códigos de error específicos).
+*   **Refrescar Tokens JWT.**
+*   **Lógica más robusta para determinar `company_id`** en `ensure-company` (ej., basado en invitaciones, dominio de email).
+*   **Validación más estricta de `company_id`** (verificar que la compañía exista en la DB antes de asignarla en `ensure-company`).

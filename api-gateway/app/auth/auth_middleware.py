@@ -5,11 +5,12 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Optional, Annotated, Dict, Any
 import structlog
 
-# Importar verify_token CON el parámetro require_company_id
-from .jwt_handler import verify_token
+# Importar verify_token del nuevo servicio de autenticación
+from app.auth.auth_service import verify_token # <-- Asegúrate que la importación es correcta
 
 log = structlog.get_logger(__name__)
-# Crear instancia del scheme. auto_error=False para manejar manualmente la ausencia de token
+
+# Instancia del scheme HTTPBearer. auto_error=False para manejar manualmente la ausencia de token.
 bearer_scheme = HTTPBearer(bearerFormat="JWT", auto_error=False)
 
 async def _get_user_payload_internal(
@@ -19,36 +20,54 @@ async def _get_user_payload_internal(
     require_company_id: bool # Parámetro interno para controlar la verificación
 ) -> Optional[Dict[str, Any]]:
     """
-    Función interna para obtener y validar el payload, controlando si se requiere company_id.
-    Devuelve el payload si es válido según los criterios, None si no hay token,
-    y lanza HTTPException si el token existe pero es inválido.
+    Función interna para obtener y validar el payload JWT.
+    Controla si se requiere company_id según el parámetro.
+    Devuelve el payload si el token es válido y cumple el requisito de company_id.
+    Devuelve None si no se proporciona token (cabecera Authorization ausente).
+    Lanza HTTPException si el token existe pero es inválido (firma, exp, usuario no existe)
+    o si falta company_id cuando es requerido (403).
     """
-    # Limpiar estado previo si existiera
-    request.state.user = None
+    # Limpiar estado previo si existiera para evitar contaminación entre requests
+    if hasattr(request.state, 'user'):
+        del request.state.user
 
     if authorization is None:
         # No hay cabecera Authorization: Bearer
         log.debug("No Authorization Bearer header found.")
-        # No es un error aún, la ruta decidirá si lo requiere
+        # No es un error aún, la dependencia que lo use decidirá si lo requiere
         return None
 
     token = authorization.credentials
     try:
-        # Pasar require_company_id a verify_token
-        payload = verify_token(token, require_company_id=require_company_id)
-        # Guardar payload en el estado de la request para posible uso posterior
+        # Llamar a la función de verificación centralizada
+        # Esta función ya maneja las excepciones 401 y 403 internamente
+        payload = await verify_token(token, require_company_id=require_company_id)
+
+        # Guardar payload en el estado de la request para posible uso posterior (ej. logging middleware)
         request.state.user = payload
-        log_msg = "Token verified" + (" (company_id required and present)" if require_company_id and 'company_id' in payload else " (company_id check passed/not required)")
+
+        # Log de éxito más descriptivo
+        log_msg = "Token verified successfully via internal getter"
+        if require_company_id:
+            log_msg += " (company_id required and present)"
+        else:
+            log_msg += " (company_id check passed or not required)"
         log.debug(log_msg, subject=payload.get('sub'), company_id=payload.get('company_id'))
+
         return payload
     except HTTPException as e:
         # verify_token lanza 401 (inválido) o 403 (falta company_id requerido)
-        log.info(f"Token verification failed in dependency: {e.detail}", status_code=e.status_code, user_id=getattr(e, 'user_id', None)) # Loggear detalle
-        # Re-lanzar la excepción para que FastAPI la maneje
+        # Loguear el error específico antes de relanzar
+        log_detail = getattr(e, 'detail', 'No detail provided')
+        log.info(f"Token verification failed in dependency: {log_detail}",
+                 status_code=e.status_code,
+                 user_id=getattr(e, 'user_id', None)) # Loguear user_id si está disponible
+        # Re-lanzar la excepción para que FastAPI la maneje y devuelva la respuesta HTTP correcta
         raise e
     except Exception as e:
-        # Capturar errores inesperados de verify_token
+        # Capturar errores inesperados *dentro* de verify_token que no sean HTTPException
         log.exception("Unexpected error during internal payload retrieval", error=str(e))
+        # Devolver un error 500 genérico para no exponer detalles internos
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal error during authentication check."
@@ -60,83 +79,102 @@ async def get_current_user_payload(
     authorization: Annotated[Optional[HTTPAuthorizationCredentials], Depends(bearer_scheme)]
 ) -> Optional[Dict[str, Any]]:
     """
-    Dependencia FastAPI para intentar validar el token JWT (requiriendo company_id).
-    Devuelve el payload si es válido Y tiene company_id.
-    Devuelve None si no hay token.
-    Lanza 401/403 si el token es inválido o falta company_id.
+    Dependencia FastAPI para intentar validar el token JWT requiriendo company_id.
+    - Devuelve el payload si el token es válido Y tiene company_id.
+    - Devuelve None si no se proporciona token.
+    - Lanza 401 si el token es inválido (firma, exp, usuario no existe).
+    - Lanza 403 si el token es válido pero falta company_id.
     """
     try:
         # Llama a la función interna requiriendo company_id
         return await _get_user_payload_internal(request, authorization, require_company_id=True)
     except HTTPException as e:
-        # Si _get_user_payload_internal lanza 401/403, lo relanzamos
+        # Si _get_user_payload_internal lanza 401 o 403, simplemente relanzamos
         raise e
     except Exception as e:
          # Manejar cualquier otro error inesperado aquí también
          log.exception("Unexpected error in get_current_user_payload wrapper", error=str(e))
          raise HTTPException(status_code=500, detail="Internal Server Error in auth wrapper")
 
+# --- Dependencia para la Asociación Inicial (NO requiere company_id) ---
+async def get_initial_user_payload(
+    request: Request,
+    authorization: Annotated[Optional[HTTPAuthorizationCredentials], Depends(bearer_scheme)]
+) -> Optional[Dict[str, Any]]:
+    """
+    Dependencia FastAPI para validar el token JWT sin requerir company_id.
+    Útil para la ruta de asociación inicial de company_id.
+    - Devuelve el payload si el token es válido (firma, exp, usuario existe), incluso sin company_id.
+    - Devuelve None si no se proporciona token.
+    - Lanza 401 si el token es inválido (firma, exp, usuario no existe).
+    """
+    try:
+        # Llama a la función interna sin requerir company_id
+        return await _get_user_payload_internal(request, authorization, require_company_id=False)
+    except HTTPException as e:
+        # Si _get_user_payload_internal lanza 401 (o 403, aunque no debería aquí), lo relanzamos
+        raise e
+    except Exception as e:
+         # Manejar cualquier otro error inesperado aquí también
+         log.exception("Unexpected error in get_initial_user_payload wrapper", error=str(e))
+         raise HTTPException(status_code=500, detail="Internal Server Error in auth wrapper")
 
 # --- Dependencia que Requiere Usuario Estricto (Falla si no hay token válido CON company_id) ---
 async def require_user(
-    # Depende de la función anterior. Si esa función lanza excepción, esta no se ejecuta.
-    # Si devuelve None (sin token), esta dependencia lanzará 401.
+    # Depende de la función anterior (get_current_user_payload).
+    # Si esa función devuelve None (sin token) o lanza una excepción (401/403),
+    # esta dependencia manejará el caso o no se ejecutará.
     user_payload: Annotated[Optional[Dict[str, Any]], Depends(get_current_user_payload)]
 ) -> Dict[str, Any]:
     """
     Dependencia FastAPI que *asegura* que una ruta requiere un usuario autenticado
     con un token válido Y con company_id asociado.
-    Lanza 401 si no hay token o es inválido.
-    Lanza 403 si el token es válido pero falta company_id.
+    - Lanza 401 si no hay token o es inválido (lo hace la dependencia `get_current_user_payload`).
+    - Lanza 403 si el token es válido pero falta company_id (lo hace la dependencia `get_current_user_payload`).
+    - Si `get_current_user_payload` devuelve `None` (porque no se envió token), esta función lanzará 401.
     """
     if user_payload is None:
-        # Esto ocurre si get_current_user_payload devolvió None (sin token)
-        # o si _get_user_payload_internal devolvió None (sin token)
-        log.info("Access denied by require_user: Authentication required but no valid token was found or provided.")
+        # Esto ocurre si get_current_user_payload devolvió None (sin cabecera Authorization)
+        log.info("Access denied by require_user: Authentication required but no token was provided.")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated",
             headers={"WWW-Authenticate": "Bearer"}, # Indica al cliente cómo autenticarse
         )
-    # Si get_current_user_payload lanzó 403 (falta company_id), la ejecución ya se detuvo allí.
-    # Si llegamos aquí, user_payload es un diccionario válido con company_id.
-    log.debug("User requirement met (StrictAuth: token valid with company_id).", subject=user_payload.get('sub'), company_id=user_payload.get('company_id'))
-    return user_payload # Devolver el payload para uso en la ruta
+    # Si user_payload no es None, significa que get_current_user_payload tuvo éxito
+    # (el token era válido y tenía company_id), así que simplemente lo devolvemos.
+    # Las excepciones 401/403 ya habrían sido lanzadas por la dependencia anterior.
+    return user_payload
 
-# --- Dependencia que Requiere Autenticación pero NO company_id ---
-async def require_authenticated_user_no_company_check(
-    request: Request,
-    authorization: Annotated[Optional[HTTPAuthorizationCredentials], Depends(bearer_scheme)]
+# --- Dependencia que Requiere Usuario Inicial (Falla si no hay token válido, pero NO requiere company_id) ---
+async def require_initial_user(
+    # Depende de get_initial_user_payload.
+    # Si esa función devuelve None (sin token) o lanza una excepción (401),
+    # esta dependencia manejará el caso o no se ejecutará.
+    user_payload: Annotated[Optional[Dict[str, Any]], Depends(get_initial_user_payload)]
 ) -> Dict[str, Any]:
     """
-    Dependencia FastAPI que asegura que el usuario está autenticado (token válido:
-    firma, exp, aud) pero NO requiere que el company_id esté presente en el token.
-    Útil para endpoints como el de asociación inicial de compañía.
-    Lanza 401 si no hay token o es inválido.
+    Dependencia FastAPI que *asegura* que una ruta requiere un usuario autenticado
+    con un token válido (firma, exp, usuario existe), pero NO requiere company_id.
+    Útil para la ruta de asociación inicial de company_id.
+    - Lanza 401 si no hay token o es inválido (lo hace la dependencia `get_initial_user_payload`).
+    - Si `get_initial_user_payload` devuelve `None` (sin token), esta función lanzará 401.
     """
-    try:
-        # Llama a la función interna SIN requerir company_id
-        payload = await _get_user_payload_internal(request, authorization, require_company_id=False)
+    if user_payload is None:
+        # Esto ocurre si get_initial_user_payload devolvió None (sin cabecera Authorization)
+        log.info("Access denied by require_initial_user: Authentication required but no token was provided.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    # Si user_payload no es None, significa que get_initial_user_payload tuvo éxito
+    # (el token era válido), así que simplemente lo devolvemos.
+    return user_payload
 
-        if payload is None:
-            # Si no hay token, lanzar 401
-            log.info("Access denied by require_authenticated_user_no_company_check: Authentication required but no token provided.")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Authentication required",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        # Si había token pero era inválido (firma, exp, aud), _get_user_payload_internal ya lanzó 401.
-        # Si llegamos aquí, el token es válido según los criterios básicos.
-        log.debug("User requirement met (InitialAuth: token valid, company_id not checked).", subject=payload.get('sub'), company_id=payload.get('company_id', 'N/A'))
-        return payload
-    except HTTPException as e:
-        # Re-lanzar 401 si el token era inválido
-        raise e
-    except Exception as e:
-        log.exception("Unexpected error in require_authenticated_user_no_company_check", error=str(e))
-        raise HTTPException(status_code=500, detail="Internal Server Error during initial auth check")
-
-# Alias para claridad en las dependencias de las rutas
-InitialAuth = Annotated[Dict[str, Any], Depends(require_authenticated_user_no_company_check)]
+# --- Tipos anotados para usar en las rutas y mejorar la legibilidad ---
+# StrictAuth: Requiere token válido con company_id
 StrictAuth = Annotated[Dict[str, Any], Depends(require_user)]
+
+# InitialAuth: Requiere token válido, pero company_id no es obligatorio
+InitialAuth = Annotated[Dict[str, Any], Depends(require_initial_user)]

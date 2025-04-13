@@ -1,8 +1,9 @@
+# ingest-service/pyproject.toml
 [tool.poetry]
 name = "ingest-service"
-version = "0.1.0"
-description = "Ingest service for AUDIZOR B2B"
-authors = ["Nyro <dev@nyro.com>"]
+version = "0.1.1" # Incremento de versión
+description = "Ingest service for Atenex B2B SaaS (Haystack/Postgres/Minio/Milvus)" # Descripción actualizada
+authors = ["Atenex Team <dev@atenex.com>"] # Autor actualizado
 
 [tool.poetry.dependencies]
 python = "^3.10"
@@ -14,33 +15,33 @@ pydantic-settings = "^2.2.1"
 celery = {extras = ["redis"], version = "^5.3.6"}
 gevent = "^23.9.1" # Necesario para el pool de workers de Celery
 httpx = "^0.27.0"
-asyncpg = "^0.29.0"
-python-jose = {extras = ["cryptography"], version = "^3.3.0"}
+asyncpg = "^0.29.0" # Para PostgreSQL directo
+# python-jose no es necesario aquí si no se validan tokens
 tenacity = "^8.2.3"
-python-multipart = "^0.0.9"
+python-multipart = "^0.0.9" # Para subir archivos
 structlog = "^24.1.0"
-aiofiles = "^23.2.1"
+# aiofiles no es estrictamente necesario si usamos BytesIO directamente con MinIO
 minio = "^7.1.17"
 
 # --- Haystack Dependencies ---
-haystack-ai = "^2.0.1"
-openai = "^1.14.3"
-# *** CORREGIDO: Asegurar pymilvus explícitamente como recomienda la doc ***
-pymilvus = "^2.4.1" # Añadir pymilvus explícitamente (verifica versión compatible si es necesario)
-milvus-haystack = "^0.0.6" # Paquete correcto para la integración Haystack 2.x
+haystack-ai = "^2.0.1" # O la versión estable que uses de Haystack 2.x
+openai = "^1.14.3" # Para embeddings
+# --- Asegurar pymilvus explícitamente ---
+pymilvus = "^2.4.1" # Verifica compatibilidad con tu versión de Milvus
+milvus-haystack = "^0.0.6" # Integración Milvus con Haystack 2.x
 
 # --- Haystack Converter Dependencies ---
-pypdf = "^4.0.1"
-python-docx = "^1.1.0"
-# Añadir 'markdown' y 'beautifulsoup4' si usas MarkdownToDocument y HTMLToDocument
-markdown = "^3.5" # Añadido para MarkdownToDocument
-beautifulsoup4 = "^4.12.3" # Añadido para HTMLToDocument
+pypdf = "^4.0.1" # Para PDFs
+python-docx = "^1.1.0" # Para DOCX
+markdown = "^3.5.1" # Para Markdown (asegura última versión)
+beautifulsoup4 = "^4.12.3" # Para HTML
 
 
-[tool.poetry.dev-dependencies]
+[tool.poetry.group.dev.dependencies] # Grupo dev corregido
 pytest = "^7.4.4"
 pytest-asyncio = "^0.21.1"
 httpx = "^0.27.0" # Para test client
+# Añadir otros como black, ruff, mypy si los usas
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

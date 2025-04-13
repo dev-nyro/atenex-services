@@ -69,16 +69,16 @@ import io
 
 from fastapi import (
     APIRouter, UploadFile, File, Depends, HTTPException,
-    status, Form, Header, Query # Importar Query para parámetros de consulta si fueran necesarios
+    status, Form, Header, Query # Asegurar Query está importado para paginación
 )
 from minio.error import S3Error
 
 from app.api.v1 import schemas
 from app.core.config import settings
-from app.db import postgres_client
+from app.db import postgres_client # Cliente DB async
 from app.models.domain import DocumentStatus
-from app.tasks.process_document import process_document_haystack_task
-from app.services.minio_client import MinioStorageClient
+from app.tasks.process_document import process_document_haystack_task # Tarea Celery
+from app.services.minio_client import MinioStorageClient # Cliente MinIO async
 
 log = structlog.get_logger(__name__)
 
@@ -97,66 +97,142 @@ async def get_current_company_id(x_company_id: Optional[str] = Header(None)) -> 
 
 # --- Endpoints ---
 
+# Ruta relativa al prefijo /api/v1/ingest definido en main.py
 @router.post(
-    "/upload", # Ruta relativa al prefijo /api/v1/ingest añadido en main.py
+    "/upload", # <- El endpoint se accede como POST /api/v1/ingest/upload
     response_model=schemas.IngestResponse,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Ingestar un nuevo documento",
-    description="Sube un documento, lo almacena, crea un registro en BD y lo encola para procesamiento Haystack.",
+    description="Sube un documento, lo almacena en MinIO (bucket 'atenex'), crea registro en DB y encola para procesamiento Haystack.",
 )
 async def ingest_document_haystack(
-    # Dependencias primero
+    # Dependencias
     company_id: uuid.UUID = Depends(get_current_company_id),
     # Datos del Formulario
-    metadata_json: str = Form(default="{}", description="String JSON de metadatos del documento"),
+    metadata_json: str = Form(default="{}", description="String JSON de metadatos opcionales del documento"),
     file: UploadFile = File(..., description="El archivo del documento a ingestar"),
-    # NINGÚN OTRO PARÁMETRO QUE PUEDA SER INTERPRETADO COMO BODY O QUERY['query']
 ):
     request_log = log.bind(company_id=str(company_id), filename=file.filename, content_type=file.content_type)
-    request_log.info("Received document ingestion request (Haystack)")
+    request_log.info("Received document ingestion request")
 
-    # 1. Validate Content Type
-    if not file.content_type or file.content_type not in settings.SUPPORTED_CONTENT_TYPES:
-        request_log.warning("Unsupported or missing content type received", received_type=file.content_type)
-        raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail=f"Unsupported file type: {file.content_type or 'Unknown'}. Supported types: {settings.SUPPORTED_CONTENT_TYPES}")
-    content_type = file.content_type
+    # 1. Validar Content Type
+    content_type = file.content_type or "application/octet-stream" # Default si no se provee
+    if content_type not in settings.SUPPORTED_CONTENT_TYPES:
+        request_log.warning("Unsupported content type received", received_type=content_type)
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Unsupported file type: '{content_type}'. Supported: {', '.join(settings.SUPPORTED_CONTENT_TYPES)}"
+        )
+    request_log = request_log.bind(validated_content_type=content_type) # Loguear tipo validado
 
-    # 2. Validate Metadata
+    # 2. Validar y Parsear Metadata JSON
     try:
-        metadata = json.loads(metadata_json); assert isinstance(metadata, dict)
-    except (json.JSONDecodeError, AssertionError):
-         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON object format for metadata")
-    except Exception as e:
-         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid metadata: {e}")
+        metadata = json.loads(metadata_json)
+        if not isinstance(metadata, dict):
+            raise ValueError("Metadata must be a JSON object (dictionary)")
+        request_log.debug("Metadata JSON parsed successfully", metadata_keys=list(metadata.keys()))
+    except (json.JSONDecodeError, ValueError) as json_err:
+         request_log.warning("Invalid metadata JSON received", raw_metadata=metadata_json, error=str(json_err))
+         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid JSON format for metadata: {json_err}")
+    except Exception as e: # Captura otros errores inesperados del parseo
+         request_log.error("Unexpected error parsing metadata JSON", error=str(e), exc_info=True)
+         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Error processing metadata")
 
-    minio_client = MinioStorageClient(); minio_object_name: Optional[str] = None
-    document_id: Optional[uuid.UUID] = None; task_id: Optional[str] = None
+    # Inicializar variables fuera del try principal
+    minio_client = None
+    minio_object_name: Optional[str] = None
+    document_id: Optional[uuid.UUID] = None
+    task_id: Optional[str] = None
 
     try:
-        # --- Lógica de creación, subida y encolado (sin cambios) ---
-        document_id = await postgres_client.create_document(company_id=company_id, file_name=file.filename or "untitled", file_type=content_type, metadata=metadata)
-        request_log = request_log.bind(document_id=str(document_id)); request_log.info("Initial document record created")
-        file_content = await file.read(); content_length = len(file_content)
+        # 3. Crear registro inicial en DB (async)
+        document_id = await postgres_client.create_document(
+            company_id=company_id,
+            file_name=file.filename or "untitled",
+            file_type=content_type, # Usar tipo validado
+            metadata=metadata
+        )
+        request_log = request_log.bind(document_id=str(document_id))
+        request_log.info("Initial document record created in DB")
+
+        # 4. Leer contenido del archivo y subir a MinIO (async)
+        file_content = await file.read()
+        content_length = len(file_content)
         if content_length == 0:
+            # Manejar archivo vacío (error no recuperable para procesamiento)
+            request_log.error("Uploaded file is empty.")
             await postgres_client.update_document_status(document_id=document_id, status=DocumentStatus.ERROR, error_message="Uploaded file is empty.")
-            request_log.error("Uploaded file is empty."); raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file cannot be empty.")
-        file_stream = io.BytesIO(file_content)
-        minio_object_name = await minio_client.upload_file(company_id=company_id, document_id=document_id, file_name=file.filename or "untitled", file_content_stream=file_stream, content_type=content_type, content_length=content_length)
-        request_log.info("File uploaded to MinIO", object_name=minio_object_name)
-        await postgres_client.update_document_status(document_id=document_id, status=DocumentStatus.UPLOADED, file_path=minio_object_name)
-        request_log.info("Document record updated with MinIO path")
-        task = process_document_haystack_task.delay(document_id_str=str(document_id), company_id_str=str(company_id), minio_object_name=minio_object_name, file_name=file.filename or "untitled", content_type=content_type, original_metadata=metadata)
-        task_id = task.id
-        request_log.info("Haystack processing task queued", task_id=task_id)
-        return schemas.IngestResponse(document_id=document_id, task_id=task_id, status=DocumentStatus.UPLOADED, message="Document upload received and queued for processing.")
-    # --- Manejo de errores (sin cambios) ---
-    except HTTPException as http_exc: raise http_exc
-    except S3Error as s3_err: request_log.error("MinIO S3 Error", error=str(s3_err), code=s3_err.code, exc_info=True); raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Storage service error: {s3_err.code}")
-    except Exception as e: request_log.error("Unexpected ingestion error", error=str(e), exc_info=True); raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to process ingestion request.")
-    finally: await file.close()
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file cannot be empty.")
 
+        file_stream = io.BytesIO(file_content) # Crear stream en memoria
+
+        minio_client = MinioStorageClient() # Instanciar cliente MinIO
+        minio_object_name = await minio_client.upload_file(
+            company_id=company_id,
+            document_id=document_id,
+            file_name=file.filename or "untitled",
+            file_content_stream=file_stream, # Pasar el BytesIO
+            content_type=content_type,
+            content_length=content_length
+        )
+        request_log.info("File uploaded to MinIO", object_name=minio_object_name, bucket=settings.MINIO_BUCKET_NAME)
+
+        # 5. Actualizar registro DB con path MinIO y estado UPLOADED (async)
+        # Este estado indica que está listo para ser procesado por Celery
+        await postgres_client.update_document_status(
+            document_id=document_id,
+            status=DocumentStatus.UPLOADED, # Estado LISTO para Celery
+            file_path=minio_object_name
+        )
+        request_log.info("Document record updated with MinIO path and UPLOADED status")
+
+        # 6. Encolar tarea Celery (async)
+        task = process_document_haystack_task.delay(
+            document_id_str=str(document_id),
+            company_id_str=str(company_id),
+            minio_object_name=minio_object_name,
+            file_name=file.filename or "untitled",
+            content_type=content_type,
+            original_metadata=metadata # Pasar metadata parseada
+        )
+        task_id = task.id
+        request_log.info("Haystack processing task queued successfully", task_id=task_id)
+
+        # 7. Devolver respuesta 202 Accepted
+        return schemas.IngestResponse(
+            document_id=document_id,
+            task_id=task_id,
+            status=DocumentStatus.UPLOADED, # Devuelve el estado actual
+            message="Document upload received and queued for processing."
+        )
+
+    # Manejo de Errores Específicos y Genéricos
+    except HTTPException as http_exc:
+        # Si ya es una HTTPException (ej. 400 por metadata, 415 por tipo), relanzar
+        raise http_exc
+    except (IOError, S3Error) as storage_err:
+        # Errores al subir a MinIO
+        request_log.error("Storage service error during upload", error=str(storage_err), exc_info=True)
+        # Si ya se creó el registro en DB, marcarlo como error
+        if document_id:
+            try: await postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=f"Storage upload failed: {storage_err}")
+            except Exception as db_err: request_log.error("Failed to update document status to ERROR after storage failure", nested_error=str(db_err))
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Storage service error during upload.")
+    except Exception as e:
+        # Otros errores inesperados (DB, Celery dispatch, etc.)
+        request_log.exception("Unexpected error during document ingestion endpoint processing", error=str(e))
+        if document_id: # Intentar marcar como error si ya se creó
+            try: await postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=f"Unexpected ingestion error: {e}")
+            except Exception as db_err: request_log.error("Failed to update document status to ERROR after unexpected failure", nested_error=str(db_err))
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An unexpected error occurred during ingestion.")
+    finally:
+        # Asegurar que el archivo subido se cierra
+        await file.close()
+
+
+# Ruta relativa al prefijo /api/v1/ingest
 @router.get(
-    "/status/{document_id}", # Ruta relativa correcta
+    "/status/{document_id}",
     response_model=schemas.StatusResponse,
     status_code=status.HTTP_200_OK,
     summary="Consultar estado de ingesta de un documento",
@@ -164,120 +240,123 @@ async def ingest_document_haystack(
 )
 async def get_ingestion_status(
     # Path parameter
-    document_id: uuid.UUID,
+    document_id: uuid.UUID, # FastAPI valida UUID automáticamente
     # Header dependency
     company_id: uuid.UUID = Depends(get_current_company_id),
-    # NINGÚN OTRO PARÁMETRO (especialmente ninguno llamado 'query' que pueda ser un modelo)
 ):
     status_log = log.bind(document_id=str(document_id), company_id=str(company_id))
     status_log.info("Received request for single document status")
-    # --- Lógica de obtención y validación (sin cambios) ---
-    try: doc_data = await postgres_client.get_document_status(document_id)
-    except Exception as e: status_log.error("DB error getting status", e=e); raise HTTPException(status_code=500)
-    if not doc_data: raise HTTPException(status_code=404)
-    if doc_data.get("company_id") != company_id: raise HTTPException(status_code=403)
-    try: response_data = schemas.StatusResponse.model_validate(doc_data)
-    except Exception as p_err: status_log.error("Schema validation error", e=p_err); raise HTTPException(status_code=500)
-    # --- Mensaje descriptivo (sin cambios) ---
-    status_messages = {
-        DocumentStatus.UPLOADED: "The document has been successfully uploaded.",
-        DocumentStatus.PROCESSING: "The document is currently being processed.",
-        DocumentStatus.COMPLETED: "The document has been processed successfully.",
-        DocumentStatus.ERROR: "An error occurred during document processing.",
-    }
-    response_data.message = status_messages.get(response_data.status, "Unknown status.")
-    status_log.info("Returning document status", status=response_data.status)
-    return response_data
+
+    try:
+        # Obtener datos del documento de la DB (async)
+        doc_data = await postgres_client.get_document_status(document_id)
+
+        if not doc_data:
+            status_log.warning("Document not found in DB")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+        # Validar pertenencia a la compañía
+        if doc_data.get("company_id") != company_id:
+            status_log.warning("Attempt to access document belonging to another company", owner_company=str(doc_data.get('company_id')))
+            # Devolver 404 para no revelar existencia a otras compañías
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+        # Validar y construir la respuesta usando el schema Pydantic
+        response_data = schemas.StatusResponse.model_validate(doc_data)
+
+        # Generar mensaje descriptivo basado en el estado
+        status_messages = {
+            DocumentStatus.UPLOADED: "Document uploaded, awaiting processing.",
+            DocumentStatus.PROCESSING: "Document is currently being processed.",
+            DocumentStatus.PROCESSED: "Document processed successfully.", # O INDEXED si usas ese estado
+            DocumentStatus.ERROR: f"An error occurred during processing: {response_data.error_message or 'Unknown error'}",
+        }
+        response_data.message = status_messages.get(response_data.status, "Unknown document status.")
+
+        status_log.info("Returning document status", status=response_data.status)
+        return response_data
+
+    except HTTPException as http_exc:
+         # Relanzar excepciones HTTP ya manejadas (404, 403 convertido a 404)
+         raise http_exc
+    except Exception as e:
+        status_log.exception("Error retrieving document status", error=str(e))
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error retrieving document status.")
 
 
+# Ruta relativa al prefijo /api/v1/ingest
 @router.get(
-    "/status", # Ruta relativa correcta
-    response_model=List[schemas.StatusResponse],
+    "/status",
+    response_model=List[schemas.StatusResponse], # Devolver una lista
     status_code=status.HTTP_200_OK,
     summary="Listar estados de ingesta para la compañía",
-    description="Recupera una lista de todos los documentos y sus estados de procesamiento para la compañía actual.",
+    description="Recupera una lista paginada de todos los documentos y sus estados para la compañía actual.",
 )
 async def list_ingestion_statuses(
     # Header dependency
     company_id: uuid.UUID = Depends(get_current_company_id),
-    # Opcional: Añadir parámetros de consulta explícitos si se necesitan
-    limit: int = Query(default=100, ge=1, le=1000),
-    offset: int = Query(default=0, ge=0)
-    # NINGÚN OTRO PARÁMETRO (especialmente ninguno llamado 'query' que pueda ser un modelo)
+    # Parámetros de Paginación (Query)
+    limit: int = Query(default=100, ge=1, le=500, description="Número máximo de documentos a devolver"),
+    offset: int = Query(default=0, ge=0, description="Número de documentos a saltar (para paginación)")
 ):
     list_log = log.bind(company_id=str(company_id), limit=limit, offset=offset)
     list_log.info("Received request to list document statuses")
+
     try:
-        # Pasar limit y offset a la función DB si la soporta
-        # documents_data = await postgres_client.list_documents_by_company(company_id, limit=limit, offset=offset)
-        # Si no, obtener todos y paginar aquí (menos eficiente)
-        documents_data = await postgres_client.list_documents_by_company(company_id, limit=limit, offset=offset) # Implementar paginación en la consulta DB
+        # Llamar a la función DB con paginación (async)
+        documents_data = await postgres_client.list_documents_by_company(
+            company_id, limit=limit, offset=offset
+        )
 
-    except Exception as e: list_log.error("DB error listing statuses", e=e); raise HTTPException(status_code=500)
+        # Mapear los resultados al schema Pydantic (sin mensaje descriptivo aquí)
+        response_list = [schemas.StatusResponse.model_validate(doc) for doc in documents_data]
 
-    response_list = [schemas.StatusResponse.model_validate(doc_data) for doc_data in paginated_data]
-    list_log.info(f"Returning status list", count=len(response_list))
-    return response_list
+        list_log.info(f"Returning status list for {len(response_list)} documents")
+        return response_list
+
+    except Exception as e:
+        list_log.exception("Error listing document statuses", error=str(e))
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error listing document statuses.")
 ```
 
 ## File: `app\api\v1\schemas.py`
 ```py
+# ingest-service/app/api/v1/schemas.py
 import uuid
-from pydantic import BaseModel, Field, Json # Json no es necesario aquí ahora
+from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 from app.models.domain import DocumentStatus
 from datetime import datetime
 
-# Pydantic schema for metadata validation (optional but recommended)
-# class DocumentMetadata(BaseModel):
-#     category: Optional[str] = None
-#     author: Optional[str] = None
-#     # Add other expected metadata fields
-
-class IngestRequest(BaseModel):
-    # company_id vendrá de la dependencia/header, no de este modelo
-    # metadata ahora se maneja como Form(metadata_json) en el endpoint
-    pass # Este modelo ya no es estrictamente necesario para el endpoint actual
+# Ya no se usa IngestRequest aquí, se maneja con Form y File en el endpoint
+# class IngestRequest(BaseModel):
+#     pass
 
 class IngestResponse(BaseModel):
+    """Respuesta devuelta al iniciar la ingesta."""
     document_id: uuid.UUID
-    task_id: Optional[str] = None # Devolver ID de tarea Celery para seguimiento
-    status: DocumentStatus = DocumentStatus.UPLOADED # Estado inicial devuelto
+    task_id: Optional[str] = None # ID de la tarea Celery
+    status: DocumentStatus = DocumentStatus.UPLOADED # Estado inicial UPLOADED
     message: str = "Document upload received and queued for processing."
 
-# Schema para la respuesta de estado (usado para GET individual y lista)
 class StatusResponse(BaseModel):
-    document_id: uuid.UUID = Field(..., alias="id") # Mapear 'id' de la DB a 'document_id'
-    status: DocumentStatus
+    """Schema para representar el estado de un documento."""
+    # Usar alias para mapear nombres de columnas de DB a nombres de campo API
+    document_id: uuid.UUID = Field(..., alias="id")
+    status: DocumentStatus # El enum se valida automáticamente
     file_name: Optional[str] = None
     file_type: Optional[str] = None
     chunk_count: Optional[int] = None
-    error_message: Optional[str] = None
-    last_updated: Optional[datetime] = Field(None, alias="updated_at") # Mapear 'updated_at' de la DB
-    message: Optional[str] = None # Mensaje descriptivo (añadido en el endpoint)
+    error_message: Optional[str] = None # Mensaje de error de la DB
+    last_updated: Optional[datetime] = Field(None, alias="updated_at")
+    # Mensaje descriptivo añadido en el endpoint, no viene de la DB directamente
+    message: Optional[str] = Field(None, exclude=False) # Incluir en respuesta si se añade
 
-    # Pydantic v2: Configuración para permitir alias y populación desde atributos
+    # Configuración Pydantic v2 para mapeo y creación desde atributos
     model_config = {
-        "populate_by_name": True, # Permite usar alias para mapear nombres de campos de DB
-        "from_attributes": True # Necesario si se crean instancias desde objetos con atributos (como asyncpg.Record)
+        "populate_by_name": True, # Permite usar 'alias' para mapear desde nombres de DB/dict
+        "from_attributes": True   # Permite crear instancia desde un objeto con atributos (como asyncpg.Record)
     }
-
-# (Opcional) Si prefieres un modelo específico para la lista sin el campo 'message'
-# class StatusListItemResponse(BaseModel):
-#     document_id: uuid.UUID = Field(..., alias="id")
-#     status: DocumentStatus
-#     file_name: Optional[str] = None
-#     file_type: Optional[str] = None
-#     chunk_count: Optional[int] = None
-#     error_message: Optional[str] = None
-#     last_updated: Optional[datetime] = Field(None, alias="updated_at")
-#
-#     model_config = {
-#         "populate_by_name": True,
-#         "from_attributes": True
-#     }
-# En ese caso, el endpoint de lista usaría response_model=List[StatusListItemResponse]
-# Pero usar StatusResponse para ambos es más simple para MVP.
 ```
 
 ## File: `app\core\__init__.py`
@@ -287,27 +366,34 @@ class StatusResponse(BaseModel):
 
 ## File: `app\core\config.py`
 ```py
-# ./app/core/config.py (CORREGIDO - Defaults para Session Pooler)
+# ingest-service/app/core/config.py
 import logging
 import os
-from typing import Optional, List, Any, Dict
+from typing import Optional, List, Any, Dict, Union
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import RedisDsn, AnyHttpUrl, SecretStr, Field, validator, ValidationError, HttpUrl
 import sys
+import json # Para parsear MILVUS_INDEX_PARAMS/SEARCH_PARAMS
 
-# --- Supabase Connection Defaults (Usando Session Pooler por defecto) ---
-# *** CORREGIDO: Defaults actualizados a Session Pooler y puerto correcto ***
-SUPABASE_SESSION_POOLER_HOST = "aws-0-sa-east-1.pooler.supabase.com"
-SUPABASE_SESSION_POOLER_PORT_INT = 6543 # Puerto estándar del Session Pooler
-SUPABASE_SESSION_POOLER_USER = "postgres.ymsilkrhstwxikjiqqog" # Cambiar ymsilkrhstwxikjiqqog si tu project-ref es diferente
-SUPABASE_DEFAULT_DB = "postgres"
+# --- Service Names en K8s Namespace 'nyro-develop' ---
+POSTGRES_K8S_SVC = "postgresql.nyro-develop.svc.cluster.local"
+MINIO_K8S_SVC = "minio-service.nyro-develop.svc.cluster.local" # Asumiendo nombre 'minio-service'
+MILVUS_K8S_SVC = "milvus-milvus.default.svc.cluster.local" # Asumiendo nombre 'milvus-milvus'
+REDIS_K8S_SVC = "redis-service-master.nyro-develop.svc.cluster.local" # Asumiendo nombre 'redis-service-master'
 
-# --- Milvus Kubernetes Defaults ---
-MILVUS_K8S_DEFAULT_URI = "http://milvus-service.nyro-develop.svc.cluster.local:19530"
-
-# --- Redis Kubernetes Defaults ---
-REDIS_K8S_DEFAULT_HOST = "redis-service-master.nyro-develop.svc.cluster.local"
-REDIS_K8S_DEFAULT_PORT = 6379
+# --- Defaults ---
+POSTGRES_K8S_PORT_DEFAULT = 5432
+POSTGRES_K8S_DB_DEFAULT = "atenex" # Base de datos para Atenex
+POSTGRES_K8S_USER_DEFAULT = "postgres" # Usuario por defecto
+MINIO_K8S_PORT_DEFAULT = 9000
+MINIO_BUCKET_DEFAULT = "atenex" # Bucket específico
+MILVUS_K8S_PORT_DEFAULT = 19530
+REDIS_K8S_PORT_DEFAULT = 6379
+MILVUS_DEFAULT_COLLECTION = "atenex_doc_chunks" # Nombre de colección más específico
+MILVUS_DEFAULT_INDEX_PARAMS = '{"metric_type": "COSINE", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}}'
+MILVUS_DEFAULT_SEARCH_PARAMS = '{"metric_type": "COSINE", "params": {"ef": 128}}'
+OPENAI_DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
+DEFAULT_EMBEDDING_DIM = 1536 # Para text-embedding-3-small / ada-002
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -319,105 +405,156 @@ class Settings(BaseSettings):
     )
 
     # --- General ---
-    PROJECT_NAME: str = "Ingest Service (Haystack/K8s/Supabase/SessionPooler)"
-    API_V1_STR: str = "/api/v1"
+    PROJECT_NAME: str = "Atenex Ingest Service" # Nombre actualizado
+    API_V1_STR: str = "/api/v1/ingest" # Prefijo base para este servicio
     LOG_LEVEL: str = "INFO"
 
-    # --- Celery ---
-    CELERY_BROKER_URL: RedisDsn = RedisDsn(f"redis://{REDIS_K8S_DEFAULT_HOST}:{REDIS_K8S_DEFAULT_PORT}/0")
-    CELERY_RESULT_BACKEND: RedisDsn = RedisDsn(f"redis://{REDIS_K8S_DEFAULT_HOST}:{REDIS_K8S_DEFAULT_PORT}/1")
+    # --- Celery (Usando Redis en K8s) ---
+    CELERY_BROKER_URL: RedisDsn = RedisDsn(f"redis://{REDIS_K8S_SVC}:{REDIS_K8S_PORT_DEFAULT}/0")
+    CELERY_RESULT_BACKEND: RedisDsn = RedisDsn(f"redis://{REDIS_K8S_SVC}:{REDIS_K8S_PORT_DEFAULT}/1")
 
-    # --- Database (Supabase Session Pooler Settings) ---
-    # *** CORREGIDO: Defaults cambiados a Session Pooler con puerto 6543 ***
-    POSTGRES_USER: str = SUPABASE_SESSION_POOLER_USER
+    # --- Database (PostgreSQL Directo en K8s) ---
+    POSTGRES_USER: str = POSTGRES_K8S_USER_DEFAULT
     POSTGRES_PASSWORD: SecretStr # Obligatorio desde Secrets
-    POSTGRES_SERVER: str = SUPABASE_SESSION_POOLER_HOST
-    POSTGRES_PORT: int = SUPABASE_SESSION_POOLER_PORT_INT # Usará 6543 por defecto
-    POSTGRES_DB: str = SUPABASE_DEFAULT_DB
+    POSTGRES_SERVER: str = POSTGRES_K8S_SVC
+    POSTGRES_PORT: int = POSTGRES_K8S_PORT_DEFAULT
+    POSTGRES_DB: str = POSTGRES_K8S_DB_DEFAULT
 
-    # --- Milvus ---
-    MILVUS_URI: AnyHttpUrl = AnyHttpUrl(MILVUS_K8S_DEFAULT_URI)
-    MILVUS_COLLECTION_NAME: str = "document_chunks_haystack"
-    MILVUS_INDEX_PARAMS: Dict[str, Any] = Field(default={
-        "metric_type": "COSINE", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}
-    })
-    MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default={
-        "metric_type": "COSINE", "params": {"ef": 128}
-    })
+    # --- Milvus (en K8s) ---
+    MILVUS_URI: str = f"http://{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}" # URI como string simple para Milvus client/Haystack
+    MILVUS_COLLECTION_NAME: str = MILVUS_DEFAULT_COLLECTION
+    # Usar json.loads en el validador para parsear los params desde string env var
+    MILVUS_INDEX_PARAMS: Dict[str, Any] = Field(default=json.loads(MILVUS_DEFAULT_INDEX_PARAMS))
+    MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default=json.loads(MILVUS_DEFAULT_SEARCH_PARAMS))
+    # Campos estándar de Haystack MilvusDocumentStore
     MILVUS_CONTENT_FIELD: str = "content"
     MILVUS_EMBEDDING_FIELD: str = "embedding"
+    # Campos de metadatos que se guardarán en Milvus (¡Importante!)
     MILVUS_METADATA_FIELDS: List[str] = Field(default=[
         "company_id", "document_id", "file_name", "file_type",
+        # Añadir otros metadatos relevantes si se pasan y se quieren indexar/filtrar
+        # "category", "author", ...
     ])
 
-    # --- MinIO Storage ---
-    MINIO_ENDPOINT: str = "minio-service.nyro-develop.svc.cluster.local:9000"
+    # --- MinIO Storage (en K8s, bucket 'atenex') ---
+    MINIO_ENDPOINT: str = f"{MINIO_K8S_SVC}:{MINIO_K8S_PORT_DEFAULT}" # Endpoint como host:port
     MINIO_ACCESS_KEY: SecretStr # Obligatorio desde Secrets
     MINIO_SECRET_KEY: SecretStr # Obligatorio desde Secrets
-    MINIO_BUCKET_NAME: str = "ingested-documents"
-    MINIO_USE_SECURE: bool = False
+    MINIO_BUCKET_NAME: str = MINIO_BUCKET_DEFAULT # Bucket fijo 'atenex'
+    MINIO_USE_SECURE: bool = False # HTTP dentro del cluster
 
-    # --- External Services ---
-    OCR_SERVICE_URL: Optional[AnyHttpUrl] = None
+    # --- External Services (OpenAI) ---
+    OPENAI_API_KEY: SecretStr # Obligatorio desde Secrets
+    OPENAI_EMBEDDING_MODEL: str = OPENAI_DEFAULT_EMBEDDING_MODEL
+    EMBEDDING_DIMENSION: int = DEFAULT_EMBEDDING_DIM # Dimensión del modelo de embedding
 
-    # --- Service Client Config ---
+    # --- Service Client Config (Genérico) ---
     HTTP_CLIENT_TIMEOUT: int = 60
     HTTP_CLIENT_MAX_RETRIES: int = 2
     HTTP_CLIENT_BACKOFF_FACTOR: float = 1.0
 
     # --- File Processing & Haystack ---
     SUPPORTED_CONTENT_TYPES: List[str] = Field(default=[
-        "application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "text/plain", "text/markdown", "text/html", "image/jpeg", "image/png",
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document", # DOCX
+        "text/plain",
+        "text/markdown",
+        "text/html",
+        # "image/jpeg", "image/png", # Descomentar si se añade OCR
     ])
-    EXTERNAL_OCR_REQUIRED_CONTENT_TYPES: List[str] = Field(default=["image/jpeg", "image/png"])
+    # OCR_REQUIRED_CONTENT_TYPES: List[str] = Field(default=["image/jpeg", "image/png"]) # Para futura implementación
     SPLITTER_CHUNK_SIZE: int = 500
     SPLITTER_CHUNK_OVERLAP: int = 50
-    SPLITTER_SPLIT_BY: str = "word"
+    SPLITTER_SPLIT_BY: str = "word" # Opciones: "word", "sentence", "passage"
 
-    # --- OpenAI ---
-    OPENAI_API_KEY: SecretStr # Obligatorio desde Secrets
-    OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
-    EMBEDDING_DIMENSION: int = 1536 # Default, ajustado por validador
+    # --- Validadores ---
 
-    # --- Validators ---
-    @validator("EMBEDDING_DIMENSION", pre=True, always=True)
-    def set_embedding_dimension(cls, v: Optional[int], values: dict[str, Any]) -> int:
-        model = values.get("OPENAI_EMBEDDING_MODEL")
-        # Ajusta la dimensión según el modelo especificado
-        if model == "text-embedding-3-large": return 3072
-        elif model in ["text-embedding-3-small", "text-embedding-ada-002"]: return 1536
-        # Si no se especifica o es 0, intenta deducir del modelo o usa default
-        if v is None or v == 0:
-            if model:
-                 if model == "text-embedding-3-large": return 3072
-                 if model in ["text-embedding-3-small", "text-embedding-ada-002"]: return 1536
-            return 1536 # Default general si no se puede determinar
-        return v # Devuelve el valor si se proporcionó explícitamente
+    @validator("LOG_LEVEL")
+    def check_log_level(cls, v):
+        valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+        if v.upper() not in valid_levels:
+            raise ValueError(f"Invalid LOG_LEVEL '{v}'. Must be one of {valid_levels}")
+        return v.upper()
+
+    # Validador para parsear params de Milvus si vienen como string JSON del entorno
+    @validator("MILVUS_INDEX_PARAMS", "MILVUS_SEARCH_PARAMS", pre=True)
+    def parse_milvus_params(cls, v):
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except json.JSONDecodeError:
+                raise ValueError("Milvus params must be a valid JSON string if provided as string")
+        return v # Asume que ya es un dict si no es string
+
+    # Validador para ajustar EMBEDDING_DIMENSION basado en el modelo
+    @validator('EMBEDDING_DIMENSION', pre=True, always=True)
+    def set_embedding_dimension(cls, v: Optional[int], values: Dict[str, Any]) -> int:
+        model = values.get('OPENAI_EMBEDDING_MODEL', OPENAI_DEFAULT_EMBEDDING_MODEL)
+        if model == "text-embedding-3-large":
+            calculated_dim = 3072
+        elif model in ["text-embedding-3-small", "text-embedding-ada-002"]:
+            calculated_dim = 1536
+        else:
+            # Si es un modelo desconocido, mantenemos el default o el valor explícito si existe
+            return v if v is not None else DEFAULT_EMBEDDING_DIM
+
+        if v is not None and v != calculated_dim:
+             logging.warning(f"Provided EMBEDDING_DIMENSION {v} conflicts with model {model} ({calculated_dim} expected). Using calculated value: {calculated_dim}")
+             return calculated_dim
+        return calculated_dim # Devuelve la dimensión calculada (o la explícita si coincidía)
+
+    @validator('POSTGRES_PASSWORD', 'MINIO_ACCESS_KEY', 'MINIO_SECRET_KEY', 'OPENAI_API_KEY')
+    def check_secrets_not_empty(cls, v: SecretStr, field: Field):
+        if not v or not v.get_secret_value():
+            raise ValueError(f"Secret field '{field.alias or field.name}' must not be empty.")
+        return v
 
 # --- Instancia Global ---
+# Usar un logger temporal básico para la carga inicial
+temp_log = logging.getLogger("ingest_service.config.loader")
+if not temp_log.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    formatter = logging.Formatter('%(levelname)s: [%(name)s] %(message)s')
+    handler.setFormatter(formatter)
+    temp_log.addHandler(handler)
+    temp_log.setLevel(logging.INFO)
+
 try:
+    temp_log.info("Loading Ingest Service settings...")
     settings = Settings()
-    # *** CORREGIDO: Mensajes de debug para reflejar la configuración real ***
-    print("DEBUG: Settings loaded successfully.")
-    print(f"DEBUG: Using Postgres Server: {settings.POSTGRES_SERVER}:{settings.POSTGRES_PORT}") # Reflejará el puerto 6543 si usa default
-    print(f"DEBUG: Using Postgres User: {settings.POSTGRES_USER}")
-    print(f"DEBUG: Using Milvus URI: {settings.MILVUS_URI}")
-    print(f"DEBUG: Using Redis Broker: {settings.CELERY_BROKER_URL}")
-    print(f"DEBUG: Using Minio Endpoint: {settings.MINIO_ENDPOINT}")
+    temp_log.info("Ingest Service Settings Loaded Successfully:")
+    temp_log.info(f"  PROJECT_NAME: {settings.PROJECT_NAME}")
+    temp_log.info(f"  LOG_LEVEL: {settings.LOG_LEVEL}")
+    temp_log.info(f"  CELERY_BROKER_URL: {settings.CELERY_BROKER_URL}")
+    temp_log.info(f"  CELERY_RESULT_BACKEND: {settings.CELERY_RESULT_BACKEND}")
+    temp_log.info(f"  POSTGRES_SERVER: {settings.POSTGRES_SERVER}:{settings.POSTGRES_PORT}")
+    temp_log.info(f"  POSTGRES_DB: {settings.POSTGRES_DB}")
+    temp_log.info(f"  POSTGRES_USER: {settings.POSTGRES_USER}")
+    temp_log.info(f"  POSTGRES_PASSWORD: *** SET ***")
+    temp_log.info(f"  MILVUS_URI: {settings.MILVUS_URI}")
+    temp_log.info(f"  MILVUS_COLLECTION_NAME: {settings.MILVUS_COLLECTION_NAME}")
+    temp_log.info(f"  MINIO_ENDPOINT: {settings.MINIO_ENDPOINT}")
+    temp_log.info(f"  MINIO_BUCKET_NAME: {settings.MINIO_BUCKET_NAME}")
+    temp_log.info(f"  MINIO_ACCESS_KEY: *** SET ***")
+    temp_log.info(f"  MINIO_SECRET_KEY: *** SET ***")
+    temp_log.info(f"  OPENAI_API_KEY: *** SET ***")
+    temp_log.info(f"  OPENAI_EMBEDDING_MODEL: {settings.OPENAI_EMBEDDING_MODEL}")
+    temp_log.info(f"  EMBEDDING_DIMENSION: {settings.EMBEDDING_DIMENSION}")
+    temp_log.info(f"  SUPPORTED_CONTENT_TYPES: {settings.SUPPORTED_CONTENT_TYPES}")
 
 except (ValidationError, ValueError) as e:
     error_details = ""
     if isinstance(e, ValidationError):
         try: error_details = f"\nValidation Errors:\n{e.json(indent=2)}"
-        except Exception:
-             try: error_details = f"\nRaw Errors: {e.errors()}"
-             except Exception: error_details = f"\nError details unavailable: {e}"
-    print(f"FATAL: Configuration validation failed:{error_details}\nOriginal Error: {e}")
-    sys.exit(1)
+        except Exception: error_details = f"\nRaw Errors: {e.errors()}"
+    temp_log.critical(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    temp_log.critical(f"! FATAL: Ingest Service configuration validation failed:{error_details}")
+    temp_log.critical(f"! Check environment variables (prefixed with INGEST_) or .env file.")
+    temp_log.critical(f"! Original Error: {e}")
+    temp_log.critical(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    sys.exit(1) # Salir si la configuración es inválida
 except Exception as e:
-    print(f"FATAL: Unexpected error during Settings instantiation:\n{e}")
-    import traceback; traceback.print_exc()
+    temp_log.exception(f"FATAL: Unexpected error loading Ingest Service settings: {e}")
     sys.exit(1)
 ```
 
@@ -512,12 +649,13 @@ def setup_logging():
 
 ## File: `app\db\postgres_client.py`
 ```py
-# ./app/db/postgres_client.py (AÑADIDA función list_documents_by_company)
+# ingest-service/app/db/postgres_client.py
 import uuid
 from typing import Any, Optional, Dict, List
 import asyncpg
 import structlog
 import json
+from datetime import datetime, timezone
 
 from app.core.config import settings
 from app.models.domain import DocumentStatus
@@ -526,20 +664,21 @@ log = structlog.get_logger(__name__)
 
 _pool: Optional[asyncpg.Pool] = None
 
+# --- Pool Management ---
 async def get_db_pool() -> asyncpg.Pool:
-    """
-    Obtiene o crea el pool de conexiones a la base de datos (Supabase).
-    Deshabilita la caché de prepared statements (statement_cache_size=0)
-    para compatibilidad con PgBouncer en modo transaction/statement (Supabase Pooler).
-    """
+    """Obtiene o crea el pool de conexiones a PostgreSQL."""
     global _pool
     if _pool is None or _pool._closed:
+        log.info("PostgreSQL pool is not initialized or closed. Creating new pool...",
+                 host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT,
+                 user=settings.POSTGRES_USER, db=settings.POSTGRES_DB)
         try:
-            log.info("Creating Supabase/PostgreSQL connection pool using arguments...",
-                     host=settings.POSTGRES_SERVER,
-                     port=settings.POSTGRES_PORT,
-                     user=settings.POSTGRES_USER,
-                     database=settings.POSTGRES_DB)
+            # Codec para manejar JSONB correctamente
+            def _json_encoder(value): return json.dumps(value)
+            def _json_decoder(value): return json.loads(value)
+            async def init_connection(conn):
+                await conn.set_type_codec('jsonb', encoder=_json_encoder, decoder=_json_decoder, schema='pg_catalog')
+                await conn.set_type_codec('json', encoder=_json_encoder, decoder=_json_decoder, schema='pg_catalog')
 
             _pool = await asyncpg.create_pool(
                 user=settings.POSTGRES_USER,
@@ -547,82 +686,51 @@ async def get_db_pool() -> asyncpg.Pool:
                 database=settings.POSTGRES_DB,
                 host=settings.POSTGRES_SERVER,
                 port=settings.POSTGRES_PORT,
-                min_size=5,
-                max_size=20,
-                # *** CORREGIDO: Deshabilitar caché de prepared statements ***
-                # Necesario para compatibilidad con PgBouncer en modo 'transaction' o 'statement'
-                # (como el Session Pooler de Supabase) que no soporta prepared statements a nivel de sesión.
-                statement_cache_size=0,
-                # command_timeout=60, # Timeout para comandos individuales
-                # timeout=300, # Timeout general? Revisar docs de asyncpg
-                init=lambda conn: conn.set_type_codec(
-                    'jsonb',
-                    encoder=json.dumps,
-                    decoder=json.loads,
-                    schema='pg_catalog',
-                    format='text'
-                )
-                # Podrías considerar añadir el codec de UUID aquí también si lo usas frecuentemente
-                # init=setup_connection_codecs # Ver ejemplo abajo si es necesario
+                min_size=2, # Ajusta según carga esperada
+                max_size=10,
+                timeout=30.0, # Timeout de conexión
+                command_timeout=60.0, # Timeout por comando
+                init=init_connection,
+                statement_cache_size=0 # Deshabilitar si causa problemas
             )
-            log.info("Supabase/PostgreSQL connection pool created successfully (statement_cache_size=0).")
-        except OSError as e:
-             log.error("Network/OS error creating Supabase/PostgreSQL connection pool",
-                      error=str(e), errno=getattr(e, 'errno', None),
-                      host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT,
-                      db=settings.POSTGRES_DB, user=settings.POSTGRES_USER,
-                      exc_info=True)
-             raise
-        except asyncpg.exceptions.InvalidPasswordError:
-             log.error("Invalid password for Supabase/PostgreSQL connection",
-                       host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT, user=settings.POSTGRES_USER)
-             raise
-        # Capturar específicamente el error de prepared statement duplicado
-        except asyncpg.exceptions.DuplicatePreparedStatementError as e:
-            log.error("Failed to create Supabase/PostgreSQL connection pool due to DuplicatePreparedStatementError "
-                      "(Confirm statement_cache_size=0 is set correctly for PgBouncer/Pooler)",
-                      error=str(e), error_type=type(e).__name__,
-                      host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT,
-                      db=settings.POSTGRES_DB, user=settings.POSTGRES_USER,
-                      exc_info=True) # Incluir traceback en este caso es útil
-            raise # Re-lanzar para que falle el startup
-        except Exception as e: # Otros errores (incluyendo TimeoutError si volviera a ocurrir)
-            log.error("Failed to create Supabase/PostgreSQL connection pool",
-                      error=str(e), error_type=type(e).__name__,
-                      host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT,
-                      db=settings.POSTGRES_DB, user=settings.POSTGRES_USER,
-                      exc_info=True)
-            raise
+            log.info("PostgreSQL connection pool created successfully.")
+        except (asyncpg.exceptions.InvalidPasswordError, OSError, ConnectionRefusedError) as conn_err:
+            log.critical("CRITICAL: Failed to connect to PostgreSQL", error=str(conn_err), exc_info=True)
+            _pool = None
+            raise ConnectionError(f"Failed to connect to PostgreSQL: {conn_err}") from conn_err
+        except Exception as e:
+            log.critical("CRITICAL: Failed to create PostgreSQL connection pool", error=str(e), exc_info=True)
+            _pool = None
+            raise RuntimeError(f"Failed to create PostgreSQL pool: {e}") from e
     return _pool
-
-# Ejemplo de función init más compleja si necesitas más codecs (opcional)
-# async def setup_connection_codecs(connection):
-#     await connection.set_type_codec(
-#         'jsonb',
-#         encoder=json.dumps,
-#         decoder=json.loads,
-#         schema='pg_catalog',
-#         format='text'
-#     )
-#     # Añadir codec para UUID si no está por defecto o quieres asegurar el manejo
-#     await connection.set_type_codec(
-#         'uuid',
-#         encoder=str,
-#         decoder=uuid.UUID,
-#         schema='pg_catalog',
-#         format='text'
-#     )
-#     log.debug("Custom type codecs (jsonb, uuid) registered for new connection.", connection=connection)
-
 
 async def close_db_pool():
     """Cierra el pool de conexiones."""
     global _pool
     if _pool and not _pool._closed:
-        log.info("Closing Supabase/PostgreSQL connection pool...")
+        log.info("Closing PostgreSQL connection pool...")
         await _pool.close()
         _pool = None
-        log.info("Supabase/PostgreSQL connection pool closed.")
+        log.info("PostgreSQL connection pool closed.")
+    elif _pool and _pool._closed:
+        log.warning("Attempted to close an already closed PostgreSQL pool.")
+        _pool = None
+    else:
+        log.info("No active PostgreSQL connection pool to close.")
+
+async def check_db_connection() -> bool:
+    """Verifica que la conexión a la base de datos esté funcionando."""
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction(): # Usa transacción para asegurar que no haya efectos secundarios
+                result = await conn.fetchval("SELECT 1")
+        return result == 1
+    except Exception as e:
+        log.error("Database connection check failed", error=str(e))
+        return False
+
+# --- Document Operations ---
 
 async def create_document(
     company_id: uuid.UUID,
@@ -630,32 +738,39 @@ async def create_document(
     file_type: str,
     metadata: Dict[str, Any]
 ) -> uuid.UUID:
-    """Crea un registro inicial para el documento en la tabla DOCUMENTS."""
+    """
+    Crea un registro inicial para el documento en la tabla DOCUMENTS.
+    Retorna el UUID del documento creado.
+    """
     pool = await get_db_pool()
     doc_id = uuid.uuid4()
+    # Usar NOW() para timestamps, status inicial UPLOADED
+    # Incluir updated_at en el INSERT inicial
     query = """
-        INSERT INTO documents (id, company_id, file_name, file_type, metadata, status, file_path, uploaded_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, '', NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC')
+        INSERT INTO documents (id, company_id, file_name, file_type, metadata, status, uploaded_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC')
         RETURNING id;
     """
+    insert_log = log.bind(company_id=str(company_id), filename=file_name, content_type=file_type, proposed_doc_id=str(doc_id))
     try:
         async with pool.acquire() as connection:
-            # Con statement_cache_size=0, asyncpg no usará prepared statements internamente aquí
-            result = await connection.fetchval(
-                query, doc_id, company_id, file_name, file_type, json.dumps(metadata), DocumentStatus.UPLOADED.value # Asegurar que metadata se guarda como JSON
+            # Usar json.dumps para el campo jsonb 'metadata'
+            result_id = await connection.fetchval(
+                query, doc_id, company_id, file_name, file_type, json.dumps(metadata), DocumentStatus.UPLOADED.value
             )
-        if result:
-            log.info("Document record created in Supabase", document_id=doc_id, company_id=company_id)
-            return result
+        if result_id and result_id == doc_id:
+            insert_log.info("Document record created in PostgreSQL", document_id=str(doc_id))
+            return result_id
         else:
-             log.error("Failed to create document record, no ID returned.", document_id=doc_id)
-             raise RuntimeError("Failed to create document record, no ID returned.")
+             insert_log.error("Failed to create document record, unexpected or no ID returned.", returned_id=result_id)
+             raise RuntimeError(f"Failed to create document record, return value mismatch ({result_id})")
     except asyncpg.exceptions.UniqueViolationError as e:
-        log.error("Failed to create document record due to unique constraint violation.", error=str(e), document_id=doc_id, company_id=company_id, constraint=e.constraint_name, exc_info=False)
-        raise ValueError(f"Document creation failed: unique constraint violated ({e.constraint_name})") from e
+        # Esto es improbable si usamos UUID v4, pero posible si hay constraints en otros campos
+        insert_log.error("Unique constraint violation creating document record.", error=str(e), constraint=e.constraint_name, exc_info=False)
+        raise ValueError(f"Document creation failed due to unique constraint ({e.constraint_name})") from e
     except Exception as e:
-        log.error("Failed to create document record in Supabase", error=str(e), document_id=doc_id, company_id=company_id, file_name=file_name, exc_info=True)
-        raise
+        insert_log.error("Failed to create document record in PostgreSQL", error=str(e), exc_info=True)
+        raise # Relanzar para manejo superior
 
 async def update_document_status(
     document_id: uuid.UUID,
@@ -664,183 +779,284 @@ async def update_document_status(
     chunk_count: Optional[int] = None,
     error_message: Optional[str] = None,
 ) -> bool:
-    """Actualiza el estado y otros campos de un documento en la tabla DOCUMENTS."""
+    """
+    Actualiza el estado y otros campos de un documento.
+    Limpia error_message si el estado no es ERROR.
+    """
     pool = await get_db_pool()
-    fields_to_update = ["status = $2", "updated_at = NOW() AT TIME ZONE 'UTC'"]
-    params: List[Any] = [document_id, status.value]
-    current_param_index = 3
-    if file_path is not None:
-        fields_to_update.append(f"file_path = ${current_param_index}")
-        params.append(file_path)
-        current_param_index += 1
-    if chunk_count is not None:
-        fields_to_update.append(f"chunk_count = ${current_param_index}")
-        params.append(chunk_count)
-        current_param_index += 1
-    if status == DocumentStatus.ERROR:
-        safe_error_message = (error_message or "Unknown processing error")[:1000] # Limitar longitud
-        fields_to_update.append(f"error_message = ${current_param_index}")
-        params.append(safe_error_message)
-        current_param_index += 1
-    else:
-        # Limpiar error_message si el estado no es ERROR
-        fields_to_update.append("error_message = NULL")
+    update_log = log.bind(document_id=str(document_id), new_status=status.value)
 
-    query = f"UPDATE documents SET {', '.join(fields_to_update)} WHERE id = $1;"
+    fields_to_set: List[str] = []
+    params: List[Any] = [document_id] # $1 será el ID
+    param_index = 2 # Empezar parámetros desde $2
+
+    # Siempre actualizar 'status' y 'updated_at'
+    fields_to_set.append(f"status = ${param_index}")
+    params.append(status.value); param_index += 1
+    fields_to_set.append(f"updated_at = NOW() AT TIME ZONE 'UTC'")
+
+    # Añadir otros campos condicionalmente
+    if file_path is not None:
+        fields_to_set.append(f"file_path = ${param_index}")
+        params.append(file_path); param_index += 1
+    if chunk_count is not None:
+        fields_to_set.append(f"chunk_count = ${param_index}")
+        params.append(chunk_count); param_index += 1
+
+    # Manejar error_message
+    if status == DocumentStatus.ERROR:
+        safe_error = (error_message or "Unknown processing error")[:2000] # Limitar longitud de error
+        fields_to_set.append(f"error_message = ${param_index}")
+        params.append(safe_error); param_index += 1
+        update_log = update_log.bind(error_message=safe_error)
+    else:
+        # Si el nuevo estado NO es ERROR, limpiar el campo error_message
+        fields_to_set.append("error_message = NULL")
+
+    query = f"UPDATE documents SET {', '.join(fields_to_set)} WHERE id = $1;"
+    update_log.debug("Executing document status update", query=query, params_count=len(params))
+
     try:
         async with pool.acquire() as connection:
-             # Con statement_cache_size=0, asyncpg no usará prepared statements internamente aquí
-             result = await connection.execute(query, *params)
-        affected_rows = 0
-        if isinstance(result, str) and result.startswith("UPDATE "):
-            try: affected_rows = int(result.split(" ")[1])
-            except (IndexError, ValueError): log.warning("Could not parse affected rows from DB result", result_string=result)
-        success = affected_rows > 0
-        if success: log.info("Document status updated in Supabase", document_id=document_id, new_status=status.value, file_path=file_path, chunk_count=chunk_count, has_error=(status == DocumentStatus.ERROR))
-        else: log.warning("Document status update did not affect any rows", document_id=document_id, new_status=status.value)
-        return success
+             result_str = await connection.execute(query, *params) # Desempaquetar params
+
+        # Verificar si se actualizó alguna fila
+        if isinstance(result_str, str) and result_str.startswith("UPDATE "):
+            affected_rows = int(result_str.split(" ")[1])
+            if affected_rows > 0:
+                update_log.info("Document status updated successfully", affected_rows=affected_rows)
+                return True
+            else:
+                update_log.warning("Document status update command executed but no rows were affected (document ID might not exist).")
+                return False
+        else:
+             update_log.error("Unexpected result from document update execution", db_result=result_str)
+             return False # Considerar esto como fallo
+
     except Exception as e:
-        log.error("Failed to update document status in Supabase", error=str(e), document_id=document_id, new_status=status.value, exc_info=True)
-        raise
+        update_log.error("Failed to update document status in PostgreSQL", error=str(e), exc_info=True)
+        raise # Relanzar para manejo superior
 
 async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]]:
-    """Obtiene el estado y otros datos de un documento de la tabla DOCUMENTS."""
+    """Obtiene datos clave de un documento por su ID."""
     pool = await get_db_pool()
-    # Asegurar que seleccionamos las columnas correctas para StatusResponse
+    # Seleccionar columnas necesarias para la API (schema StatusResponse) y validación de company_id
     query = """
         SELECT id, status, file_name, file_type, chunk_count, error_message, updated_at, company_id
         FROM documents
         WHERE id = $1;
     """
+    get_log = log.bind(document_id=str(document_id))
     try:
         async with pool.acquire() as connection:
-            # Con statement_cache_size=0, asyncpg no usará prepared statements internamente aquí
             record = await connection.fetchrow(query, document_id)
         if record:
-            log.debug("Document status retrieved from Supabase", document_id=document_id)
-            # Convertir asyncpg.Record a Dict para consistencia
-            return dict(record)
+            get_log.debug("Document status retrieved successfully")
+            return dict(record) # Convertir a dict
         else:
-            log.warning("Document status requested for non-existent ID", document_id=document_id)
+            get_log.warning("Document status requested for non-existent ID")
             return None
     except Exception as e:
-        log.error("Failed to get document status from Supabase", error=str(e), document_id=document_id, exc_info=True)
+        get_log.error("Failed to get document status from PostgreSQL", error=str(e), exc_info=True)
         raise
 
-# --- NUEVA FUNCIÓN ---
-async def list_documents_by_company(company_id: uuid.UUID) -> List[Dict[str, Any]]:
+async def list_documents_by_company(
+    company_id: uuid.UUID,
+    limit: int = 100,
+    offset: int = 0
+) -> List[Dict[str, Any]]:
     """
-    Obtiene una lista de documentos (con su estado) para una compañía específica,
-    ordenados por fecha de actualización descendente.
+    Obtiene una lista paginada de documentos para una compañía, ordenados por updated_at DESC.
     """
     pool = await get_db_pool()
-    # Seleccionar las columnas necesarias para el schema StatusResponse
+    # Seleccionar columnas para StatusResponse
     query = """
         SELECT id, status, file_name, file_type, chunk_count, error_message, updated_at
         FROM documents
         WHERE company_id = $1
-        ORDER BY updated_at DESC;
+        ORDER BY updated_at DESC
+        LIMIT $2 OFFSET $3;
     """
-    db_log = log.bind(company_id=str(company_id))
+    list_log = log.bind(company_id=str(company_id), limit=limit, offset=offset)
     try:
         async with pool.acquire() as connection:
-            # Con statement_cache_size=0, asyncpg no usará prepared statements internamente aquí
-            records = await connection.fetch(query, company_id)
+            records = await connection.fetch(query, company_id, limit, offset)
 
-        result_list = [dict(record) for record in records] # Convertir lista de Records a lista de Dicts
-        db_log.info(f"Retrieved {len(result_list)} documents for company")
+        result_list = [dict(record) for record in records] # Convertir Records a Dicts
+        list_log.info(f"Retrieved {len(result_list)} documents for company listing")
         return result_list
     except Exception as e:
-        db_log.error("Failed to list documents by company from Supabase", error=str(e), exc_info=True)
-        raise # Relanzar para que el endpoint maneje el error
+        list_log.error("Failed to list documents by company from PostgreSQL", error=str(e), exc_info=True)
+        raise
 ```
 
 ## File: `app\main.py`
 ```py
 # ingest-service/app/main.py
-from fastapi import FastAPI, HTTPException, status as fastapi_status
+from fastapi import FastAPI, HTTPException, status as fastapi_status, Request # Añadir Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response # Importar Response
+from fastapi.responses import JSONResponse, PlainTextResponse # Usar PlainTextResponse para health
 import structlog
 import uvicorn
 import logging
 import sys
 import asyncio
+import time # Para timing
+import uuid # Para request ID
 
-# Configurar logging primero
-from app.core.config import settings
+# Configurar logging ANTES de importar otros módulos
 from app.core.logging_config import setup_logging
-setup_logging()
-log = structlog.get_logger(__name__)
+setup_logging() # Llamar a la función de configuración
 
-# Importar routers y otros módulos
-from app.api.v1.endpoints import ingest # Importar el router directamente
+# Importaciones post-logging
+from app.core.config import settings
+log = structlog.get_logger("ingest_service.main") # Logger para este módulo
+from app.api.v1.endpoints import ingest # Importar el módulo del router
 from app.db import postgres_client
 
+# Flag global para indicar si el servicio está listo (DB conectada)
 SERVICE_READY = False
 
+# --- Lifespan Manager (Startup/Shutdown) ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global SERVICE_READY
+    log.info("Executing Ingest Service startup sequence...")
+    db_pool_ok = False
+    try:
+        # Intenta obtener y verificar el pool de DB
+        await postgres_client.get_db_pool() # Esto inicializa si no existe
+        db_pool_ok = await postgres_client.check_db_connection()
+        if db_pool_ok:
+            log.info("PostgreSQL connection pool initialized and verified.")
+            SERVICE_READY = True # Marcar como listo SOLO si la DB está ok
+        else:
+            log.critical("PostgreSQL connection check FAILED after pool initialization attempt.")
+            SERVICE_READY = False
+    except Exception as e:
+        log.critical("CRITICAL FAILURE during PostgreSQL startup verification", error=str(e), exc_info=True)
+        SERVICE_READY = False # No listo si hay excepción
+
+    if SERVICE_READY:
+        log.info("Ingest Service startup successful. SERVICE IS READY.")
+    else:
+        log.error("Ingest Service startup completed BUT SERVICE IS NOT READY (DB connection issue).")
+
+    yield # La aplicación se ejecuta aquí
+
+    # --- Shutdown ---
+    log.info("Executing Ingest Service shutdown sequence...")
+    await postgres_client.close_db_pool()
+    log.info("Shutdown sequence complete.")
+
+
+# --- Creación de la App FastAPI ---
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    openapi_url=f"{settings.API_V1_STR}/openapi.json",
-    version="0.1.0",
-    description="Microservice for document ingestion and preprocessing using Haystack.",
+    openapi_url=f"{settings.API_V1_STR}/openapi.json", # Ruta API v1 para spec
+    version="0.1.1",
+    description="Microservicio Atenex para ingesta de documentos usando Haystack.",
+    lifespan=lifespan # Usar el lifespan manager
 )
 
-# --- Event Handlers (Sin cambios) ---
-@app.on_event("startup")
-async def startup_event():
-    global SERVICE_READY
-    log.info("Starting up Ingest Service...")
-    db_pool_initialized = False
+# --- Middlewares (Ejemplo: Request ID y Logging) ---
+@app.middleware("http")
+async def add_request_context_timing_logging(request: Request, call_next):
+    start_time = time.perf_counter()
+    request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    # Bind inicial para logs de entrada
+    req_log = log.bind(request_id=request_id, method=request.method, path=request.url.path)
+    req_log.info("Request received")
+
+    # Añadir request_id al estado para acceso en endpoints si es necesario
+    request.state.request_id = request_id
+
+    response = None
     try:
-        await postgres_client.get_db_pool()
-        pool = await postgres_client.get_db_pool()
-        async with pool.acquire() as conn:
-            await asyncio.wait_for(conn.execute("SELECT 1"), timeout=10.0)
-        log.info("PostgreSQL connection pool initialized and verified.")
-        db_pool_initialized = True
+        response = await call_next(request)
+        # Bind final con status_code para log de salida
+        process_time_ms = (time.perf_counter() - start_time) * 1000
+        resp_log = req_log.bind(status_code=response.status_code, duration_ms=round(process_time_ms, 2))
+        log_level = "warning" if 400 <= response.status_code < 500 else "error" if response.status_code >= 500 else "info"
+        getattr(resp_log, log_level)("Request finished")
+        # Añadir headers a la respuesta
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Process-Time-Ms"] = f"{process_time_ms:.2f}"
+
     except Exception as e:
-        log.critical("CRITICAL: Failed PostgreSQL connection on startup.", error=str(e), exc_info=True)
-    if db_pool_initialized:
-        SERVICE_READY = True
-        log.info("Ingest Service startup sequence completed. READY.")
-    else:
-        SERVICE_READY = False
-        log.warning("Ingest Service startup completed but DB connection failed. NOT READY.")
+        # Capturar excepciones no manejadas
+        process_time_ms = (time.perf_counter() - start_time) * 1000
+        exc_log = req_log.bind(status_code=500, duration_ms=round(process_time_ms, 2))
+        exc_log.exception("Unhandled exception during request processing") # Loguea el traceback
+        # Crear respuesta de error 500
+        response = JSONResponse(
+            status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": "Internal Server Error"}
+        )
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Process-Time-Ms"] = f"{process_time_ms:.2f}"
+        # No relanzar, devolver la respuesta JSON
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    log.info("Shutting down Ingest Service..."); await postgres_client.close_db_pool(); log.info("Shutdown complete.")
+    return response
 
-# --- Exception Handlers (Sin cambios) ---
+
+# --- Exception Handlers (Simplificados, middleware captura genéricos) ---
 @app.exception_handler(HTTPException)
-async def http_exception_handler(request, exc): log.warning("HTTP Exception", s=exc.status_code, d=exc.detail); return JSONResponse(s=exc.status_code, c={"detail": exc.detail})
+async def http_exception_handler(request: Request, exc: HTTPException):
+    # El middleware ya loguea esto, sólo devolvemos la respuesta JSON
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=getattr(exc, "headers", None) # Mantener headers si existen (ej. WWW-Authenticate)
+    )
+
 @app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request, exc): log.warning("Validation Error", e=exc.errors()); return JSONResponse(s=422, c={"detail": "Validation Error", "errors": exc.errors()})
-@app.exception_handler(Exception)
-async def generic_exception_handler(request, exc): log.exception("Unhandled Exception"); return JSONResponse(s=500, c={"detail": "Internal Server Error"})
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    # El middleware logueará el 422
+    return JSONResponse(
+        status_code=fastapi_status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": "Validation Error", "errors": exc.errors()},
+    )
 
-# --- Router ---
-# *** CORRECCIÓN: Usar el prefijo correcto ***
-app.include_router(ingest.router, prefix="/api/v1/ingest", tags=["Ingestion"])
-# Asegúrate que el prefijo aquí + la ruta en el endpoint coincidan con lo que llama el gateway
-# Gateway llama a /api/v1/ingest/status -> Debe mapear a GET /status aquí
-# Gateway llama a /api/v1/ingest/status/{id} -> Debe mapear a GET /status/{id} aquí
-# Gateway llama a /api/v1/ingest/upload -> Debe mapear a POST /ingest aquí (porque el endpoint usa "/ingest")
-# El prefijo parece correcto si las rutas en ingest.py son "/ingest", "/status", "/status/{id}"
+# --- Router Inclusion ---
+# Incluir el router de ingest con el prefijo correcto
+# Las rutas definidas en ingest.py ("/upload", "/status", etc.) se añadirán a este prefijo.
+# Ejemplo: POST /api/v1/ingest/upload
+app.include_router(ingest.router, prefix=settings.API_V1_STR, tags=["Ingestion"])
+log.info(f"Included ingestion router with prefix: {settings.API_V1_STR}")
 
-# --- Root Endpoint / Health Check (Sin cambios) ---
-@app.get("/", tags=["Health Check"], status_code=fastapi_status.HTTP_200_OK)
-async def read_root():
-    global SERVICE_READY; health_log = log.bind(check="liveness/readiness")
-    if not SERVICE_READY: health_log.warning("Health check failed: Not Ready"); raise HTTPException(status_code=503, detail="Service not ready")
-    try:
-        pool = await postgres_client.get_db_pool()
-        async with pool.acquire() as conn:
-            await asyncio.wait_for(conn.execute("SELECT 1"), timeout=5.0)
-        health_log.debug("Health check: DB ping successful.")
-    except Exception as db_ping_err: health_log.error("Health check failed: DB ping error", e=db_ping_err); SERVICE_READY = False; raise HTTPException(status_code=503, detail="DB connection error")
-    return Response(content="OK", status_code=fastapi_status.HTTP_200_OK, media_type="text/plain") # Cambiado a  respuesta simple OK
+# --- Root Endpoint / Health Check ---
+@app.get("/", tags=["Health Check"], status_code=fastapi_status.HTTP_200_OK, response_class=PlainTextResponse)
+async def health_check():
+    """
+    Verifica la disponibilidad del servicio.
+    Chequea la bandera SERVICE_READY (basada en la conexión DB al inicio).
+    Devuelve 'OK' y 200 si está listo, 'Service Unavailable' y 503 si no.
+    Usado por Kubernetes Liveness/Readiness Probes.
+    """
+    health_log = log.bind(check="liveness_readiness")
+    if SERVICE_READY:
+        # Opcional: Podrías añadir un ping rápido a la DB aquí también,
+        # pero puede añadir latencia. El chequeo al inicio es lo principal.
+        # try:
+        #     if not await postgres_client.check_db_connection():
+        #         raise ConnectionError("DB check failed during health check")
+        # except Exception as hc_db_err:
+        #      health_log.error("Health check failed: DB ping error", error=str(hc_db_err))
+        #      # Si falla el ping, marcar como no listo y devolver 503
+        #      # SERVICE_READY = False # Considerar si el estado debe cambiar dinámicamente
+        #      raise HTTPException(status_code=503, detail="Service Unavailable (DB Connection Lost)")
+
+        health_log.debug("Health check passed: Service is ready.")
+        return PlainTextResponse("OK", status_code=fastapi_status.HTTP_200_OK)
+    else:
+        health_log.warning("Health check failed: Service is not ready.")
+        # Devolver 503 explícitamente usando HTTPException
+        raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service Unavailable")
+
+# --- Ejecución (para uvicorn directo) ---
+# if __name__ == "__main__":
+#     uvicorn.run("app.main:app", host="0.0.0.0", port=80, reload=True) # Puerto 80 estándar si no hay otro proxy delante localmente
 ```
 
 ## File: `app\models\__init__.py`
@@ -954,24 +1170,24 @@ class BaseServiceClient:
 
 ## File: `app\services\minio_client.py`
 ```py
-# ./app/services/minio_client.py (CORREGIDO - run_in_executor para llamadas sync)
+# ingest-service/app/services/minio_client.py
 import io
 import uuid
-from typing import IO, BinaryIO # Usar BinaryIO para type hint
+from typing import IO, BinaryIO
 from minio import Minio
 from minio.error import S3Error
 import structlog
-import asyncio # Import asyncio para run_in_executor
+import asyncio
 
 from app.core.config import settings
 
 log = structlog.get_logger(__name__)
 
 class MinioStorageClient:
-    """Cliente para interactuar con MinIO."""
+    """Cliente para interactuar con MinIO usando el bucket configurado."""
 
     def __init__(self):
-        # La inicialización sigue siendo síncrona
+        self.bucket_name = settings.MINIO_BUCKET_NAME # Usar siempre el bucket de config ('atenex')
         try:
             self.client = Minio(
                 settings.MINIO_ENDPOINT,
@@ -980,131 +1196,118 @@ class MinioStorageClient:
                 secure=settings.MINIO_USE_SECURE
             )
             self._ensure_bucket_exists()
-            log.info("MinIO client initialized", endpoint=settings.MINIO_ENDPOINT, bucket=settings.MINIO_BUCKET_NAME)
+            log.info("MinIO client initialized", endpoint=settings.MINIO_ENDPOINT, bucket=self.bucket_name)
         except Exception as e:
-            log.error("Failed to initialize MinIO client", error=str(e), exc_info=True)
-            raise
+            log.critical("CRITICAL: Failed to initialize MinIO client", bucket=self.bucket_name, error=str(e), exc_info=True)
+            # Si MinIO es esencial, fallar el inicio del servicio
+            raise RuntimeError(f"MinIO client initialization failed: {e}") from e
 
     def _ensure_bucket_exists(self):
-        """Crea el bucket si no existe (síncrono)."""
+        """Crea el bucket especificado si no existe (síncrono)."""
         try:
-            found = self.client.bucket_exists(settings.MINIO_BUCKET_NAME)
+            found = self.client.bucket_exists(self.bucket_name)
             if not found:
-                self.client.make_bucket(settings.MINIO_BUCKET_NAME)
-                log.info(f"MinIO bucket '{settings.MINIO_BUCKET_NAME}' created.")
+                self.client.make_bucket(self.bucket_name)
+                log.info(f"MinIO bucket '{self.bucket_name}' created.")
             else:
-                log.debug(f"MinIO bucket '{settings.MINIO_BUCKET_NAME}' already exists.")
+                log.debug(f"MinIO bucket '{self.bucket_name}' already exists.")
         except S3Error as e:
-            log.error(f"Error checking/creating MinIO bucket '{settings.MINIO_BUCKET_NAME}'", error=str(e), exc_info=True)
-            raise
+            log.error(f"Error checking/creating MinIO bucket '{self.bucket_name}'", error=str(e), exc_info=True)
+            raise # Re-lanzar para indicar fallo crítico
 
-    # *** CORREGIDO: Usar run_in_executor para la llamada síncrona put_object ***
     async def upload_file(
         self,
         company_id: uuid.UUID,
         document_id: uuid.UUID,
         file_name: str,
-        file_content_stream: IO[bytes], # Acepta cualquier stream de bytes
+        file_content_stream: IO[bytes], # Acepta BytesIO u otro stream
         content_type: str,
         content_length: int
     ) -> str:
         """
-        Sube un archivo a MinIO de forma asíncrona (ejecutando la operación síncrona en un executor).
-        Retorna el nombre del objeto en MinIO (object_name).
+        Sube un archivo a MinIO de forma asíncrona usando run_in_executor.
+        El nombre del objeto usa company_id/document_id/filename.
+        Retorna el nombre completo del objeto en MinIO.
         """
+        # Construir nombre del objeto para organización dentro del bucket 'atenex'
         object_name = f"{str(company_id)}/{str(document_id)}/{file_name}"
-        upload_log = log.bind(bucket=settings.MINIO_BUCKET_NAME, object_name=object_name, content_type=content_type, length=content_length)
-        upload_log.info("Queueing file upload to MinIO executor...")
+        upload_log = log.bind(bucket=self.bucket_name, object_name=object_name, content_type=content_type, length=content_length)
+        upload_log.info("Queueing file upload to MinIO executor")
 
         loop = asyncio.get_running_loop()
         try:
-            # Ejecutar la operación síncrona de MinIO en un executor
-            # Asegurarse que el stream está al inicio antes de pasarlo al thread
+            # Asegurarse que el stream está al inicio antes de pasarlo
             file_content_stream.seek(0)
+            # Ejecutar la operación síncrona put_object en el executor
             result = await loop.run_in_executor(
-                None, # Usa el ThreadPoolExecutor por defecto
-                lambda: self.client.put_object(
-                    settings.MINIO_BUCKET_NAME,
-                    object_name,
-                    file_content_stream, # Pasar el stream directamente
-                    length=content_length,
-                    content_type=content_type,
-                )
+                None, # Default ThreadPoolExecutor
+                self.client.put_object, # La función síncrona
+                # Argumentos para put_object:
+                self.bucket_name,
+                object_name,
+                file_content_stream,
+                content_length, # Pasar longitud explícitamente
+                content_type=content_type,
             )
-            upload_log.info("File uploaded successfully to MinIO via executor", etag=result.etag, version_id=result.version_id)
+            upload_log.info("File uploaded successfully to MinIO via executor", etag=getattr(result, 'etag', None), version_id=getattr(result, 'version_id', None))
             return object_name
         except S3Error as e:
             upload_log.error("Failed to upload file to MinIO via executor", error=str(e), code=e.code, exc_info=True)
-            raise # Re-raise the specific S3Error
+            # Re-lanzar S3Error para que el llamador lo maneje
+            raise IOError(f"Failed to upload to storage: {e.code}") from e
         except Exception as e:
             upload_log.error("Unexpected error during file upload via executor", error=str(e), exc_info=True)
-            raise # Re-raise generic exceptions
+            # Re-lanzar como IOError genérico
+            raise IOError(f"Unexpected storage upload error") from e
 
-
-    # *** CORREGIDO: Crear función síncrona para la lógica de descarga ***
-    def download_file_stream_sync(
-        self,
-        object_name: str
-    ) -> io.BytesIO:
-        """
-        Descarga un archivo de MinIO como un stream en memoria (BytesIO).
-        Esta es una operación SÍNCRONA. Lanza FileNotFoundError si no existe.
-        """
-        download_log = log.bind(bucket=settings.MINIO_BUCKET_NAME, object_name=object_name)
-        download_log.info("Downloading file from MinIO (sync)...")
+    def download_file_stream_sync(self, object_name: str) -> io.BytesIO:
+        """Operación SÍNCRONA para descargar un archivo a BytesIO."""
+        download_log = log.bind(bucket=self.bucket_name, object_name=object_name)
+        download_log.info("Downloading file from MinIO (sync operation starting)...")
         response = None
         try:
-            # Operación bloqueante de red/IO
-            response = self.client.get_object(settings.MINIO_BUCKET_NAME, object_name)
-            file_data = response.read() # Leer todo el contenido (bloqueante)
+            # get_object es bloqueante
+            response = self.client.get_object(self.bucket_name, object_name)
+            file_data = response.read() # Leer todo en memoria (bloqueante)
             file_stream = io.BytesIO(file_data)
             download_log.info(f"File downloaded successfully from MinIO (sync, {len(file_data)} bytes)")
-            file_stream.seek(0) # Reset stream position
+            file_stream.seek(0) # Importante resetear posición
             return file_stream
         except S3Error as e:
-            download_log.error("Failed to download file from MinIO (sync)", error=str(e), code=e.code, exc_info=False) # No need for full trace on known errors like NoSuchKey
-            # Es importante lanzar una excepción clara si el archivo no se encuentra
+            download_log.error("Failed to download file from MinIO (sync)", error=str(e), code=e.code, exc_info=False)
             if e.code == 'NoSuchKey':
-                 raise FileNotFoundError(f"Object not found in MinIO: {object_name}") from e
+                 raise FileNotFoundError(f"Object not found in MinIO bucket '{self.bucket_name}': {object_name}") from e
             else:
-                 # Otro error de S3
                  raise IOError(f"S3 error downloading file {object_name}: {e.code}") from e
         except Exception as e:
-             # Capturar otros posibles errores
              download_log.error("Unexpected error during sync file download", error=str(e), exc_info=True)
              raise IOError(f"Unexpected error downloading file {object_name}") from e
         finally:
-            # Asegurar que la conexión se libera siempre
+            # Asegurar liberación de conexión
             if response:
                 response.close()
                 response.release_conn()
 
-    # *** CORREGIDO: La versión async ahora llama a la sync en el executor ***
-    async def download_file_stream(
-        self,
-        object_name: str
-    ) -> io.BytesIO:
-        """
-        Descarga un archivo de MinIO como un stream en memoria (BytesIO) de forma asíncrona.
-        Ejecuta la descarga síncrona en un executor. Lanza FileNotFoundError si no existe.
-        """
-        download_log = log.bind(bucket=settings.MINIO_BUCKET_NAME, object_name=object_name)
-        download_log.info("Queueing file download from MinIO executor...")
+    async def download_file_stream(self, object_name: str) -> io.BytesIO:
+        """Descarga un archivo de MinIO como BytesIO de forma asíncrona."""
+        download_log = log.bind(bucket=self.bucket_name, object_name=object_name)
+        download_log.info("Queueing file download from MinIO executor")
         loop = asyncio.get_running_loop()
         try:
+            # Llamar a la función síncrona en el executor
             file_stream = await loop.run_in_executor(
-                None, # Usa el ThreadPoolExecutor por defecto
-                self.download_file_stream_sync, # Llama a la función síncrona
-                object_name
+                None, # Default executor
+                self.download_file_stream_sync, # La función bloqueante
+                object_name # Argumento para la función
             )
             download_log.info("File download successful via executor")
             return file_stream
-        except FileNotFoundError: # Capturar el error específico de archivo no encontrado
+        except FileNotFoundError: # Capturar y relanzar específicamente
             download_log.error("File not found in MinIO via executor", object_name=object_name)
-            raise # Relanzar FileNotFoundError para que la tarea Celery lo maneje
+            raise
         except Exception as e: # Captura IOError u otros errores del sync helper
             download_log.error("Error downloading file via executor", error=str(e), error_type=type(e).__name__, exc_info=True)
-            raise # Relanzar otras excepciones
+            raise IOError(f"Failed to download file via executor: {e}") from e
 ```
 
 ## File: `app\tasks\__init__.py`
@@ -1147,7 +1350,7 @@ log.info("Celery app configured", broker=settings.CELERY_BROKER_URL)
 
 ## File: `app\tasks\process_document.py`
 ```py
-# ./app/tasks/process_document.py (CORREGIDO - Llamada a MinIO/Haystack en executor y manejo async)
+# ingest-service/app/tasks/process_document.py
 import uuid
 import asyncio
 from typing import Dict, Any, Optional, List, Type
@@ -1155,109 +1358,142 @@ import tempfile
 import os
 from pathlib import Path
 import structlog
-import base64
 import io
-import time # Para medir tiempos si es necesario
+import time
+import traceback # Para formatear excepciones
 
 # --- Haystack Imports ---
 from haystack import Pipeline, Document
 from haystack.utils import Secret
 from haystack.components.converters import (
-    PyPDFToDocument,
-    TextFileToDocument,
-    MarkdownToDocument,
-    HTMLToDocument,
-    DOCXToDocument,
+    PyPDFToDocument, TextFileToDocument, MarkdownToDocument,
+    HTMLToDocument, DOCXToDocument,
 )
 from haystack.components.preprocessors import DocumentSplitter
 from haystack.components.embedders import OpenAIDocumentEmbedder
-from milvus_haystack import MilvusDocumentStore # Asegúrate que esté importado
+from milvus_haystack import MilvusDocumentStore # Importación correcta
 from haystack.components.writers import DocumentWriter
 from haystack.dataclasses import ByteStream
 
 # --- Local Imports ---
 from app.tasks.celery_app import celery_app
 from app.core.config import settings
-from app.db import postgres_client # Importar funciones async del cliente DB
+from app.db import postgres_client # Cliente DB async
 from app.models.domain import DocumentStatus
-from app.services.minio_client import MinioStorageClient # Importar cliente MinIO corregido
+from app.services.minio_client import MinioStorageClient # Cliente MinIO async
 
 log = structlog.get_logger(__name__)
 
-# --- Funciones de inicialización de Haystack (sin cambios necesarios) ---
-# (Se asume que estas funciones son síncronas y seguras para llamarse desde el executor o antes)
-def get_haystack_document_store() -> MilvusDocumentStore:
-    """Initializes the MilvusDocumentStore."""
-    log.debug("Initializing MilvusDocumentStore",
-             uri=str(settings.MILVUS_URI),
-             collection=settings.MILVUS_COLLECTION_NAME,
-             dim=settings.EMBEDDING_DIMENSION,
-             metadata_fields=settings.MILVUS_METADATA_FIELDS)
-    # Asegúrate que los parámetros coinciden con tu versión de Milvus y Haystack
-    return MilvusDocumentStore(
-        uri=str(settings.MILVUS_URI),
-        collection_name=settings.MILVUS_COLLECTION_NAME,
-        dim=settings.EMBEDDING_DIMENSION,
-        embedding_field=settings.MILVUS_EMBEDDING_FIELD,
-        content_field=settings.MILVUS_CONTENT_FIELD,
-        metadata_fields=settings.MILVUS_METADATA_FIELDS,
-        index_params=settings.MILVUS_INDEX_PARAMS,
-        search_params=settings.MILVUS_SEARCH_PARAMS,
-        consistency_level="Strong", # O el nivel que necesites
-    )
+# --- Funciones Helper Síncronas para Haystack (se ejecutarán en executor o sync) ---
+def initialize_haystack_components() -> Dict[str, Any]:
+    """Inicializa y devuelve un diccionario con los componentes Haystack necesarios."""
+    task_log = log.bind(component_init="haystack")
+    task_log.info("Initializing Haystack components...")
+    try:
+        document_store = MilvusDocumentStore(
+            uri=str(settings.MILVUS_URI), # Asegurar que URI es string
+            collection_name=settings.MILVUS_COLLECTION_NAME,
+            dim=settings.EMBEDDING_DIMENSION,
+            embedding_field=settings.MILVUS_EMBEDDING_FIELD,
+            content_field=settings.MILVUS_CONTENT_FIELD,
+            metadata_fields=settings.MILVUS_METADATA_FIELDS,
+            index_params=settings.MILVUS_INDEX_PARAMS,
+            search_params=settings.MILVUS_SEARCH_PARAMS,
+            consistency_level="Strong", # O Bounded, Session, Eventually
+        )
+        task_log.debug("MilvusDocumentStore initialized")
 
-def get_haystack_embedder() -> OpenAIDocumentEmbedder:
-    """Initializes the OpenAI Embedder for documents."""
-    api_key_env_var = "INGEST_OPENAI_API_KEY" # La variable de entorno real según tu config
-    api_key = settings.OPENAI_API_KEY.get_secret_value()
-    if not api_key:
-         log.warning(f"OpenAI API Key not found in settings. Haystack embedding might fail.")
-         # Considerar lanzar un error si la clave es esencial
-         # raise ValueError("OpenAI API Key is missing in configuration")
-    return OpenAIDocumentEmbedder(
-        # Usar Secret.from_env_var si la clave viene de env var, sino from_token
-        api_key=Secret.from_env_var(api_key_env_var) if os.getenv(api_key_env_var) else Secret.from_token(api_key),
-        model=settings.OPENAI_EMBEDDING_MODEL,
-        meta_fields_to_embed=[] # Ajusta si necesitas embeber metadatos
-    )
+        # Usar el valor del SecretStr correctamente
+        api_key_value = settings.OPENAI_API_KEY.get_secret_value()
+        if not api_key_value:
+            task_log.error("OpenAI API Key is missing!")
+            raise ValueError("OpenAI API Key is required but missing in configuration.")
 
-def get_haystack_splitter() -> DocumentSplitter:
-    """Initializes the DocumentSplitter."""
-    return DocumentSplitter(
-        split_by=settings.SPLITTER_SPLIT_BY,
-        split_length=settings.SPLITTER_CHUNK_SIZE,
-        split_overlap=settings.SPLITTER_CHUNK_OVERLAP
-    )
+        embedder = OpenAIDocumentEmbedder(
+            api_key=Secret.from_token(api_key_value), # Usar from_token ya que tenemos el valor
+            model=settings.OPENAI_EMBEDDING_MODEL,
+            meta_fields_to_embed=[] # Ajustar si es necesario
+        )
+        task_log.debug("OpenAIDocumentEmbedder initialized", model=settings.OPENAI_EMBEDDING_MODEL)
+
+        splitter = DocumentSplitter(
+            split_by=settings.SPLITTER_SPLIT_BY,
+            split_length=settings.SPLITTER_CHUNK_SIZE,
+            split_overlap=settings.SPLITTER_CHUNK_OVERLAP
+        )
+        task_log.debug("DocumentSplitter initialized", split_by=settings.SPLITTER_SPLIT_BY, len=settings.SPLITTER_CHUNK_SIZE, overlap=settings.SPLITTER_CHUNK_OVERLAP)
+
+        writer = DocumentWriter(document_store=document_store)
+        task_log.debug("DocumentWriter initialized")
+
+        task_log.info("Haystack components initialized successfully.")
+        return {
+            "document_store": document_store,
+            "embedder": embedder,
+            "splitter": splitter,
+            "writer": writer,
+        }
+    except Exception as e:
+        task_log.exception("Failed to initialize Haystack components", error=str(e))
+        raise RuntimeError(f"Haystack component initialization failed: {e}") from e
 
 def get_converter_for_content_type(content_type: str) -> Optional[Type]:
-     """Returns the appropriate Haystack Converter class."""
-     if content_type == "application/pdf": return PyPDFToDocument
-     elif content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document": return DOCXToDocument
-     elif content_type == "text/plain": return TextFileToDocument
-     elif content_type == "text/markdown": return MarkdownToDocument
-     elif content_type == "text/html": return HTMLToDocument
-     # Añadir más conversores si son necesarios
+     """Devuelve la clase del conversor Haystack apropiada."""
+     # Mapeo simple
+     converters = {
+         "application/pdf": PyPDFToDocument,
+         "application/vnd.openxmlformats-officedocument.wordprocessingml.document": DOCXToDocument,
+         "text/plain": TextFileToDocument,
+         "text/markdown": MarkdownToDocument,
+         "text/html": HTMLToDocument,
+         # Añadir más tipos si se soportan
+     }
+     converter = converters.get(content_type)
+     if converter:
+         log.debug("Selected Haystack converter", converter=converter.__name__, content_type=content_type)
      else:
          log.warning("No specific Haystack converter found for content type", content_type=content_type)
-         return None
+     return converter
 
+def build_haystack_pipeline(converter_instance, splitter, embedder, writer) -> Pipeline:
+    """Construye el pipeline Haystack dinámicamente."""
+    task_log = log.bind(pipeline_build="haystack")
+    task_log.info("Building Haystack processing pipeline...")
+    pipeline = Pipeline()
+    try:
+        pipeline.add_component("converter", converter_instance)
+        pipeline.add_component("splitter", splitter)
+        pipeline.add_component("embedder", embedder)
+        pipeline.add_component("writer", writer)
 
-# --- Celery Task ---
+        pipeline.connect("converter.documents", "splitter.documents")
+        pipeline.connect("splitter.documents", "embedder.documents")
+        pipeline.connect("embedder.documents", "writer.documents")
+        task_log.info("Haystack pipeline built successfully.")
+        return pipeline
+    except Exception as e:
+        task_log.exception("Failed to build Haystack pipeline", error=str(e))
+        raise RuntimeError(f"Haystack pipeline construction failed: {e}") from e
+
+# --- Celery Task Definition ---
+# Errores NO reintentables: FileNotFoundError, ValueError, TypeError, NotImplementedError, KeyError
+NON_RETRYABLE_ERRORS = (FileNotFoundError, ValueError, TypeError, NotImplementedError, KeyError, AttributeError)
+# Errores SÍ reintentables: IOError, ConnectionError, TimeoutError, y genérico Exception (con precaución)
+RETRYABLE_ERRORS = (IOError, ConnectionError, TimeoutError, asyncpg.PostgresConnectionError, S3Error, Exception)
+
 @celery_app.task(
     bind=True,
-    # *** CORREGIDO: Reintentar solo en excepciones recuperables, NO en FileNotFoundError o ValueError ***
-    autoretry_for=(IOError, ConnectionError, TimeoutError, Exception), # Excepciones genéricas/red/IO
-    retry_kwargs={'max_retries': 2, 'countdown': 60},
-    # No reintentar en errores de lógica/datos como:
-    # FileNotFoundError (archivo no existe)
-    # ValueError (tipo de contenido no soportado, metadata inválida)
-    # NotImplementedError (OCR no implementado)
-    reject_on_worker_lost=True, # Re-encolar si el worker muere
-    acks_late=True, # Reconoce el mensaje solo después de completar o fallar definitivamente
+    autoretry_for=RETRYABLE_ERRORS, # Reintentar solo en errores recuperables
+    retry_backoff=True, # Backoff exponencial
+    retry_backoff_max=300, # Máximo 5 minutos de espera
+    retry_jitter=True, # Añadir aleatoriedad a la espera
+    retry_kwargs={'max_retries': 3, 'countdown': 60}, # Máximo 3 reintentos, empezando con 60s
+    reject_on_worker_lost=True,
+    acks_late=True,
     name="tasks.process_document_haystack"
 )
 def process_document_haystack_task(
-    self, # Instancia de la tarea (proporcionada por bind=True)
+    self, # Instancia de la tarea Celery
     document_id_str: str,
     company_id_str: str,
     minio_object_name: str,
@@ -1266,198 +1502,170 @@ def process_document_haystack_task(
     original_metadata: Dict[str, Any],
 ):
     """
-    Procesa un documento usando un pipeline Haystack (MinIO -> Haystack -> Milvus -> Supabase Status).
-    Utiliza asyncio.run para manejar operaciones async y run_in_executor para operaciones bloqueantes.
+    Tarea Celery para procesar un documento: descarga de MinIO, procesa con Haystack, indexa en Milvus.
+    Utiliza asyncio.run para la lógica async y run_in_executor para Haystack.
     """
     document_id = uuid.UUID(document_id_str)
     company_id = uuid.UUID(company_id_str)
-    task_log = log.bind(document_id=str(document_id), company_id=str(company_id),
-                      task_id=self.request.id, file_name=file_name, object_name=minio_object_name, content_type=content_type)
-    task_log.info("Starting Haystack document processing task")
+    # Logger contextual para la tarea
+    task_log = log.bind(
+        document_id=str(document_id),
+        company_id=str(company_id),
+        task_id=self.request.id or "unknown",
+        file_name=file_name,
+        object_name=minio_object_name,
+        content_type=content_type,
+        attempt=self.request.retries + 1 # Número de intento actual
+    )
+    task_log.info("Starting Haystack document processing task execution")
 
-    # *** CORREGIDO: Usar una función async interna para la lógica principal ***
-    async def async_process():
-        haystack_pipeline = Pipeline()
-        processed_docs_count = 0
-        # Crear instancia del cliente MinIO aquí dentro
-        minio_client = MinioStorageClient()
+    # --- Función async interna para orquestar el flujo ---
+    async def async_process_flow():
+        minio_client = None # Inicializar fuera del try
         downloaded_file_stream: Optional[io.BytesIO] = None
-        document_store: Optional[MilvusDocumentStore] = None
+        haystack_components = {}
+        pipeline_run_successful = False
+        processed_chunk_count = 0
 
         try:
-            # 0. Marcar como procesando en Supabase (usando await)
+            # 0. Marcar como PROCESSING en DB (async)
+            task_log.info("Updating document status to PROCESSING")
             await postgres_client.update_document_status(document_id, DocumentStatus.PROCESSING)
-            task_log.info("Document status set to PROCESSING")
 
-            # 1. Descargar archivo de MinIO (usando await en el wrapper async de Minio)
-            task_log.info("Downloading file from MinIO via async wrapper...")
-            try:
-                # *** CORREGIDO: Llamar al método async download_file_stream que usa executor internamente ***
-                downloaded_file_stream = await minio_client.download_file_stream(minio_object_name)
-            except FileNotFoundError as fnf_err:
-                 # Si el archivo no existe, no tiene sentido reintentar. Marcar como error y salir.
-                 task_log.error("File not found in MinIO storage. Cannot process.", object_name=minio_object_name, error=str(fnf_err))
-                 await postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message="File not found in storage")
-                 # No relanzamos la excepción aquí para que Celery NO intente reintentar por FileNotFoundError
-                 return # Salir de la función async_process
-            # Capturar otros errores de descarga (IOError, etc.) que SÍ podrían reintentarse
-            except (IOError, Exception) as download_err:
-                 task_log.error("Failed to download file from MinIO.", error=str(download_err), error_type=type(download_err).__name__, exc_info=True)
-                 raise download_err # Relanzar para que Celery reintente si está configurado
-
+            # 1. Descargar archivo de MinIO (async, usa executor internamente)
+            task_log.info("Attempting to download file from MinIO")
+            minio_client = MinioStorageClient() # Instanciar aquí
+            downloaded_file_stream = await minio_client.download_file_stream(minio_object_name)
             file_bytes = downloaded_file_stream.getvalue()
             if not file_bytes:
-                # Si el archivo está vacío, marcar como error y salir.
-                task_log.error("Downloaded file from MinIO is empty.")
-                await postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message="Downloaded file is empty")
-                return # Salir de la función async_process
+                task_log.error("Downloaded file is empty.")
+                # Este es un error de datos, no reintentable
+                raise ValueError("Downloaded file is empty.")
             task_log.info(f"File downloaded successfully ({len(file_bytes)} bytes)")
 
-            # 2. Preparar Input Haystack (ByteStream) con metadatos FILTRADOS
-            # (Sin cambios en esta lógica, parece correcta)
+            # 2. Inicializar Componentes Haystack (Síncrono, podría ser largo)
+            # Ejecutar en executor para no bloquear el worker por mucho tiempo si es lento
+            task_log.info("Initializing Haystack components via executor...")
+            loop = asyncio.get_running_loop()
+            haystack_components = await loop.run_in_executor(None, initialize_haystack_components)
+            task_log.info("Haystack components ready.")
+
+            # 3. Preparar Metadatos y ByteStream para Haystack
+            # Filtrar metadatos para incluir solo los definidos en config + los esenciales
             allowed_meta_keys = set(settings.MILVUS_METADATA_FIELDS)
-            # Asegurar que los IDs son strings para Milvus/Haystack
             doc_meta = {
-                "company_id": str(company_id),
-                "document_id": str(document_id),
+                "company_id": str(company_id), # Asegurar string
+                "document_id": str(document_id), # Asegurar string
                 "file_name": file_name or "unknown",
                 "file_type": content_type or "unknown",
             }
-            # Añadir metadatos originales si están permitidos y no son claves reservadas
-            filtered_original_meta_count = 0
+            added_original_meta = 0
             for key, value in original_metadata.items():
                 if key in allowed_meta_keys and key not in doc_meta:
-                    # Convertir a string para asegurar compatibilidad
                     doc_meta[key] = str(value) if value is not None else None
-                    filtered_original_meta_count += 1
-                elif key not in doc_meta:
-                    task_log.debug("Ignoring metadata field not in MILVUS_METADATA_FIELDS", field=key)
-
-            task_log.debug("Filtered metadata for Haystack/Milvus", final_meta=doc_meta, original_allowed_added=filtered_original_meta_count)
+                    added_original_meta += 1
+            task_log.debug("Prepared metadata for Haystack", final_meta=doc_meta, added_original_count=added_original_meta)
             source_stream = ByteStream(data=file_bytes, meta=doc_meta)
 
-            # 3. Seleccionar Conversor o Manejar OCR / Construir Pipeline
-            # (Sin cambios en esta lógica)
+            # 4. Seleccionar Conversor y Construir Pipeline (Síncrono)
             ConverterClass = get_converter_for_content_type(content_type)
-            if content_type in settings.EXTERNAL_OCR_REQUIRED_CONTENT_TYPES:
-                task_log.error("OCR processing required but not implemented.", content_type=content_type)
-                # Lanzar NotImplementedError para que Celery NO reintente
-                raise NotImplementedError(f"OCR processing for {content_type} not implemented.")
-            elif ConverterClass:
-                 task_log.info(f"Using Haystack converter: {ConverterClass.__name__}")
-                 # Inicializar componentes (síncrono)
-                 document_store = get_haystack_document_store()
-                 converter = ConverterClass()
-                 splitter = get_haystack_splitter()
-                 embedder = get_haystack_embedder()
-                 writer = DocumentWriter(document_store=document_store)
+            if not ConverterClass:
+                 task_log.error("Unsupported content type for Haystack converters", content_type=content_type)
+                 raise ValueError(f"Unsupported content type: {content_type}")
 
-                 # Construir pipeline (síncrono)
-                 haystack_pipeline.add_component("converter", converter)
-                 haystack_pipeline.add_component("splitter", splitter)
-                 haystack_pipeline.add_component("embedder", embedder)
-                 haystack_pipeline.add_component("writer", writer)
-                 haystack_pipeline.connect("converter.documents", "splitter.documents")
-                 haystack_pipeline.connect("splitter.documents", "embedder.documents")
-                 haystack_pipeline.connect("embedder.documents", "writer.documents")
+            converter_instance = ConverterClass()
+            pipeline = build_haystack_pipeline(
+                converter_instance,
+                haystack_components["splitter"],
+                haystack_components["embedder"],
+                haystack_components["writer"]
+            )
+            pipeline_input = {"converter": {"sources": [source_stream]}}
 
-                 pipeline_input = {"converter": {"sources": [source_stream]}}
-            else:
-                 # Si no hay conversor y no es OCR, es un tipo no soportado
-                 task_log.error("Unsupported content type for Haystack processing", content_type=content_type)
-                 # Lanzar ValueError para que Celery NO reintente
-                 raise ValueError(f"Unsupported content type for processing: {content_type}")
-
-            # 4. Ejecutar el Pipeline Haystack (usando executor porque es bloqueante)
-            if not haystack_pipeline.inputs: # Verificar si la pipeline se construyó
-                 raise RuntimeError("Haystack pipeline construction failed or is empty.")
-
-            task_log.info("Running Haystack indexing pipeline via executor...", pipeline_input_keys=list(pipeline_input.keys()))
+            # 5. Ejecutar Pipeline Haystack (Síncrono y potencialmente largo -> Executor)
+            task_log.info("Running Haystack pipeline via executor...")
             start_time = time.monotonic()
-            loop = asyncio.get_running_loop()
-            # *** CORREGIDO: Ejecutar el pipeline síncrono en el executor ***
-            pipeline_result = await loop.run_in_executor(
-                None, # Default executor
-                lambda: haystack_pipeline.run(pipeline_input)
-            )
+            pipeline_result = await loop.run_in_executor(None, pipeline.run, pipeline_input)
             duration = time.monotonic() - start_time
-            task_log.info(f"Haystack pipeline finished via executor in {duration:.2f} seconds.")
+            task_log.info(f"Haystack pipeline execution finished via executor", duration_sec=round(duration, 2))
 
-            # 5. Verificar resultado y obtener contador de chunks/documentos procesados
-            # (Sin cambios en esta lógica)
+            # 6. Procesar Resultado y Contar Chunks
             writer_output = pipeline_result.get("writer", {})
-            # Haystack 2.x: el output del writer suele ser {"documents_written": count}
             if isinstance(writer_output, dict) and "documents_written" in writer_output:
-                 processed_docs_count = writer_output["documents_written"]
-                 task_log.info(f"Chunks/Documents written to Milvus (from writer output): {processed_docs_count}")
+                processed_chunk_count = writer_output["documents_written"]
+                task_log.info(f"Chunks written to Milvus: {processed_chunk_count}")
+                pipeline_run_successful = True # Asumir éxito si el writer reporta algo
             else:
-                 # Fallback: intentar contar desde el splitter si el writer no informa
-                 splitter_output = pipeline_result.get("splitter", {})
-                 if isinstance(splitter_output, dict) and "documents" in splitter_output:
-                      processed_docs_count = len(splitter_output["documents"])
-                      task_log.warning(f"Could not get count from writer, inferred processed chunk count from splitter: {processed_docs_count}", writer_output=writer_output)
-                 else:
-                      processed_docs_count = 0 # No se pudo determinar
-                      task_log.warning("Processed chunk count could not be determined from pipeline output, setting to 0.", pipeline_output=pipeline_result)
+                # Intentar inferir de otro componente si es posible, o marcar como 0/error
+                task_log.warning("Could not determine documents written from writer output", output=writer_output)
+                # Podrías intentar contar desde splitter output como fallback
+                splitter_output = pipeline_result.get("splitter", {})
+                if isinstance(splitter_output, dict) and "documents" in splitter_output:
+                     processed_chunk_count = len(splitter_output["documents"])
+                     task_log.warning(f"Inferred chunk count from splitter: {processed_chunk_count}")
+                     pipeline_run_successful = True # Considerar éxito si hubo chunks
+                else:
+                     processed_chunk_count = 0
+                     pipeline_run_successful = False # Marcar como fallo si no se pudo procesar/escribir nada
+                     task_log.error("Pipeline execution seems to have failed, no documents processed/written.")
+                     # Levantar una excepción para marcar como error en DB
+                     raise RuntimeError("Haystack pipeline failed to process or write any documents.")
 
-            # 6. Actualizar Estado Final en Supabase como PROCESSED (o INDEXED si prefieres)
-            final_status = DocumentStatus.PROCESSED # O DocumentStatus.INDEXED
+            # 7. Actualizar Estado Final en DB (async)
+            final_status = DocumentStatus.PROCESSED # O INDEXED
+            task_log.info(f"Updating document status to {final_status.value} with {processed_chunk_count} chunks.")
             await postgres_client.update_document_status(
-                document_id, final_status, chunk_count=processed_docs_count, error_message=None # Limpiar mensaje de error
+                document_id,
+                final_status,
+                chunk_count=processed_chunk_count,
+                error_message=None # Limpiar cualquier error previo
             )
-            task_log.info("Document status set to PROCESSED/INDEXED in Supabase", chunk_count=processed_docs_count)
+            task_log.info("Document status updated successfully in PostgreSQL.")
 
-        # *** CORREGIDO: Manejo de excepciones específicas para evitar reintentos innecesarios ***
-        except (ValueError, NotImplementedError, TypeError) as logical_error:
-             # Errores de lógica/datos (tipo no soportado, OCR no implementado, etc.) - NO REINTENTAR
-             task_log.error("Logical/Data error during processing, will not retry.", error=str(logical_error), error_type=type(logical_error).__name__, exc_info=True)
-             try:
-                 await postgres_client.update_document_status(
-                     document_id, DocumentStatus.ERROR, error_message=f"Task Error (No Retry): {type(logical_error).__name__}: {str(logical_error)[:500]}"
-                 )
-                 task_log.info("Document status set to ERROR in Supabase due to logical/data failure.")
-             except Exception as db_update_err:
-                 task_log.error("CRITICAL: Failed to update document status to ERROR after logical/data failure", nested_error=str(db_update_err), exc_info=True)
-             # NO relanzar la excepción para que Celery no la vea como un fallo reintentable
-             # La tarea se marcará como SUCCESSFUL en Celery, pero el estado en la BD será ERROR.
-             # Si prefieres que Celery la marque como FAILED, puedes relanzarla, pero asegúrate que no está en `autoretry_for`.
-             # raise logical_error # Descomentar si quieres que Celery marque como FAILED
-        except Exception as e:
-            # Captura cualquier OTRA excepción (IOError, TimeoutError, errores inesperados) que SÍ podría reintentarse
-            task_log.error("Potentially recoverable error during Haystack processing", error=str(e), error_type=type(e).__name__, exc_info=True)
+        except NON_RETRYABLE_ERRORS as e_non_retry:
+            # Errores de datos, lógica, archivo no encontrado, tipo no soportado, etc.
+            err_msg = f"Non-retryable task error: {type(e_non_retry).__name__}: {str(e_non_retry)[:500]}"
+            task_log.error(f"Processing failed permanently: {err_msg}", exc_info=True)
             try:
-                # Intenta marcar como error en la BD (puede que se revierta si hay reintento exitoso)
-                await postgres_client.update_document_status(
-                    document_id, DocumentStatus.ERROR, error_message=f"Task Error (Retry Pending): {type(e).__name__}: {str(e)[:500]}" # Limita longitud del error
-                )
-                task_log.info("Document status set to ERROR in Supabase due to potentially recoverable failure.")
-            except Exception as db_update_err:
-                # Loguea si falla la actualización de estado a ERROR
-                task_log.error("CRITICAL: Failed to update document status to ERROR after potentially recoverable failure", nested_error=str(db_update_err), exc_info=True)
-            # Re-lanza la excepción original para que Celery la vea y maneje reintentos/fallo según `autoretry_for`
-            raise e
+                await postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=err_msg)
+                task_log.info("Document status set to ERROR due to non-retryable failure.")
+            except Exception as db_err:
+                task_log.critical("Failed to update document status to ERROR after non-retryable failure!", db_error=str(db_err), original_error=err_msg, exc_info=True)
+            # No relanzar e_non_retry para que Celery no reintente
+            # La tarea se marcará como SUCCESS en Celery, pero la DB indicará ERROR.
+            # Si quieres que Celery marque FAILED, elimina el try/except y deja que la excepción se propague,
+            # asegurándote que NON_RETRYABLE_ERRORS no estén en autoretry_for.
+
+        except RETRYABLE_ERRORS as e_retry:
+            # Errores de red, IO, timeout, DB temporal, S3 temporal, etc.
+            err_msg = f"Retryable task error: {type(e_retry).__name__}: {str(e_retry)[:500]}"
+            task_log.warning(f"Processing failed, will retry if possible: {err_msg}", exc_info=True)
+            try:
+                # Marcar error temporalmente en DB (puede ser sobrescrito en reintento exitoso)
+                await postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=f"Task Error (Retry Attempt {self.request.retries + 1}): {err_msg}")
+            except Exception as db_err:
+                 task_log.error("Failed to update document status to ERROR during retryable failure!", db_error=str(db_err), original_error=err_msg, exc_info=True)
+            # Relanzar la excepción original para que Celery la capture y aplique la lógica de reintento
+            raise e_retry
+
         finally:
-            # Asegurar limpieza de recursos
+            # Limpieza final
             if downloaded_file_stream:
                 downloaded_file_stream.close()
-            # Si se inicializó el document_store, podrías cerrarlo si es necesario (revisar documentación de MilvusDocumentStore)
-            # if document_store: await document_store.close() # O método similar si existe y es async
-            task_log.debug("Cleaned up resources for task.")
+            task_log.debug("Cleaned up task resources.")
 
-    # --- Ejecutar la lógica async dentro de la tarea síncrona de Celery ---
+    # --- Ejecutar el flujo async dentro de la tarea Celery síncrona ---
     try:
-        # *** CORREGIDO: Ejecuta la función async_process hasta que complete ***
-        asyncio.run(async_process())
-        task_log.info("Haystack document processing task finished.")
-    except Exception as task_exception:
-        # Si async_process lanzó una excepción (y fue una de las reintentables O una que no se capturó explícitamente arriba),
-        # Celery necesita verla para marcar la tarea como fallida y potencialmente reintentar.
-        # Las excepciones FileNotFoundError, ValueError, NotImplementedError, etc., ya se manejaron dentro de async_process y no deberían llegar aquí si no se relanzaron.
-        task_log.exception("Haystack processing task failed at top level after potential retries or due to unhandled exception.")
-        # La excepción ya fue relanzada desde async_process si era reintentable.
-        # No es necesario relanzar explícitamente aquí si ya se hizo en async_process.
-        # Si quieres asegurarte que Celery la vea, puedes añadir: raise task_exception
-        pass # La excepción ya se propagó (si era reintentable) y Celery la manejará
+        asyncio.run(async_process_flow())
+        task_log.info("Haystack document processing task completed.")
+    except Exception as top_level_exc:
+        # Esta excepción sólo debería ocurrir si async_process_flow relanza una excepción
+        # (normalmente una RETRYABLE_ERROR para que Celery la maneje).
+        # Las NON_RETRYABLE_ERRORS se capturan dentro de async_process_flow y no se relanzan.
+        task_log.exception("Haystack processing task failed at top level (likely pending retry or unexpected issue).")
+        # No necesitamos hacer nada más aquí, Celery manejará el reintento o marcará como FAILED
+        # si la excepción relanzada coincide con autoretry_for o si se agotan los reintentos.
+        pass
 ```
 
 ## File: `app\utils\__init__.py`
@@ -1472,11 +1680,12 @@ def process_document_haystack_task(
 
 ## File: `pyproject.toml`
 ```toml
+# ingest-service/pyproject.toml
 [tool.poetry]
 name = "ingest-service"
-version = "0.1.0"
-description = "Ingest service for AUDIZOR B2B"
-authors = ["Nyro <dev@nyro.com>"]
+version = "0.1.1" # Incremento de versión
+description = "Ingest service for Atenex B2B SaaS (Haystack/Postgres/Minio/Milvus)" # Descripción actualizada
+authors = ["Atenex Team <dev@atenex.com>"] # Autor actualizado
 
 [tool.poetry.dependencies]
 python = "^3.10"
@@ -1488,33 +1697,33 @@ pydantic-settings = "^2.2.1"
 celery = {extras = ["redis"], version = "^5.3.6"}
 gevent = "^23.9.1" # Necesario para el pool de workers de Celery
 httpx = "^0.27.0"
-asyncpg = "^0.29.0"
-python-jose = {extras = ["cryptography"], version = "^3.3.0"}
+asyncpg = "^0.29.0" # Para PostgreSQL directo
+# python-jose no es necesario aquí si no se validan tokens
 tenacity = "^8.2.3"
-python-multipart = "^0.0.9"
+python-multipart = "^0.0.9" # Para subir archivos
 structlog = "^24.1.0"
-aiofiles = "^23.2.1"
+# aiofiles no es estrictamente necesario si usamos BytesIO directamente con MinIO
 minio = "^7.1.17"
 
 # --- Haystack Dependencies ---
-haystack-ai = "^2.0.1"
-openai = "^1.14.3"
-# *** CORREGIDO: Asegurar pymilvus explícitamente como recomienda la doc ***
-pymilvus = "^2.4.1" # Añadir pymilvus explícitamente (verifica versión compatible si es necesario)
-milvus-haystack = "^0.0.6" # Paquete correcto para la integración Haystack 2.x
+haystack-ai = "^2.0.1" # O la versión estable que uses de Haystack 2.x
+openai = "^1.14.3" # Para embeddings
+# --- Asegurar pymilvus explícitamente ---
+pymilvus = "^2.4.1" # Verifica compatibilidad con tu versión de Milvus
+milvus-haystack = "^0.0.6" # Integración Milvus con Haystack 2.x
 
 # --- Haystack Converter Dependencies ---
-pypdf = "^4.0.1"
-python-docx = "^1.1.0"
-# Añadir 'markdown' y 'beautifulsoup4' si usas MarkdownToDocument y HTMLToDocument
-markdown = "^3.5" # Añadido para MarkdownToDocument
-beautifulsoup4 = "^4.12.3" # Añadido para HTMLToDocument
+pypdf = "^4.0.1" # Para PDFs
+python-docx = "^1.1.0" # Para DOCX
+markdown = "^3.5.1" # Para Markdown (asegura última versión)
+beautifulsoup4 = "^4.12.3" # Para HTML
 
 
-[tool.poetry.dev-dependencies]
+[tool.poetry.group.dev.dependencies] # Grupo dev corregido
 pytest = "^7.4.4"
 pytest-asyncio = "^0.21.1"
 httpx = "^0.27.0" # Para test client
+# Añadir otros como black, ruff, mypy si los usas
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
