@@ -3,10 +3,10 @@ import logging
 import os
 from typing import Optional, List, Any, Dict, Union
 from pydantic_settings import BaseSettings, SettingsConfigDict
-# *** CORREGIDO: Importar sólo lo necesario de Pydantic ***
+# *** CORREGIDO: Importar field_validator en lugar de validator ***
 from pydantic import (
-    RedisDsn, AnyHttpUrl, SecretStr, Field, validator, ValidationError,
-    ValidationInfo # Importar ValidationInfo para V2 si fuera necesario (no lo es aquí)
+    RedisDsn, AnyHttpUrl, SecretStr, Field, field_validator, ValidationError, # Usar field_validator
+    ValidationInfo # No se usa aquí, pero se mantiene por si acaso
 )
 import sys
 import json # Para parsear MILVUS_INDEX_PARAMS/SEARCH_PARAMS
@@ -59,8 +59,8 @@ class Settings(BaseSettings):
     # --- Milvus (en K8s 'default') ---
     MILVUS_URI: str = f"http://{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}"
     MILVUS_COLLECTION_NAME: str = MILVUS_DEFAULT_COLLECTION
-    MILVUS_INDEX_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_INDEX_PARAMS)) # Usar default_factory
-    MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_SEARCH_PARAMS)) # Usar default_factory
+    MILVUS_INDEX_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_INDEX_PARAMS))
+    MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_SEARCH_PARAMS))
     MILVUS_CONTENT_FIELD: str = "content"
     MILVUS_EMBEDDING_FIELD: str = "embedding"
     MILVUS_METADATA_FIELDS: List[str] = Field(default=[
@@ -98,9 +98,8 @@ class Settings(BaseSettings):
 
     # --- Validadores (Pydantic V2 Style) ---
 
-    # No se necesita un validador para el nivel de log si se usan Enums o Literal,
-    # pero si se usa string, este validador es útil.
-    @validator("LOG_LEVEL")
+    @field_validator("LOG_LEVEL") # Usar field_validator si se aplica a un campo específico
+    @classmethod # Los validadores de campo suelen ser classmethods
     def check_log_level(cls, v: str) -> str:
         valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
         normalized_v = v.upper()
@@ -108,57 +107,75 @@ class Settings(BaseSettings):
             raise ValueError(f"Invalid LOG_LEVEL '{v}'. Must be one of {valid_levels}")
         return normalized_v
 
-    # Usar root_validator o model_validator para parsear params de Milvus si vienen como JSON string
-    # O definir los campos como string y parsearlos donde se usen.
-    # El enfoque con Field(default_factory=...) es más simple si los defaults son fijos.
-    # Si necesitas leerlos como JSON string de env vars, un model_validator es mejor:
-    # from pydantic import model_validator
-    # @model_validator(mode='before')
-    # def parse_milvus_json_params(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-    #     for key in ['MILVUS_INDEX_PARAMS', 'MILVUS_SEARCH_PARAMS']:
-    #         if key in values and isinstance(values[key], str):
-    #             try: values[key] = json.loads(values[key])
-    #             except json.JSONDecodeError: raise ValueError(f"{key} must be a valid JSON string")
-    #     return values
+    # Validador para parsear params de Milvus (default_factory es más simple aquí)
 
-    @validator('EMBEDDING_DIMENSION', pre=True, always=True)
-    def set_embedding_dimension(cls, v: Optional[int], values: Dict[str, Any]) -> int:
-        # Esta forma V1 de acceder a 'values' puede funcionar con always=True,
-        # pero es menos robusta que usar un model_validator en V2.
-        # Sin embargo, no causa el error específico de los logs.
-        model = values.get('OPENAI_EMBEDDING_MODEL', OPENAI_DEFAULT_EMBEDDING_MODEL)
+    @field_validator('EMBEDDING_DIMENSION', mode='before', check_fields=False) # Ejecutar antes de la validación del tipo
+    @classmethod
+    def set_embedding_dimension(cls, v: Optional[int], info: ValidationInfo) -> int:
+        # En Pydantic V2, se accede a otros valores a través de info.data
+        config_values = info.data # Diccionario con los valores ya parseados hasta este punto
+        model = config_values.get('OPENAI_EMBEDDING_MODEL', OPENAI_DEFAULT_EMBEDDING_MODEL)
+
+        calculated_dim = DEFAULT_EMBEDDING_DIM # Default inicial
         if model == "text-embedding-3-large": calculated_dim = 3072
         elif model in ["text-embedding-3-small", "text-embedding-ada-002"]: calculated_dim = 1536
-        else: return v if v is not None else DEFAULT_EMBEDDING_DIM
 
         if v is not None and v != calculated_dim:
-             # Usar logging estándar aquí porque el logger de structlog aún no está configurado
              logging.warning(f"Provided EMBEDDING_DIMENSION {v} conflicts with model {model} ({calculated_dim} expected). Using calculated value: {calculated_dim}")
-             return calculated_dim
-        return calculated_dim
+             return calculated_dim # Devolver el valor calculado si hay conflicto
+        elif v is None:
+            return calculated_dim # Devolver el calculado si no se proporcionó explícitamente
+        else: # v is not None and v == calculated_dim
+            return v # Devolver el valor proporcionado si coincide con el calculado
 
-    # *** CORREGIDO: Validador para secretos compatible con Pydantic V2 ***
-    # Aplicar individualmente a cada campo secreto
-    @validator('POSTGRES_PASSWORD', 'MINIO_ACCESS_KEY', 'MINIO_SECRET_KEY', 'OPENAI_API_KEY', mode='before')
-    def check_secret_value_present(cls, v: Any) -> Any:
-        # Este validador se ejecuta antes de que el valor se convierta a SecretStr
-        # Verifica que la variable de entorno o el valor del .env no esté vacío.
-        # Pydantic se encargará de validar si es un SecretStr válido después.
+    # *** CORREGIDO: Usar field_validator en lugar de validator y quitar 'mode' incorrecto ***
+    @field_validator('POSTGRES_PASSWORD', 'MINIO_ACCESS_KEY', 'MINIO_SECRET_KEY', 'OPENAI_API_KEY', mode='before')
+    @classmethod
+    def check_secret_value_present(cls, v: Any, info: ValidationInfo) -> Any:
+        """Valida que el valor para un campo secreto no esté vacío antes de convertir a SecretStr."""
         if v is None or v == "":
-             # Es difícil obtener el nombre del campo aquí sin `info` (que no está disponible en mode='before')
-             # o sin hacerlo específico por campo. Lanzar un error genérico.
-             raise ValueError("Required secret field cannot be empty.")
+             # Obtener el nombre del campo desde ValidationInfo
+             field_name = info.field_name if info.field_name else "Unknown Secret Field"
+             raise ValueError(f"Required secret field '{field_name}' cannot be empty.")
+        # Pydantic se encargará de convertir a SecretStr después de este validador 'before'
         return v
 
 
 # --- Instancia Global ---
 temp_log = logging.getLogger("ingest_service.config.loader")
-# (resto del código de inicialización y logging de config sin cambios) ...
+# (Configuración del logger temporal sin cambios)...
+if not temp_log.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    formatter = logging.Formatter('%(levelname)s: [%(name)s] %(message)s')
+    handler.setFormatter(formatter)
+    temp_log.addHandler(handler)
+    temp_log.setLevel(logging.INFO)
+
 try:
     temp_log.info("Loading Ingest Service settings...")
     settings = Settings()
     temp_log.info("Ingest Service Settings Loaded Successfully:")
-    # (mensajes de log sin cambios)...
+    # (Mensajes de log sin cambios)...
+    temp_log.info(f"  PROJECT_NAME: {settings.PROJECT_NAME}")
+    temp_log.info(f"  LOG_LEVEL: {settings.LOG_LEVEL}")
+    temp_log.info(f"  API_V1_STR: {settings.API_V1_STR}")
+    temp_log.info(f"  CELERY_BROKER_URL: {settings.CELERY_BROKER_URL}")
+    temp_log.info(f"  CELERY_RESULT_BACKEND: {settings.CELERY_RESULT_BACKEND}")
+    temp_log.info(f"  POSTGRES_SERVER: {settings.POSTGRES_SERVER}:{settings.POSTGRES_PORT}")
+    temp_log.info(f"  POSTGRES_DB: {settings.POSTGRES_DB}")
+    temp_log.info(f"  POSTGRES_USER: {settings.POSTGRES_USER}")
+    temp_log.info(f"  POSTGRES_PASSWORD: *** SET ***")
+    temp_log.info(f"  MILVUS_URI: {settings.MILVUS_URI} (Points to 'default' namespace service)")
+    temp_log.info(f"  MILVUS_COLLECTION_NAME: {settings.MILVUS_COLLECTION_NAME}")
+    temp_log.info(f"  MINIO_ENDPOINT: {settings.MINIO_ENDPOINT}")
+    temp_log.info(f"  MINIO_BUCKET_NAME: {settings.MINIO_BUCKET_NAME}")
+    temp_log.info(f"  MINIO_ACCESS_KEY: *** SET ***")
+    temp_log.info(f"  MINIO_SECRET_KEY: *** SET ***")
+    temp_log.info(f"  OPENAI_API_KEY: *** SET ***")
+    temp_log.info(f"  OPENAI_EMBEDDING_MODEL: {settings.OPENAI_EMBEDDING_MODEL}")
+    temp_log.info(f"  EMBEDDING_DIMENSION: {settings.EMBEDDING_DIMENSION}")
+    temp_log.info(f"  SUPPORTED_CONTENT_TYPES: {settings.SUPPORTED_CONTENT_TYPES}")
+
 except (ValidationError, ValueError) as e:
     error_details = ""
     if isinstance(e, ValidationError):
