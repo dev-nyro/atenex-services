@@ -1,7 +1,7 @@
 # File: app/routers/user_router.py
 # api-gateway/app/routers/user_router.py
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Body
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Annotated # Asegúrate de importar Annotated
 import structlog
 import uuid
 
@@ -110,10 +110,11 @@ async def login_for_access_token(login_data: LoginRequest):
 @router.post("/me/ensure-company", response_model=EnsureCompanyResponse)
 async def ensure_company_association(
     request: Request, # Necesitamos la request para el log
+    # *** CORRECCIÓN: Parámetro sin default va primero ***
+    # La dependencia se define únicamente a través de la anotación InitialAuth
+    user_payload: InitialAuth,
     # Cuerpo opcional para especificar company_id, default a vacío si no se envía
-    ensure_request: Optional[EnsureCompanyRequest] = Body(None),
-    # Dependencia: requiere token válido, pero no necesariamente con company_id
-    user_payload: InitialAuth = Depends()
+    ensure_request: Optional[EnsureCompanyRequest] = Body(None)
 ):
     """
     Endpoint para que un usuario autenticado (con token válido)
