@@ -1,50 +1,51 @@
-# File: pyproject.toml
-# api-gateway/pyproject.toml
+# ingest-service/pyproject.toml
 [tool.poetry]
-name = "atenex-api-gateway"
-version = "1.0.1"
-description = "API Gateway for Atenex Microservices"
-authors = ["Atenex Team <dev@atenex.com>"]
-readme = "README.md"
+name = "ingest-service"
+version = "0.1.1" # Incremento de versión
+description = "Ingest service for Atenex B2B SaaS (Haystack/Postgres/Minio/Milvus)" # Descripción actualizada
+authors = ["Atenex Team <dev@atenex.com>"] # Autor actualizado
 
 [tool.poetry.dependencies]
 python = "^3.10"
-
-# Core FastAPI y servidor ASGI
 fastapi = "^0.110.0"
 uvicorn = {extras = ["standard"], version = "^0.28.0"}
 gunicorn = "^21.2.0"
-
-# Configuración y validación
 pydantic = {extras = ["email"], version = "^2.6.4"}
 pydantic-settings = "^2.2.1"
-
-# --- CORRECCIÓN: Añadir extras [http2] ---
-# Cliente HTTP asíncrono
-httpx = {extras = ["http2"], version = "^0.27.0"} # <-- AÑADIDO [http2]
-
-# Manejo de JWT
-python-jose = {extras = ["cryptography"], version = "^3.3.0"}
-
-# Logging estructurado
+celery = {extras = ["redis"], version = "^5.3.6"}
+gevent = "^23.9.1" # Necesario para el pool de workers de Celery
+httpx = "^0.27.0"
+asyncpg = "^0.29.0" # Para PostgreSQL directo
+# python-jose no es necesario aquí si no se validan tokens
+tenacity = "^8.2.3"
+python-multipart = "^0.0.9" # Para subir archivos
 structlog = "^24.1.0"
+# aiofiles no es estrictamente necesario si usamos BytesIO directamente con MinIO
+minio = "^7.1.17"
 
-# Cliente PostgreSQL Asíncrono
-asyncpg = "^0.29.0"
+# --- Haystack Dependencies ---
+haystack-ai = "^2.0.1" # O la versión estable que uses de Haystack 2.x
+openai = "^1.14.3" # Para embeddings
+# --- Asegurar pymilvus explícitamente ---
+pymilvus = "^2.4.1" # Verifica compatibilidad con tu versión de Milvus
+milvus-haystack = "^0.0.6" # Integración Milvus con Haystack 2.x
 
-# Hashing de Contraseñas
-passlib = {extras = ["bcrypt"], version = "^1.7.4"}
+# --- Haystack Converter Dependencies ---
+pypdf = "^4.0.1" # Para PDFs
+python-docx = "^1.1.0" # Para DOCX
+markdown = "^3.5.1" # Para Markdown (asegura última versión)
+beautifulsoup4 = "^4.12.3" # Para HTML
 
+# Cliente HTTP asíncrono
+httpx = {extras = ["http2"], version = "^0.27.0"}
 # Dependencia necesaria para httpx[http2]
-h2 = "^4.1.0" # <-- AÑADIDO EXPLÍCITAMENTE
+h2 = "^4.1.0"
 
-[tool.poetry.group.dev.dependencies]
+[tool.poetry.group.dev.dependencies] # Grupo dev corregido
 pytest = "^7.4.4"
 pytest-asyncio = "^0.21.1"
-pytest-httpx = "^0.29.0"
-# black = "^24.3.0"
-# ruff = "^0.3.4"
-# mypy = "^1.9.0"
+httpx = "^0.27.0" # Para test client
+# Añadir otros como black, ruff, mypy si los usas
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
