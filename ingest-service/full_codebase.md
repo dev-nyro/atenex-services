@@ -1175,6 +1175,9 @@ import io
 import time
 import traceback # Para formatear excepciones
 
+# *** CORRECCIÓN: Añadir import faltante ***
+import asyncpg
+
 # --- Haystack Imports ---
 from haystack import Pipeline, Document
 from haystack.utils import Secret
@@ -1185,8 +1188,10 @@ from haystack.components.converters import (
 from haystack.components.preprocessors import DocumentSplitter
 from haystack.components.embedders import OpenAIDocumentEmbedder
 from milvus_haystack import MilvusDocumentStore # Importación correcta
-# *** Importar excepciones de Milvus para manejo específico si es necesario ***
+# Importar excepciones de Milvus para manejo específico si es necesario
 from pymilvus.exceptions import MilvusException
+# Importar excepciones de Minio para manejo específico
+from minio.error import S3Error
 from haystack.components.writers import DocumentWriter
 from haystack.dataclasses import ByteStream
 
@@ -1282,15 +1287,16 @@ def get_converter_for_content_type(content_type: str) -> Optional[Type]:
 
 # --- Celery Task Definition ---
 NON_RETRYABLE_ERRORS = (FileNotFoundError, ValueError, TypeError, NotImplementedError, KeyError, AttributeError)
-RETRYABLE_ERRORS = (IOError, ConnectionError, TimeoutError, asyncpg.PostgresConnectionError, S3Error, MilvusException, Exception) # Añadir MilvusException
+# *** CORREGIDO: asyncpg ahora está definido porque se importó arriba ***
+RETRYABLE_ERRORS = (IOError, ConnectionError, TimeoutError, asyncpg.PostgresConnectionError, S3Error, MilvusException, Exception)
 
 @celery_app.task(
     bind=True,
     autoretry_for=RETRYABLE_ERRORS,
     retry_backoff=True,
-    retry_backoff_max=300,
+    retry_backoff_max=300, # 5 minutos máximo backoff
     retry_jitter=True,
-    retry_kwargs={'max_retries': 3, 'countdown': 60},
+    retry_kwargs={'max_retries': 3}, # Reintentar 3 veces
     reject_on_worker_lost=True,
     acks_late=True,
     name="tasks.process_document_haystack"
@@ -1304,10 +1310,18 @@ def process_document_haystack_task(
     content_type: str,
     original_metadata: Dict[str, Any],
 ):
-    """Tarea Celery para procesar un documento."""
+    """Tarea Celery para procesar un documento usando Haystack."""
     document_id = uuid.UUID(document_id_str)
     company_id = uuid.UUID(company_id_str)
-    task_log = log.bind(document_id=str(document_id), company_id=str(company_id), task_id=self.request.id or "unknown", attempt=self.request.retries + 1)
+    # Configurar logger con contexto de la tarea
+    task_log = log.bind(
+        document_id=str(document_id),
+        company_id=str(company_id),
+        task_id=self.request.id or "unknown",
+        attempt=self.request.retries + 1,
+        filename=file_name,
+        content_type=content_type
+    )
     task_log.info("Starting Haystack document processing task execution")
 
     # --- Función async interna para orquestar el flujo ---
@@ -1319,18 +1333,21 @@ def process_document_haystack_task(
         try:
             # 0. Marcar como PROCESSING en DB
             task_log.info("Updating document status to PROCESSING")
+            # Asegurarse que la conexión DB esté disponible (puede requerir get_db_pool si no está globalmente disponible aquí)
+            # Si postgres_client maneja el pool internamente, esto está bien.
             await postgres_client.update_document_status(document_id, DocumentStatus.PROCESSING)
 
             # 1. Descargar archivo de MinIO
             task_log.info("Attempting to download file from MinIO")
-            minio_client = MinioStorageClient()
+            minio_client = MinioStorageClient() # Asume que maneja errores de conexión internamente
             downloaded_file_stream = await minio_client.download_file_stream(minio_object_name)
             file_bytes = downloaded_file_stream.getvalue()
-            if not file_bytes: raise ValueError("Downloaded file is empty.")
+            if not file_bytes:
+                raise ValueError("Downloaded file is empty.")
             task_log.info(f"File downloaded successfully ({len(file_bytes)} bytes)")
 
-            # *** CORREGIDO: Inicializar componentes y construir pipeline AQUÍ ***
-            task_log.info("Initializing Haystack components and building pipeline...")
+            # 2. Inicializar componentes Haystack y construir pipeline (Síncrono -> Executor)
+            task_log.info("Initializing Haystack components and building pipeline via executor...")
             loop = asyncio.get_running_loop()
             # Ejecutar inicialización síncrona en executor
             store = await loop.run_in_executor(None, _initialize_milvus_store)
@@ -1339,7 +1356,8 @@ def process_document_haystack_task(
             writer = await loop.run_in_executor(None, _initialize_document_writer, store) # Pasar store inicializado
 
             ConverterClass = get_converter_for_content_type(content_type)
-            if not ConverterClass: raise ValueError(f"Unsupported content type: {content_type}")
+            if not ConverterClass:
+                raise ValueError(f"Unsupported content type: {content_type}")
             converter_instance = ConverterClass()
 
             # Construir el pipeline (esto es rápido, no necesita executor)
@@ -1352,73 +1370,115 @@ def process_document_haystack_task(
             pipeline.connect("splitter.documents", "embedder.documents")
             pipeline.connect("embedder.documents", "writer.documents")
             task_log.info("Haystack components initialized and pipeline built.")
-            # *** FIN CORRECCIÓN INICIALIZACIÓN ***
 
-            # 3. Preparar Metadatos y ByteStream (Sin cambios)
+            # 3. Preparar Metadatos y ByteStream
             allowed_meta_keys = set(settings.MILVUS_METADATA_FIELDS)
-            doc_meta = {"company_id": str(company_id), "document_id": str(document_id), "file_name": file_name or "unknown", "file_type": content_type or "unknown"}
+            # Asegurar que los metadatos clave siempre estén presentes
+            doc_meta = {
+                "company_id": str(company_id),
+                "document_id": str(document_id),
+                "file_name": file_name or "unknown",
+                "file_type": content_type or "unknown"
+            }
+            # Añadir metadatos originales si están permitidos y no colisionan
             added_original_meta = 0
             for key, value in original_metadata.items():
-                if key in allowed_meta_keys and key not in doc_meta:
-                    doc_meta[key] = str(value) if value is not None else None; added_original_meta += 1
+                # Solo añadir si está en la lista permitida Y no es uno de los campos clave ya definidos
+                if key in allowed_meta_keys and key not in ["company_id", "document_id", "file_name", "file_type"]:
+                    doc_meta[key] = str(value) if value is not None else None # Convertir a string por si acaso
+                    added_original_meta += 1
             task_log.debug("Prepared metadata for Haystack", final_meta=doc_meta, added_original_count=added_original_meta)
+
             source_stream = ByteStream(data=file_bytes, meta=doc_meta)
             pipeline_input = {"converter": {"sources": [source_stream]}}
 
             # 4. Ejecutar Pipeline Haystack (Síncrono -> Executor)
             task_log.info("Running Haystack pipeline via executor...")
             start_time = time.monotonic()
+            # Usar el pipeline construido previamente
             pipeline_result = await loop.run_in_executor(None, pipeline.run, pipeline_input)
             duration = time.monotonic() - start_time
             task_log.info(f"Haystack pipeline execution finished via executor", duration_sec=round(duration, 2))
 
-            # 5. Procesar Resultado y Contar Chunks (Sin cambios)
+            # 5. Procesar Resultado y Contar Chunks
             processed_chunk_count = 0
             writer_output = pipeline_result.get("writer", {})
             if isinstance(writer_output, dict) and "documents_written" in writer_output:
                 processed_chunk_count = writer_output["documents_written"]
                 task_log.info(f"Chunks written to Milvus: {processed_chunk_count}")
-            else: # Fallback
-                task_log.warning("Could not determine count from writer", output=writer_output)
+            else:
+                # Fallback si 'documents_written' no está (podría indicar error o versión distinta)
+                task_log.warning("Could not determine count from writer output, attempting fallback", output=writer_output)
                 splitter_output = pipeline_result.get("splitter", {})
-                if isinstance(splitter_output, dict) and "documents" in splitter_output:
+                if isinstance(splitter_output, dict) and "documents" in splitter_output and isinstance(splitter_output["documents"], list):
                      processed_chunk_count = len(splitter_output["documents"])
-                     task_log.warning(f"Inferred chunk count from splitter: {processed_chunk_count}")
-                else: task_log.error("Pipeline failed, no documents processed/written."); raise RuntimeError("Pipeline failed.")
+                     task_log.warning(f"Inferred chunk count from splitter output: {processed_chunk_count}")
+                else:
+                    task_log.error("Pipeline failed or did not produce expected output structure. No documents processed/written.", pipeline_output=pipeline_result)
+                    raise RuntimeError("Pipeline execution failed or yielded unexpected results.")
+
+            if processed_chunk_count == 0:
+                 task_log.warning("Pipeline ran but resulted in 0 chunks being written.")
+                 # Considerar si 0 chunks es un error o un caso válido (documento vacío post-conversión?)
+                 # Por ahora, lo marcamos como procesado pero con 0 chunks.
 
             # 6. Actualizar Estado Final en DB
-            final_status = DocumentStatus.PROCESSED
+            final_status = DocumentStatus.PROCESSED # O INDEXED si quieres ese estado
             task_log.info(f"Updating document status to {final_status.value} with {processed_chunk_count} chunks.")
-            await postgres_client.update_document_status(document_id, final_status, chunk_count=processed_chunk_count, error_message=None)
+            await postgres_client.update_document_status(
+                document_id=document_id,
+                status=final_status,
+                chunk_count=processed_chunk_count,
+                error_message=None # Limpiar cualquier error previo
+            )
             task_log.info("Document status updated successfully in PostgreSQL.")
 
         except NON_RETRYABLE_ERRORS as e_non_retry:
             err_msg = f"Non-retryable error: {type(e_non_retry).__name__}: {str(e_non_retry)[:500]}"
-            task_log.error(f"Processing failed permanently: {err_msg}", exc_info=True)
-            try: await postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=err_msg)
-            except Exception as db_err: task_log.critical("Failed update status to ERROR after non-retryable failure!", db_error=str(db_err))
-            # No relanzar
+            formatted_traceback = traceback.format_exc()
+            task_log.error(f"Processing failed permanently: {err_msg}", traceback=formatted_traceback)
+            try:
+                await postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=err_msg)
+            except Exception as db_err:
+                task_log.critical("Failed update status to ERROR after non-retryable failure!", db_error=str(db_err))
+            # No relanzar para que Celery no reintente
 
         except RETRYABLE_ERRORS as e_retry:
-            err_msg = f"Retryable error: {type(e_retry).__name__}: {str(e_retry)[:500]}"
-            task_log.warning(f"Processing failed, will retry: {err_msg}", exc_info=True)
-            try: await postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=f"Task Error (Retry Attempt {self.request.retries + 1}): {err_msg}")
-            except Exception as db_err: task_log.error("Failed update status to ERROR during retryable failure!", db_error=str(db_err))
-            raise e_retry # Relanzar para Celery
+            err_msg = f"Retryable error (attempt {self.request.retries + 1}/{self.request.retries_limit}): {type(e_retry).__name__}: {str(e_retry)[:500]}"
+            formatted_traceback = traceback.format_exc()
+            task_log.warning(f"Processing failed, will retry: {err_msg}", traceback=formatted_traceback)
+            try:
+                # Actualizar estado a ERROR pero indicando que es parte de un reintento
+                await postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=f"Task Error (Retry Attempt {self.request.retries + 1}): {err_msg}")
+            except Exception as db_err:
+                task_log.error("Failed update status to ERROR during retryable failure!", db_error=str(db_err))
+            # Relanzar la excepción para que Celery maneje el reintento
+            raise e_retry
 
         finally:
-            if downloaded_file_stream: downloaded_file_stream.close()
+            # Limpieza de recursos
+            if downloaded_file_stream:
+                downloaded_file_stream.close()
+            # Si se crearon archivos temporales, limpiarlos aquí
             task_log.debug("Cleaned up task resources.")
 
     # --- Ejecutar el flujo async ---
     try:
+        # Usar asyncio.run() para ejecutar la corutina principal
         asyncio.run(async_process_flow())
-        task_log.info("Haystack document processing task completed.")
+        task_log.info("Haystack document processing task completed successfully.")
+        return {"status": "success", "document_id": str(document_id)} # Retornar algo útil
+
     except Exception as top_level_exc:
-        # Captura excepciones relanzadas por async_process_flow (RETRYABLE)
-        task_log.exception("Haystack processing task failed at top level (pending retry or final failure).")
-        # Celery manejará el reintento o fallo final basado en la excepción
-        pass
+        # Esta captura es principalmente para excepciones que podrían ocurrir
+        # *fuera* del bloque try/except principal de async_process_flow,
+        # o si algo se relanza inesperadamente. Celery debería haber manejado
+        # los reintentos basados en las excepciones RETRYABLE relanzadas.
+        task_log.exception("Haystack processing task failed at top level (after potential retries). This indicates a final failure.", exc_info=top_level_exc)
+        # No es necesario actualizar DB aquí, ya debería estar en ERROR por la última falla retryable o non-retryable.
+        # Celery marcará la tarea como FAILED.
+        # No necesitamos relanzar aquí, ya que asyncio.run() habrá terminado.
+        return {"status": "failure", "document_id": str(document_id), "error": str(top_level_exc)}
 ```
 
 ## File: `app\utils\__init__.py`
@@ -1433,12 +1493,12 @@ def process_document_haystack_task(
 
 ## File: `pyproject.toml`
 ```toml
-# ingest-service/pyproject.toml
 [tool.poetry]
 name = "ingest-service"
 version = "0.1.1" # Incremento de versión
 description = "Ingest service for Atenex B2B SaaS (Haystack/Postgres/Minio/Milvus)" # Descripción actualizada
 authors = ["Atenex Team <dev@atenex.com>"] # Autor actualizado
+readme = "README.md"
 
 [tool.poetry.dependencies]
 python = "^3.10"
@@ -1449,7 +1509,8 @@ pydantic = {extras = ["email"], version = "^2.6.4"}
 pydantic-settings = "^2.2.1"
 celery = {extras = ["redis"], version = "^5.3.6"}
 gevent = "^23.9.1" # Necesario para el pool de workers de Celery
-httpx = "^0.27.0"
+# --- CORRECCIÓN: Eliminar la primera definición duplicada de httpx ---
+# httpx = "^0.27.0" # <-- ESTA LÍNEA SE ELIMINA
 asyncpg = "^0.29.0" # Para PostgreSQL directo
 # python-jose no es necesario aquí si no se validan tokens
 tenacity = "^8.2.3"
@@ -1471,11 +1532,16 @@ python-docx = "^1.1.0" # Para DOCX
 markdown = "^3.5.1" # Para Markdown (asegura última versión)
 beautifulsoup4 = "^4.12.3" # Para HTML
 
+# --- CORRECCIÓN: Mantener esta definición completa de httpx ---
+# Cliente HTTP asíncrono (se mantiene esta con extras)
+httpx = {extras = ["http2"], version = "^0.27.0"}
+# Dependencia necesaria para httpx[http2]
+h2 = "^4.1.0"
 
 [tool.poetry.group.dev.dependencies] # Grupo dev corregido
 pytest = "^7.4.4"
 pytest-asyncio = "^0.21.1"
-httpx = "^0.27.0" # Para test client
+# httpx ya está en dependencias principales, no necesita repetirse aquí para test client
 # Añadir otros como black, ruff, mypy si los usas
 
 [build-system]
