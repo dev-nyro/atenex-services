@@ -262,8 +262,9 @@ async def proxy_get_chats(
     user_payload: LoggedStrictAuth # Obtener payload validado
 ):
     """Reenvía GET /api/v1/query/chats al Query Service."""
-    # Path en el backend Query Service
-    backend_path = "/api/v1/chats"
+    # *** CORRECCIÓN RUTA DESTINO ***
+    # Path en el backend Query Service (prefijo del servicio + ruta del endpoint)
+    backend_path = "/api/v1/query/chats"
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
 @router.post(
@@ -277,9 +278,10 @@ async def proxy_post_query(
     client: Annotated[httpx.AsyncClient, Depends(get_client)],
     user_payload: LoggedStrictAuth
 ):
-    """Reenvía POST /api/v1/query/ask al Query Service (posiblemente a /api/v1/query)."""
-    # Path en el backend Query Service (asume que es /api/v1/query, ajusta si no)
-    backend_path = "/api/v1/query"
+    """Reenvía POST /api/v1/query/ask al Query Service."""
+    # *** CORRECCIÓN RUTA DESTINO ***
+    # Path en el backend Query Service
+    backend_path = "/api/v1/query/query"
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
 @router.get(
@@ -295,7 +297,8 @@ async def proxy_get_chat_messages(
     chat_id: uuid.UUID = Path(...) # Obtener chat_id de la URL
 ):
     """Reenvía GET /api/v1/query/chats/{chat_id}/messages al Query Service."""
-    backend_path = f"/api/v1/chats/{chat_id}/messages"
+    # *** CORRECCIÓN RUTA DESTINO ***
+    backend_path = f"/api/v1/query/chats/{chat_id}/messages"
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
 @router.delete(
@@ -311,7 +314,8 @@ async def proxy_delete_chat(
     chat_id: uuid.UUID = Path(...)
 ):
     """Reenvía DELETE /api/v1/query/chats/{chat_id} al Query Service."""
-    backend_path = f"/api/v1/chats/{chat_id}"
+    # *** CORRECCIÓN RUTA DESTINO ***
+    backend_path = f"/api/v1/query/chats/{chat_id}"
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
 
@@ -334,20 +338,20 @@ async def proxy_ingest_service_generic(
 ):
     """
     Reenvía solicitudes autenticadas a `/api/v1/ingest/*` al Ingest Service.
-    El path enviado al backend es `/{endpoint_path}`.
+    El path enviado al backend es `/api/v1/ingest/{endpoint_path}`.
     """
-    # Path en el backend Ingest Service (sin /api/v1/ingest)
-    backend_path = f"/{endpoint_path}"
-    # Agregar query params si existen
-    if request.url.query:
-         backend_path += f"?{request.url.query}"
+    # *** CORRECCIÓN RUTA DESTINO: Añadir prefijo API del servicio ***
+    # Path en el backend Ingest Service (prefijo API + path capturado)
+    backend_path = f"/api/v1/ingest/{endpoint_path}"
+    # Agregar query params si existen (manejado automáticamente por copy_with en _proxy_request)
 
     return await _proxy_request(
         request=request,
         target_service_base_url_str=str(settings.INGEST_SERVICE_URL),
         client=client,
         user_payload=user_payload, # Pasa el payload para inyectar cabeceras X-*
-        backend_service_path=backend_path.split("?")[0] # Path sin query params para httpx
+        # Pasar path sin query params a _proxy_request, copy_with lo añade
+        backend_service_path=backend_path
     )
 
 
@@ -369,10 +373,10 @@ if settings.AUTH_SERVICE_URL:
         endpoint_path: str = Path(...)
     ):
         """Reenvía solicitudes a `/api/v1/auth/*` al Auth Service externo (si está configurado)."""
-        # Path en el backend Auth Service
-        backend_path = f"/{endpoint_path}"
-        if request.url.query:
-             backend_path += f"?{request.url.query}"
+        # *** CORRECCIÓN RUTA DESTINO: Añadir prefijo API del servicio ***
+        # Path en el backend Auth Service (asume que el servicio escucha en /api/v1/auth/)
+        backend_path = f"/api/v1/auth/{endpoint_path}"
+        # query params manejados en _proxy_request
 
         # user_payload=None porque no validamos token aquí
         return await _proxy_request(
@@ -380,7 +384,7 @@ if settings.AUTH_SERVICE_URL:
             target_service_base_url_str=str(settings.AUTH_SERVICE_URL),
             client=client,
             user_payload=None,
-            backend_service_path=backend_path.split("?")[0]
+            backend_service_path=backend_path
         )
 else:
      log.info("Auth service proxy is disabled (GATEWAY_AUTH_SERVICE_URL not set).")

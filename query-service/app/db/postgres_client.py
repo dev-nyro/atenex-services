@@ -51,7 +51,9 @@ async def close_db_pool():
     global _pool
     if _pool and not _pool._closed:
         log.info("Closing PostgreSQL connection pool..."); await _pool.close(); _pool = None; log.info("PostgreSQL connection pool closed.")
-    # (resto sin cambios) ...
+    elif _pool and _pool._closed: log.warning("Attempted to close an already closed PostgreSQL pool."); _pool = None
+    else: log.info("No active PostgreSQL connection pool to close.")
+
 
 async def check_db_connection() -> bool:
     try:
@@ -61,13 +63,12 @@ async def check_db_connection() -> bool:
         return result == 1
     except Exception as e: log.error("Database connection check failed", error=str(e)); return False
 
-# --- Query Logging ---
+# --- Query Logging (sin cambios) ---
 async def log_query_interaction(
     user_id: Optional[uuid.UUID],
     company_id: uuid.UUID,
     query: str,
     answer: str,
-    # *** CORREGIDO: Aceptar la lista de dicts formateada ***
     retrieved_documents_data: List[Dict[str, Any]],
     metadata: Optional[Dict[str, Any]] = None,
     chat_id: Optional[uuid.UUID] = None,
@@ -77,28 +78,23 @@ async def log_query_interaction(
     log_id = uuid.uuid4()
     log_entry = log.bind(log_id=str(log_id), company_id=str(company_id), chat_id=str(chat_id) if chat_id else "None")
 
-    # Usar nombre de columna correcto 'response'
     query_sql = """
     INSERT INTO query_logs (
         id, user_id, company_id, query, response,
         metadata, chat_id, created_at
-        -- Nota: 'relevance_score' y 'retrieved_documents' no están directamente aquí
-        -- Se podría añadir un campo JSONB para los documentos o scores agregados si fuera necesario.
     ) VALUES (
         $1, $2, $3, $4, $5, $6, $7, NOW() AT TIME ZONE 'UTC'
     ) RETURNING id;
     """
-    # Preparar metadatos para guardar (incluyendo info de documentos si se desea)
     log_metadata = metadata or {}
-    # Podríamos añadir un resumen de los documentos aquí si la tabla tuviera un campo JSONB
-    # log_metadata["retrieved_summary"] = [{"id": d.get("id"), "score": d.get("score")} for d in retrieved_documents_data]
+    log_metadata["retrieved_summary"] = [{"id": d.get("id"), "score": d.get("score"), "file_name": d.get("file_name")} for d in retrieved_documents_data]
 
     try:
         async with pool.acquire() as connection:
             result = await connection.fetchval(
                 query_sql,
                 log_id, user_id, company_id, query, answer,
-                json.dumps(log_metadata), # Guardar metadatos generales + resumen docs
+                json.dumps(log_metadata),
                 chat_id
             )
         if not result or result != log_id:
@@ -108,12 +104,10 @@ async def log_query_interaction(
         return log_id
     except Exception as e:
         log_entry.error("Failed to log query interaction", error=str(e), exc_info=True)
-        # No relanzar para no interrumpir el flujo principal, pero loguear error
-        # Considerar devolver None si el log es crítico
         raise RuntimeError(f"Failed to log query interaction: {e}") from e
 
 
-# --- Funciones para gestión de chats ---
+# --- Funciones para gestión de chats (Renombradas y columna sources corregida) ---
 
 async def create_chat(user_id: uuid.UUID, company_id: uuid.UUID, title: Optional[str] = None) -> uuid.UUID:
     """Crea un nuevo chat."""
@@ -132,11 +126,10 @@ async def create_chat(user_id: uuid.UUID, company_id: uuid.UUID, title: Optional
         else: raise RuntimeError("Failed to create chat, no ID returned")
     except Exception as e: log.error("Failed to create chat", error=str(e), exc_info=True); raise
 
-# *** CORREGIDO: Renombrar función ***
+# *** FUNCIÓN RENOMBRADA ***
 async def get_user_chats(user_id: uuid.UUID, company_id: uuid.UUID, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
     """Obtiene la lista de chats para un usuario/compañía (sumario)."""
     pool = await get_db_pool()
-    # Seleccionar sólo id, title, updated_at para el sumario
     query = """
     SELECT id, title, updated_at FROM chats
     WHERE user_id = $1 AND company_id = $2
@@ -158,18 +151,16 @@ async def check_chat_ownership(chat_id: uuid.UUID, user_id: uuid.UUID, company_i
         return exists is True
     except Exception as e: log.error("Failed to check chat ownership", chat_id=str(chat_id), error=str(e), exc_info=True); return False # Asumir no propietario en caso de error
 
-# *** CORREGIDO: Renombrar función y columna 'sources' ***
+# *** FUNCIÓN RENOMBRADA y columna SOURCES CORREGIDA ***
 async def get_chat_messages(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
     """Obtiene mensajes de un chat, verificando propiedad."""
     pool = await get_db_pool()
-    # Verificar propiedad primero
     owner = await check_chat_ownership(chat_id, user_id, company_id)
     if not owner:
         log.warning("Attempt to get messages for chat not owned or non-existent", chat_id=str(chat_id), user_id=str(user_id), company_id=str(company_id))
-        # Devolver lista vacía o lanzar excepción dependiendo del comportamiento deseado
-        return [] # Devolver lista vacía si no se encuentra o no es propietario
+        return []
 
-    # Seleccionar columnas correctas, usando alias 'sources' para la columna de DB
+    # Usar columna 'sources'
     messages_query = """
     SELECT id, role, content, sources, created_at FROM messages
     WHERE chat_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3;
@@ -181,29 +172,26 @@ async def get_chat_messages(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: 
         return messages
     except Exception as e: log.error("Failed to get chat messages", error=str(e), exc_info=True); raise
 
-# *** CORREGIDO: Renombrar función y columna 'sources' ***
+# *** FUNCIÓN RENOMBRADA y columna SOURCES CORREGIDA ***
 async def save_message(chat_id: uuid.UUID, role: str, content: str, sources: Optional[List[Dict[str, Any]]] = None) -> uuid.UUID:
     """Guarda un mensaje en un chat y actualiza el timestamp del chat."""
     pool = await get_db_pool()
     message_id = uuid.uuid4()
-    # Transacción para asegurar atomicidad de update+insert
     async with pool.acquire() as conn:
         async with conn.transaction():
             try:
-                # Actualizar timestamp del chat
                 update_chat_query = "UPDATE chats SET updated_at = NOW() AT TIME ZONE 'UTC' WHERE id = $1 RETURNING id;"
                 chat_updated = await conn.fetchval(update_chat_query, chat_id)
                 if not chat_updated:
                      log.error("Failed to update chat timestamp, chat might not exist", chat_id=str(chat_id))
                      raise ValueError(f"Chat with ID {chat_id} not found for saving message.")
 
-                # Insertar mensaje usando columna 'sources'
+                # Usar columna 'sources'
                 insert_message_query = """
                 INSERT INTO messages (id, chat_id, role, content, sources, created_at)
                 VALUES ($1, $2, $3, $4, $5, NOW() AT TIME ZONE 'UTC') RETURNING id;
                 """
-                # Usar json.dumps para el campo 'sources' (jsonb)
-                result = await conn.fetchval(insert_message_query, message_id, chat_id, role, content, json.dumps(sources or []))
+                result = await conn.fetchval(insert_message_query, message_id, chat_id, role, content, json.dumps(sources or [])) # Usar json.dumps
 
                 if result and result == message_id:
                     log.info("Message saved successfully", message_id=str(message_id), chat_id=str(chat_id), role=role)
@@ -213,13 +201,11 @@ async def save_message(chat_id: uuid.UUID, role: str, content: str, sources: Opt
                     raise RuntimeError("Failed to save message, ID mismatch or not returned.")
             except Exception as e:
                 log.error("Failed to save message within transaction", error=str(e), chat_id=str(chat_id), exc_info=True)
-                # La transacción hará rollback automáticamente al salir del bloque 'with' con excepción
-                raise # Relanzar para indicar fallo
+                raise
 
 async def delete_chat(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID) -> bool:
     """Elimina un chat si pertenece al usuario/compañía."""
     pool = await get_db_pool()
-    # La relación ON DELETE CASCADE en la FK messages.chat_id debería borrar los mensajes
     query = "DELETE FROM chats WHERE id = $1 AND user_id = $2 AND company_id = $3 RETURNING id;"
     delete_log = log.bind(chat_id=str(chat_id), user_id=str(user_id), company_id=str(company_id))
     try:

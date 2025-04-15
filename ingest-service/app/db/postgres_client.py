@@ -54,7 +54,7 @@ async def check_db_connection() -> bool:
         return result == 1
     except Exception as e: log.error("Database connection check failed", error=str(e)); return False
 
-# --- Document Operations (create_document, update_document_status, get_document_status, list_documents_by_company sin cambios) ---
+# --- Document Operations (sin cambios) ---
 async def create_document(company_id: uuid.UUID, file_name: str, file_type: str, metadata: Dict[str, Any]) -> uuid.UUID:
     pool = await get_db_pool(); doc_id = uuid.uuid4()
     query = "INSERT INTO documents (id, company_id, file_name, file_type, metadata, status, uploaded_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC') RETURNING id;"
@@ -102,87 +102,57 @@ async def list_documents_by_company(company_id: uuid.UUID, limit: int = 100, off
         return result_list
     except Exception as e: list_log.error("Failed to list docs", error=str(e), exc_info=True); raise
 
-# --- Funciones de Chat (Añadidas/Corregidas desde el análisis del Query Service) ---
+# --- Funciones de Chat (Nombres Corregidos para consistencia) ---
+# Aunque este servicio no las use directamente, mantenemos los nombres consistentes
 
-# *** CORREGIDO: Renombrar función para coincidir con llamada en chat.py ***
-async def get_chats_for_user(user_id: uuid.UUID, company_id: uuid.UUID, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
-    """Obtiene la lista de chats para un usuario/compañía (sumario)."""
+async def create_chat(user_id: uuid.UUID, company_id: uuid.UUID, title: Optional[str] = None) -> uuid.UUID:
     pool = await get_db_pool()
-    query = """
-    SELECT id, title, updated_at FROM chats
-    WHERE user_id = $1 AND company_id = $2
-    ORDER BY updated_at DESC LIMIT $3 OFFSET $4;
-    """
+    chat_id = uuid.uuid4()
+    query = """INSERT INTO chats (id, user_id, company_id, title, created_at, updated_at) VALUES ($1, $2, $3, $4, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC') RETURNING id;"""
     try:
-        async with pool.acquire() as conn: rows = await conn.fetch(query, user_id, company_id, limit, offset)
-        chats = [dict(row) for row in rows]
-        log.info(f"Retrieved {len(chats)} chat summaries", user_id=str(user_id), company_id=str(company_id))
-        return chats
-    except Exception as e: log.error("Failed get_chats_for_user", error=str(e), exc_info=True); raise
+        async with pool.acquire() as conn:
+            result = await conn.fetchval(query, chat_id, user_id, company_id, title or f"Chat {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}")
+            return result
+    except Exception as e:
+        log.error("Failed create_chat (ingest context)", error=str(e))
+        raise
+
+async def get_user_chats(user_id: uuid.UUID, company_id: uuid.UUID, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
+    pool = await get_db_pool()
+    query = """SELECT id, title, updated_at FROM chats WHERE user_id = $1 AND company_id = $2 ORDER BY updated_at DESC LIMIT $3 OFFSET $4;"""
+    try: 
+        async with pool.acquire() as conn: rows = await conn.fetch(query, user_id, company_id, limit, offset); return [dict(row) for row in rows]
+    except Exception as e: log.error("Failed get_user_chats (ingest context)", error=str(e)); raise
 
 async def check_chat_ownership(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID) -> bool:
-    """Verifica si un chat existe y pertenece al usuario/compañía."""
     pool = await get_db_pool()
     query = "SELECT EXISTS (SELECT 1 FROM chats WHERE id = $1 AND user_id = $2 AND company_id = $3);"
-    try:
-        async with pool.acquire() as conn: exists = await conn.fetchval(query, chat_id, user_id, company_id)
-        return exists is True
-    except Exception as e: log.error("Failed check_chat_ownership", chat_id=str(chat_id), error=str(e)); return False
+    try: 
+        async with pool.acquire() as conn: exists = await conn.fetchval(query, chat_id, user_id, company_id); return exists is True
+    except Exception as e: log.error("Failed check_chat_ownership (ingest context)", error=str(e)); return False
 
-# *** CORREGIDO: Renombrar función para coincidir con llamada en chat.py ***
-async def get_messages_for_chat(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-    """Obtiene mensajes de un chat, verificando propiedad."""
-    pool = await get_db_pool()
-    owner = await check_chat_ownership(chat_id, user_id, company_id)
-    if not owner:
-        log.warning("Attempt get_messages_for_chat not owned or non-existent", chat_id=str(chat_id), user_id=str(user_id))
-        return []
+async def get_chat_messages(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+    pool = await get_db_pool(); owner = await check_chat_ownership(chat_id, user_id, company_id)
+    if not owner: return []
+    messages_query = """SELECT id, role, content, sources, created_at FROM messages WHERE chat_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3;"""
+    try: 
+        async with pool.acquire() as conn: message_rows = await conn.fetch(messages_query, chat_id, limit, offset); return [dict(row) for row in message_rows]
+    except Exception as e: log.error("Failed get_chat_messages (ingest context)", error=str(e)); raise
 
-    # *** CORREGIDO: Usar columna 'sources' ***
-    messages_query = """
-    SELECT id, role, content, sources, created_at FROM messages
-    WHERE chat_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3;
-    """
-    try:
-        async with pool.acquire() as conn: message_rows = await conn.fetch(messages_query, chat_id, limit, offset)
-        messages = [dict(row) for row in message_rows]
-        log.info(f"Retrieved {len(messages)} messages", chat_id=str(chat_id))
-        return messages
-    except Exception as e: log.error("Failed get_messages_for_chat", error=str(e), exc_info=True); raise
-
-# *** CORREGIDO: Renombrar función para coincidir con llamada en query.py y usar columna 'sources' ***
-async def add_message_to_chat(chat_id: uuid.UUID, role: str, content: str, sources: Optional[List[Dict[str, Any]]] = None) -> uuid.UUID:
-    """Guarda un mensaje en un chat y actualiza el timestamp del chat."""
-    pool = await get_db_pool()
-    message_id = uuid.uuid4()
+async def save_message(chat_id: uuid.UUID, role: str, content: str, sources: Optional[List[Dict[str, Any]]] = None) -> uuid.UUID:
+    pool = await get_db_pool(); message_id = uuid.uuid4()
     async with pool.acquire() as conn:
         async with conn.transaction():
             try:
-                update_chat_query = "UPDATE chats SET updated_at = NOW() AT TIME ZONE 'UTC' WHERE id = $1 RETURNING id;"
-                chat_updated = await conn.fetchval(update_chat_query, chat_id)
-                if not chat_updated: raise ValueError(f"Chat {chat_id} not found for adding message.")
+                update_chat_query = "UPDATE chats SET updated_at = NOW() AT TIME ZONE 'UTC' WHERE id = $1 RETURNING id;"; chat_updated = await conn.fetchval(update_chat_query, chat_id)
+                if not chat_updated: raise ValueError(f"Chat {chat_id} not found (ingest context).")
+                insert_message_query = """INSERT INTO messages (id, chat_id, role, content, sources, created_at) VALUES ($1, $2, $3, $4, $5, NOW() AT TIME ZONE 'UTC') RETURNING id;"""
+                result = await conn.fetchval(insert_message_query, message_id, chat_id, role, content, json.dumps(sources or [])); return result
+            except Exception as e: log.error("Failed save_message (ingest context)", error=str(e)); raise
 
-                # *** CORREGIDO: Usar columna 'sources' ***
-                insert_message_query = """
-                INSERT INTO messages (id, chat_id, role, content, sources, created_at)
-                VALUES ($1, $2, $3, $4, $5, NOW() AT TIME ZONE 'UTC') RETURNING id;
-                """
-                result = await conn.fetchval(insert_message_query, message_id, chat_id, role, content, json.dumps(sources or []))
-
-                if result and result == message_id:
-                    log.info("Message saved", message_id=str(message_id), chat_id=str(chat_id), role=role)
-                    return message_id
-                else: raise RuntimeError("Failed save message, ID mismatch or not returned.")
-            except Exception as e: log.error("Failed add_message_to_chat", error=str(e), exc_info=True); raise
-
-# --- delete_chat (sin cambios necesarios) ---
 async def delete_chat(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID) -> bool:
-    pool = await get_db_pool(); delete_log = log.bind(chat_id=str(chat_id), user_id=str(user_id))
-    query = "DELETE FROM chats WHERE id = $1 AND user_id = $2 AND company_id = $3 RETURNING id;"
-    try:
-        async with pool.acquire() as conn: deleted_id = await conn.fetchval(query, chat_id, user_id, company_id)
-        success = deleted_id is not None
-        if success: delete_log.info("Chat deleted")
-        else: delete_log.warning("Chat not found or no permission")
-        return success
-    except Exception as e: delete_log.error("Failed to delete chat", error=str(e), exc_info=True); raise
+    pool = await get_db_pool()
+    query = "DELETE FROM chats WHERE id = $1 AND user_id = $2 AND company_id = $3 RETURNING id;"; delete_log = log.bind(chat_id=str(chat_id), user_id=str(user_id))
+    try: 
+        async with pool.acquire() as conn: deleted_id = await conn.fetchval(query, chat_id, user_id, company_id); return deleted_id is not None
+    except Exception as e: delete_log.error("Failed to delete chat (ingest context)", error=str(e)); raise

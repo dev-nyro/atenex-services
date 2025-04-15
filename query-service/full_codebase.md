@@ -44,62 +44,65 @@ app/
 import uuid
 from typing import List, Optional
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, status, Path, Query, Header, Request # Añadir Header, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Path, Query, Header, Request # Importar Request
 
 from app.api.v1 import schemas
 from app.db import postgres_client
-# --- CORRECCIÓN: Definir las dependencias localmente o importar de un módulo compartido ---
-# Eliminamos la importación cruzada de .query y definimos aquí
+# --- CORRECCIÓN: Usar las dependencias DEFINIDAS LOCALMENTE ---
+# (Se aseguran de que las cabeceras X- estén presentes y sean válidas)
 
 log = structlog.get_logger(__name__)
 
 router = APIRouter()
 
-# --- NUEVAS Dependencias para usar cabeceras X-* ---
+# --- Dependencias para usar cabeceras X-* ---
 async def get_current_company_id(x_company_id: Optional[str] = Header(None, alias="X-Company-ID")) -> uuid.UUID:
+    """Obtiene y valida el Company ID de la cabecera X-Company-ID."""
     if not x_company_id:
         log.warning("Missing required X-Company-ID header")
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing X-Company-ID header")
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing required header: X-Company-ID")
     try:
         return uuid.UUID(x_company_id)
     except ValueError:
         log.warning("Invalid UUID format in X-Company-ID header", header_value=x_company_id)
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid X-Company-ID header format")
 
-async def get_current_user_id(x_user_id: Optional[str] = Header(None, alias="X-User-ID")) -> uuid.UUID: # Hacerlo requerido
+async def get_current_user_id(x_user_id: Optional[str] = Header(None, alias="X-User-ID")) -> uuid.UUID:
+    """Obtiene y valida el User ID de la cabecera X-User-ID."""
     if not x_user_id:
         log.warning("Missing required X-User-ID header")
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing X-User-ID header")
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing required header: X-User-ID")
     try:
         return uuid.UUID(x_user_id)
     except ValueError:
         log.warning("Invalid UUID format in X-User-ID header", header_value=x_user_id)
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid X-User-ID header format")
 
-# --- Endpoints Modificados ---
+# --- Endpoints Modificados para USAR las nuevas dependencias ---
 
 @router.get(
     "/chats",
     response_model=List[schemas.ChatSummary],
     status_code=status.HTTP_200_OK,
     summary="List User Chats",
-    description="Retrieves a list of chat summaries for the authenticated user and company.",
+    description="Retrieves a list of chat summaries using X-Company-ID and X-User-ID headers.",
 )
 async def list_chats(
-    # Usar las nuevas dependencias
+    # *** CORRECCIÓN CLAVE: Usar las dependencias correctas ***
     user_id: uuid.UUID = Depends(get_current_user_id),
     company_id: uuid.UUID = Depends(get_current_company_id),
+    # Ya no se depende de Authorization
+    # --- Parámetros de Query ---
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
-    request: Request = None # Para request_id
+    request: Request = None
 ):
     request_id = request.headers.get("x-request-id") if request else str(uuid.uuid4())
     endpoint_log = log.bind(request_id=request_id, user_id=str(user_id), company_id=str(company_id), limit=limit, offset=offset)
-    endpoint_log.info("Request received to list chats via gateway headers")
-    # Ya no necesitamos comprobar user_id aquí, la dependencia lo hace
+    endpoint_log.info("Request received to list chats")
 
     try:
-        # La lógica interna no cambia, solo cómo se obtienen user_id y company_id
+        # Usar la función con el nombre corregido
         chats = await postgres_client.get_user_chats(
             user_id=user_id, company_id=company_id, limit=limit, offset=offset
         )
@@ -109,62 +112,66 @@ async def list_chats(
         endpoint_log.exception("Error listing chats")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve chat list.")
 
+
 @router.get(
     "/chats/{chat_id}/messages",
     response_model=List[schemas.ChatMessage],
     status_code=status.HTTP_200_OK,
     summary="Get Chat Messages",
-    description="Retrieves messages for a specific chat, verifying ownership.",
+    description="Retrieves messages for a specific chat using X-Company-ID and X-User-ID headers.",
     responses={404: {"description": "Chat not found or access denied."}}
 )
 async def get_chat_messages_endpoint(
     chat_id: uuid.UUID = Path(..., description="The ID of the chat."),
-    # Usar las nuevas dependencias
+    # *** CORRECCIÓN CLAVE: Usar las dependencias correctas ***
     user_id: uuid.UUID = Depends(get_current_user_id),
     company_id: uuid.UUID = Depends(get_current_company_id),
+    # --- Parámetros de Query ---
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
-    request: Request = None # Para request_id
+    request: Request = None
 ):
     request_id = request.headers.get("x-request-id") if request else str(uuid.uuid4())
     endpoint_log = log.bind(request_id=request_id, user_id=str(user_id), company_id=str(company_id), chat_id=str(chat_id), limit=limit, offset=offset)
-    endpoint_log.info("Request received to get chat messages via gateway headers")
+    endpoint_log.info("Request received to get chat messages")
 
     try:
-        # La lógica interna no cambia
+        # Usar la función con el nombre corregido
         messages = await postgres_client.get_chat_messages(
             chat_id=chat_id, user_id=user_id, company_id=company_id, limit=limit, offset=offset
         )
         endpoint_log.info("Chat messages retrieved successfully", count=len(messages))
+        # Nota: la función DB ya devuelve [] si no se encuentra o no es propietario
         return messages
     except Exception as e:
         endpoint_log.exception("Error getting chat messages")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve chat messages.")
 
+
 @router.delete(
     "/chats/{chat_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete Chat",
-    description="Deletes a chat and its messages, verifying ownership.",
+    description="Deletes a chat using X-Company-ID and X-User-ID headers.",
     responses={404: {"description": "Chat not found or access denied."}, 204: {}}
 )
 async def delete_chat_endpoint(
     chat_id: uuid.UUID = Path(..., description="The ID of the chat to delete."),
-    # Usar las nuevas dependencias
+    # *** CORRECCIÓN CLAVE: Usar las dependencias correctas ***
     user_id: uuid.UUID = Depends(get_current_user_id),
     company_id: uuid.UUID = Depends(get_current_company_id),
-    request: Request = None # Para request_id
+    request: Request = None
 ):
     request_id = request.headers.get("x-request-id") if request else str(uuid.uuid4())
     endpoint_log = log.bind(request_id=request_id, user_id=str(user_id), company_id=str(company_id), chat_id=str(chat_id))
-    endpoint_log.info("Request received to delete chat via gateway headers")
+    endpoint_log.info("Request received to delete chat")
 
     try:
-        # La lógica interna no cambia
         deleted = await postgres_client.delete_chat(chat_id=chat_id, user_id=user_id, company_id=company_id)
         if deleted:
             endpoint_log.info("Chat deleted successfully")
-            return None # Respuesta 204 (FastAPI maneja el cuerpo vacío)
+            # Para 204, no devuelvas nada o devuelve Response(status_code=204)
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
         else:
             endpoint_log.warning("Chat not found or access denied for deletion")
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found or access denied.")
@@ -181,11 +188,7 @@ from typing import Dict, Any, Optional, List
 import structlog
 import asyncio
 
-# Ya no necesitamos jose aquí
-# from jose import jwt, JWTError
-# from jose.exceptions import ExpiredSignatureError, JWTClaimsError, JWSError
-
-from fastapi import APIRouter, Depends, HTTPException, status, Header, Body, Request # Añadir Request
+from fastapi import APIRouter, Depends, HTTPException, status, Header, Body, Request
 
 from app.api.v1 import schemas
 from app.core.config import settings
@@ -193,71 +196,44 @@ from app.db import postgres_client
 from app.pipelines import rag_pipeline
 from haystack import Document
 from app.utils.helpers import truncate_text
+# Importar dependencias definidas en chat.py (o módulo compartido)
+from .chat import get_current_company_id, get_current_user_id
 
 log = structlog.get_logger(__name__)
 
 router = APIRouter()
 
-# --- CORRECCIÓN: Usar las dependencias basadas en X-* headers ---
-# (Estas ya se definieron en chat.py, pero las copiamos/redefinimos aquí
-#  o las movemos a un módulo compartido de dependencias si preferimos)
-async def get_current_company_id(x_company_id: Optional[str] = Header(None, alias="X-Company-ID")) -> uuid.UUID:
-    if not x_company_id:
-        log.warning("Missing required X-Company-ID header")
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing X-Company-ID header")
-    try:
-        return uuid.UUID(x_company_id)
-    except ValueError:
-        log.warning("Invalid UUID format in X-Company-ID header", header_value=x_company_id)
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid X-Company-ID header format")
-
-async def get_current_user_id(x_user_id: Optional[str] = Header(None, alias="X-User-ID")) -> uuid.UUID: # Hacerlo requerido
-    if not x_user_id:
-        log.warning("Missing required X-User-ID header")
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing X-User-ID header")
-    try:
-        return uuid.UUID(x_user_id)
-    except ValueError:
-        log.warning("Invalid UUID format in X-User-ID header", header_value=x_user_id)
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid X-User-ID header format")
-# --- FIN CORRECCIÓN Dependencias ---
-
-
-# --- Endpoint Principal Modificado ---
+# --- Endpoint Principal Modificado para usar dependencias de X- Headers ---
 @router.post(
-    # Mantenemos la ruta interna /query, ya que el gateway mapea /ask a esta
-    "/query",
+    "/query", # Mantenemos la ruta interna /query
     response_model=schemas.QueryResponse,
     status_code=status.HTTP_200_OK,
     summary="Process a user query using RAG pipeline and manage chat history",
-    description="Receives a query via API Gateway. Uses X-Company-ID and X-User-ID headers. If chat_id is provided, continues the chat. If not, creates a new chat. Saves user and assistant messages, runs RAG, logs the interaction, and returns the result including the chat_id.",
+    description="Receives query via API Gateway. Uses X-Company-ID and X-User-ID. Continues or creates chat.",
 )
 async def process_query(
     request_body: schemas.QueryRequest = Body(...),
-    # Usar las nuevas dependencias
+    # *** CORRECCIÓN CLAVE: Usar las dependencias importadas/definidas ***
     company_id: uuid.UUID = Depends(get_current_company_id),
-    user_id: uuid.UUID = Depends(get_current_user_id), # User ID ahora viene del header y es requerido
-    request: Request = None # Para request_id
+    user_id: uuid.UUID = Depends(get_current_user_id),
+    request: Request = None
 ):
-    # Ya no necesitamos la validación if not user_id, la dependencia se encarga
-
     request_id = request.headers.get("x-request-id") if request else str(uuid.uuid4())
     endpoint_log = log.bind(
         request_id=request_id,
         company_id=str(company_id),
-        user_id=str(user_id), # user_id ahora siempre está presente
+        user_id=str(user_id),
         query=truncate_text(request_body.query, 100),
         provided_chat_id=str(request_body.chat_id) if request_body.chat_id else "None"
     )
-    endpoint_log.info("Received query request via gateway headers with chat context")
+    endpoint_log.info("Received query request with chat context")
 
     current_chat_id: uuid.UUID
     is_new_chat = False
 
     try:
-        # --- Lógica Chat ID (sin cambios) ---
+        # Lógica de Chat ID (sin cambios, ya usa los user_id/company_id de Depends)
         if request_body.chat_id:
-            # check_chat_ownership usa user_id y company_id de los Depends
             if not await postgres_client.check_chat_ownership(request_body.chat_id, user_id, company_id):
                  raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Chat not found or access denied.")
             current_chat_id = request_body.chat_id
@@ -271,38 +247,31 @@ async def process_query(
             endpoint_log = endpoint_log.bind(chat_id=str(current_chat_id))
             endpoint_log.info("New chat created", title=initial_title)
 
-        # --- Guardar Mensaje Usuario (sin cambios) ---
+        # Guardar Mensaje Usuario (sin cambios, usa user_id de Depends)
         endpoint_log.info("Saving user message...")
         await postgres_client.save_message(
             chat_id=current_chat_id, role='user', content=request_body.query
         )
         endpoint_log.info("User message saved")
 
-        # --- Ejecutar Pipeline RAG (pasando user_id como string) ---
+        # Ejecutar Pipeline RAG (sin cambios, usa user_id/company_id de Depends)
         endpoint_log.info("Running RAG pipeline...")
         answer, retrieved_docs_haystack, log_id = await rag_pipeline.run_rag_pipeline(
-            query=request_body.query,
-            company_id=str(company_id),
-            user_id=str(user_id), # Pasar user_id como string a la función del pipeline
-            top_k=request_body.retriever_top_k,
-            chat_id=current_chat_id
+            query=request_body.query, company_id=str(company_id), user_id=str(user_id),
+            top_k=request_body.retriever_top_k, chat_id=current_chat_id
         )
         endpoint_log.info("RAG pipeline finished")
 
-        # --- Formatear Documentos y Fuentes (sin cambios) ---
+        # Formatear Documentos y Fuentes (sin cambios)
         response_docs_schema: List[schemas.RetrievedDocument] = []
         assistant_sources: List[Dict[str, Any]] = []
         for doc in retrieved_docs_haystack:
             schema_doc = schemas.RetrievedDocument.from_haystack_doc(doc)
             response_docs_schema.append(schema_doc)
-            source_info = {
-                "chunk_id": schema_doc.id, "document_id": schema_doc.document_id,
-                "file_name": schema_doc.file_name, "score": schema_doc.score,
-                "preview": schema_doc.content_preview
-            }
+            source_info = { "chunk_id": schema_doc.id, "document_id": schema_doc.document_id, "file_name": schema_doc.file_name, "score": schema_doc.score, "preview": schema_doc.content_preview }
             assistant_sources.append(source_info)
 
-        # --- Guardar Mensaje Asistente (sin cambios) ---
+        # Guardar Mensaje Asistente (sin cambios)
         endpoint_log.info("Saving assistant message...")
         await postgres_client.save_message(
             chat_id=current_chat_id, role='assistant', content=answer,
@@ -312,13 +281,13 @@ async def process_query(
 
         endpoint_log.info("Query processed successfully", log_id=str(log_id) if log_id else "Log Failed", num_retrieved=len(response_docs_schema))
 
-        # --- Devolver Respuesta (sin cambios) ---
+        # Devolver Respuesta (sin cambios)
         return schemas.QueryResponse(
             answer=answer, retrieved_documents=response_docs_schema,
             query_log_id=log_id, chat_id=current_chat_id
         )
 
-    # --- Manejo de Errores (sin cambios) ---
+    # Manejo de Errores (sin cambios)
     except ValueError as ve: endpoint_log.warning("Value error", error=str(ve)); raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
     except ConnectionError as ce: endpoint_log.error("Connection error", error=str(ce), exc_info=True); raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Dependency unavailable: {ce}")
     except HTTPException as http_exc: raise http_exc

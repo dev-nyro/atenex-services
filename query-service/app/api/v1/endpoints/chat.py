@@ -2,12 +2,13 @@
 import uuid
 from typing import List, Optional
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, status, Path, Query, Header, Request # Importar Request
+from fastapi import (
+    APIRouter, Depends, HTTPException, status, Path, Query, Header, Request,
+    Response # Importar Response para el 204
+)
 
 from app.api.v1 import schemas
 from app.db import postgres_client
-# --- CORRECCIÓN: Usar las dependencias DEFINIDAS LOCALMENTE ---
-# (Se aseguran de que las cabeceras X- estén presentes y sean válidas)
 
 log = structlog.get_logger(__name__)
 
@@ -46,11 +47,8 @@ async def get_current_user_id(x_user_id: Optional[str] = Header(None, alias="X-U
     description="Retrieves a list of chat summaries using X-Company-ID and X-User-ID headers.",
 )
 async def list_chats(
-    # *** CORRECCIÓN CLAVE: Usar las dependencias correctas ***
     user_id: uuid.UUID = Depends(get_current_user_id),
     company_id: uuid.UUID = Depends(get_current_company_id),
-    # Ya no se depende de Authorization
-    # --- Parámetros de Query ---
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     request: Request = None
@@ -60,7 +58,7 @@ async def list_chats(
     endpoint_log.info("Request received to list chats")
 
     try:
-        # Usar la función con el nombre corregido
+        # *** LLAMADA CORREGIDA ***
         chats = await postgres_client.get_user_chats(
             user_id=user_id, company_id=company_id, limit=limit, offset=offset
         )
@@ -81,10 +79,8 @@ async def list_chats(
 )
 async def get_chat_messages_endpoint(
     chat_id: uuid.UUID = Path(..., description="The ID of the chat."),
-    # *** CORRECCIÓN CLAVE: Usar las dependencias correctas ***
     user_id: uuid.UUID = Depends(get_current_user_id),
     company_id: uuid.UUID = Depends(get_current_company_id),
-    # --- Parámetros de Query ---
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     request: Request = None
@@ -94,12 +90,11 @@ async def get_chat_messages_endpoint(
     endpoint_log.info("Request received to get chat messages")
 
     try:
-        # Usar la función con el nombre corregido
+        # *** LLAMADA CORREGIDA ***
         messages = await postgres_client.get_chat_messages(
             chat_id=chat_id, user_id=user_id, company_id=company_id, limit=limit, offset=offset
         )
         endpoint_log.info("Chat messages retrieved successfully", count=len(messages))
-        # Nota: la función DB ya devuelve [] si no se encuentra o no es propietario
         return messages
     except Exception as e:
         endpoint_log.exception("Error getting chat messages")
@@ -115,7 +110,6 @@ async def get_chat_messages_endpoint(
 )
 async def delete_chat_endpoint(
     chat_id: uuid.UUID = Path(..., description="The ID of the chat to delete."),
-    # *** CORRECCIÓN CLAVE: Usar las dependencias correctas ***
     user_id: uuid.UUID = Depends(get_current_user_id),
     company_id: uuid.UUID = Depends(get_current_company_id),
     request: Request = None
@@ -125,10 +119,10 @@ async def delete_chat_endpoint(
     endpoint_log.info("Request received to delete chat")
 
     try:
+        # Llamada a la función DB (nombre no cambia)
         deleted = await postgres_client.delete_chat(chat_id=chat_id, user_id=user_id, company_id=company_id)
         if deleted:
             endpoint_log.info("Chat deleted successfully")
-            # Para 204, no devuelvas nada o devuelve Response(status_code=204)
             return Response(status_code=status.HTTP_204_NO_CONTENT)
         else:
             endpoint_log.warning("Chat not found or access denied for deletion")
