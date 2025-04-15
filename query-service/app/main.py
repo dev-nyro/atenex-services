@@ -121,4 +121,4 @@ if __name__ == "__main__":
     log.info(f"Starting Uvicorn server for {settings.PROJECT_NAME} local development...")
     log_level_str = settings.LOG_LEVEL.lower()
     if log_level_str not in logging._nameToLevel: log.warning(f"Invalid LOG_LEVEL '{settings.LOG_LEVEL}', defaulting Uvicorn log level to 'info'."); log_level_str = "info"
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8001, reload=True, log_level=log_level_str)
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8001, reload=True, log_level=log_level_str) 
