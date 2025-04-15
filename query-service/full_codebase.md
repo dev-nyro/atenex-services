@@ -44,12 +44,13 @@ app/
 import uuid
 from typing import List, Optional
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, status, Path, Query, Header, Request # Importar Request
+from fastapi import (
+    APIRouter, Depends, HTTPException, status, Path, Query, Header, Request,
+    Response # Importar Response para el 204
+)
 
 from app.api.v1 import schemas
 from app.db import postgres_client
-# --- CORRECCIÓN: Usar las dependencias DEFINIDAS LOCALMENTE ---
-# (Se aseguran de que las cabeceras X- estén presentes y sean válidas)
 
 log = structlog.get_logger(__name__)
 
@@ -88,11 +89,8 @@ async def get_current_user_id(x_user_id: Optional[str] = Header(None, alias="X-U
     description="Retrieves a list of chat summaries using X-Company-ID and X-User-ID headers.",
 )
 async def list_chats(
-    # *** CORRECCIÓN CLAVE: Usar las dependencias correctas ***
     user_id: uuid.UUID = Depends(get_current_user_id),
     company_id: uuid.UUID = Depends(get_current_company_id),
-    # Ya no se depende de Authorization
-    # --- Parámetros de Query ---
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     request: Request = None
@@ -102,7 +100,7 @@ async def list_chats(
     endpoint_log.info("Request received to list chats")
 
     try:
-        # Usar la función con el nombre corregido
+        # *** LLAMADA CORREGIDA ***
         chats = await postgres_client.get_user_chats(
             user_id=user_id, company_id=company_id, limit=limit, offset=offset
         )
@@ -123,10 +121,8 @@ async def list_chats(
 )
 async def get_chat_messages_endpoint(
     chat_id: uuid.UUID = Path(..., description="The ID of the chat."),
-    # *** CORRECCIÓN CLAVE: Usar las dependencias correctas ***
     user_id: uuid.UUID = Depends(get_current_user_id),
     company_id: uuid.UUID = Depends(get_current_company_id),
-    # --- Parámetros de Query ---
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     request: Request = None
@@ -136,12 +132,11 @@ async def get_chat_messages_endpoint(
     endpoint_log.info("Request received to get chat messages")
 
     try:
-        # Usar la función con el nombre corregido
+        # *** LLAMADA CORREGIDA ***
         messages = await postgres_client.get_chat_messages(
             chat_id=chat_id, user_id=user_id, company_id=company_id, limit=limit, offset=offset
         )
         endpoint_log.info("Chat messages retrieved successfully", count=len(messages))
-        # Nota: la función DB ya devuelve [] si no se encuentra o no es propietario
         return messages
     except Exception as e:
         endpoint_log.exception("Error getting chat messages")
@@ -157,7 +152,6 @@ async def get_chat_messages_endpoint(
 )
 async def delete_chat_endpoint(
     chat_id: uuid.UUID = Path(..., description="The ID of the chat to delete."),
-    # *** CORRECCIÓN CLAVE: Usar las dependencias correctas ***
     user_id: uuid.UUID = Depends(get_current_user_id),
     company_id: uuid.UUID = Depends(get_current_company_id),
     request: Request = None
@@ -167,10 +161,10 @@ async def delete_chat_endpoint(
     endpoint_log.info("Request received to delete chat")
 
     try:
+        # Llamada a la función DB (nombre no cambia)
         deleted = await postgres_client.delete_chat(chat_id=chat_id, user_id=user_id, company_id=company_id)
         if deleted:
             endpoint_log.info("Chat deleted successfully")
-            # Para 204, no devuelvas nada o devuelve Response(status_code=204)
             return Response(status_code=status.HTTP_204_NO_CONTENT)
         else:
             endpoint_log.warning("Chat not found or access denied for deletion")
@@ -213,7 +207,6 @@ router = APIRouter()
 )
 async def process_query(
     request_body: schemas.QueryRequest = Body(...),
-    # *** CORRECCIÓN CLAVE: Usar las dependencias importadas/definidas ***
     company_id: uuid.UUID = Depends(get_current_company_id),
     user_id: uuid.UUID = Depends(get_current_user_id),
     request: Request = None
@@ -232,7 +225,7 @@ async def process_query(
     is_new_chat = False
 
     try:
-        # Lógica de Chat ID (sin cambios, ya usa los user_id/company_id de Depends)
+        # Lógica de Chat ID
         if request_body.chat_id:
             if not await postgres_client.check_chat_ownership(request_body.chat_id, user_id, company_id):
                  raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Chat not found or access denied.")
@@ -247,14 +240,14 @@ async def process_query(
             endpoint_log = endpoint_log.bind(chat_id=str(current_chat_id))
             endpoint_log.info("New chat created", title=initial_title)
 
-        # Guardar Mensaje Usuario (sin cambios, usa user_id de Depends)
+        # *** LLAMADA CORREGIDA ***
         endpoint_log.info("Saving user message...")
         await postgres_client.save_message(
             chat_id=current_chat_id, role='user', content=request_body.query
         )
         endpoint_log.info("User message saved")
 
-        # Ejecutar Pipeline RAG (sin cambios, usa user_id/company_id de Depends)
+        # Ejecutar Pipeline RAG
         endpoint_log.info("Running RAG pipeline...")
         answer, retrieved_docs_haystack, log_id = await rag_pipeline.run_rag_pipeline(
             query=request_body.query, company_id=str(company_id), user_id=str(user_id),
@@ -262,7 +255,7 @@ async def process_query(
         )
         endpoint_log.info("RAG pipeline finished")
 
-        # Formatear Documentos y Fuentes (sin cambios)
+        # Formatear Documentos y Fuentes
         response_docs_schema: List[schemas.RetrievedDocument] = []
         assistant_sources: List[Dict[str, Any]] = []
         for doc in retrieved_docs_haystack:
@@ -271,7 +264,7 @@ async def process_query(
             source_info = { "chunk_id": schema_doc.id, "document_id": schema_doc.document_id, "file_name": schema_doc.file_name, "score": schema_doc.score, "preview": schema_doc.content_preview }
             assistant_sources.append(source_info)
 
-        # Guardar Mensaje Asistente (sin cambios)
+        # *** LLAMADA CORREGIDA ***
         endpoint_log.info("Saving assistant message...")
         await postgres_client.save_message(
             chat_id=current_chat_id, role='assistant', content=answer,
@@ -281,13 +274,13 @@ async def process_query(
 
         endpoint_log.info("Query processed successfully", log_id=str(log_id) if log_id else "Log Failed", num_retrieved=len(response_docs_schema))
 
-        # Devolver Respuesta (sin cambios)
+        # Devolver Respuesta
         return schemas.QueryResponse(
             answer=answer, retrieved_documents=response_docs_schema,
             query_log_id=log_id, chat_id=current_chat_id
         )
 
-    # Manejo de Errores (sin cambios)
+    # Manejo de Errores
     except ValueError as ve: endpoint_log.warning("Value error", error=str(ve)); raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
     except ConnectionError as ce: endpoint_log.error("Connection error", error=str(ce), exc_info=True); raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Dependency unavailable: {ce}")
     except HTTPException as http_exc: raise http_exc
@@ -656,7 +649,9 @@ async def close_db_pool():
     global _pool
     if _pool and not _pool._closed:
         log.info("Closing PostgreSQL connection pool..."); await _pool.close(); _pool = None; log.info("PostgreSQL connection pool closed.")
-    # (resto sin cambios) ...
+    elif _pool and _pool._closed: log.warning("Attempted to close an already closed PostgreSQL pool."); _pool = None
+    else: log.info("No active PostgreSQL connection pool to close.")
+
 
 async def check_db_connection() -> bool:
     try:
@@ -666,13 +661,12 @@ async def check_db_connection() -> bool:
         return result == 1
     except Exception as e: log.error("Database connection check failed", error=str(e)); return False
 
-# --- Query Logging ---
+# --- Query Logging (sin cambios) ---
 async def log_query_interaction(
     user_id: Optional[uuid.UUID],
     company_id: uuid.UUID,
     query: str,
     answer: str,
-    # *** CORREGIDO: Aceptar la lista de dicts formateada ***
     retrieved_documents_data: List[Dict[str, Any]],
     metadata: Optional[Dict[str, Any]] = None,
     chat_id: Optional[uuid.UUID] = None,
@@ -682,28 +676,23 @@ async def log_query_interaction(
     log_id = uuid.uuid4()
     log_entry = log.bind(log_id=str(log_id), company_id=str(company_id), chat_id=str(chat_id) if chat_id else "None")
 
-    # Usar nombre de columna correcto 'response'
     query_sql = """
     INSERT INTO query_logs (
         id, user_id, company_id, query, response,
         metadata, chat_id, created_at
-        -- Nota: 'relevance_score' y 'retrieved_documents' no están directamente aquí
-        -- Se podría añadir un campo JSONB para los documentos o scores agregados si fuera necesario.
     ) VALUES (
         $1, $2, $3, $4, $5, $6, $7, NOW() AT TIME ZONE 'UTC'
     ) RETURNING id;
     """
-    # Preparar metadatos para guardar (incluyendo info de documentos si se desea)
     log_metadata = metadata or {}
-    # Podríamos añadir un resumen de los documentos aquí si la tabla tuviera un campo JSONB
-    # log_metadata["retrieved_summary"] = [{"id": d.get("id"), "score": d.get("score")} for d in retrieved_documents_data]
+    log_metadata["retrieved_summary"] = [{"id": d.get("id"), "score": d.get("score"), "file_name": d.get("file_name")} for d in retrieved_documents_data]
 
     try:
         async with pool.acquire() as connection:
             result = await connection.fetchval(
                 query_sql,
                 log_id, user_id, company_id, query, answer,
-                json.dumps(log_metadata), # Guardar metadatos generales + resumen docs
+                json.dumps(log_metadata),
                 chat_id
             )
         if not result or result != log_id:
@@ -713,12 +702,10 @@ async def log_query_interaction(
         return log_id
     except Exception as e:
         log_entry.error("Failed to log query interaction", error=str(e), exc_info=True)
-        # No relanzar para no interrumpir el flujo principal, pero loguear error
-        # Considerar devolver None si el log es crítico
         raise RuntimeError(f"Failed to log query interaction: {e}") from e
 
 
-# --- Funciones para gestión de chats ---
+# --- Funciones para gestión de chats (Renombradas y columna sources corregida) ---
 
 async def create_chat(user_id: uuid.UUID, company_id: uuid.UUID, title: Optional[str] = None) -> uuid.UUID:
     """Crea un nuevo chat."""
@@ -737,11 +724,10 @@ async def create_chat(user_id: uuid.UUID, company_id: uuid.UUID, title: Optional
         else: raise RuntimeError("Failed to create chat, no ID returned")
     except Exception as e: log.error("Failed to create chat", error=str(e), exc_info=True); raise
 
-# *** CORREGIDO: Renombrar función ***
+# *** FUNCIÓN RENOMBRADA ***
 async def get_user_chats(user_id: uuid.UUID, company_id: uuid.UUID, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
     """Obtiene la lista de chats para un usuario/compañía (sumario)."""
     pool = await get_db_pool()
-    # Seleccionar sólo id, title, updated_at para el sumario
     query = """
     SELECT id, title, updated_at FROM chats
     WHERE user_id = $1 AND company_id = $2
@@ -763,18 +749,16 @@ async def check_chat_ownership(chat_id: uuid.UUID, user_id: uuid.UUID, company_i
         return exists is True
     except Exception as e: log.error("Failed to check chat ownership", chat_id=str(chat_id), error=str(e), exc_info=True); return False # Asumir no propietario en caso de error
 
-# *** CORREGIDO: Renombrar función y columna 'sources' ***
+# *** FUNCIÓN RENOMBRADA y columna SOURCES CORREGIDA ***
 async def get_chat_messages(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
     """Obtiene mensajes de un chat, verificando propiedad."""
     pool = await get_db_pool()
-    # Verificar propiedad primero
     owner = await check_chat_ownership(chat_id, user_id, company_id)
     if not owner:
         log.warning("Attempt to get messages for chat not owned or non-existent", chat_id=str(chat_id), user_id=str(user_id), company_id=str(company_id))
-        # Devolver lista vacía o lanzar excepción dependiendo del comportamiento deseado
-        return [] # Devolver lista vacía si no se encuentra o no es propietario
+        return []
 
-    # Seleccionar columnas correctas, usando alias 'sources' para la columna de DB
+    # Usar columna 'sources'
     messages_query = """
     SELECT id, role, content, sources, created_at FROM messages
     WHERE chat_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3;
@@ -786,29 +770,26 @@ async def get_chat_messages(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: 
         return messages
     except Exception as e: log.error("Failed to get chat messages", error=str(e), exc_info=True); raise
 
-# *** CORREGIDO: Renombrar función y columna 'sources' ***
+# *** FUNCIÓN RENOMBRADA y columna SOURCES CORREGIDA ***
 async def save_message(chat_id: uuid.UUID, role: str, content: str, sources: Optional[List[Dict[str, Any]]] = None) -> uuid.UUID:
     """Guarda un mensaje en un chat y actualiza el timestamp del chat."""
     pool = await get_db_pool()
     message_id = uuid.uuid4()
-    # Transacción para asegurar atomicidad de update+insert
     async with pool.acquire() as conn:
         async with conn.transaction():
             try:
-                # Actualizar timestamp del chat
                 update_chat_query = "UPDATE chats SET updated_at = NOW() AT TIME ZONE 'UTC' WHERE id = $1 RETURNING id;"
                 chat_updated = await conn.fetchval(update_chat_query, chat_id)
                 if not chat_updated:
                      log.error("Failed to update chat timestamp, chat might not exist", chat_id=str(chat_id))
                      raise ValueError(f"Chat with ID {chat_id} not found for saving message.")
 
-                # Insertar mensaje usando columna 'sources'
+                # Usar columna 'sources'
                 insert_message_query = """
                 INSERT INTO messages (id, chat_id, role, content, sources, created_at)
                 VALUES ($1, $2, $3, $4, $5, NOW() AT TIME ZONE 'UTC') RETURNING id;
                 """
-                # Usar json.dumps para el campo 'sources' (jsonb)
-                result = await conn.fetchval(insert_message_query, message_id, chat_id, role, content, json.dumps(sources or []))
+                result = await conn.fetchval(insert_message_query, message_id, chat_id, role, content, json.dumps(sources or [])) # Usar json.dumps
 
                 if result and result == message_id:
                     log.info("Message saved successfully", message_id=str(message_id), chat_id=str(chat_id), role=role)
@@ -818,13 +799,11 @@ async def save_message(chat_id: uuid.UUID, role: str, content: str, sources: Opt
                     raise RuntimeError("Failed to save message, ID mismatch or not returned.")
             except Exception as e:
                 log.error("Failed to save message within transaction", error=str(e), chat_id=str(chat_id), exc_info=True)
-                # La transacción hará rollback automáticamente al salir del bloque 'with' con excepción
-                raise # Relanzar para indicar fallo
+                raise
 
 async def delete_chat(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID) -> bool:
     """Elimina un chat si pertenece al usuario/compañía."""
     pool = await get_db_pool()
-    # La relación ON DELETE CASCADE en la FK messages.chat_id debería borrar los mensajes
     query = "DELETE FROM chats WHERE id = $1 AND user_id = $2 AND company_id = $3 RETURNING id;"
     delete_log = log.bind(chat_id=str(chat_id), user_id=str(user_id), company_id=str(company_id))
     try:
@@ -985,7 +964,8 @@ import asyncio
 import uuid
 from typing import Dict, Any, List, Tuple, Optional
 
-from pymilvus.exceptions import MilvusException
+# *** CORRECCIÓN: Usar MilvusException para tipo correcto ***
+from pymilvus.exceptions import MilvusException, CollectionNotDefinedException
 from fastapi import HTTPException, status
 
 from haystack import Pipeline, Document
@@ -1005,40 +985,31 @@ log = structlog.get_logger(__name__)
 # --- Component Initialization Functions ---
 def get_milvus_document_store() -> MilvusDocumentStore:
     connection_uri = str(settings.MILVUS_URI)
-    connection_timeout = 30.0
+    connection_timeout = 30.0 # Aumentado ligeramente
     log.debug("Initializing MilvusDocumentStore...", uri=connection_uri, collection=settings.MILVUS_COLLECTION_NAME)
     try:
-        # --- CORRECCIÓN: Eliminar argumentos inválidos ---
-        # embedding_field, content_field, metadata_fields no son argumentos directos
-        # para MilvusDocumentStore en la integración milvus-haystack para Haystack 2.x.
-        # Haystack los maneja internamente basado en los objetos Document.
+        # --- CORRECCIÓN: Eliminar argumentos inválidos para Haystack 2.x ---
+        # embedding_field, content_field, metadata_fields no son argumentos aquí.
+        # Se manejan por la estructura del objeto Document de Haystack.
         store = MilvusDocumentStore(
             connection_args={"uri": connection_uri, "timeout": connection_timeout},
             collection_name=settings.MILVUS_COLLECTION_NAME,
-            # search_params SÍ es válido
             search_params=settings.MILVUS_SEARCH_PARAMS,
-            # consistency_level también es válido
-            consistency_level="Strong"
-            # Eliminar: embedding_field=settings.MILVUS_EMBEDDING_FIELD,
-            # Eliminar: content_field=settings.MILVUS_CONTENT_FIELD,
-            # Eliminar: metadata_fields=settings.MILVUS_METADATA_FIELDS
+            consistency_level="Strong",
+            # dim = settings.EMBEDDING_DIMENSION # Dimensión no es un argumento directo aquí, Milvus lo infiere o usa el índice.
         )
         # ----------------------------------------------------
-
-        # No verificar conexión aquí para acelerar startup, se hace en check_dependencies
         log.info("MilvusDocumentStore parameters configured.", uri=connection_uri, collection=settings.MILVUS_COLLECTION_NAME)
         return store
     except MilvusException as e:
         log.error("Failed to initialize MilvusDocumentStore", error_code=e.code, error_message=e.message, exc_info=True)
         raise RuntimeError(f"Milvus connection/initialization failed: {e.message}") from e
-    except TypeError as te: # Capturar específicamente el TypeError que vimos
+    except TypeError as te:
         log.error("TypeError during MilvusDocumentStore initialization (likely invalid argument)", error=str(te), exc_info=True)
         raise RuntimeError(f"Milvus initialization error (Invalid argument): {te}") from te
     except Exception as e:
         log.error("Unexpected error during MilvusDocumentStore initialization", error=str(e), exc_info=True)
         raise RuntimeError(f"Unexpected error initializing Milvus: {e}") from e
-
-# --- Otras inicializaciones y funciones (get_openai_text_embedder, etc.) sin cambios ---
 
 def get_openai_text_embedder() -> OpenAITextEmbedder:
     log.debug("Initializing OpenAITextEmbedder", model=settings.OPENAI_EMBEDDING_MODEL)
@@ -1057,7 +1028,7 @@ def get_prompt_builder() -> PromptBuilder:
     log.debug("Initializing PromptBuilder")
     return PromptBuilder(template=settings.RAG_PROMPT_TEMPLATE)
 
-# --- Pipeline Construction (sin cambios en lógica, pero ahora debería funcionar) ---
+# --- Pipeline Construction ---
 _rag_pipeline_instance: Optional[Pipeline] = None
 def build_rag_pipeline() -> Pipeline:
     global _rag_pipeline_instance
@@ -1065,7 +1036,7 @@ def build_rag_pipeline() -> Pipeline:
     log.info("Building Haystack RAG pipeline...")
     rag_pipeline = Pipeline()
     try:
-        doc_store = get_milvus_document_store() # Ahora no debería dar TypeError
+        doc_store = get_milvus_document_store() # Llamar a la función corregida
         text_embedder = get_openai_text_embedder()
         retriever = get_milvus_retriever(document_store=doc_store)
         prompt_builder = get_prompt_builder()
@@ -1081,7 +1052,7 @@ def build_rag_pipeline() -> Pipeline:
         log.error("Failed to build Haystack RAG pipeline", error=str(e), exc_info=True)
         raise RuntimeError("Could not build the RAG pipeline") from e
 
-# --- Pipeline Execution (sin cambios) ---
+# --- Pipeline Execution (sin cambios lógicos aquí) ---
 async def run_rag_pipeline(
     query: str,
     company_id: str,
@@ -1145,17 +1116,22 @@ async def run_rag_pipeline(
         run_log.exception("Error occurred during RAG pipeline execution")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error processing query: {type(e).__name__}")
 
-# --- check_pipeline_dependencies (sin cambios) ---
+# --- CORRECCIÓN: Usar store.count() en lugar de describe_collection ---
 async def check_pipeline_dependencies() -> Dict[str, str]:
     results = {"milvus_connection": "pending", "openai_api": "pending", "gemini_api": "pending"}
     try:
         store = get_milvus_document_store()
-        await asyncio.to_thread(store.describe_collection)
+        # Verificar conexión contando documentos (más fiable que describe_collection)
+        count = await asyncio.to_thread(store.count_documents)
         results["milvus_connection"] = "ok"
-        log.debug("Milvus dependency check successful.")
+        log.debug("Milvus dependency check successful.", document_count=count)
+    except CollectionNotDefinedException:
+         results["milvus_connection"] = "ok (collection not found yet)" # Colección vacía/no creada no es error de conexión
+         log.info("Milvus dependency check: Collection not found (will be created on write).")
     except Exception as e:
+        # Capturar cualquier error de Milvus u otro error durante la comprobación
         results["milvus_connection"] = f"error: {type(e).__name__}"
-        log.warning("Milvus dependency check failed", error=str(e), exc_info=False)
+        log.warning("Milvus dependency check failed", error=str(e), exc_info=False) # Log menos verboso aquí
     if settings.OPENAI_API_KEY.get_secret_value(): results["openai_api"] = "key_present"
     else: results["openai_api"] = "key_missing"; log.warning("OpenAI API Key missing in config.")
     if settings.GEMINI_API_KEY.get_secret_value(): results["gemini_api"] = "key_present"
