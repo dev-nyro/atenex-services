@@ -1245,7 +1245,7 @@ async def logged_strict_auth(user_payload: StrictAuth) -> Dict[str, Any]:
 
 LoggedStrictAuth = Annotated[Dict[str, Any], Depends(logged_strict_auth)]
 
-# --- Función Principal de Proxy (Sin cambios internos significativos) ---
+# --- Función Principal de Proxy ---
 async def _proxy_request(
     request: Request,
     target_service_base_url_str: str,
@@ -1304,11 +1304,13 @@ async def _proxy_request(
         # StrictAuth ya valida esto, pero una doble verificación no hace daño
         if not user_id or not company_id:
              proxy_log.critical("Payload from auth dependency missing required fields!", payload_keys=list(user_payload.keys()))
-             raise HTTPException(status_code=500, detail="Internal authentication context error after auth check.")
-
-        # Inyectar las cabeceras X-*
+             raise HTTPException(status_code=500, detail="Internal authentication context error after auth check.")        # Inyectar las cabeceras X-* (en formato estándar y caso exacto esperado por el backend)
         headers_to_forward['X-User-ID'] = str(user_id)
         headers_to_forward['X-Company-ID'] = str(company_id)
+        # También añadimos formas alternativas por si hay problemas de caso
+        headers_to_forward['x-user-id'] = str(user_id)
+        headers_to_forward['x-company-id'] = str(company_id)
+        # Añadir al contexto de log para trazabilidad
         log_context_headers['user_id'] = str(user_id)
         log_context_headers['company_id'] = str(company_id)
         if user_email:
@@ -1387,25 +1389,21 @@ async def _proxy_request(
 
 
 # --- *** INICIO SECCIÓN CORS OPTIONS HANDLERS *** ---
-# Es crucial definir handlers OPTIONS *antes* de las rutas `api_route` correspondientes
-# para que FastAPI los encuentre primero y no intente aplicar autenticación a las preflight.
-
+# (Sin cambios aquí, ya están correctos)
 @router.options(
     "/api/v1/ingest/{endpoint_path:path}",
     tags=["CORS", "Proxy - Ingest Service"],
     summary="CORS Preflight handler for Ingest Service proxy",
-    include_in_schema=False # No mostrar en docs OpenAPI
+    include_in_schema=False
 )
 async def options_proxy_ingest_service_generic(endpoint_path: str = Path(...)):
-    """Responde OK a las solicitudes OPTIONS para CORS preflight en ingest."""
     return Response(status_code=200)
 
 @router.options(
-    "/api/v1/query/ask", # Ruta actualizada
+    "/api/v1/query/ask",
     tags=["CORS", "Proxy - Query Service"],
     include_in_schema=False)
 async def options_query_ask():
-    """Handler OPTIONS para la ruta de query/ask."""
     return Response(status_code=200)
 
 @router.options(
@@ -1413,7 +1411,6 @@ async def options_query_ask():
     tags=["CORS", "Proxy - Query Service"],
     include_in_schema=False)
 async def options_query_chats():
-    """Handler OPTIONS para la ruta de listar chats."""
     return Response(status_code=200)
 
 @router.options(
@@ -1421,7 +1418,6 @@ async def options_query_chats():
     tags=["CORS", "Proxy - Query Service"],
     include_in_schema=False)
 async def options_chat_messages(chat_id: uuid.UUID = Path(...)):
-    """Handler OPTIONS para obtener mensajes de un chat."""
     return Response(status_code=200)
 
 @router.options(
@@ -1429,10 +1425,8 @@ async def options_chat_messages(chat_id: uuid.UUID = Path(...)):
     tags=["CORS", "Proxy - Query Service"],
     include_in_schema=False)
 async def options_delete_chat(chat_id: uuid.UUID = Path(...)):
-    """Handler OPTIONS para eliminar un chat."""
     return Response(status_code=200)
 
-# Handler OPTIONS para el proxy opcional de Auth Service (si está activo)
 if settings.AUTH_SERVICE_URL:
     @router.options(
         "/api/v1/auth/{endpoint_path:path}",
@@ -1440,34 +1434,30 @@ if settings.AUTH_SERVICE_URL:
         include_in_schema=False
     )
     async def options_proxy_auth_service_generic(endpoint_path: str = Path(...)):
-        """Handler OPTIONS para el proxy del servicio de autenticación."""
         return Response(status_code=200)
-
 # --- *** FIN SECCIÓN CORS OPTIONS HANDLERS *** ---
 
 
 # --- Rutas Proxy Específicas para Query Service ---
-# Ahora usamos los métodos específicos (GET, POST, DELETE) y excluimos OPTIONS
 
 @router.get(
     "/api/v1/query/chats",
-    dependencies=[Depends(LoggedStrictAuth)], # Requiere autenticación estricta
+    dependencies=[Depends(LoggedStrictAuth)],
     tags=["Proxy - Query Service"],
     summary="List user's chats (Proxied)"
 )
 async def proxy_get_chats(
     request: Request,
     client: Annotated[httpx.AsyncClient, Depends(get_client)],
-    user_payload: LoggedStrictAuth # Obtener payload validado
+    user_payload: LoggedStrictAuth
 ):
     """Reenvía GET /api/v1/query/chats al Query Service."""
-    # *** CORRECCIÓN RUTA DESTINO ***
-    # Path en el backend Query Service (prefijo del servicio + ruta del endpoint)
+    # La ruta interna en query-service coincide con la externa expuesta aquí
     backend_path = "/api/v1/query/chats"
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
 @router.post(
-    "/api/v1/query/ask", # Usar la ruta corregida/deseada
+    "/api/v1/query/ask", # Ruta externa/frontend
     dependencies=[Depends(LoggedStrictAuth)],
     tags=["Proxy - Query Service"],
     summary="Submit a query or message to a chat (Proxied)"
@@ -1477,10 +1467,10 @@ async def proxy_post_query(
     client: Annotated[httpx.AsyncClient, Depends(get_client)],
     user_payload: LoggedStrictAuth
 ):
-    """Reenvía POST /api/v1/query/ask al Query Service."""
+    """Reenvía POST /api/v1/query/ask al endpoint /api/v1/query/ask del Query Service."""
     # *** CORRECCIÓN RUTA DESTINO ***
-    # Path en el backend Query Service
-    backend_path = "/api/v1/query/query"
+    # Ahora la ruta interna en query-service también es /ask
+    backend_path = "/api/v1/query/ask"
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
 @router.get(
@@ -1493,10 +1483,9 @@ async def proxy_get_chat_messages(
     request: Request,
     client: Annotated[httpx.AsyncClient, Depends(get_client)],
     user_payload: LoggedStrictAuth,
-    chat_id: uuid.UUID = Path(...) # Obtener chat_id de la URL
+    chat_id: uuid.UUID = Path(...)
 ):
     """Reenvía GET /api/v1/query/chats/{chat_id}/messages al Query Service."""
-    # *** CORRECCIÓN RUTA DESTINO ***
     backend_path = f"/api/v1/query/chats/{chat_id}/messages"
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
@@ -1513,19 +1502,16 @@ async def proxy_delete_chat(
     chat_id: uuid.UUID = Path(...)
 ):
     """Reenvía DELETE /api/v1/query/chats/{chat_id} al Query Service."""
-    # *** CORRECCIÓN RUTA DESTINO ***
     backend_path = f"/api/v1/query/chats/{chat_id}"
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
 
 # --- Rutas Proxy Genéricas para Ingest Service ---
-# Usa api_route para manejar múltiples métodos (GET, POST, etc.) pero EXCLUYENDO OPTIONS
-
+# (Sin cambios, ya estaba bien mapeado)
 @router.api_route(
     "/api/v1/ingest/{endpoint_path:path}",
-    # *** CORRECCIÓN: Excluir OPTIONS de los métodos manejados aquí ***
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
-    dependencies=[Depends(LoggedStrictAuth)], # Aplicar autenticación estricta
+    dependencies=[Depends(LoggedStrictAuth)],
     tags=["Proxy - Ingest Service"],
     summary="Generic proxy for Ingest Service endpoints (Authenticated)"
 )
@@ -1533,36 +1519,29 @@ async def proxy_ingest_service_generic(
     request: Request,
     client: Annotated[httpx.AsyncClient, Depends(get_client)],
     user_payload: LoggedStrictAuth,
-    endpoint_path: str = Path(...) # Captura el resto del path
+    endpoint_path: str = Path(...)
 ):
     """
     Reenvía solicitudes autenticadas a `/api/v1/ingest/*` al Ingest Service.
     El path enviado al backend es `/api/v1/ingest/{endpoint_path}`.
     """
-    # *** CORRECCIÓN RUTA DESTINO: Añadir prefijo API del servicio ***
-    # Path en el backend Ingest Service (prefijo API + path capturado)
     backend_path = f"/api/v1/ingest/{endpoint_path}"
-    # Agregar query params si existen (manejado automáticamente por copy_with en _proxy_request)
-
     return await _proxy_request(
         request=request,
         target_service_base_url_str=str(settings.INGEST_SERVICE_URL),
         client=client,
-        user_payload=user_payload, # Pasa el payload para inyectar cabeceras X-*
-        # Pasar path sin query params a _proxy_request, copy_with lo añade
+        user_payload=user_payload,
         backend_service_path=backend_path
     )
 
 
 # --- Proxy Opcional para Auth Service (Excluir OPTIONS) ---
+# (Sin cambios, ya estaba bien mapeado si está activo)
 if settings.AUTH_SERVICE_URL:
     log.info(f"Auth service proxy enabled, forwarding to {settings.AUTH_SERVICE_URL}")
-    # OPTIONS handler ya definido arriba
     @router.api_route(
         "/api/v1/auth/{endpoint_path:path}",
-        # *** CORRECCIÓN: Excluir OPTIONS ***
         methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
-        # SIN Auth Dependency (asume que el Auth Service maneja su propia auth)
         tags=["Proxy - Auth Service (Optional)"],
         summary="Generic proxy for Auth Service endpoints (No Gateway Auth)"
     )
@@ -1572,12 +1551,7 @@ if settings.AUTH_SERVICE_URL:
         endpoint_path: str = Path(...)
     ):
         """Reenvía solicitudes a `/api/v1/auth/*` al Auth Service externo (si está configurado)."""
-        # *** CORRECCIÓN RUTA DESTINO: Añadir prefijo API del servicio ***
-        # Path en el backend Auth Service (asume que el servicio escucha en /api/v1/auth/)
         backend_path = f"/api/v1/auth/{endpoint_path}"
-        # query params manejados en _proxy_request
-
-        # user_payload=None porque no validamos token aquí
         return await _proxy_request(
             request=request,
             target_service_base_url_str=str(settings.AUTH_SERVICE_URL),
