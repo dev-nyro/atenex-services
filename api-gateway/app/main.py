@@ -281,4 +281,4 @@ if __name__ == "__main__":
         port=int(os.getenv("PORT", 8080)), # Usar PORT de env var si existe, default 8080
         reload=True, # Desactivar reload en producción o al usar Gunicorn con workers
         log_level=settings.LOG_LEVEL.lower(),
-    )
+    ) 
