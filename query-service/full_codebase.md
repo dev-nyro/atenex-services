@@ -964,20 +964,19 @@ import asyncio
 import uuid
 from typing import Dict, Any, List, Tuple, Optional
 
-# *** CORRECCIÓN: Usar MilvusException para tipo correcto ***
-from pymilvus.exceptions import MilvusException, CollectionNotDefinedException
+# *** CORRECCIÓN: Usar MilvusException y ErrorCode ***
+from pymilvus.exceptions import MilvusException, ErrorCode
 from fastapi import HTTPException, status
 
 from haystack import Pipeline, Document
 from haystack.components.embedders import OpenAITextEmbedder
 from haystack.components.builders.prompt_builder import PromptBuilder
-from milvus_haystack import MilvusDocumentStore, MilvusEmbeddingRetriever # Asegúrate de tener milvus-haystack instalado
+from milvus_haystack import MilvusDocumentStore, MilvusEmbeddingRetriever
 from haystack.utils import Secret
 
 from app.core.config import settings
-from app.db import postgres_client # Importar cliente DB
-from app.services.gemini_client import gemini_client # Importar cliente Gemini
-# Importar schema para formatear documentos
+from app.db import postgres_client
+from app.services.gemini_client import gemini_client
 from app.api.v1.schemas import RetrievedDocument
 
 log = structlog.get_logger(__name__)
@@ -985,20 +984,15 @@ log = structlog.get_logger(__name__)
 # --- Component Initialization Functions ---
 def get_milvus_document_store() -> MilvusDocumentStore:
     connection_uri = str(settings.MILVUS_URI)
-    connection_timeout = 30.0 # Aumentado ligeramente
+    connection_timeout = 30.0
     log.debug("Initializing MilvusDocumentStore...", uri=connection_uri, collection=settings.MILVUS_COLLECTION_NAME)
     try:
-        # --- CORRECCIÓN: Eliminar argumentos inválidos para Haystack 2.x ---
-        # embedding_field, content_field, metadata_fields no son argumentos aquí.
-        # Se manejan por la estructura del objeto Document de Haystack.
         store = MilvusDocumentStore(
             connection_args={"uri": connection_uri, "timeout": connection_timeout},
             collection_name=settings.MILVUS_COLLECTION_NAME,
             search_params=settings.MILVUS_SEARCH_PARAMS,
             consistency_level="Strong",
-            # dim = settings.EMBEDDING_DIMENSION # Dimensión no es un argumento directo aquí, Milvus lo infiere o usa el índice.
         )
-        # ----------------------------------------------------
         log.info("MilvusDocumentStore parameters configured.", uri=connection_uri, collection=settings.MILVUS_COLLECTION_NAME)
         return store
     except MilvusException as e:
@@ -1036,7 +1030,7 @@ def build_rag_pipeline() -> Pipeline:
     log.info("Building Haystack RAG pipeline...")
     rag_pipeline = Pipeline()
     try:
-        doc_store = get_milvus_document_store() # Llamar a la función corregida
+        doc_store = get_milvus_document_store()
         text_embedder = get_openai_text_embedder()
         retriever = get_milvus_retriever(document_store=doc_store)
         prompt_builder = get_prompt_builder()
@@ -1052,7 +1046,7 @@ def build_rag_pipeline() -> Pipeline:
         log.error("Failed to build Haystack RAG pipeline", error=str(e), exc_info=True)
         raise RuntimeError("Could not build the RAG pipeline") from e
 
-# --- Pipeline Execution (sin cambios lógicos aquí) ---
+# --- Pipeline Execution ---
 async def run_rag_pipeline(
     query: str,
     company_id: str,
@@ -1116,22 +1110,31 @@ async def run_rag_pipeline(
         run_log.exception("Error occurred during RAG pipeline execution")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error processing query: {type(e).__name__}")
 
-# --- CORRECCIÓN: Usar store.count() en lugar de describe_collection ---
+# --- CORRECCIÓN: Ajustar manejo de excepciones en check_dependencies ---
 async def check_pipeline_dependencies() -> Dict[str, str]:
     results = {"milvus_connection": "pending", "openai_api": "pending", "gemini_api": "pending"}
     try:
         store = get_milvus_document_store()
-        # Verificar conexión contando documentos (más fiable que describe_collection)
+        # Verificar conexión contando documentos
         count = await asyncio.to_thread(store.count_documents)
         results["milvus_connection"] = "ok"
         log.debug("Milvus dependency check successful.", document_count=count)
-    except CollectionNotDefinedException:
-         results["milvus_connection"] = "ok (collection not found yet)" # Colección vacía/no creada no es error de conexión
-         log.info("Milvus dependency check: Collection not found (will be created on write).")
+    except MilvusException as e:
+        # Verificar si el error es específicamente "Collection not found"
+        # El código para esto suele ser ErrorCode.COLLECTION_NOT_FOUND (valor 1)
+        if e.code == ErrorCode.COLLECTION_NOT_FOUND: # Importar ErrorCode de pymilvus.exceptions
+            results["milvus_connection"] = "ok (collection not found yet)"
+            log.info("Milvus dependency check: Collection not found (will be created on write).")
+        else:
+            # Otro error de Milvus (conexión, etc.)
+            results["milvus_connection"] = f"error: MilvusException (code={e.code}, msg={e.message})"
+            log.warning("Milvus dependency check failed with error", error_code=e.code, error_message=e.message, exc_info=False)
     except Exception as e:
-        # Capturar cualquier error de Milvus u otro error durante la comprobación
+        # Otro tipo de error durante la comprobación de Milvus
         results["milvus_connection"] = f"error: {type(e).__name__}"
-        log.warning("Milvus dependency check failed", error=str(e), exc_info=False) # Log menos verboso aquí
+        log.warning("Milvus dependency check failed with unexpected error", error=str(e), exc_info=False)
+
+    # Comprobaciones de API keys (sin cambios)
     if settings.OPENAI_API_KEY.get_secret_value(): results["openai_api"] = "key_present"
     else: results["openai_api"] = "key_missing"; log.warning("OpenAI API Key missing in config.")
     if settings.GEMINI_API_KEY.get_secret_value(): results["gemini_api"] = "key_present"
