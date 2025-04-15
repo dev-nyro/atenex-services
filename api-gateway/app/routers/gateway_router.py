@@ -105,11 +105,13 @@ async def _proxy_request(
         # StrictAuth ya valida esto, pero una doble verificación no hace daño
         if not user_id or not company_id:
              proxy_log.critical("Payload from auth dependency missing required fields!", payload_keys=list(user_payload.keys()))
-             raise HTTPException(status_code=500, detail="Internal authentication context error after auth check.")
-
-        # Inyectar las cabeceras X-*
+             raise HTTPException(status_code=500, detail="Internal authentication context error after auth check.")        # Inyectar las cabeceras X-* (en formato estándar y caso exacto esperado por el backend)
         headers_to_forward['X-User-ID'] = str(user_id)
         headers_to_forward['X-Company-ID'] = str(company_id)
+        # También añadimos formas alternativas por si hay problemas de caso
+        headers_to_forward['x-user-id'] = str(user_id)
+        headers_to_forward['x-company-id'] = str(company_id)
+        # Añadir al contexto de log para trazabilidad
         log_context_headers['user_id'] = str(user_id)
         log_context_headers['company_id'] = str(company_id)
         if user_email:
