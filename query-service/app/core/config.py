@@ -7,7 +7,7 @@ from pydantic import AnyHttpUrl, SecretStr, Field, validator, ValidationError, H
 import sys
 
 # --- PostgreSQL Kubernetes Defaults ---
-POSTGRES_K8S_HOST_DEFAULT = "postgres-postgresql.nyro-develop.svc.cluster.local"
+POSTGRES_K8S_HOST_DEFAULT = "postgres-service.nyro-develop.svc.cluster.local"
 POSTGRES_K8S_PORT_DEFAULT = 5432
 POSTGRES_K8S_DB_DEFAULT = "nyro"
 POSTGRES_K8S_USER_DEFAULT = "postgres"

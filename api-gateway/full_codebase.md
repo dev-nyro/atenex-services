@@ -1005,33 +1005,47 @@ app = FastAPI(
 # --- Middlewares ---
 
 # 1. CORS Middleware
-# --- *** CORRECCIÓN: Usar allow_origin_regex *** ---
-# Construir expresión regular para permitir localhost, URL Vercel principal y previews
-vercel_base_url_pattern = ""
+# --- *** CORRECCIÓN: Usar allow_origin_regex para Vercel y localhost *** ---
+# Construir expresión regular para permitir localhost, URL Vercel principal y previews/branches
+# Asumimos que settings.VERCEL_FRONTEND_URL contiene la URL BASE DE PRODUCCIÓN o similar
+# y que las previews siguen un patrón predecible. Ajusta si es necesario.
+vercel_pattern = ""
 if settings.VERCEL_FRONTEND_URL:
-    # Escapar puntos y permitir cualquier subdominio de despliegue tipo preview
-    escaped_vercel_url = re.escape(settings.VERCEL_FRONTEND_URL).replace(r"https://atenex-frontend", r"https://atenex-frontend(-[a-z0-9]+)?")
-    vercel_base_url_pattern = rf"({escaped_vercel_url})" # Patrón para URL Vercel (principal y previews)
-
-localhost_pattern = r"(http://localhost:300[0-9])" # Patrón para localhost:3000 y localhost:3001 (u otros puertos 300x)
-
-# Combinar patrones si la URL de Vercel está definida
-if vercel_base_url_pattern:
-    allowed_origin_regex = rf"^{localhost_pattern}|{vercel_base_url_pattern}$"
+    # Ejemplo: VERCEL_FRONTEND_URL="https://atenex-frontend.vercel.app"
+    # El regex permitirá "https://atenex-frontend.vercel.app" y "https://atenex-frontend-*.vercel.app"
+    # O si VERCEL_FRONTEND_URL="https://atenex-frontend-git-main-....vercel.app"
+    # Este regex intentará adaptarse:
+    base_vercel_url = settings.VERCEL_FRONTEND_URL
+    # Quita el posible hash/branch para generalizar (esto es una heurística, puede necesitar ajuste)
+    base_vercel_url = re.sub(r"(-git-[a-z0-9-]+)?(-[a-z0-9]+)?\.vercel\.app", ".vercel.app", base_vercel_url)
+    escaped_base = re.escape(base_vercel_url).replace(r"\.vercel\.app", "")
+    # Permitir la URL base exacta O con partes adicionales antes de .vercel.app
+    vercel_pattern = rf"({escaped_base}(-[a-z0-9-]+)*\.vercel\.app)"
+    log.info("Derived Vercel CORS pattern", pattern=vercel_pattern, original_url=settings.VERCEL_FRONTEND_URL)
 else:
-    # Si no hay Vercel URL, solo permitir localhost
-    allowed_origin_regex = rf"^{localhost_pattern}$"
+    log.warning("VERCEL_FRONTEND_URL not set in config, CORS for Vercel might not work correctly.")
 
-log.info("Configuring CORS middleware", allow_origin_regex=allowed_origin_regex)
+# Patrón para localhost en puertos 3000 a 3009 (común para desarrollo frontend)
+localhost_pattern = r"(http://localhost:300[0-9])"
+
+# Combinar patrones: localhost Y Vercel (si está definido)
+allowed_origin_patterns = [localhost_pattern]
+if vercel_pattern:
+    allowed_origin_patterns.append(vercel_pattern)
+
+# Crear la regex final (inicio de línea ^, patrón1 | patrón2, fin de línea $)
+final_regex = rf"^{ '|'.join(allowed_origin_patterns) }$"
+
+log.info("Configuring CORS middleware", allow_origin_regex=final_regex)
 app.add_middleware(
     CORSMiddleware,
-    # allow_origins=allowed_origins if allowed_origins else ["*"], # <-- REEMPLAZADO
-    allow_origin_regex=allowed_origin_regex, # <-- USAR REGEX
-    allow_credentials=True,
-    allow_methods=["*"], # GET, POST, OPTIONS, DELETE, PUT, etc.
+    # allow_origins=allowed_origins if allowed_origins else ["*"], # <-- REEMPLAZADO POR REGEX
+    allow_origin_regex=final_regex, # <-- USAR REGEX CONSTRUIDA
+    allow_credentials=True, # Necesario para enviar/recibir cookies o cabeceras Authorization
+    allow_methods=["*"], # Permite GET, POST, OPTIONS, DELETE, PUT, etc.
     allow_headers=["*"], # Permite 'Content-Type', 'Authorization', 'X-Request-ID', etc.
-    expose_headers=["X-Request-ID", "X-Process-Time"],
-    max_age=600,
+    expose_headers=["X-Request-ID", "X-Process-Time"], # Cabeceras expuestas al frontend
+    max_age=600, # Tiempo en segundos que el resultado preflight puede ser cacheado
 )
 # --- *** FIN DE LA CORRECCIÓN CORS *** ---
 
@@ -1044,14 +1058,22 @@ async def add_request_context_timing_logging(request: Request, call_next):
     request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
     request.state.request_id = request_id
 
+    # Bind inicial para el logger de la request
     request_log = log.bind(
         request_id=request_id,
         method=request.method,
         path=request.url.path,
-        client_ip=request.client.host if request.client else "unknown"
+        client_ip=request.client.host if request.client else "unknown",
+        origin=request.headers.get("origin", "N/A") # <-- Añadir origin para debugging CORS
     )
 
-    request_log.info("Request received")
+    # Si es una solicitud OPTIONS, loguearla de forma diferente
+    if request.method == "OPTIONS":
+        request_log.info("OPTIONS preflight request received")
+        # El middleware CORS debería manejar la respuesta
+        # Dejamos que continúe para que CORSMiddleware actúe
+    else:
+        request_log.info("Request received") # Log para otras solicitudes
 
     response = None
     status_code = 500
@@ -1066,23 +1088,41 @@ async def add_request_context_timing_logging(request: Request, call_next):
         request_log.exception("Unhandled exception during request processing",
                               error=str(e), status_code=status_code,
                               process_time_ms=round(process_time_ms, 2))
+        # Crear respuesta de error estándar
         response = JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"detail": "Internal Server Error"}
         )
+        # Importante: Añadir cabeceras CORS también a las respuestas de error generadas aquí
+        origin = request.headers.get("Origin")
+        if origin and re.match(final_regex, origin): # Si el origen es permitido por nuestra regex
+             response.headers["Access-Control-Allow-Origin"] = origin
+             response.headers["Access-Control-Allow-Credentials"] = "true"
+        else:
+             request_log.warning("Origin not allowed or missing for error response CORS headers", origin=origin)
+
         response.headers["X-Request-ID"] = request_id
-        response.headers["X-Process-Time"] = f"{process_time_ms:.2f}ms"
+        # No añadir X-Process-Time a la respuesta de error necesariamente
         return response
+
     finally:
+        # Código que se ejecuta después de que la solicitud se procesó (incluso si hubo excepción NO CAPTURADA POR EL TRY)
+        # Si la respuesta fue generada por el call_next() normal:
         if response:
             process_time_ms = (time.perf_counter() - start_time) * 1000
             response.headers["X-Request-ID"] = request_id
             response.headers["X-Process-Time"] = f"{process_time_ms:.2f}ms"
+
+            # Logging final (evitar loguear /health en INFO)
             log_level = "debug" if request.url.path == "/health" else "info"
             log_func = getattr(request_log, log_level)
-            log_func("Request completed",
-                     status_code=status_code,
-                     process_time_ms=round(process_time_ms, 2))
+
+            # Añadir status_code al contexto del logger antes del mensaje final
+            request_log = request_log.bind(status_code=status_code)
+
+            if request.method != "OPTIONS": # No loguear completado para OPTIONS si ya logueamos "received"
+                log_func("Request completed",
+                         process_time_ms=round(process_time_ms, 2))
 
     return response
 
@@ -1101,12 +1141,19 @@ async def read_root():
 
 @app.get("/health", tags=["Health"], summary="Basic health check endpoint")
 async def health_check():
+    # Comprobación básica, se podría extender para verificar DB, etc.
     health_status = {"status": "healthy", "service": settings.PROJECT_NAME}
-    # db_ok = await postgres_client.check_db_connection()
-    # if not db_ok:
-    #     health_status["status"] = "unhealthy"
-    #     health_status["checks"] = { "database": db_ok}
-    #     return JSONResponse(content=health_status, status_code=503)
+    db_ok = await postgres_client.check_db_connection()
+    if not db_ok:
+       log.warning("Health check warning: Database connection failed")
+       # No cambiar status a unhealthy por ahora, solo loguear
+       # health_status["status"] = "unhealthy"
+       # health_status["checks"] = { "database_connection": "failed" }
+       # return JSONResponse(content=health_status, status_code=503) # Podría causar problemas en K8s probes
+       health_status["checks"] = { "database_connection": "failed (warning)" }
+    else:
+       health_status["checks"] = { "database_connection": "ok" }
+
     return health_status
 
 
@@ -1116,8 +1163,8 @@ if __name__ == "__main__":
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
-        port=8080,
-        reload=True, # Considera desactivar 'reload' si usas Gunicorn con workers
+        port=int(os.getenv("PORT", 8080)), # Usar PORT de env var si existe, default 8080
+        reload=True, # Desactivar reload en producción o al usar Gunicorn con workers
         log_level=settings.LOG_LEVEL.lower(),
     )
 ```
@@ -1174,10 +1221,12 @@ http_client: Optional[httpx.AsyncClient] = None # Inyectado desde main
 HOP_BY_HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade",
-    "content-encoding",
+    # Añadimos estos también, suelen ser problemáticos
+    "content-encoding", "content-length"
 }
 
 def get_client() -> httpx.AsyncClient:
+    """Dependencia para obtener el cliente HTTP global."""
     if http_client is None or http_client.is_closed:
         dep_log.error("Gateway HTTP client dependency check failed: Client not available or closed.")
         raise HTTPException(
@@ -1188,57 +1237,76 @@ def get_client() -> httpx.AsyncClient:
     return http_client
 
 async def logged_strict_auth(user_payload: StrictAuth) -> Dict[str, Any]:
-     auth_dep_log.info("StrictAuth dependency successfully resolved in wrapper.",
-                     user_id=user_payload.get('sub'),
-                     company_id=user_payload.get('company_id'))
-     return user_payload
+    """Wrapper para StrictAuth que loguea éxito (útil para debug)."""
+    # auth_dep_log.info("StrictAuth dependency successfully resolved in wrapper.", # Muy verboso
+    #                  user_id=user_payload.get('sub'),
+    #                  company_id=user_payload.get('company_id'))
+    return user_payload
 
 LoggedStrictAuth = Annotated[Dict[str, Any], Depends(logged_strict_auth)]
 
-# --- Función Principal de Proxy (Sin cambios internos) ---
+# --- Función Principal de Proxy (Sin cambios internos significativos) ---
 async def _proxy_request(
     request: Request,
     target_service_base_url_str: str,
     client: httpx.AsyncClient,
-    user_payload: Optional[Dict[str, Any]],
-    backend_service_path: str
+    user_payload: Optional[Dict[str, Any]], # Payload JWT decodificado (si la ruta está protegida)
+    backend_service_path: str # Path al que llamar en el servicio backend
 ):
+    """Función interna para realizar la solicitud proxy al servicio backend."""
     method = request.method
     request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
+
+    # Crear un logger con contexto para esta solicitud proxy específica
     proxy_log = log.bind(
         request_id=request_id, method=method, original_path=request.url.path,
         target_service=target_service_base_url_str, target_path=backend_service_path
     )
-    proxy_log.info("Initiating proxy request")
+    proxy_log.info("Initiating proxy request") # Log inicio proxy
+
+    # Construir URL de destino
     try:
         target_base_url = httpx.URL(target_service_base_url_str)
+        # Usar copy_with para combinar base, path y query params originales
         target_url = target_base_url.copy_with(path=backend_service_path, query=request.url.query.encode("utf-8"))
     except Exception as e:
         proxy_log.error("Failed to construct target URL", error=str(e))
         raise HTTPException(status_code=500, detail="Internal gateway configuration error.")
 
+    # Preparar cabeceras para reenviar
     headers_to_forward = {}
+
+    # Añadir cabeceras X-Forwarded-*
     client_host = request.client.host if request.client else "unknown"
     x_forwarded_for = request.headers.get("x-forwarded-for", client_host)
     headers_to_forward["X-Forwarded-For"] = x_forwarded_for
     headers_to_forward["X-Forwarded-Proto"] = request.url.scheme
     if "host" in request.headers: headers_to_forward["X-Forwarded-Host"] = request.headers["host"]
-    headers_to_forward["X-Request-ID"] = request_id
+    headers_to_forward["X-Request-ID"] = request_id # Propagar request ID
 
+    # Copiar cabeceras originales, excluyendo hop-by-hop y host
     for name, value in request.headers.items():
         lower_name = name.lower()
+        # Excluimos los hop-by-hop definidos arriba y el 'host' original
         if lower_name not in HOP_BY_HOP_HEADERS and lower_name != "host":
             headers_to_forward[name] = value
-        elif lower_name == "content-type": headers_to_forward[name] = value
+        # Conservamos Content-Type explícitamente si está presente
+        elif lower_name == "content-type":
+             headers_to_forward[name] = value
 
+    # Añadir cabeceras de contexto si hay payload de usuario (ruta autenticada)
     log_context_headers = {}
     if user_payload:
         user_id = user_payload.get('sub')
         company_id = user_payload.get('company_id')
         user_email = user_payload.get('email')
-        if not user_id or not company_id: # StrictAuth lo asegura, pero doble check
-             proxy_log.critical("Payload missing required fields!", payload_keys=list(user_payload.keys()))
-             raise HTTPException(status_code=500, detail="Internal authentication context error.")
+
+        # StrictAuth ya valida esto, pero una doble verificación no hace daño
+        if not user_id or not company_id:
+             proxy_log.critical("Payload from auth dependency missing required fields!", payload_keys=list(user_payload.keys()))
+             raise HTTPException(status_code=500, detail="Internal authentication context error after auth check.")
+
+        # Inyectar las cabeceras X-*
         headers_to_forward['X-User-ID'] = str(user_id)
         headers_to_forward['X-Company-ID'] = str(company_id)
         log_context_headers['user_id'] = str(user_id)
@@ -1246,10 +1314,14 @@ async def _proxy_request(
         if user_email:
             headers_to_forward['X-User-Email'] = str(user_email)
             log_context_headers['user_email'] = str(user_email)
-        proxy_log = proxy_log.bind(**log_context_headers)
-        # proxy_log.debug("Added context headers based on user payload.") # Verboso
 
+        # Añadir contexto al logger para trazabilidad
+        proxy_log = proxy_log.bind(**log_context_headers)
+        # proxy_log.debug("Added context headers based on user payload.") # Podría ser verboso
+
+    # Leer cuerpo de la solicitud si es necesario (POST, PUT, PATCH)
     request_body_bytes: Optional[bytes] = None
+    # Evitar leer body para GET, DELETE, etc.
     if method.upper() in ["POST", "PUT", "PATCH"]:
         try:
             request_body_bytes = await request.body()
@@ -1258,94 +1330,66 @@ async def _proxy_request(
             proxy_log.error("Failed to read request body", error=str(e))
             raise HTTPException(status_code=400, detail="Could not read request body.")
 
-    # proxy_log.debug("Prepared request for backend", ...) # Verboso
-
-    backend_response: Optional[httpx.Response] = None
+    # Preparar la solicitud al backend usando el cliente httpx
+    backend_response: Optional[httpx.Response] = None # Inicializar por si falla antes del send
     try:
         proxy_log.info(f"Sending request to backend target: {method} {target_url.path}")
-        req = client.build_request(method=method, url=target_url, headers=headers_to_forward, content=request_body_bytes)
+        # Construir la request con los datos preparados
+        req = client.build_request(
+            method=method,
+            url=target_url,
+            headers=headers_to_forward,
+            content=request_body_bytes
+        )
+        # Enviar la solicitud (stream=True para manejar respuestas grandes/streaming)
         backend_response = await client.send(req, stream=True)
-        proxy_log.info(f"Received response from backend", status_code=backend_response.status_code)
+
+        # Loguear respuesta recibida del backend
+        proxy_log.info(f"Received response from backend", status_code=backend_response.status_code,
+                       content_type=backend_response.headers.get("content-type"))
+
+        # Preparar cabeceras de respuesta para enviar al cliente original
         response_headers = {}
         for name, value in backend_response.headers.items():
-            if name.lower() not in HOP_BY_HOP_HEADERS: response_headers[name] = value
+            # Filtrar cabeceras hop-by-hop de la respuesta del backend
+            if name.lower() not in HOP_BY_HOP_HEADERS:
+                response_headers[name] = value
+
+        # Añadir X-Request-ID a la respuesta final
         response_headers["X-Request-ID"] = request_id
+
+        # Devolver una StreamingResponse para reenviar el cuerpo eficientemente
         return StreamingResponse(
-            backend_response.aiter_raw(),
+            backend_response.aiter_raw(), # Iterador asíncrono del cuerpo
             status_code=backend_response.status_code,
             headers=response_headers,
-            media_type=backend_response.headers.get("content-type"),
-            background=backend_response.aclose
+            media_type=backend_response.headers.get("content-type"), # Preservar media type
+            background=backend_response.aclose # Asegurar que la conexión al backend se cierre
         )
+
+    # Manejo de errores específicos de HTTPX
     except httpx.TimeoutException as exc:
-        proxy_log.error(f"Proxy request timed out waiting for backend", target=str(target_url), error=str(exc))
+        proxy_log.error(f"Proxy request timed out waiting for backend", target=str(target_url), error=str(exc), exc_info=False) # No log stack trace for timeouts
         if backend_response: await backend_response.aclose()
         raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Upstream service timed out.")
     except httpx.ConnectError as exc:
-        proxy_log.error(f"Proxy connection error: Could not connect to backend", target=str(target_url), error=str(exc))
+        proxy_log.error(f"Proxy connection error: Could not connect to backend", target=str(target_url), error=str(exc), exc_info=False) # No log stack trace
         if backend_response: await backend_response.aclose()
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Could not connect to upstream service.")
-    except httpx.RequestError as exc:
-        proxy_log.error(f"Proxy request error communicating with backend", target=str(target_url), error=str(exc))
+    except httpx.RequestError as exc: # Otros errores de httpx (ej. SSL)
+        proxy_log.error(f"Proxy request error communicating with backend", target=str(target_url), error=str(exc), exc_info=True)
         if backend_response: await backend_response.aclose()
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Error communicating with upstream service: {exc}")
-    except Exception as exc:
+    except Exception as exc: # Errores inesperados
         proxy_log.exception(f"Unexpected error occurred during proxy request", target=str(target_url))
-        if backend_response: await backend_response.aclose()
+        if backend_response: await backend_response.aclose() # Intentar cerrar si existe
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An unexpected error occurred in the gateway.")
 
 
-# --- Rutas Proxy Específicas para Query Service ---
+# --- *** INICIO SECCIÓN CORS OPTIONS HANDLERS *** ---
+# Es crucial definir handlers OPTIONS *antes* de las rutas `api_route` correspondientes
+# para que FastAPI los encuentre primero y no intente aplicar autenticación a las preflight.
 
-# GET /chats
-@router.get(
-    "/api/v1/query/chats",
-    dependencies=[Depends(LoggedStrictAuth)],
-    tags=["Proxy - Query Service"],
-    summary="List user's chats (Proxied)"
-)
-async def proxy_get_chats(request: Request, client: Annotated[httpx.AsyncClient, Depends(get_client)], user_payload: LoggedStrictAuth):
-    return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, "/api/v1/chats")
-
-# *** CORRECCIÓN DE RUTA: Cambiar /query a /query/ask ***
-# POST /ask (antes /query)
-@router.post(
-    "/api/v1/query/ask", # <-- RUTA CORREGIDA
-    dependencies=[Depends(LoggedStrictAuth)],
-    tags=["Proxy - Query Service"],
-    summary="Submit a query or message (Proxied)"
-)
-async def proxy_post_query(request: Request, client: Annotated[httpx.AsyncClient, Depends(get_client)], user_payload: LoggedStrictAuth):
-    # *** CORRECCIÓN: El path en el backend sigue siendo /query ***
-    # El gateway expone /ask pero llama internamente a /query del query-service
-    backend_path = "/api/v1/query"
-    # Si el backend query-service TAMBIÉN espera /ask, cambia backend_path a "/api/v1/ask"
-    return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
-
-# GET /chats/{chat_id}/messages
-@router.get(
-    "/api/v1/query/chats/{chat_id}/messages",
-    dependencies=[Depends(LoggedStrictAuth)],
-    tags=["Proxy - Query Service"],
-    summary="Get messages for a specific chat (Proxied)"
-)
-async def proxy_get_chat_messages(request: Request, client: Annotated[httpx.AsyncClient, Depends(get_client)], user_payload: LoggedStrictAuth, chat_id: uuid.UUID = Path(...)):
-    return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, f"/api/v1/chats/{chat_id}/messages")
-
-# DELETE /chats/{chat_id}
-@router.delete(
-    "/api/v1/query/chats/{chat_id}",
-    dependencies=[Depends(LoggedStrictAuth)],
-    tags=["Proxy - Query Service"],
-    summary="Delete a specific chat (Proxied)"
-)
-async def proxy_delete_chat(request: Request, client: Annotated[httpx.AsyncClient, Depends(get_client)], user_payload: LoggedStrictAuth, chat_id: uuid.UUID = Path(...)):
-    return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, f"/api/v1/chats/{chat_id}")
-
-
-# --- Rutas Proxy Genéricas para Ingest Service ---
-
-# *** CORRECCIÓN CORS: Handler OPTIONS explícito SIN autenticación ***
 @router.options(
     "/api/v1/ingest/{endpoint_path:path}",
     tags=["CORS", "Proxy - Ingest Service"],
@@ -1353,13 +1397,130 @@ async def proxy_delete_chat(request: Request, client: Annotated[httpx.AsyncClien
     include_in_schema=False # No mostrar en docs OpenAPI
 )
 async def options_proxy_ingest_service_generic(endpoint_path: str = Path(...)):
-    """Responde OK a las solicitudes OPTIONS para CORS preflight."""
+    """Responde OK a las solicitudes OPTIONS para CORS preflight en ingest."""
     return Response(status_code=200)
 
-# Handler principal para otros métodos (GET, POST, etc.) CON autenticación
+@router.options(
+    "/api/v1/query/ask", # Ruta actualizada
+    tags=["CORS", "Proxy - Query Service"],
+    include_in_schema=False)
+async def options_query_ask():
+    """Handler OPTIONS para la ruta de query/ask."""
+    return Response(status_code=200)
+
+@router.options(
+    "/api/v1/query/chats",
+    tags=["CORS", "Proxy - Query Service"],
+    include_in_schema=False)
+async def options_query_chats():
+    """Handler OPTIONS para la ruta de listar chats."""
+    return Response(status_code=200)
+
+@router.options(
+    "/api/v1/query/chats/{chat_id}/messages",
+    tags=["CORS", "Proxy - Query Service"],
+    include_in_schema=False)
+async def options_chat_messages(chat_id: uuid.UUID = Path(...)):
+    """Handler OPTIONS para obtener mensajes de un chat."""
+    return Response(status_code=200)
+
+@router.options(
+    "/api/v1/query/chats/{chat_id}",
+    tags=["CORS", "Proxy - Query Service"],
+    include_in_schema=False)
+async def options_delete_chat(chat_id: uuid.UUID = Path(...)):
+    """Handler OPTIONS para eliminar un chat."""
+    return Response(status_code=200)
+
+# Handler OPTIONS para el proxy opcional de Auth Service (si está activo)
+if settings.AUTH_SERVICE_URL:
+    @router.options(
+        "/api/v1/auth/{endpoint_path:path}",
+        tags=["CORS", "Proxy - Auth Service (Optional)"],
+        include_in_schema=False
+    )
+    async def options_proxy_auth_service_generic(endpoint_path: str = Path(...)):
+        """Handler OPTIONS para el proxy del servicio de autenticación."""
+        return Response(status_code=200)
+
+# --- *** FIN SECCIÓN CORS OPTIONS HANDLERS *** ---
+
+
+# --- Rutas Proxy Específicas para Query Service ---
+# Ahora usamos los métodos específicos (GET, POST, DELETE) y excluimos OPTIONS
+
+@router.get(
+    "/api/v1/query/chats",
+    dependencies=[Depends(LoggedStrictAuth)], # Requiere autenticación estricta
+    tags=["Proxy - Query Service"],
+    summary="List user's chats (Proxied)"
+)
+async def proxy_get_chats(
+    request: Request,
+    client: Annotated[httpx.AsyncClient, Depends(get_client)],
+    user_payload: LoggedStrictAuth # Obtener payload validado
+):
+    """Reenvía GET /api/v1/query/chats al Query Service."""
+    # Path en el backend Query Service
+    backend_path = "/api/v1/chats"
+    return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
+
+@router.post(
+    "/api/v1/query/ask", # Usar la ruta corregida/deseada
+    dependencies=[Depends(LoggedStrictAuth)],
+    tags=["Proxy - Query Service"],
+    summary="Submit a query or message to a chat (Proxied)"
+)
+async def proxy_post_query(
+    request: Request,
+    client: Annotated[httpx.AsyncClient, Depends(get_client)],
+    user_payload: LoggedStrictAuth
+):
+    """Reenvía POST /api/v1/query/ask al Query Service (posiblemente a /api/v1/query)."""
+    # Path en el backend Query Service (asume que es /api/v1/query, ajusta si no)
+    backend_path = "/api/v1/query"
+    return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
+
+@router.get(
+    "/api/v1/query/chats/{chat_id}/messages",
+    dependencies=[Depends(LoggedStrictAuth)],
+    tags=["Proxy - Query Service"],
+    summary="Get messages for a specific chat (Proxied)"
+)
+async def proxy_get_chat_messages(
+    request: Request,
+    client: Annotated[httpx.AsyncClient, Depends(get_client)],
+    user_payload: LoggedStrictAuth,
+    chat_id: uuid.UUID = Path(...) # Obtener chat_id de la URL
+):
+    """Reenvía GET /api/v1/query/chats/{chat_id}/messages al Query Service."""
+    backend_path = f"/api/v1/chats/{chat_id}/messages"
+    return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
+
+@router.delete(
+    "/api/v1/query/chats/{chat_id}",
+    dependencies=[Depends(LoggedStrictAuth)],
+    tags=["Proxy - Query Service"],
+    summary="Delete a specific chat (Proxied)"
+)
+async def proxy_delete_chat(
+    request: Request,
+    client: Annotated[httpx.AsyncClient, Depends(get_client)],
+    user_payload: LoggedStrictAuth,
+    chat_id: uuid.UUID = Path(...)
+):
+    """Reenvía DELETE /api/v1/query/chats/{chat_id} al Query Service."""
+    backend_path = f"/api/v1/chats/{chat_id}"
+    return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
+
+
+# --- Rutas Proxy Genéricas para Ingest Service ---
+# Usa api_route para manejar múltiples métodos (GET, POST, etc.) pero EXCLUYENDO OPTIONS
+
 @router.api_route(
     "/api/v1/ingest/{endpoint_path:path}",
-    methods=["GET", "POST", "PUT", "DELETE", "PATCH"], # Excluir OPTIONS aquí
+    # *** CORRECCIÓN: Excluir OPTIONS de los métodos manejados aquí ***
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
     dependencies=[Depends(LoggedStrictAuth)], # Aplicar autenticación estricta
     tags=["Proxy - Ingest Service"],
     summary="Generic proxy for Ingest Service endpoints (Authenticated)"
@@ -1368,56 +1529,36 @@ async def proxy_ingest_service_generic(
     request: Request,
     client: Annotated[httpx.AsyncClient, Depends(get_client)],
     user_payload: LoggedStrictAuth,
-    endpoint_path: str = Path(...)
+    endpoint_path: str = Path(...) # Captura el resto del path
 ):
-    # Determinar el path real para el backend Ingest Service
-    # Asume que el Ingest Service NO espera /api/v1/ingest en su path
+    """
+    Reenvía solicitudes autenticadas a `/api/v1/ingest/*` al Ingest Service.
+    El path enviado al backend es `/{endpoint_path}`.
+    """
+    # Path en el backend Ingest Service (sin /api/v1/ingest)
     backend_path = f"/{endpoint_path}"
-    # Ejemplo: si llega /api/v1/ingest/status, backend_path será /status
+    # Agregar query params si existen
+    if request.url.query:
+         backend_path += f"?{request.url.query}"
+
     return await _proxy_request(
         request=request,
         target_service_base_url_str=str(settings.INGEST_SERVICE_URL),
         client=client,
-        user_payload=user_payload,
-        backend_service_path=backend_path
+        user_payload=user_payload, # Pasa el payload para inyectar cabeceras X-*
+        backend_service_path=backend_path.split("?")[0] # Path sin query params para httpx
     )
 
 
-# --- Handlers OPTIONS Explícitos Adicionales para CORS ---
-# Añadir handlers para las rutas específicas que causaban problemas de CORS
-
-@router.options("/api/v1/query/ask", tags=["CORS"], include_in_schema=False)
-async def options_query_ask():
-    """Handler OPTIONS para la ruta de query/ask."""
-    return Response(status_code=200)
-
-# Los handlers OPTIONS para las rutas de chat ya estaban definidos y eran correctos:
-@router.options("/api/v1/query/chats", tags=["CORS"], include_in_schema=False)
-async def options_query_chats_existing(): return Response(status_code=200)
-
-@router.options("/api/v1/query/chats/{chat_id}/messages", tags=["CORS"], include_in_schema=False)
-async def options_chat_messages_existing(chat_id: uuid.UUID = Path(...)): return Response(status_code=200)
-
-@router.options("/api/v1/query/chats/{chat_id}", tags=["CORS"], include_in_schema=False)
-async def options_delete_chat_existing(chat_id: uuid.UUID = Path(...)): return Response(status_code=200)
-
-
-# --- Proxy Opcional para Auth Service (Sin cambios) ---
-# (El código para esto ya estaba bien, se incluye por completitud si AUTH_SERVICE_URL está seteado)
+# --- Proxy Opcional para Auth Service (Excluir OPTIONS) ---
 if settings.AUTH_SERVICE_URL:
     log.info(f"Auth service proxy enabled, forwarding to {settings.AUTH_SERVICE_URL}")
-    @router.options( # Handler OPTIONS para Auth Service Proxy
-        "/api/v1/auth/{endpoint_path:path}",
-        tags=["CORS", "Proxy - Auth Service (Optional)"],
-        include_in_schema=False
-    )
-    async def options_proxy_auth_service_generic(endpoint_path: str = Path(...)):
-        return Response(status_code=200)
-
+    # OPTIONS handler ya definido arriba
     @router.api_route(
         "/api/v1/auth/{endpoint_path:path}",
-        methods=["GET", "POST", "PUT", "DELETE", "PATCH"], # Excluir OPTIONS
-        # SIN Auth Dependency
+        # *** CORRECCIÓN: Excluir OPTIONS ***
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+        # SIN Auth Dependency (asume que el Auth Service maneja su propia auth)
         tags=["Proxy - Auth Service (Optional)"],
         summary="Generic proxy for Auth Service endpoints (No Gateway Auth)"
     )
@@ -1426,13 +1567,19 @@ if settings.AUTH_SERVICE_URL:
         client: Annotated[httpx.AsyncClient, Depends(get_client)],
         endpoint_path: str = Path(...)
     ):
+        """Reenvía solicitudes a `/api/v1/auth/*` al Auth Service externo (si está configurado)."""
+        # Path en el backend Auth Service
         backend_path = f"/{endpoint_path}"
+        if request.url.query:
+             backend_path += f"?{request.url.query}"
+
+        # user_payload=None porque no validamos token aquí
         return await _proxy_request(
             request=request,
             target_service_base_url_str=str(settings.AUTH_SERVICE_URL),
             client=client,
             user_payload=None,
-            backend_service_path=backend_path
+            backend_service_path=backend_path.split("?")[0]
         )
 else:
      log.info("Auth service proxy is disabled (GATEWAY_AUTH_SERVICE_URL not set).")
@@ -1681,36 +1828,38 @@ readme = "README.md"
 python = "^3.10"
 
 # Core FastAPI y servidor ASGI
-fastapi = "^0.110.0"
-uvicorn = {extras = ["standard"], version = "^0.28.0"}
-gunicorn = "^21.2.0"
+fastapi = "^0.110.0" # Verifica la versión exacta que necesitas o usa rangos
+uvicorn = {extras = ["standard"], version = "^0.28.0"} # Servidor ASGI
+gunicorn = "^21.2.0" # Servidor WSGI/Worker manager (para producción)
 
 # Configuración y validación
-pydantic = {extras = ["email"], version = "^2.6.4"}
-pydantic-settings = "^2.2.1"
+pydantic = {extras = ["email"], version = "^2.6.4"} # Validación de datos + email
+pydantic-settings = "^2.2.1" # Cargar config desde env vars/files
 
 # Cliente HTTP asíncrono
-httpx = "^0.27.0"
+httpx = "^0.27.0" # Para hacer llamadas proxy a otros servicios
 
 # Manejo de JWT
-python-jose = {extras = ["cryptography"], version = "^3.3.0"}
+python-jose = {extras = ["cryptography"], version = "^3.3.0"} # Crear/validar JWTs
 
 # Logging estructurado
-structlog = "^24.1.0"
+structlog = "^24.1.0" # Logging avanzado JSON
 
 # Cliente PostgreSQL Asíncrono
-asyncpg = "^0.29.0" # <-- AÑADIDO: Cliente PostgreSQL
+asyncpg = "^0.29.0" # <-- ASEGURADO QUE ESTÁ AQUÍ
 
 # Hashing de Contraseñas
-passlib = {extras = ["bcrypt"], version = "^1.7.4"} # <-- AÑADIDO: Para verificar hashes de contraseña
+passlib = {extras = ["bcrypt"], version = "^1.7.4"} # <-- ASEGURADO QUE ESTÁ AQUÍ
 
-# Utilidades (opcional)
-# tenacity = "^8.2.3"
+# Utilidades (opcional, descomenta si las usas)
+# tenacity = "^8.2.3" # Para reintentos
+# email-validator = "^2.1.0" # Si pydantic necesita validación extra
 
 [tool.poetry.group.dev.dependencies]
-pytest = "^7.4.4"
-pytest-asyncio = "^0.21.1"
-pytest-httpx = "^0.29.0"
+pytest = "^7.4.4" # Framework de testing
+pytest-asyncio = "^0.21.1" # Soporte async en pytest
+pytest-httpx = "^0.29.0" # Mockear cliente httpx en tests
+# Descomenta y usa linters/formatters si los necesitas
 # black = "^24.3.0"
 # ruff = "^0.3.4"
 # mypy = "^1.9.0"
