@@ -185,7 +185,7 @@ async def proxy_get_chats(
     client: Annotated[httpx.AsyncClient, Depends(get_client)],
     user_payload: LoggedStrictAuth,
 ):
-    """Reenvía GET /query/chats al Query Service."""
+    log.info("proxy_get_chats called", headers=dict(request.headers), user_payload=user_payload)
     backend_path = "/chats"
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
@@ -201,7 +201,11 @@ async def proxy_post_query(
     client: Annotated[httpx.AsyncClient, Depends(get_client)],
     user_payload: LoggedStrictAuth,
 ):
-    """Reenvía POST /query/ask al endpoint /ask del Query Service."""
+    try:
+        body = await request.body()
+        log.info("proxy_post_query called", headers=dict(request.headers), user_payload=user_payload, body=body.decode(errors='replace'))
+    except Exception as e:
+        log.error("Error reading request body in proxy_post_query", error=str(e))
     backend_path = "/ask"
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
