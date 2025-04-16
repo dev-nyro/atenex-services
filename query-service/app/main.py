@@ -1,6 +1,6 @@
 # query-service/app/main.py
 from fastapi import FastAPI, HTTPException, status as fastapi_status, Request # <-- Importar Request
-from fastapi.exceptions import RequestValidationError # <-- Importar RequestValidationError
+from fastapi.exceptions import RequestValidationError, ResponseValidationError # <-- Importar ResponseValidationError
 from fastapi.responses import JSONResponse, Response, PlainTextResponse # <-- Importar PlainTextResponse
 import structlog
 import uvicorn
@@ -16,7 +16,6 @@ setup_logging()
 log = structlog.get_logger("query_service.main")
 
 # Importar routers y otros módulos
-# Asumiendo que los endpoints están directamente en estos módulos (ajustar si endpoints/ está separado)
 from app.api.v1.endpoints import query as query_router_module
 from app.api.v1.endpoints import chat as chat_router_module
 from app.db import postgres_client
@@ -31,42 +30,61 @@ GLOBAL_RAG_PIPELINE = None # Se construye en startup
 # Crear instancia de FastAPI
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    openapi_url=f"{settings.API_V1_STR}/openapi.json",
-    version="0.2.1", # Incrementar versión por cambios
-    description="Microservice to handle user queries using a Haystack RAG pipeline with Milvus and Gemini, including chat history management. Explicit HTTP endpoint communication.",
+    # No establecer openapi_url aquí si el Gateway lo expone
+    # openapi_url=f"{settings.API_V1_STR}/openapi.json",
+    version="0.2.2", # Incrementar versión por correcciones
+    description="Microservice to handle user queries using a Haystack RAG pipeline with Milvus and Gemini, including chat history management. Routes are relative (e.g., /ask, /chats).",
 )
 
-# --- Event Handlers (Sin cambios en lógica) ---
+# --- Event Handlers (Sin cambios en lógica interna) ---
 @app.on_event("startup")
 async def startup_event():
     global SERVICE_READY, GLOBAL_RAG_PIPELINE
     log.info(f"Starting up {settings.PROJECT_NAME}...")
-    # (Misma lógica de inicialización de DB y pipeline)
     db_pool_initialized = False
     pipeline_built = False
     milvus_startup_ok = False
+    # Intenta inicializar la BD
     try:
         await postgres_client.get_db_pool()
         db_ready = await postgres_client.check_db_connection()
-        if db_ready: log.info("PostgreSQL connection pool initialized and verified."); db_pool_initialized = True
-        else: log.critical("CRITICAL: Failed PostgreSQL connection verification."); SERVICE_READY = False; return
-    except Exception as e: log.critical("CRITICAL: Failed PostgreSQL pool initialization.", error=str(e)); SERVICE_READY = False; return
+        if db_ready:
+            log.info("PostgreSQL connection pool initialized and verified.")
+            db_pool_initialized = True
+        else:
+            log.critical("CRITICAL: Failed PostgreSQL connection verification during startup.")
+            # No marcar como listo, pero no salir inmediatamente, podría recuperarse
+            db_pool_initialized = False
+    except Exception as e:
+        log.critical("CRITICAL: Failed PostgreSQL pool initialization during startup.", error=str(e), exc_info=True)
+        db_pool_initialized = False
+        # Podríamos decidir salir si la DB es crítica: sys.exit(1)
 
+    # Intenta construir el pipeline RAG
     try:
         GLOBAL_RAG_PIPELINE = build_rag_pipeline()
         dep_status = await check_pipeline_dependencies()
-        if dep_status.get("milvus_connection", "") == "ok":
-            log.info("Haystack RAG pipeline built and Milvus connection verified."); pipeline_built = True; milvus_startup_ok = True
+        milvus_status = dep_status.get("milvus_connection", "error: check failed")
+        if "ok" in milvus_status: # Aceptar 'ok' u 'ok (collection not found yet)'
+            log.info("Haystack RAG pipeline built and Milvus connection status is OK.", status=milvus_status)
+            pipeline_built = True
+            milvus_startup_ok = True
         else:
-             log.warning("RAG pipeline built, but Milvus check failed/pending.", status=dep_status.get("milvus_connection")); pipeline_built = True; milvus_startup_ok = False # Pipeline OK, Milvus warn
-    except Exception as e: log.error("Failed building Haystack RAG pipeline.", error=str(e)); pipeline_built = False
+             log.warning("Haystack RAG pipeline built, but initial Milvus check failed or pending.", status=milvus_status)
+             pipeline_built = True # El pipeline se construyó, pero Milvus podría tener problemas
+             milvus_startup_ok = False
+    except Exception as e:
+        log.error("Failed building Haystack RAG pipeline during startup.", error=str(e), exc_info=True)
+        pipeline_built = False
 
-    if db_pool_initialized and pipeline_built:
+    # Marcar como listo solo si las dependencias críticas (DB, Pipeline) están OK
+    # Considerar si Milvus es estrictamente necesario para estar 'ready'
+    if db_pool_initialized and pipeline_built: # Milvus puede recuperarse, pero DB y pipeline son esenciales
         SERVICE_READY = True
-        log.info(f"{settings.PROJECT_NAME} READY. Initial Milvus Check: {'OK' if milvus_startup_ok else 'Failed/Warn'}")
+        log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY. Initial Milvus Check: {'OK' if milvus_startup_ok else 'WARN/FAIL'}")
     else:
         SERVICE_READY = False
-        log.critical(f"{settings.PROJECT_NAME} startup FAILED. DB OK: {db_pool_initialized}, Pipeline OK: {pipeline_built}. Service NOT READY.")
+        log.critical(f"{settings.PROJECT_NAME} startup FAILED critical components. DB OK: {db_pool_initialized}, Pipeline Built: {pipeline_built}. Service NOT READY.")
 
 
 @app.on_event("shutdown")
@@ -75,62 +93,86 @@ async def shutdown_event():
     await postgres_client.close_db_pool()
     log.info("Shutdown complete.")
 
-# --- Exception Handlers (Verificar RequestValidationError) ---
+# --- Exception Handlers ---
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
+    # Log detallado incluyendo request ID si está disponible
+    request_id = request.headers.get("x-request-id", "N/A")
     log_level = log.warning if exc.status_code < 500 else log.error
-    log_level("HTTP Exception caught", status_code=exc.status_code, detail=exc.detail, path=str(request.url))
+    log_level("HTTP Exception caught by handler",
+              status_code=exc.status_code,
+              detail=exc.detail,
+              path=str(request.url),
+              method=request.method,
+              client=request.client.host if request.client else "unknown",
+              request_id=request_id)
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    # Extraer los detalles de validación del error
+    request_id = request.headers.get("x-request-id", "N/A")
     error_details = []
     try:
-         # exc.errors() devuelve una lista de diccionarios con 'loc', 'msg', 'type'
-         for error in exc.errors():
-             error_details.append({
-                 "loc": error.get("loc", []),
-                 "msg": error.get("msg", "Unknown validation error"),
-                 "type": error.get("type", "validation_error")
-             })
-    except Exception as e:
-        log.error("Error formatting validation exception details", internal_error=str(e))
-        error_details = [{"loc": [], "msg": "Failed to parse validation errors.", "type": "internal_parsing_error"}]
+         error_details = exc.errors() # Pydantic v2 / FastAPI >= 0.100
+    except Exception:
+         error_details = [{"loc": [], "msg": "Failed to parse validation errors.", "type": "internal_parsing_error"}]
 
-    # Loguear con el detalle formateado
     log.warning("Request Validation Error",
                 path=str(request.url),
+                method=request.method,
                 client=request.client.host if request.client else "unknown",
-                errors=error_details) # Loguear el detalle formateado
+                errors=error_details, # Loguear el detalle formateado
+                request_id=request_id)
 
-    # Devolver respuesta 422 con el formato esperado por el frontend (list[detail])
     return JSONResponse(
         status_code=fastapi_status.HTTP_422_UNPROCESSABLE_ENTITY,
-        # FastAPI/Pydantic por defecto envuelve 'detail' así. Frontend parece esperar esto.
-        content={"detail": error_details},
+        content={"detail": error_details}, # FastAPI espera 'detail' como clave
     )
+
+# *** AÑADIDO: Handler específico para ResponseValidationError ***
+@app.exception_handler(ResponseValidationError)
+async def response_validation_exception_handler(request: Request, exc: ResponseValidationError):
+    request_id = request.headers.get("x-request-id", "N/A")
+    # Loguear el error de validación de RESPUESTA - esto es un error del SERVIDOR
+    log.error("Response Validation Error - Server failed to construct valid response",
+              path=str(request.url),
+              method=request.method,
+              errors=exc.errors(), # Loguear los detalles del error de validación
+              request_id=request_id,
+              exc_info=True) # Incluir traceback
+
+    # Devolver un error 500 genérico al cliente, porque es un problema del backend
+    return JSONResponse(
+        status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "Internal Server Error: Failed to serialize response."},
+    )
+
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    log.exception("Unhandled Exception caught", path=str(request.url))
+    request_id = request.headers.get("x-request-id", "N/A")
+    log.exception("Unhandled Exception caught by generic handler",
+                  path=str(request.url),
+                  method=request.method,
+                  client=request.client.host if request.client else "unknown",
+                  request_id=request_id)
     return JSONResponse(
         status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"detail": "Internal Server Error"},
     )
 
 
-# --- Routers (Usando las instancias de los módulos) ---
-# Asegurar prefijo común para todos los endpoints bajo /api/v1/query
-app.include_router(query_router_module.router, prefix=settings.API_V1_STR, tags=["Query Interaction"])
-app.include_router(chat_router_module.router, prefix=settings.API_V1_STR, tags=["Chat Management"])
-log.info("Routers included", prefix=settings.API_V1_STR)
+# --- Routers ---
+# *** CORRECCIÓN: Eliminar el prefijo API_V1_STR ***
+# El API Gateway maneja el prefijo /api/v1/query
+app.include_router(query_router_module.router, tags=["Query Interaction"]) # Ruta expuesta: /ask
+app.include_router(chat_router_module.router, tags=["Chat Management"])   # Rutas expuestas: /chats, /chats/{id}/messages, etc.
+log.info("Routers included without prefix.")
 
 # --- Root Endpoint / Health Check ---
 @app.get("/", tags=["Health Check"], summary="Service Liveness/Readiness Check")
 async def read_root(request: Request): # Añadir Request para poder loguear X-Request-ID
-    # Health check ahora también verifica DB explícitamente
     global SERVICE_READY
     request_id = request.headers.get("x-request-id", "N/A")
     health_log = log.bind(request_id=request_id)
@@ -138,20 +180,25 @@ async def read_root(request: Request): # Añadir Request para poder loguear X-Re
 
     if not SERVICE_READY:
          health_log.warning("Health check failed: Service not ready (SERVICE_READY is False).")
+         # Devolver 503 Service Unavailable
          return PlainTextResponse("Service Not Ready", status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE)
 
-    # Verificar DB conexión adicionalmente en cada health check si es rápido
+    # Si el servicio se marcó como listo, verificar conexión DB como chequeo adicional
     db_ok = await postgres_client.check_db_connection()
     if db_ok:
         health_log.info("Health check successful (Service Ready, DB connection OK).")
         return PlainTextResponse("OK", status_code=fastapi_status.HTTP_200_OK)
     else:
         health_log.error("Health check failed: Service is READY but DB check FAILED.")
-        # Marcar como no saludable si la DB falla, aunque el servicio haya iniciado
+        # Marcar como no saludable si la DB falla ahora, aunque el servicio haya iniciado
         return PlainTextResponse("Service Ready but DB check failed", status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE)
 
 
-# --- Main execution (for local development) ---
+# --- Main execution (for local development, sin cambios) ---
 if __name__ == "__main__":
+    # Nota: el puerto 8001 podría colisionar con ingest-service si corren localmente.
+    # Cambiar a 8002 como indica el README del gateway para desarrollo local.
+    port = 8002 # Usar puerto 8002 para query-service localmente
     log_level_str = settings.LOG_LEVEL.lower()
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8001, reload=True, log_level=log_level_str)
+    print(f"----- Starting Query Service locally on port {port} -----")
+    uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True, log_level=log_level_str)

@@ -21,11 +21,12 @@ async def get_db_pool() -> asyncpg.Pool:
                  host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT,
                  user=settings.POSTGRES_USER, db=settings.POSTGRES_DB)
         try:
+            # Codecs para manejar JSON/JSONB automáticamente
             def _json_encoder(value): return json.dumps(value)
             def _json_decoder(value): return json.loads(value)
             async def init_connection(conn):
-                await conn.set_type_codec('jsonb', encoder=_json_encoder, decoder=_json_decoder, schema='pg_catalog')
-                await conn.set_type_codec('json', encoder=_json_encoder, decoder=_json_decoder, schema='pg_catalog')
+                await conn.set_type_codec('jsonb', encoder=_json_encoder, decoder=_json_decoder, schema='pg_catalog', format='text') # Añadir format='text' puede ayudar
+                await conn.set_type_codec('json', encoder=_json_encoder, decoder=_json_decoder, schema='pg_catalog', format='text')  # Añadir format='text' puede ayudar
 
             _pool = await asyncpg.create_pool(
                 user=settings.POSTGRES_USER,
@@ -34,7 +35,8 @@ async def get_db_pool() -> asyncpg.Pool:
                 host=settings.POSTGRES_SERVER,
                 port=settings.POSTGRES_PORT,
                 min_size=2, max_size=10, timeout=30.0, command_timeout=60.0,
-                init=init_connection, statement_cache_size=0
+                init=init_connection, # Asegurar que init se aplica
+                statement_cache_size=0 # Deshabilitar cache para evitar problemas con codecs
             )
             log.info("PostgreSQL connection pool created successfully.")
         except (asyncpg.exceptions.InvalidPasswordError, OSError, ConnectionRefusedError) as conn_err:
@@ -94,7 +96,7 @@ async def log_query_interaction(
             result = await connection.fetchval(
                 query_sql,
                 log_id, user_id, company_id, query, answer,
-                json.dumps(log_metadata),
+                json.dumps(log_metadata), # Usar json.dumps aquí está bien
                 chat_id
             )
         if not result or result != log_id:
@@ -104,10 +106,12 @@ async def log_query_interaction(
         return log_id
     except Exception as e:
         log_entry.error("Failed to log query interaction", error=str(e), exc_info=True)
+        # No relanzar como RuntimeError aquí necesariamente, podría ser manejado en el caller
+        # Lanzamos de nuevo para que el endpoint sepa que falló
         raise RuntimeError(f"Failed to log query interaction: {e}") from e
 
 
-# --- Funciones para gestión de chats (Renombradas y columna sources corregida) ---
+# --- Funciones para gestión de chats ---
 
 async def create_chat(user_id: uuid.UUID, company_id: uuid.UUID, title: Optional[str] = None) -> uuid.UUID:
     """Crea un nuevo chat."""
@@ -126,7 +130,6 @@ async def create_chat(user_id: uuid.UUID, company_id: uuid.UUID, title: Optional
         else: raise RuntimeError("Failed to create chat, no ID returned")
     except Exception as e: log.error("Failed to create chat", error=str(e), exc_info=True); raise
 
-# *** FUNCIÓN RENOMBRADA ***
 async def get_user_chats(user_id: uuid.UUID, company_id: uuid.UUID, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
     """Obtiene la lista de chats para un usuario/compañía (sumario)."""
     pool = await get_db_pool()
@@ -137,6 +140,7 @@ async def get_user_chats(user_id: uuid.UUID, company_id: uuid.UUID, limit: int =
     """
     try:
         async with pool.acquire() as conn: rows = await conn.fetch(query, user_id, company_id, limit, offset)
+        # Convertir asyncpg.Record a dict
         chats = [dict(row) for row in rows]
         log.info(f"Retrieved {len(chats)} chat summaries for user", user_id=str(user_id), company_id=str(company_id))
         return chats
@@ -151,14 +155,14 @@ async def check_chat_ownership(chat_id: uuid.UUID, user_id: uuid.UUID, company_i
         return exists is True
     except Exception as e: log.error("Failed to check chat ownership", chat_id=str(chat_id), error=str(e), exc_info=True); return False # Asumir no propietario en caso de error
 
-# *** FUNCIÓN RENOMBRADA y columna SOURCES CORREGIDA ***
+# *** FUNCIÓN CORREGIDA: get_chat_messages ***
 async def get_chat_messages(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-    """Obtiene mensajes de un chat, verificando propiedad."""
+    """Obtiene mensajes de un chat, verificando propiedad y decodificando sources."""
     pool = await get_db_pool()
     owner = await check_chat_ownership(chat_id, user_id, company_id)
     if not owner:
         log.warning("Attempt to get messages for chat not owned or non-existent", chat_id=str(chat_id), user_id=str(user_id), company_id=str(company_id))
-        return []
+        return [] # Devolver lista vacía si no es propietario o no existe
 
     # Usar columna 'sources'
     messages_query = """
@@ -166,13 +170,39 @@ async def get_chat_messages(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: 
     WHERE chat_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3;
     """
     try:
-        async with pool.acquire() as conn: message_rows = await conn.fetch(messages_query, chat_id, limit, offset)
-        messages = [dict(row) for row in message_rows]
+        async with pool.acquire() as conn:
+            message_rows = await conn.fetch(messages_query, chat_id, limit, offset)
+
+        messages = []
+        for row in message_rows:
+            msg_dict = dict(row)
+            # *** CORRECCIÓN: Asegurar que 'sources' sea una lista Python ***
+            # asyncpg con el codec debería devolver una lista/dict directamente si es JSONB válido.
+            # Si devuelve una string (ej. '[]' o '{}'), intentamos cargarla.
+            if isinstance(msg_dict.get('sources'), str):
+                try:
+                    msg_dict['sources'] = json.loads(msg_dict['sources'])
+                except json.JSONDecodeError:
+                    log.warning("Failed to decode 'sources' field from string", chat_id=str(chat_id), message_id=str(msg_dict.get('id')), raw_sources=msg_dict['sources'])
+                    msg_dict['sources'] = None # O devolver lista vacía? None es más seguro
+            # Si es None o ya es una lista/dict (codec funcionó), no hacer nada
+            elif msg_dict.get('sources') is None:
+                 msg_dict['sources'] = None # Asegurar que sea None explícito si es NULL en DB
+
+            # Asegurarse que 'sources' sea una Lista o None para el schema
+            if not isinstance(msg_dict.get('sources'), (list, type(None))):
+                log.warning("Unexpected type for 'sources' after potential decoding", type=type(msg_dict['sources']).__name__, message_id=str(msg_dict.get('id')))
+                msg_dict['sources'] = None # Forzar a None si sigue siendo inválido
+
+            messages.append(msg_dict)
+
         log.info(f"Retrieved {len(messages)} messages for chat", chat_id=str(chat_id))
         return messages
-    except Exception as e: log.error("Failed to get chat messages", error=str(e), exc_info=True); raise
+    except Exception as e:
+        log.error("Failed to get chat messages", error=str(e), exc_info=True)
+        # Relanzar la excepción para que el endpoint devuelva 500
+        raise
 
-# *** FUNCIÓN RENOMBRADA y columna SOURCES CORREGIDA ***
 async def save_message(chat_id: uuid.UUID, role: str, content: str, sources: Optional[List[Dict[str, Any]]] = None) -> uuid.UUID:
     """Guarda un mensaje en un chat y actualiza el timestamp del chat."""
     pool = await get_db_pool()
@@ -180,18 +210,22 @@ async def save_message(chat_id: uuid.UUID, role: str, content: str, sources: Opt
     async with pool.acquire() as conn:
         async with conn.transaction():
             try:
+                # Actualizar timestamp del chat
                 update_chat_query = "UPDATE chats SET updated_at = NOW() AT TIME ZONE 'UTC' WHERE id = $1 RETURNING id;"
                 chat_updated = await conn.fetchval(update_chat_query, chat_id)
                 if not chat_updated:
                      log.error("Failed to update chat timestamp, chat might not exist", chat_id=str(chat_id))
                      raise ValueError(f"Chat with ID {chat_id} not found for saving message.")
 
-                # Usar columna 'sources'
+                # Insertar mensaje (usando json.dumps para 'sources')
                 insert_message_query = """
                 INSERT INTO messages (id, chat_id, role, content, sources, created_at)
                 VALUES ($1, $2, $3, $4, $5, NOW() AT TIME ZONE 'UTC') RETURNING id;
                 """
-                result = await conn.fetchval(insert_message_query, message_id, chat_id, role, content, json.dumps(sources or [])) # Usar json.dumps
+                # Asegurar que sources sea JSON válido antes de insertar
+                sources_json = json.dumps(sources) if sources is not None else None # Guardar NULL si sources es None
+
+                result = await conn.fetchval(insert_message_query, message_id, chat_id, role, content, sources_json)
 
                 if result and result == message_id:
                     log.info("Message saved successfully", message_id=str(message_id), chat_id=str(chat_id), role=role)
@@ -201,17 +235,44 @@ async def save_message(chat_id: uuid.UUID, role: str, content: str, sources: Opt
                     raise RuntimeError("Failed to save message, ID mismatch or not returned.")
             except Exception as e:
                 log.error("Failed to save message within transaction", error=str(e), chat_id=str(chat_id), exc_info=True)
-                raise
+                raise # Relanzar para abortar transacción
 
+# *** FUNCIÓN CORREGIDA: delete_chat ***
 async def delete_chat(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID) -> bool:
-    """Elimina un chat si pertenece al usuario/compañía."""
+    """Elimina un chat y sus mensajes si pertenece al usuario/compañía."""
     pool = await get_db_pool()
-    query = "DELETE FROM chats WHERE id = $1 AND user_id = $2 AND company_id = $3 RETURNING id;"
     delete_log = log.bind(chat_id=str(chat_id), user_id=str(user_id), company_id=str(company_id))
-    try:
-        async with pool.acquire() as conn: deleted_id = await conn.fetchval(query, chat_id, user_id, company_id)
-        success = deleted_id is not None
-        if success: delete_log.info("Chat deleted successfully")
-        else: delete_log.warning("Chat not found or does not belong to user, deletion skipped")
-        return success
-    except Exception as e: delete_log.error("Failed to delete chat", error=str(e), exc_info=True); raise
+
+    # Verificar propiedad primero
+    owner = await check_chat_ownership(chat_id, user_id, company_id)
+    if not owner:
+        delete_log.warning("Chat not found or does not belong to user, deletion skipped")
+        return False
+
+    async with pool.acquire() as conn:
+        async with conn.transaction(): # Usar transacción
+            try:
+                # 1. Eliminar mensajes asociados
+                delete_messages_query = "DELETE FROM messages WHERE chat_id = $1;"
+                await conn.execute(delete_messages_query, chat_id)
+                delete_log.info("Associated messages deleted (if any)")
+
+                # 2. Eliminar el chat
+                delete_chat_query = "DELETE FROM chats WHERE id = $1 RETURNING id;"
+                deleted_id = await conn.fetchval(delete_chat_query, chat_id)
+
+                success = deleted_id is not None
+                if success:
+                    delete_log.info("Chat deleted successfully after deleting messages")
+                else:
+                    # Esto no debería ocurrir si la verificación de propiedad pasó y estamos en transacción
+                    delete_log.error("Chat deletion failed after deleting messages, despite ownership check")
+                return success
+            except Exception as e:
+                # Capturar ForeignKeyViolationError específicamente si ocurre aquí (inesperado)
+                if isinstance(e, asyncpg.exceptions.ForeignKeyViolationError):
+                     delete_log.error("Foreign key violation during chat deletion transaction (unexpected)", error=str(e), exc_info=True)
+                else:
+                     delete_log.error("Failed to delete chat within transaction", error=str(e), exc_info=True)
+                # La transacción se revertirá automáticamente al salir del bloque with
+                raise # Relanzar para que el endpoint devuelva 500
