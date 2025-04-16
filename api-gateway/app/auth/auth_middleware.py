@@ -9,9 +9,6 @@ import httpx
 # Importar verify_token del nuevo servicio de autenticación
 from app.auth.auth_service import verify_token # <-- Asegúrate que la importación es correcta
 
-# Importar get_client desde el módulo de dependencias centralizado
-from app.dependencies import get_client
-
 log = structlog.get_logger(__name__)
 
 # Instancia del scheme HTTPBearer. auto_error=False para manejar manualmente la ausencia de token.
