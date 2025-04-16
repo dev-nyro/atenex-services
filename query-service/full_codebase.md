@@ -621,11 +621,12 @@ async def get_db_pool() -> asyncpg.Pool:
                  host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT,
                  user=settings.POSTGRES_USER, db=settings.POSTGRES_DB)
         try:
+            # Codecs para manejar JSON/JSONB automáticamente
             def _json_encoder(value): return json.dumps(value)
             def _json_decoder(value): return json.loads(value)
             async def init_connection(conn):
-                await conn.set_type_codec('jsonb', encoder=_json_encoder, decoder=_json_decoder, schema='pg_catalog')
-                await conn.set_type_codec('json', encoder=_json_encoder, decoder=_json_decoder, schema='pg_catalog')
+                await conn.set_type_codec('jsonb', encoder=_json_encoder, decoder=_json_decoder, schema='pg_catalog', format='text') # Añadir format='text' puede ayudar
+                await conn.set_type_codec('json', encoder=_json_encoder, decoder=_json_decoder, schema='pg_catalog', format='text')  # Añadir format='text' puede ayudar
 
             _pool = await asyncpg.create_pool(
                 user=settings.POSTGRES_USER,
@@ -634,7 +635,8 @@ async def get_db_pool() -> asyncpg.Pool:
                 host=settings.POSTGRES_SERVER,
                 port=settings.POSTGRES_PORT,
                 min_size=2, max_size=10, timeout=30.0, command_timeout=60.0,
-                init=init_connection, statement_cache_size=0
+                init=init_connection, # Asegurar que init se aplica
+                statement_cache_size=0 # Deshabilitar cache para evitar problemas con codecs
             )
             log.info("PostgreSQL connection pool created successfully.")
         except (asyncpg.exceptions.InvalidPasswordError, OSError, ConnectionRefusedError) as conn_err:
@@ -694,7 +696,7 @@ async def log_query_interaction(
             result = await connection.fetchval(
                 query_sql,
                 log_id, user_id, company_id, query, answer,
-                json.dumps(log_metadata),
+                json.dumps(log_metadata), # Usar json.dumps aquí está bien
                 chat_id
             )
         if not result or result != log_id:
@@ -704,10 +706,12 @@ async def log_query_interaction(
         return log_id
     except Exception as e:
         log_entry.error("Failed to log query interaction", error=str(e), exc_info=True)
+        # No relanzar como RuntimeError aquí necesariamente, podría ser manejado en el caller
+        # Lanzamos de nuevo para que el endpoint sepa que falló
         raise RuntimeError(f"Failed to log query interaction: {e}") from e
 
 
-# --- Funciones para gestión de chats (Renombradas y columna sources corregida) ---
+# --- Funciones para gestión de chats ---
 
 async def create_chat(user_id: uuid.UUID, company_id: uuid.UUID, title: Optional[str] = None) -> uuid.UUID:
     """Crea un nuevo chat."""
@@ -726,7 +730,6 @@ async def create_chat(user_id: uuid.UUID, company_id: uuid.UUID, title: Optional
         else: raise RuntimeError("Failed to create chat, no ID returned")
     except Exception as e: log.error("Failed to create chat", error=str(e), exc_info=True); raise
 
-# *** FUNCIÓN RENOMBRADA ***
 async def get_user_chats(user_id: uuid.UUID, company_id: uuid.UUID, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
     """Obtiene la lista de chats para un usuario/compañía (sumario)."""
     pool = await get_db_pool()
@@ -737,6 +740,7 @@ async def get_user_chats(user_id: uuid.UUID, company_id: uuid.UUID, limit: int =
     """
     try:
         async with pool.acquire() as conn: rows = await conn.fetch(query, user_id, company_id, limit, offset)
+        # Convertir asyncpg.Record a dict
         chats = [dict(row) for row in rows]
         log.info(f"Retrieved {len(chats)} chat summaries for user", user_id=str(user_id), company_id=str(company_id))
         return chats
@@ -751,14 +755,14 @@ async def check_chat_ownership(chat_id: uuid.UUID, user_id: uuid.UUID, company_i
         return exists is True
     except Exception as e: log.error("Failed to check chat ownership", chat_id=str(chat_id), error=str(e), exc_info=True); return False # Asumir no propietario en caso de error
 
-# *** FUNCIÓN RENOMBRADA y columna SOURCES CORREGIDA ***
+# *** FUNCIÓN CORREGIDA: get_chat_messages ***
 async def get_chat_messages(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-    """Obtiene mensajes de un chat, verificando propiedad."""
+    """Obtiene mensajes de un chat, verificando propiedad y decodificando sources."""
     pool = await get_db_pool()
     owner = await check_chat_ownership(chat_id, user_id, company_id)
     if not owner:
         log.warning("Attempt to get messages for chat not owned or non-existent", chat_id=str(chat_id), user_id=str(user_id), company_id=str(company_id))
-        return []
+        return [] # Devolver lista vacía si no es propietario o no existe
 
     # Usar columna 'sources'
     messages_query = """
@@ -766,13 +770,39 @@ async def get_chat_messages(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: 
     WHERE chat_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3;
     """
     try:
-        async with pool.acquire() as conn: message_rows = await conn.fetch(messages_query, chat_id, limit, offset)
-        messages = [dict(row) for row in message_rows]
+        async with pool.acquire() as conn:
+            message_rows = await conn.fetch(messages_query, chat_id, limit, offset)
+
+        messages = []
+        for row in message_rows:
+            msg_dict = dict(row)
+            # *** CORRECCIÓN: Asegurar que 'sources' sea una lista Python ***
+            # asyncpg con el codec debería devolver una lista/dict directamente si es JSONB válido.
+            # Si devuelve una string (ej. '[]' o '{}'), intentamos cargarla.
+            if isinstance(msg_dict.get('sources'), str):
+                try:
+                    msg_dict['sources'] = json.loads(msg_dict['sources'])
+                except json.JSONDecodeError:
+                    log.warning("Failed to decode 'sources' field from string", chat_id=str(chat_id), message_id=str(msg_dict.get('id')), raw_sources=msg_dict['sources'])
+                    msg_dict['sources'] = None # O devolver lista vacía? None es más seguro
+            # Si es None o ya es una lista/dict (codec funcionó), no hacer nada
+            elif msg_dict.get('sources') is None:
+                 msg_dict['sources'] = None # Asegurar que sea None explícito si es NULL en DB
+
+            # Asegurarse que 'sources' sea una Lista o None para el schema
+            if not isinstance(msg_dict.get('sources'), (list, type(None))):
+                log.warning("Unexpected type for 'sources' after potential decoding", type=type(msg_dict['sources']).__name__, message_id=str(msg_dict.get('id')))
+                msg_dict['sources'] = None # Forzar a None si sigue siendo inválido
+
+            messages.append(msg_dict)
+
         log.info(f"Retrieved {len(messages)} messages for chat", chat_id=str(chat_id))
         return messages
-    except Exception as e: log.error("Failed to get chat messages", error=str(e), exc_info=True); raise
+    except Exception as e:
+        log.error("Failed to get chat messages", error=str(e), exc_info=True)
+        # Relanzar la excepción para que el endpoint devuelva 500
+        raise
 
-# *** FUNCIÓN RENOMBRADA y columna SOURCES CORREGIDA ***
 async def save_message(chat_id: uuid.UUID, role: str, content: str, sources: Optional[List[Dict[str, Any]]] = None) -> uuid.UUID:
     """Guarda un mensaje en un chat y actualiza el timestamp del chat."""
     pool = await get_db_pool()
@@ -780,18 +810,22 @@ async def save_message(chat_id: uuid.UUID, role: str, content: str, sources: Opt
     async with pool.acquire() as conn:
         async with conn.transaction():
             try:
+                # Actualizar timestamp del chat
                 update_chat_query = "UPDATE chats SET updated_at = NOW() AT TIME ZONE 'UTC' WHERE id = $1 RETURNING id;"
                 chat_updated = await conn.fetchval(update_chat_query, chat_id)
                 if not chat_updated:
                      log.error("Failed to update chat timestamp, chat might not exist", chat_id=str(chat_id))
                      raise ValueError(f"Chat with ID {chat_id} not found for saving message.")
 
-                # Usar columna 'sources'
+                # Insertar mensaje (usando json.dumps para 'sources')
                 insert_message_query = """
                 INSERT INTO messages (id, chat_id, role, content, sources, created_at)
                 VALUES ($1, $2, $3, $4, $5, NOW() AT TIME ZONE 'UTC') RETURNING id;
                 """
-                result = await conn.fetchval(insert_message_query, message_id, chat_id, role, content, json.dumps(sources or [])) # Usar json.dumps
+                # Asegurar que sources sea JSON válido antes de insertar
+                sources_json = json.dumps(sources) if sources is not None else None # Guardar NULL si sources es None
+
+                result = await conn.fetchval(insert_message_query, message_id, chat_id, role, content, sources_json)
 
                 if result and result == message_id:
                     log.info("Message saved successfully", message_id=str(message_id), chat_id=str(chat_id), role=role)
@@ -801,27 +835,54 @@ async def save_message(chat_id: uuid.UUID, role: str, content: str, sources: Opt
                     raise RuntimeError("Failed to save message, ID mismatch or not returned.")
             except Exception as e:
                 log.error("Failed to save message within transaction", error=str(e), chat_id=str(chat_id), exc_info=True)
-                raise
+                raise # Relanzar para abortar transacción
 
+# *** FUNCIÓN CORREGIDA: delete_chat ***
 async def delete_chat(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID) -> bool:
-    """Elimina un chat si pertenece al usuario/compañía."""
+    """Elimina un chat y sus mensajes si pertenece al usuario/compañía."""
     pool = await get_db_pool()
-    query = "DELETE FROM chats WHERE id = $1 AND user_id = $2 AND company_id = $3 RETURNING id;"
     delete_log = log.bind(chat_id=str(chat_id), user_id=str(user_id), company_id=str(company_id))
-    try:
-        async with pool.acquire() as conn: deleted_id = await conn.fetchval(query, chat_id, user_id, company_id)
-        success = deleted_id is not None
-        if success: delete_log.info("Chat deleted successfully")
-        else: delete_log.warning("Chat not found or does not belong to user, deletion skipped")
-        return success
-    except Exception as e: delete_log.error("Failed to delete chat", error=str(e), exc_info=True); raise
+
+    # Verificar propiedad primero
+    owner = await check_chat_ownership(chat_id, user_id, company_id)
+    if not owner:
+        delete_log.warning("Chat not found or does not belong to user, deletion skipped")
+        return False
+
+    async with pool.acquire() as conn:
+        async with conn.transaction(): # Usar transacción
+            try:
+                # 1. Eliminar mensajes asociados
+                delete_messages_query = "DELETE FROM messages WHERE chat_id = $1;"
+                await conn.execute(delete_messages_query, chat_id)
+                delete_log.info("Associated messages deleted (if any)")
+
+                # 2. Eliminar el chat
+                delete_chat_query = "DELETE FROM chats WHERE id = $1 RETURNING id;"
+                deleted_id = await conn.fetchval(delete_chat_query, chat_id)
+
+                success = deleted_id is not None
+                if success:
+                    delete_log.info("Chat deleted successfully after deleting messages")
+                else:
+                    # Esto no debería ocurrir si la verificación de propiedad pasó y estamos en transacción
+                    delete_log.error("Chat deletion failed after deleting messages, despite ownership check")
+                return success
+            except Exception as e:
+                # Capturar ForeignKeyViolationError específicamente si ocurre aquí (inesperado)
+                if isinstance(e, asyncpg.exceptions.ForeignKeyViolationError):
+                     delete_log.error("Foreign key violation during chat deletion transaction (unexpected)", error=str(e), exc_info=True)
+                else:
+                     delete_log.error("Failed to delete chat within transaction", error=str(e), exc_info=True)
+                # La transacción se revertirá automáticamente al salir del bloque with
+                raise # Relanzar para que el endpoint devuelva 500
 ```
 
 ## File: `app\main.py`
 ```py
 # query-service/app/main.py
 from fastapi import FastAPI, HTTPException, status as fastapi_status, Request # <-- Importar Request
-from fastapi.exceptions import RequestValidationError # <-- Importar RequestValidationError
+from fastapi.exceptions import RequestValidationError, ResponseValidationError # <-- Importar ResponseValidationError
 from fastapi.responses import JSONResponse, Response, PlainTextResponse # <-- Importar PlainTextResponse
 import structlog
 import uvicorn
@@ -837,7 +898,6 @@ setup_logging()
 log = structlog.get_logger("query_service.main")
 
 # Importar routers y otros módulos
-# Asumiendo que los endpoints están directamente en estos módulos (ajustar si endpoints/ está separado)
 from app.api.v1.endpoints import query as query_router_module
 from app.api.v1.endpoints import chat as chat_router_module
 from app.db import postgres_client
@@ -852,42 +912,61 @@ GLOBAL_RAG_PIPELINE = None # Se construye en startup
 # Crear instancia de FastAPI
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    openapi_url=f"{settings.API_V1_STR}/openapi.json",
-    version="0.2.1", # Incrementar versión por cambios
-    description="Microservice to handle user queries using a Haystack RAG pipeline with Milvus and Gemini, including chat history management. Explicit HTTP endpoint communication.",
+    # No establecer openapi_url aquí si el Gateway lo expone
+    # openapi_url=f"{settings.API_V1_STR}/openapi.json",
+    version="0.2.2", # Incrementar versión por correcciones
+    description="Microservice to handle user queries using a Haystack RAG pipeline with Milvus and Gemini, including chat history management. Routes are relative (e.g., /ask, /chats).",
 )
 
-# --- Event Handlers (Sin cambios en lógica) ---
+# --- Event Handlers (Sin cambios en lógica interna) ---
 @app.on_event("startup")
 async def startup_event():
     global SERVICE_READY, GLOBAL_RAG_PIPELINE
     log.info(f"Starting up {settings.PROJECT_NAME}...")
-    # (Misma lógica de inicialización de DB y pipeline)
     db_pool_initialized = False
     pipeline_built = False
     milvus_startup_ok = False
+    # Intenta inicializar la BD
     try:
         await postgres_client.get_db_pool()
         db_ready = await postgres_client.check_db_connection()
-        if db_ready: log.info("PostgreSQL connection pool initialized and verified."); db_pool_initialized = True
-        else: log.critical("CRITICAL: Failed PostgreSQL connection verification."); SERVICE_READY = False; return
-    except Exception as e: log.critical("CRITICAL: Failed PostgreSQL pool initialization.", error=str(e)); SERVICE_READY = False; return
+        if db_ready:
+            log.info("PostgreSQL connection pool initialized and verified.")
+            db_pool_initialized = True
+        else:
+            log.critical("CRITICAL: Failed PostgreSQL connection verification during startup.")
+            # No marcar como listo, pero no salir inmediatamente, podría recuperarse
+            db_pool_initialized = False
+    except Exception as e:
+        log.critical("CRITICAL: Failed PostgreSQL pool initialization during startup.", error=str(e), exc_info=True)
+        db_pool_initialized = False
+        # Podríamos decidir salir si la DB es crítica: sys.exit(1)
 
+    # Intenta construir el pipeline RAG
     try:
         GLOBAL_RAG_PIPELINE = build_rag_pipeline()
         dep_status = await check_pipeline_dependencies()
-        if dep_status.get("milvus_connection", "") == "ok":
-            log.info("Haystack RAG pipeline built and Milvus connection verified."); pipeline_built = True; milvus_startup_ok = True
+        milvus_status = dep_status.get("milvus_connection", "error: check failed")
+        if "ok" in milvus_status: # Aceptar 'ok' u 'ok (collection not found yet)'
+            log.info("Haystack RAG pipeline built and Milvus connection status is OK.", status=milvus_status)
+            pipeline_built = True
+            milvus_startup_ok = True
         else:
-             log.warning("RAG pipeline built, but Milvus check failed/pending.", status=dep_status.get("milvus_connection")); pipeline_built = True; milvus_startup_ok = False # Pipeline OK, Milvus warn
-    except Exception as e: log.error("Failed building Haystack RAG pipeline.", error=str(e)); pipeline_built = False
+             log.warning("Haystack RAG pipeline built, but initial Milvus check failed or pending.", status=milvus_status)
+             pipeline_built = True # El pipeline se construyó, pero Milvus podría tener problemas
+             milvus_startup_ok = False
+    except Exception as e:
+        log.error("Failed building Haystack RAG pipeline during startup.", error=str(e), exc_info=True)
+        pipeline_built = False
 
-    if db_pool_initialized and pipeline_built:
+    # Marcar como listo solo si las dependencias críticas (DB, Pipeline) están OK
+    # Considerar si Milvus es estrictamente necesario para estar 'ready'
+    if db_pool_initialized and pipeline_built: # Milvus puede recuperarse, pero DB y pipeline son esenciales
         SERVICE_READY = True
-        log.info(f"{settings.PROJECT_NAME} READY. Initial Milvus Check: {'OK' if milvus_startup_ok else 'Failed/Warn'}")
+        log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY. Initial Milvus Check: {'OK' if milvus_startup_ok else 'WARN/FAIL'}")
     else:
         SERVICE_READY = False
-        log.critical(f"{settings.PROJECT_NAME} startup FAILED. DB OK: {db_pool_initialized}, Pipeline OK: {pipeline_built}. Service NOT READY.")
+        log.critical(f"{settings.PROJECT_NAME} startup FAILED critical components. DB OK: {db_pool_initialized}, Pipeline Built: {pipeline_built}. Service NOT READY.")
 
 
 @app.on_event("shutdown")
@@ -896,62 +975,86 @@ async def shutdown_event():
     await postgres_client.close_db_pool()
     log.info("Shutdown complete.")
 
-# --- Exception Handlers (Verificar RequestValidationError) ---
+# --- Exception Handlers ---
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
+    # Log detallado incluyendo request ID si está disponible
+    request_id = request.headers.get("x-request-id", "N/A")
     log_level = log.warning if exc.status_code < 500 else log.error
-    log_level("HTTP Exception caught", status_code=exc.status_code, detail=exc.detail, path=str(request.url))
+    log_level("HTTP Exception caught by handler",
+              status_code=exc.status_code,
+              detail=exc.detail,
+              path=str(request.url),
+              method=request.method,
+              client=request.client.host if request.client else "unknown",
+              request_id=request_id)
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    # Extraer los detalles de validación del error
+    request_id = request.headers.get("x-request-id", "N/A")
     error_details = []
     try:
-         # exc.errors() devuelve una lista de diccionarios con 'loc', 'msg', 'type'
-         for error in exc.errors():
-             error_details.append({
-                 "loc": error.get("loc", []),
-                 "msg": error.get("msg", "Unknown validation error"),
-                 "type": error.get("type", "validation_error")
-             })
-    except Exception as e:
-        log.error("Error formatting validation exception details", internal_error=str(e))
-        error_details = [{"loc": [], "msg": "Failed to parse validation errors.", "type": "internal_parsing_error"}]
+         error_details = exc.errors() # Pydantic v2 / FastAPI >= 0.100
+    except Exception:
+         error_details = [{"loc": [], "msg": "Failed to parse validation errors.", "type": "internal_parsing_error"}]
 
-    # Loguear con el detalle formateado
     log.warning("Request Validation Error",
                 path=str(request.url),
+                method=request.method,
                 client=request.client.host if request.client else "unknown",
-                errors=error_details) # Loguear el detalle formateado
+                errors=error_details, # Loguear el detalle formateado
+                request_id=request_id)
 
-    # Devolver respuesta 422 con el formato esperado por el frontend (list[detail])
     return JSONResponse(
         status_code=fastapi_status.HTTP_422_UNPROCESSABLE_ENTITY,
-        # FastAPI/Pydantic por defecto envuelve 'detail' así. Frontend parece esperar esto.
-        content={"detail": error_details},
+        content={"detail": error_details}, # FastAPI espera 'detail' como clave
     )
+
+# *** AÑADIDO: Handler específico para ResponseValidationError ***
+@app.exception_handler(ResponseValidationError)
+async def response_validation_exception_handler(request: Request, exc: ResponseValidationError):
+    request_id = request.headers.get("x-request-id", "N/A")
+    # Loguear el error de validación de RESPUESTA - esto es un error del SERVIDOR
+    log.error("Response Validation Error - Server failed to construct valid response",
+              path=str(request.url),
+              method=request.method,
+              errors=exc.errors(), # Loguear los detalles del error de validación
+              request_id=request_id,
+              exc_info=True) # Incluir traceback
+
+    # Devolver un error 500 genérico al cliente, porque es un problema del backend
+    return JSONResponse(
+        status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "Internal Server Error: Failed to serialize response."},
+    )
+
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    log.exception("Unhandled Exception caught", path=str(request.url))
+    request_id = request.headers.get("x-request-id", "N/A")
+    log.exception("Unhandled Exception caught by generic handler",
+                  path=str(request.url),
+                  method=request.method,
+                  client=request.client.host if request.client else "unknown",
+                  request_id=request_id)
     return JSONResponse(
         status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"detail": "Internal Server Error"},
     )
 
 
-# --- Routers (Usando las instancias de los módulos) ---
-# Asegurar prefijo común para todos los endpoints bajo /api/v1/query
-app.include_router(query_router_module.router, prefix=settings.API_V1_STR, tags=["Query Interaction"])
-app.include_router(chat_router_module.router, prefix=settings.API_V1_STR, tags=["Chat Management"])
-log.info("Routers included", prefix=settings.API_V1_STR)
+# --- Routers ---
+# *** CORRECCIÓN: Eliminar el prefijo API_V1_STR ***
+# El API Gateway maneja el prefijo /api/v1/query
+app.include_router(query_router_module.router, tags=["Query Interaction"]) # Ruta expuesta: /ask
+app.include_router(chat_router_module.router, tags=["Chat Management"])   # Rutas expuestas: /chats, /chats/{id}/messages, etc.
+log.info("Routers included without prefix.")
 
 # --- Root Endpoint / Health Check ---
 @app.get("/", tags=["Health Check"], summary="Service Liveness/Readiness Check")
 async def read_root(request: Request): # Añadir Request para poder loguear X-Request-ID
-    # Health check ahora también verifica DB explícitamente
     global SERVICE_READY
     request_id = request.headers.get("x-request-id", "N/A")
     health_log = log.bind(request_id=request_id)
@@ -959,23 +1062,28 @@ async def read_root(request: Request): # Añadir Request para poder loguear X-Re
 
     if not SERVICE_READY:
          health_log.warning("Health check failed: Service not ready (SERVICE_READY is False).")
+         # Devolver 503 Service Unavailable
          return PlainTextResponse("Service Not Ready", status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE)
 
-    # Verificar DB conexión adicionalmente en cada health check si es rápido
+    # Si el servicio se marcó como listo, verificar conexión DB como chequeo adicional
     db_ok = await postgres_client.check_db_connection()
     if db_ok:
         health_log.info("Health check successful (Service Ready, DB connection OK).")
         return PlainTextResponse("OK", status_code=fastapi_status.HTTP_200_OK)
     else:
         health_log.error("Health check failed: Service is READY but DB check FAILED.")
-        # Marcar como no saludable si la DB falla, aunque el servicio haya iniciado
+        # Marcar como no saludable si la DB falla ahora, aunque el servicio haya iniciado
         return PlainTextResponse("Service Ready but DB check failed", status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE)
 
 
-# --- Main execution (for local development) ---
+# --- Main execution (for local development, sin cambios) ---
 if __name__ == "__main__":
+    # Nota: el puerto 8001 podría colisionar con ingest-service si corren localmente.
+    # Cambiar a 8002 como indica el README del gateway para desarrollo local.
+    port = 8002 # Usar puerto 8002 para query-service localmente
     log_level_str = settings.LOG_LEVEL.lower()
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8001, reload=True, log_level=log_level_str)
+    print(f"----- Starting Query Service locally on port {port} -----")
+    uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True, log_level=log_level_str)
 ```
 
 ## File: `app\models\__init__.py`
@@ -1000,14 +1108,14 @@ import uuid
 from typing import Dict, Any, List, Tuple, Optional
 
 # *** CORRECCIÓN: Usar MilvusException y ErrorCode ***
-from pymilvus.exceptions import MilvusException, ErrorCode
+from pymilvus.exceptions import MilvusException, ErrorCode # Asegurarse que ErrorCode esté importado
 from fastapi import HTTPException, status
 
 from haystack import Pipeline, Document
 from haystack.components.embedders import OpenAITextEmbedder
 from haystack.components.builders.prompt_builder import PromptBuilder
-from milvus_haystack import MilvusDocumentStore, MilvusEmbeddingRetriever
-from haystack.utils import Secret
+from milvus_haystack import MilvusDocumentStore, MilvusEmbeddingRetriever # Asegurar que esté importado
+from haystack.utils import Secret # Asegurar que esté importado
 
 from app.core.config import settings
 from app.db import postgres_client
@@ -1016,7 +1124,7 @@ from app.api.v1.schemas import RetrievedDocument
 
 log = structlog.get_logger(__name__)
 
-# --- Component Initialization Functions ---
+# --- Component Initialization Functions (sin cambios) ---
 def get_milvus_document_store() -> MilvusDocumentStore:
     connection_uri = str(settings.MILVUS_URI)
     connection_timeout = 30.0
@@ -1045,7 +1153,7 @@ def get_openai_text_embedder() -> OpenAITextEmbedder:
     api_key_value = settings.OPENAI_API_KEY.get_secret_value()
     if not api_key_value: log.warning("QUERY_OPENAI_API_KEY is missing or empty!")
     return OpenAITextEmbedder(
-        api_key=Secret.from_token(api_key_value or "dummy-key"),
+        api_key=Secret.from_token(api_key_value or "dummy-key"), # Usar Secret.from_token
         model=settings.OPENAI_EMBEDDING_MODEL
     )
 
@@ -1055,9 +1163,11 @@ def get_milvus_retriever(document_store: MilvusDocumentStore) -> MilvusEmbedding
 
 def get_prompt_builder() -> PromptBuilder:
     log.debug("Initializing PromptBuilder")
+    # Pasar las variables requeridas explícitamente ayuda a la validación de Haystack
     return PromptBuilder(template=settings.RAG_PROMPT_TEMPLATE)
 
-# --- Pipeline Construction ---
+
+# --- Pipeline Construction (sin cambios) ---
 _rag_pipeline_instance: Optional[Pipeline] = None
 def build_rag_pipeline() -> Pipeline:
     global _rag_pipeline_instance
@@ -1069,11 +1179,18 @@ def build_rag_pipeline() -> Pipeline:
         text_embedder = get_openai_text_embedder()
         retriever = get_milvus_retriever(document_store=doc_store)
         prompt_builder = get_prompt_builder()
+
+        # Añadir componentes con nombres explícitos
         rag_pipeline.add_component("text_embedder", text_embedder)
         rag_pipeline.add_component("retriever", retriever)
         rag_pipeline.add_component("prompt_builder", prompt_builder)
+
+        # Conectar los sockets
+        # text_embedder output 'embedding' -> retriever input 'query_embedding'
         rag_pipeline.connect("text_embedder.embedding", "retriever.query_embedding")
+        # retriever output 'documents' -> prompt_builder input 'documents'
         rag_pipeline.connect("retriever.documents", "prompt_builder.documents")
+
         log.info("Haystack RAG pipeline built successfully.")
         _rag_pipeline_instance = rag_pipeline
         return rag_pipeline
@@ -1082,6 +1199,7 @@ def build_rag_pipeline() -> Pipeline:
         raise RuntimeError("Could not build the RAG pipeline") from e
 
 # --- Pipeline Execution ---
+# *** FUNCIÓN CORREGIDA: run_rag_pipeline ***
 async def run_rag_pipeline(
     query: str,
     company_id: str,
@@ -1093,88 +1211,158 @@ async def run_rag_pipeline(
     Ejecuta el pipeline RAG, llama a Gemini, y loguea la interacción.
     """
     run_log = log.bind(query=query, company_id=company_id, user_id=user_id or "N/A", chat_id=str(chat_id) if chat_id else "N/A")
-    run_log.info("Running RAG pipeline...")
+    run_log.info("Running RAG pipeline execution flow...") # Mensaje ligeramente diferente
+
     try:
-        pipeline = build_rag_pipeline()
+        pipeline = build_rag_pipeline() # Obtener/construir el pipeline
     except Exception as build_err:
          run_log.error("Failed to get or build RAG pipeline for execution", error=str(build_err))
          raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="RAG pipeline is not available.")
+
     retriever_top_k = top_k if top_k is not None else settings.RETRIEVER_TOP_K
-    retriever_filters = {"company_id": company_id}
-    run_log.debug("Retriever filters set", filters=retriever_filters, top_k=retriever_top_k)
+    # *** CORRECCIÓN: Filtro para retriever ***
+    # Asegurarse que el filtro usa el nombre de campo correcto definido en settings
+    retriever_filters = {"field": settings.MILVUS_COMPANY_ID_FIELD, "operator": "==", "value": company_id}
+    # Milvus-Haystack retriever espera filtros en este formato ^^^ (o similar, verificar su doc)
+    # Alternativa si Milvus-Haystack usa el formato directo de Pymilvus expr:
+    # retriever_filters_expr = f"{settings.MILVUS_COMPANY_ID_FIELD} == '{company_id}'"
+
+
+    run_log.debug("Pipeline execution parameters set", filters=retriever_filters, top_k=retriever_top_k) # Loguear filtros usados
+
+    # *** CORRECCIÓN: Estructura de pipeline_input ***
+    # Mapear nombres de componentes a diccionarios de {socket_name: value}
     pipeline_input = {
-        "text_embedder": {"args": [query], "kwargs": {}},
-        "retriever": {"args": [], "kwargs": {"filters": retriever_filters, "top_k": retriever_top_k}},
-        "prompt_builder": {"args": [query], "kwargs": {}},
+        "text_embedder": {"text": query},  # Input 'text' para el componente 'text_embedder'
+        "retriever": {"filters": [retriever_filters], "top_k": retriever_top_k}, # Inputs 'filters' y 'top_k' para 'retriever'. Filters es una lista.
+        "prompt_builder": {"query": query} # Input 'query' para 'prompt_builder'. 'documents' viene del retriever.
     }
+    # Nota: Si se usara retriever_filters_expr: "retriever": {"filters": retriever_filters_expr, ...}
+
+    run_log.debug("Constructed pipeline input dictionary", pipeline_input_structure=pipeline_input)
 
     try:
         loop = asyncio.get_running_loop()
+        # Ejecutar el pipeline en un executor para no bloquear el loop (si alguna parte es síncrona)
         pipeline_result = await loop.run_in_executor(None, pipeline.run, pipeline_input)
-        run_log.info("Haystack pipeline (embed, retrieve, prompt) executed.")
+
+        run_log.info("Haystack pipeline (embed, retrieve, prompt) executed successfully.")
+
+        # Extraer resultados (con verificación robusta)
         retrieved_docs: List[Document] = pipeline_result.get("retriever", {}).get("documents", [])
         prompt_builder_output = pipeline_result.get("prompt_builder", {})
-        generated_prompt: Optional[str] = prompt_builder_output.get("prompt")
-        if not retrieved_docs: run_log.warning("No relevant documents found by retriever.")
+        generated_prompt: Optional[str] = prompt_builder_output.get("prompt") if isinstance(prompt_builder_output, dict) else None
+
+        if not retrieved_docs:
+             run_log.warning("No relevant documents found by retriever for the query.")
+        else:
+             run_log.info(f"Retriever found {len(retrieved_docs)} documents.")
+
         if not generated_prompt:
-             run_log.error("Failed to extract prompt from pipeline output", output=prompt_builder_output)
-             generated_prompt = f"Pregunta: {query}\n\nNo se encontraron documentos relevantes. Por favor responde basado en conocimiento general si es posible, o indica que no tienes información específica."
+             run_log.error("Failed to extract prompt from prompt_builder output", component_output=prompt_builder_output)
+             # Crear un prompt de fallback si falla la generación
+             generated_prompt = f"Pregunta: {query}\n\n(No se pudo construir el prompt con documentos recuperados). Por favor responde a la pregunta."
+
         run_log.debug("Generated prompt for LLM", prompt_length=len(generated_prompt))
+
+        # Llamar a Gemini (asíncrono)
         answer = await gemini_client.generate_answer(generated_prompt)
         run_log.info("Answer generated by Gemini", answer_length=len(answer))
+
+        # Loguear la interacción en la BD (con manejo de errores)
         log_id: Optional[uuid.UUID] = None
         try:
+            # Formatear documentos para el log
             formatted_docs_for_log = [
                 RetrievedDocument.from_haystack_doc(doc).model_dump(exclude_none=True)
                 for doc in retrieved_docs
             ]
-            user_uuid = uuid.UUID(user_id) if user_id else None
-            company_uuid = uuid.UUID(company_id)
+            # Convertir IDs a UUID si es necesario
+            user_uuid = uuid.UUID(user_id) if user_id and isinstance(user_id, str) else user_id
+            company_uuid = uuid.UUID(company_id) if isinstance(company_id, str) else company_id
+
             log_id = await postgres_client.log_query_interaction(
-                company_id=company_uuid, user_id=user_uuid, query=query, answer=answer,
-                retrieved_documents_data=formatted_docs_for_log, chat_id=chat_id,
+                company_id=company_uuid,
+                user_id=user_uuid, # Puede ser None si user_id no se pasó o es inválido
+                query=query,
+                answer=answer,
+                retrieved_documents_data=formatted_docs_for_log,
+                chat_id=chat_id,
                 metadata={"retriever_top_k": retriever_top_k, "llm_model": settings.GEMINI_MODEL_NAME}
             )
+            run_log.info("Query interaction logged to database", db_log_id=str(log_id))
         except Exception as log_err:
-             run_log.error("Failed to log query interaction to database", error=str(log_err), exc_info=True)
+             # Loguear el error pero continuar, la respuesta al usuario es más crítica
+             run_log.error("Failed to log query interaction to database after successful generation", error=str(log_err), exc_info=True)
+
+        # Devolver la respuesta, documentos y log_id (puede ser None si el log falló)
         return answer, retrieved_docs, log_id
-    except HTTPException as http_exc: raise http_exc
+
+    except HTTPException as http_exc:
+        # Relanzar excepciones HTTP conocidas (ej. 403, 404 de check_chat_ownership)
+        raise http_exc
     except MilvusException as milvus_err:
         run_log.error("Milvus error during pipeline execution", error_code=milvus_err.code, error_message=milvus_err.message, exc_info=True)
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Vector database error: {milvus_err.message}")
+    except ValueError as val_err:
+         # Capturar ValueErrors específicos (como el "Missing input" original)
+         run_log.error("ValueError during pipeline execution", error=str(val_err), exc_info=True)
+         # Podría ser un 400 si es por input inválido, o 500 si es error interno del pipeline
+         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Pipeline configuration or input error: {val_err}")
     except Exception as e:
-        run_log.exception("Error occurred during RAG pipeline execution")
+        # Capturar cualquier otra excepción inesperada
+        run_log.exception("Unexpected error occurred during RAG pipeline execution")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error processing query: {type(e).__name__}")
 
-# --- CORRECCIÓN: Ajustar manejo de excepciones en check_dependencies ---
+# --- Dependency Check Function ---
+# *** FUNCIÓN CORREGIDA: check_pipeline_dependencies (manejo de errores Milvus) ***
 async def check_pipeline_dependencies() -> Dict[str, str]:
     results = {"milvus_connection": "pending", "openai_api": "pending", "gemini_api": "pending"}
     try:
         store = get_milvus_document_store()
-        # Verificar conexión contando documentos
+        # Intentar verificar la conexión. count_documents() es una buena forma.
+        # Ejecutar en thread porque puede ser bloqueante
         count = await asyncio.to_thread(store.count_documents)
         results["milvus_connection"] = "ok"
         log.debug("Milvus dependency check successful.", document_count=count)
     except MilvusException as e:
         # Verificar si el error es específicamente "Collection not found"
-        # El código para esto suele ser ErrorCode.COLLECTION_NOT_FOUND (valor 1)
-        if e.code == ErrorCode.COLLECTION_NOT_FOUND: # Importar ErrorCode de pymilvus.exceptions
+        # El código para esto puede variar, pero ErrorCode.COLLECTION_NOT_FOUND es común (valor 1)
+        # Consultar documentación de Pymilvus para códigos de error exactos si es necesario.
+        if e.code == ErrorCode.COLLECTION_NOT_FOUND: # Usar ErrorCode importado
+            # Considerar esto como OK, ya que la colección se creará al escribir
             results["milvus_connection"] = "ok (collection not found yet)"
-            log.info("Milvus dependency check: Collection not found (will be created on write).")
+            log.info("Milvus dependency check: Collection not found (expected if empty, will be created on write).")
+        elif e.code == ErrorCode.UNEXPECTED_ERROR and "connect failed" in e.message.lower():
+            # Error de conexión específico
+            results["milvus_connection"] = f"error: Connection Failed (code={e.code}, msg={e.message})"
+            log.warning("Milvus dependency check failed: Connection Error", error_code=e.code, error_message=e.message, exc_info=False)
         else:
-            # Otro error de Milvus (conexión, etc.)
+            # Otro error de Milvus (configuración, timeout, etc.)
             results["milvus_connection"] = f"error: MilvusException (code={e.code}, msg={e.message})"
-            log.warning("Milvus dependency check failed with error", error_code=e.code, error_message=e.message, exc_info=False)
+            log.warning("Milvus dependency check failed with Milvus error", error_code=e.code, error_message=e.message, exc_info=False) # No mostrar exc_info por defecto
+    except RuntimeError as rte:
+         # Capturar errores de RuntimeError de get_milvus_document_store si falla la inicialización
+         results["milvus_connection"] = f"error: Initialization Failed ({rte})"
+         log.warning("Milvus dependency check failed during store initialization", error=str(rte), exc_info=False)
     except Exception as e:
-        # Otro tipo de error durante la comprobación de Milvus
-        results["milvus_connection"] = f"error: {type(e).__name__}"
-        log.warning("Milvus dependency check failed with unexpected error", error=str(e), exc_info=False)
+        # Otro tipo de error inesperado durante la comprobación de Milvus
+        results["milvus_connection"] = f"error: Unexpected {type(e).__name__}"
+        log.warning("Milvus dependency check failed with unexpected error", error=str(e), exc_info=True) # Mostrar exc_info aquí puede ser útil
 
     # Comprobaciones de API keys (sin cambios)
-    if settings.OPENAI_API_KEY.get_secret_value(): results["openai_api"] = "key_present"
-    else: results["openai_api"] = "key_missing"; log.warning("OpenAI API Key missing in config.")
-    if settings.GEMINI_API_KEY.get_secret_value(): results["gemini_api"] = "key_present"
-    else: results["gemini_api"] = "key_missing"; log.warning("Gemini API Key missing in config.")
+    if settings.OPENAI_API_KEY.get_secret_value() and settings.OPENAI_API_KEY.get_secret_value() != "dummy-key":
+        results["openai_api"] = "key_present"
+    else:
+        results["openai_api"] = "key_missing"
+        log.warning("OpenAI API Key missing or is dummy key in config.")
+
+    if settings.GEMINI_API_KEY.get_secret_value():
+        results["gemini_api"] = "key_present"
+    else:
+        results["gemini_api"] = "key_missing"
+        log.warning("Gemini API Key missing in config.")
+
     return results
 ```
 
