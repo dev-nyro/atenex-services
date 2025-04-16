@@ -34,6 +34,7 @@ def get_client(request: Request) -> httpx.AsyncClient:
     return client
 
 async def logged_strict_auth(user_payload: StrictAuth) -> Dict[str, Any]:
+    log.info("logged_strict_auth called", user_payload=user_payload, type=str(type(user_payload)))
     return user_payload
 
 LoggedStrictAuth = Annotated[Dict[str, Any], Depends(logged_strict_auth)]
