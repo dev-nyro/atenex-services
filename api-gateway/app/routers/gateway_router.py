@@ -216,7 +216,7 @@ async def proxy_post_query(
 ):
     """Reenvía POST /api/v1/query/ask al endpoint /api/v1/query/ask del Query Service."""
     # Asegúrate que Query Service escucha en esta ruta
-    backend_path = "/api/v1/query/ask"
+    backend_path = "ask"
     # _proxy_request leerá el body desde request.body()
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
