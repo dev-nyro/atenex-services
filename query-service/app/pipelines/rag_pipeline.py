@@ -108,10 +108,11 @@ async def run_rag_pipeline(
     retriever_filters = {"company_id": company_id}
     run_log.debug("Retriever filters set", filters=retriever_filters, top_k=retriever_top_k)
     pipeline_input = {
-        "text_embedder": {"text": query},
-        "retriever": {"filters": retriever_filters, "top_k": retriever_top_k},
-        "prompt_builder": {"query": query}
+        "text_embedder": {"args": [query], "kwargs": {}},
+        "retriever": {"args": [], "kwargs": {"filters": retriever_filters, "top_k": retriever_top_k}},
+        "prompt_builder": {"args": [query], "kwargs": {}},
     }
+
     try:
         loop = asyncio.get_running_loop()
         pipeline_result = await loop.run_in_executor(None, pipeline.run, pipeline_input)
