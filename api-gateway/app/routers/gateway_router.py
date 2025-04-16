@@ -156,25 +156,25 @@ async def _proxy_request(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An unexpected error occurred in the gateway.")
 
 # --- CORS OPTIONS HANDLERS (sin cambios) ---
-@router.options("/api/v1/ingest/{endpoint_path:path}", tags=["CORS", "Proxy - Ingest Service"], include_in_schema=False)
+@router.options("/ingest/{endpoint_path:path}", tags=["CORS", "Proxy - Ingest Service"], include_in_schema=False)
 async def options_proxy_ingest_service_generic(endpoint_path: str = Path(...)): return Response(status_code=200)
-@router.options("/api/v1/query/ask", tags=["CORS", "Proxy - Query Service"], include_in_schema=False)
+@router.options("/query/ask", tags=["CORS", "Proxy - Query Service"], include_in_schema=False)
 async def options_query_ask(): return Response(status_code=200)
-@router.options("/api/v1/query/chats", tags=["CORS", "Proxy - Query Service"], include_in_schema=False)
+@router.options("/query/chats", tags=["CORS", "Proxy - Query Service"], include_in_schema=False)
 async def options_query_chats(): return Response(status_code=200)
-@router.options("/api/v1/query/chats/{chat_id}/messages", tags=["CORS", "Proxy - Query Service"], include_in_schema=False)
+@router.options("/query/chats/{chat_id}/messages", tags=["CORS", "Proxy - Query Service"], include_in_schema=False)
 async def options_chat_messages(chat_id: uuid.UUID = Path(...)): return Response(status_code=200)
-@router.options("/api/v1/query/chats/{chat_id}", tags=["CORS", "Proxy - Query Service"], include_in_schema=False)
+@router.options("/query/chats/{chat_id}", tags=["CORS", "Proxy - Query Service"], include_in_schema=False)
 async def options_delete_chat(chat_id: uuid.UUID = Path(...)): return Response(status_code=200)
 if settings.AUTH_SERVICE_URL:
-    @router.options("/api/v1/auth/{endpoint_path:path}", tags=["CORS", "Proxy - Auth Service (Optional)"], include_in_schema=False)
+    @router.options("/auth/{endpoint_path:path}", tags=["CORS", "Proxy - Auth Service (Optional)"], include_in_schema=False)
     async def options_proxy_auth_service_generic(endpoint_path: str = Path(...)): return Response(status_code=200)
 
 # --- Rutas Proxy Específicas para Query Service ---
 
 # GET /chats
 @router.get(
-    "/api/v1/query/chats",
+    "/query/chats",
     dependencies=[Depends(LoggedStrictAuth)],
     tags=["Proxy - Query Service"],
     summary="List user's chats (Proxied)"
@@ -184,13 +184,13 @@ async def proxy_get_chats(
     client: Annotated[httpx.AsyncClient, Depends(get_client)],
     user_payload: LoggedStrictAuth,
 ):
-    """Reenvía GET /api/v1/query/chats al Query Service."""
-    backend_path = "/api/v1/query/chats"
+    """Reenvía GET /query/chats al Query Service."""
+    backend_path = "/chats"
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
 # POST /ask
 @router.post(
-    "/api/v1/query/ask",
+    "/query/ask",
     dependencies=[Depends(LoggedStrictAuth)],
     tags=["Proxy - Query Service"],
     summary="Submit a query or message to a chat (Proxied)"
@@ -200,13 +200,13 @@ async def proxy_post_query(
     client: Annotated[httpx.AsyncClient, Depends(get_client)],
     user_payload: LoggedStrictAuth,
 ):
-    """Reenvía POST /api/v1/query/ask al endpoint /api/v1/query/ask del Query Service."""
-    backend_path = "/api/v1/query/ask"
+    """Reenvía POST /query/ask al endpoint /ask del Query Service."""
+    backend_path = "/ask"
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
 # GET /chats/{chat_id}/messages
 @router.get(
-    "/api/v1/query/chats/{chat_id}/messages",
+    "/query/chats/{chat_id}/messages",
     dependencies=[Depends(LoggedStrictAuth)],
     tags=["Proxy - Query Service"],
     summary="Get messages for a specific chat (Proxied)"
@@ -217,13 +217,13 @@ async def proxy_get_chat_messages(
     user_payload: LoggedStrictAuth,
     chat_id: uuid.UUID = Path(...),
 ):
-    """Reenvía GET /api/v1/query/chats/{chat_id}/messages al Query Service."""
-    backend_path = f"/api/v1/query/chats/{chat_id}/messages"
+    """Reenvía GET /query/chats/{chat_id}/messages al Query Service."""
+    backend_path = f"/chats/{chat_id}/messages"
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
 # DELETE /chats/{chat_id}
 @router.delete(
-    "/api/v1/query/chats/{chat_id}",
+    "/query/chats/{chat_id}",
     dependencies=[Depends(LoggedStrictAuth)],
     tags=["Proxy - Query Service"],
     summary="Delete a specific chat (Proxied)"
@@ -234,14 +234,14 @@ async def proxy_delete_chat(
     user_payload: LoggedStrictAuth,
     chat_id: uuid.UUID = Path(...),
 ):
-    """Reenvía DELETE /api/v1/query/chats/{chat_id} al Query Service."""
-    backend_path = f"/api/v1/query/chats/{chat_id}"
+    """Reenvía DELETE /query/chats/{chat_id} al Query Service."""
+    backend_path = f"/chats/{chat_id}"
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
 # --- Rutas Proxy Genéricas para Ingest Service ---
 
 @router.api_route(
-    "/api/v1/ingest/{endpoint_path:path}",
+    "/ingest/{endpoint_path:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
     dependencies=[Depends(LoggedStrictAuth)],
     tags=["Proxy - Ingest Service"],
@@ -253,8 +253,8 @@ async def proxy_ingest_service_generic(
     user_payload: LoggedStrictAuth,
     endpoint_path: str = Path(...),
 ):
-    """Reenvía solicitudes autenticadas a `/api/v1/ingest/*` al Ingest Service."""
-    backend_path = f"/api/v1/ingest/{endpoint_path}"
+    """Reenvía solicitudes autenticadas a `/ingest/*` al Ingest Service."""
+    backend_path = f"/ingest/{endpoint_path}"
     return await _proxy_request(
         request=request,
         target_service_base_url_str=str(settings.INGEST_SERVICE_URL),
