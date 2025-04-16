@@ -48,9 +48,6 @@ import httpx
 # Importar verify_token del nuevo servicio de autenticación
 from app.auth.auth_service import verify_token # <-- Asegúrate que la importación es correcta
 
-# Importar get_client desde el módulo de dependencias centralizado
-from app.dependencies import get_client
-
 log = structlog.get_logger(__name__)
 
 # Instancia del scheme HTTPBearer. auto_error=False para manejar manualmente la ausencia de token.
@@ -911,11 +908,12 @@ setup_logging()
 from app.core.config import settings
 from app.db import postgres_client
 
-# --- !!! REMOVE Global HTTP Client Variable !!! ---
-# proxy_http_client: Optional[httpx.AsyncClient] = None # REMOVED
-
 # --- Importar Routers ---
-from app.routers import gateway_router, user_router
+# Import specific router instances
+from app.routers.gateway_router import router as gateway_router_instance
+from app.routers.user_router import router as user_router_instance
+# You might not need to import auth_router if it's empty or deleted
+# from app.routers.auth_router import router as auth_router_instance
 
 log = structlog.get_logger("atenex_api_gateway.main")
 
@@ -933,18 +931,19 @@ async def lifespan(app: FastAPI):
             max_keepalive_connections=settings.HTTP_CLIENT_MAX_KEEPALIVE_CONNECTIONS,
             max_connections=settings.HTTP_CLIENT_MAX_CONNECTIONS
         )
-        timeout = httpx.Timeout(settings.HTTP_CLIENT_TIMEOUT, connect=10.0)
+        # Increased default timeout slightly
+        timeout = httpx.Timeout(settings.HTTP_CLIENT_TIMEOUT, connect=15.0)
         http_client_instance = httpx.AsyncClient(
             limits=limits,
             timeout=timeout,
             follow_redirects=False,
             http2=True
         )
-        app.state.http_client = http_client_instance # <-- Attach to app.state
+        app.state.http_client = http_client_instance # Attach to app.state
         log.info("HTTPX client initialized and attached to app.state successfully.")
     except Exception as e:
         log.exception("CRITICAL: Failed to initialize HTTPX client during startup!", error=str(e))
-        app.state.http_client = None # Ensure state is None if init fails
+        app.state.http_client = None
 
     # 2. Initialize and Verify PostgreSQL Connection
     log.info("Initializing and verifying PostgreSQL connection pool...")
@@ -961,7 +960,7 @@ async def lifespan(app: FastAPI):
             log.critical("PostgreSQL connection pool initialization returned None!")
     except Exception as e:
         log.exception("CRITICAL: Failed to initialize or verify PostgreSQL connection!", error=str(e))
-        db_pool_ok = False # Ensure DB is marked as not OK
+        db_pool_ok = False
 
     # Log final readiness check
     if getattr(app.state, 'http_client', None) and db_pool_ok:
@@ -970,89 +969,72 @@ async def lifespan(app: FastAPI):
         log.error("Application startup sequence FAILED. Check HTTP Client or DB init.",
                   http_client_ready=bool(getattr(app.state, 'http_client', None)),
                   db_ready=db_pool_ok)
-        # Optional: raise an error to prevent startup if critical dependencies failed
+        # Consider raising an error to prevent startup if critical dependencies failed
         # raise RuntimeError("Critical dependencies failed to initialize during startup.")
 
-    yield # <--- Application runs here
+    yield # Application runs here
 
     log.info("Application shutdown sequence initiated...")
-    # 1. Close HTTP Client (Retrieve from app.state)
+    # Close HTTP Client
     client_to_close = getattr(app.state, 'http_client', None)
     if client_to_close and not client_to_close.is_closed:
         log.info("Closing HTTPX client from app.state...")
-        try:
-            await client_to_close.aclose()
-            log.info("HTTPX client closed successfully.")
-        except Exception as e:
-            log.exception("Error closing HTTPX client during shutdown.", error=str(e))
-    else:
-        log.info("HTTPX client was not initialized or already closed.")
-
-    # 2. Close PostgreSQL Pool
+        try: await client_to_close.aclose(); log.info("HTTPX client closed.")
+        except Exception as e: log.exception("Error closing HTTPX client.", error=str(e))
+    else: log.info("HTTPX client was not initialized or already closed.")
+    # Close DB Pool
     log.info("Closing PostgreSQL connection pool...")
-    try:
-        await postgres_client.close_db_pool()
-    except Exception as e:
-        log.exception("Error closing PostgreSQL connection pool during shutdown.", error=str(e))
-
-    log.info("Application shutdown sequence complete.")
+    try: await postgres_client.close_db_pool()
+    except Exception as e: log.exception("Error closing PostgreSQL pool.", error=str(e))
+    log.info("Application shutdown complete.")
 
 
 # --- Create FastAPI App Instance ---
 app = FastAPI(
     title=settings.PROJECT_NAME,
     description="Atenex API Gateway: Single entry point, JWT auth, routing via explicit HTTP calls.",
-    version="1.0.3", # Version bump
-    lifespan=lifespan, # Use the updated lifespan manager
+    version="1.0.4", # Version bump
+    lifespan=lifespan,
 )
 
-# --- Middlewares (No changes needed here) ---
-# CORS Configuration (using regex)
+# --- Middlewares ---
+# CORS
 vercel_pattern = ""
 if settings.VERCEL_FRONTEND_URL:
-    # Simplified regex derivation (adjust if needed)
-    base_vercel_url = settings.VERCEL_FRONTEND_URL.split("://")[1] # Remove scheme
+    # (Regex logic kept same as previous version)
+    base_vercel_url = settings.VERCEL_FRONTEND_URL.split("://")[1]
     base_vercel_url = re.sub(r"(-git-[a-z0-9-]+)?(-[a-z0-9]+)?\.vercel\.app", ".vercel.app", base_vercel_url)
     escaped_base = re.escape(base_vercel_url).replace(r"\.vercel\.app", "")
-    vercel_pattern = rf"(https://{escaped_base}(-[a-z0-9-]+)*\.vercel\.app)" # Re-add scheme
-else:
-    log.warning("VERCEL_FRONTEND_URL not set for CORS.")
+    vercel_pattern = rf"(https://{escaped_base}(-[a-z0-9-]+)*\.vercel\.app)"
+else: log.warning("VERCEL_FRONTEND_URL not set for CORS.")
 localhost_pattern = r"(http://localhost:300[0-9])"
-allowed_origin_patterns = [localhost_pattern]
+allowed_origin_patterns = [localhost_pattern];
 if vercel_pattern: allowed_origin_patterns.append(vercel_pattern)
 final_regex = rf"^{ '|'.join(allowed_origin_patterns) }$"
 log.info("Configuring CORS middleware", allow_origin_regex=final_regex)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=final_regex, allow_credentials=True, allow_methods=["*"],
-    allow_headers=["*"], expose_headers=["X-Request-ID", "X-Process-Time"], max_age=600,
-)
+app.add_middleware(CORSMiddleware, allow_origin_regex=final_regex, allow_credentials=True,
+                   allow_methods=["*"], allow_headers=["*"],
+                   expose_headers=["X-Request-ID", "X-Process-Time"], max_age=600)
 
 # Request Context/Timing/Logging Middleware
 @app.middleware("http")
 async def add_request_context_timing_logging(request: Request, call_next):
     start_time = time.perf_counter()
     request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
-    request.state.request_id = request_id # Attach request_id to request state
-
+    request.state.request_id = request_id
     request_log = log.bind(request_id=request_id, method=request.method, path=request.url.path,
                            client_ip=request.client.host if request.client else "unknown",
                            origin=request.headers.get("origin", "N/A"))
-
-    if request.method == "OPTIONS": request_log.info("OPTIONS preflight request received")
+    if request.method == "OPTIONS": request_log.debug("OPTIONS preflight request received") # Downgraded log level
     else: request_log.info("Request received")
-
-    response = None
-    status_code = 500 # Default
+    response = None; status_code = 500
     try:
-        response = await call_next(request)
-        status_code = response.status_code
+        response = await call_next(request); status_code = response.status_code
     except Exception as e:
-        process_time_ms = (time.perf_counter() - start_time) * 1000
-        request_log.exception("Unhandled exception", status_code=500, error=str(e), proc_time=round(process_time_ms,2))
+        proc_time = (time.perf_counter() - start_time) * 1000
+        request_log.exception("Unhandled exception", status_code=500, error=str(e), proc_time=round(proc_time,2))
         response = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
-        # Add CORS headers to manual error responses if needed
-        origin = request.headers.get("Origin")
+        origin = request.headers.get("Origin");
         if origin and re.match(final_regex, origin):
              response.headers["Access-Control-Allow-Origin"] = origin
              response.headers["Access-Control-Allow-Credentials"] = "true"
@@ -1060,19 +1042,25 @@ async def add_request_context_timing_logging(request: Request, call_next):
         return response
     finally:
         if response:
-            process_time_ms = (time.perf_counter() - start_time) * 1000
+            proc_time = (time.perf_counter() - start_time) * 1000
             response.headers["X-Request-ID"] = request_id
-            response.headers["X-Process-Time"] = f"{process_time_ms:.2f}ms"
+            response.headers["X-Process-Time"] = f"{proc_time:.2f}ms"
             log_level = "debug" if request.url.path == "/health" else "info"
             log_func = getattr(request_log.bind(status_code=status_code), log_level)
-            if request.method != "OPTIONS": log_func("Request completed", proc_time=round(process_time_ms, 2))
+            # Avoid logging OPTIONS completion if already logged received
+            if request.method != "OPTIONS": log_func("Request completed", proc_time=round(proc_time, 2))
     return response
-
 
 # --- Include Routers ---
 log.info("Including application routers...")
-app.include_router(user_router.router)
-app.include_router(gateway_router.router)
+# User router has its own prefix defined internally (/api/v1/users)
+app.include_router(user_router_instance)
+
+# --- *** CORRECTION: ADD PREFIX HERE *** ---
+# Apply the /api/v1 prefix when including the gateway router
+app.include_router(gateway_router_instance, prefix="/api/v1")
+# -------------------------------------------
+
 log.info("Routers included successfully.")
 
 # --- Root & Health Endpoints ---
@@ -1081,32 +1069,25 @@ async def read_root():
     return {"message": f"{settings.PROJECT_NAME} is running!"}
 
 @app.get("/health", tags=["Health"], summary="Health check endpoint")
-async def health_check(request: Request): # Inject request to access app.state
+async def health_check(request: Request):
     health_status = {"status": "healthy", "service": settings.PROJECT_NAME, "checks": {}}
     db_ok = await postgres_client.check_db_connection()
     health_status["checks"]["database_connection"] = "ok" if db_ok else "failed"
-
-    # Check HTTP Client from app.state
     http_client = getattr(request.app.state, 'http_client', None)
     http_client_ok = http_client is not None and not http_client.is_closed
     health_status["checks"]["http_client"] = "ok" if http_client_ok else "failed"
-
     if not db_ok or not http_client_ok:
         health_status["status"] = "unhealthy"
         log.warning("Health check determined service unhealthy", checks=health_status["checks"])
         return JSONResponse(content=health_status, status_code=503)
-
     log.debug("Health check successful", checks=health_status["checks"])
     return health_status
 
-
-# --- Main Execution (for local development) ---
+# --- Main Execution ---
 if __name__ == "__main__":
-    print(f"Starting {settings.PROJECT_NAME} using Uvicorn for local dev...")
-    uvicorn.run(
-        "app.main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8080)),
-        reload=True, log_level=settings.LOG_LEVEL.lower(),
-    )
+    print(f"Starting {settings.PROJECT_NAME} using Uvicorn...")
+    uvicorn.run("app.main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8080)),
+                reload=True, log_level=settings.LOG_LEVEL.lower())
 ```
 
 ## File: `app\routers\__init__.py`
@@ -1139,302 +1120,173 @@ log.info("Auth router loaded (currently defines no active endpoints).")
 ```py
 # api-gateway/app/routers/gateway_router.py
 from fastapi import APIRouter, Request, Response, Depends, HTTPException, status, Path
-from fastapi.responses import JSONResponse, StreamingResponse
-from typing import Optional, Annotated, Dict, Any, List, Union
+from fastapi.responses import JSONResponse # Removed StreamingResponse as it wasn't used effectively
+from typing import Optional, Annotated, Dict, Any
 import httpx
 import structlog
-import asyncio
 import uuid
-import json
+import json # Ensure json is imported for error handling
 
 from app.core.config import settings
-# Usar las dependencias de autenticación directamente donde se necesiten
 from app.auth.auth_middleware import StrictAuth
 
 log = structlog.get_logger("atenex_api_gateway.router.gateway")
 
-# Instancia del Router
-router = APIRouter(prefix="/api/v1", tags=["Gateway Proxy (Explicit Calls)"]) # Cambiar tags
+# --- *** CORRECTION: Remove prefix from APIRouter definition *** ---
+router = APIRouter(tags=["Gateway (Explicit Calls)"])
+# --------------------------------------------------------------------
 
-# --- Helper para construir headers comunes ---
+# --- Helpers (_prepare_forwarded_headers, _handle_backend_response, _handle_httpx_error) ---
+# (Keep these helpers exactly as they were in the previous corrected version)
 def _prepare_forwarded_headers(request: Request, user_payload: Dict[str, Any]) -> Dict[str, str]:
-    """Prepara los headers para reenviar, incluyendo X-User-ID y X-Company-ID."""
     headers_to_forward = {}
     request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
-
-    # Headers de contexto de proxy estándar
     client_host = request.client.host if request.client else "unknown"
     x_forwarded_for = request.headers.get("x-forwarded-for", client_host)
     headers_to_forward["X-Forwarded-For"] = x_forwarded_for
     headers_to_forward["X-Forwarded-Proto"] = request.url.scheme
-    if "host" in request.headers:
-        headers_to_forward["X-Forwarded-Host"] = request.headers["host"]
+    if "host" in request.headers: headers_to_forward["X-Forwarded-Host"] = request.headers["host"]
     headers_to_forward["X-Request-ID"] = request_id
-
-    # Añadir Headers de Autenticación/Contexto
-    user_id = user_payload.get('sub')
-    company_id = user_payload.get('company_id')
-    user_email = user_payload.get('email')
-
-    if not user_id or not company_id:
-        log.critical("Gateway Internal Error: User payload missing sub or company_id after auth!", payload_keys=list(user_payload.keys()))
-        raise HTTPException(status_code=500, detail="Internal context error")
-
-    headers_to_forward['X-User-ID'] = str(user_id)
-    headers_to_forward['X-Company-ID'] = str(company_id)
-    if user_email:
-        headers_to_forward['X-User-Email'] = str(user_email)
-
-    # Añadir Accept header si existe
-    if "accept" in request.headers:
-        headers_to_forward["Accept"] = request.headers["accept"]
-
-    # **NO** añadir Content-Type aquí por defecto, se maneja por endpoint
+    user_id = user_payload.get('sub'); company_id = user_payload.get('company_id'); user_email = user_payload.get('email')
+    if not user_id or not company_id: log.critical("GW Error: Payload missing fields post-auth!", keys=list(user_payload.keys())); raise HTTPException(500, "Internal context error")
+    headers_to_forward['X-User-ID'] = str(user_id); headers_to_forward['X-Company-ID'] = str(company_id)
+    if user_email: headers_to_forward['X-User-Email'] = str(user_email)
+    if "accept" in request.headers: headers_to_forward["Accept"] = request.headers["accept"]
+    # Content-Type handled per endpoint
     return headers_to_forward
 
-# --- Helper para manejar la respuesta del backend ---
 async def _handle_backend_response(backend_response: httpx.Response, request_id: str) -> Response:
-    """Procesa la respuesta del backend y la convierte en una respuesta FastAPI."""
     response_log = log.bind(request_id=request_id, backend_status=backend_response.status_code)
-
     content_type = backend_response.headers.get("content-type", "application/octet-stream")
-    response_log.debug("Handling backend response", content_type=content_type)
-
-    # Preparar headers de respuesta
-    response_headers = {
-        name: value for name, value in backend_response.headers.items()
-        # Excluir hop-by-hop headers de la respuesta del backend
-        if name.lower() not in [
-            "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-            "te", "trailers", "transfer-encoding", "upgrade", "content-encoding" # Excluir content-length aquí también
-        ]
-    }
-    response_headers["X-Request-ID"] = request_id # Propagar Request ID
-
-    # Leer contenido - NO USAR STREAMINGRESPONSE a menos que sea necesario y se maneje
+    response_headers = { n: v for n, v in backend_response.headers.items() if n.lower() not in ["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade", "content-encoding"] }
+    response_headers["X-Request-ID"] = request_id
     try:
-        # Leer el cuerpo completo. Ideal para JSON/texto/binarios pequeños.
         content_bytes = await backend_response.aread()
-        # Actualizar content-length basado en lo leído
         response_headers["Content-Length"] = str(len(content_bytes))
-        response_log.debug("Backend response body read", body_length=len(content_bytes))
-
+        response_log.debug("Backend response read", len=len(content_bytes), ct=content_type)
     except Exception as read_err:
-        response_log.error("Failed to read backend response body", error=str(read_err))
-        # Devolver error genérico si no podemos leer la respuesta
-        return JSONResponse(
-             content={"detail": "Error reading response from upstream service"},
-             status_code=status.HTTP_502_BAD_GATEWAY,
-             headers={"X-Request-ID": request_id}
-        )
-    finally:
-        # Siempre cerrar la respuesta del backend
-        await backend_response.aclose()
+        response_log.error("Failed reading backend response", error=str(read_err))
+        return JSONResponse(content={"detail": "Upstream response read error"}, status_code=502, headers={"X-Request-ID": request_id})
+    finally: await backend_response.aclose()
+    return Response(content=content_bytes, status_code=backend_response.status_code, headers=response_headers, media_type=content_type)
 
-
-    return Response(
-        content=content_bytes,
-        status_code=backend_response.status_code,
-        headers=response_headers,
-        media_type=content_type
-    )
-
-# --- Helper para manejar errores HTTPX ---
 def _handle_httpx_error(exc: Exception, target_url: str, request_id: str):
     error_log = log.bind(request_id=request_id, target_url=target_url)
-    if isinstance(exc, httpx.TimeoutException):
-        error_log.error("Gateway timeout calling backend service", exc_info=False)
-        raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Upstream service timed out.")
-    elif isinstance(exc, (httpx.ConnectError, httpx.NetworkError)):
-        error_log.error("Gateway connection error calling backend service", error=str(exc), exc_info=False)
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Could not connect to upstream service.")
-    elif isinstance(exc, httpx.HTTPStatusError): # Errores 4xx/5xx devueltos por el backend
-        error_log.warning("Backend service returned error status", status_code=exc.response.status_code, response_preview=exc.response.text[:200])
-        # Reintentar devolver la respuesta original si es posible
-        try:
-            content = exc.response.json()
-        except json.JSONDecodeError:
-            content = {"detail": exc.response.text or f"Backend returned status {exc.response.status_code}"}
+    if isinstance(exc, httpx.TimeoutException): error_log.error("GW Timeout"); raise HTTPException(504, "Upstream timeout.")
+    elif isinstance(exc, (httpx.ConnectError, httpx.NetworkError)): error_log.error("GW Connection Error", e=str(exc)); raise HTTPException(503, "Upstream connection failed.")
+    elif isinstance(exc, httpx.HTTPStatusError):
+        error_log.warning("Backend Error Status", status=exc.response.status_code, resp=exc.response.text[:200])
+        try: content = exc.response.json()
+        except json.JSONDecodeError: content = {"detail": exc.response.text or f"Backend status {exc.response.status_code}"}
         raise HTTPException(status_code=exc.response.status_code, detail=content)
-    else: # Otros errores httpx o inesperados
-        error_log.exception("Unexpected error during backend call")
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="An unexpected error occurred communicating with upstream service.")
+    else: error_log.exception("Unexpected GW Backend Call Error"); raise HTTPException(502, "Unexpected upstream communication error.")
 
-# --- Endpoints Query Service (Llamadas Explícitas) ---
+
+# --- Endpoints Query Service ---
+# Paths are now relative to the prefix applied in main.py ("/api/v1")
 
 @router.post("/query/ask", summary="Ask a question (Query Service)")
-async def query_service_ask(
-    request: Request, # Inject request
-    user_payload: StrictAuth,
-    # client: HttpClientDep, # REMOVE Dependency injection here
-):
-    # --- Get client from app state ---
+async def query_service_ask(request: Request, user_payload: StrictAuth):
     client = getattr(request.app.state, 'http_client', None)
-    if not client or client.is_closed:
-         log.error("HTTP client unavailable in query_service_ask endpoint.")
-         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Gateway dependency unavailable.")
-    # --------------------------------
-
+    if not client or client.is_closed: raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Gateway dependency unavailable.")
     request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
-    endpoint_log = log.bind(request_id=request_id)
-    endpoint_log.info("Forwarding request to Query Service POST /ask")
-
-    target_url = f"{settings.QUERY_SERVICE_URL}{request.url.path}"
+    # Construct target URL: Base URL from settings + path defined here
+    target_url = f"{settings.QUERY_SERVICE_URL}/api/v1/query/ask" # Explicit full path to backend
     headers = _prepare_forwarded_headers(request, user_payload)
-
+    try: request_body = await request.json(); headers["Content-Type"] = "application/json"
+    except json.JSONDecodeError: raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid JSON body")
     try:
-        request_body = await request.json()
-        headers["Content-Type"] = "application/json"
-    except json.JSONDecodeError:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid JSON body")
-
-    try:
-        backend_response = await client.post(target_url, headers=headers, json=request_body) # Use the retrieved client
+        backend_response = await client.post(target_url, headers=headers, json=request_body)
         return await _handle_backend_response(backend_response, request_id)
-    except Exception as exc:
-        _handle_httpx_error(exc, target_url, request_id)
+    except Exception as exc: _handle_httpx_error(exc, target_url, request_id)
 
 @router.get("/query/chats", summary="List chats (Query Service)")
-async def query_service_get_chats(
-    request: Request, # Inject request
-    user_payload: StrictAuth,
-    # client: HttpClientDep, # REMOVE Dependency injection here
-):
-    # --- Get client from app state ---
+async def query_service_get_chats(request: Request, user_payload: StrictAuth):
     client = getattr(request.app.state, 'http_client', None)
     if not client or client.is_closed: raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Gateway dependency unavailable.")
-    # --------------------------------
-
     request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
-    target_url = f"{settings.QUERY_SERVICE_URL}{request.url.path}"
+    target_url = f"{settings.QUERY_SERVICE_URL}/api/v1/query/chats" # Explicit full path
     headers = _prepare_forwarded_headers(request, user_payload)
-    params = request.query_params
+    params = request.query_params # Pass original query params
     try:
-        backend_response = await client.get(target_url, headers=headers, params=params) # Use the retrieved client
+        backend_response = await client.get(target_url, headers=headers, params=params)
         return await _handle_backend_response(backend_response, request_id)
-    except Exception as exc:
-        _handle_httpx_error(exc, target_url, request_id)
+    except Exception as exc: _handle_httpx_error(exc, target_url, request_id)
 
 @router.get("/query/chats/{chat_id}/messages", summary="Get chat messages (Query Service)")
-async def query_service_get_chat_messages(
-    request: Request, # Inject request
-    user_payload: StrictAuth,
-    # client: HttpClientDep, # REMOVE Dependency injection here
-    chat_id: uuid.UUID = Path(...),
-):
-    # --- Get client from app state ---
+async def query_service_get_chat_messages(request: Request, user_payload: StrictAuth, chat_id: uuid.UUID = Path(...)):
     client = getattr(request.app.state, 'http_client', None)
     if not client or client.is_closed: raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Gateway dependency unavailable.")
-    # --------------------------------
-
     request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
-    target_url = f"{settings.QUERY_SERVICE_URL}{request.url.path}"
+    # Construct backend path carefully
+    backend_path = f"/api/v1/query/chats/{chat_id}/messages"
+    target_url = f"{settings.QUERY_SERVICE_URL}{backend_path}"
     headers = _prepare_forwarded_headers(request, user_payload)
     params = request.query_params
     try:
-        backend_response = await client.get(target_url, headers=headers, params=params) # Use the retrieved client
+        backend_response = await client.get(target_url, headers=headers, params=params)
         return await _handle_backend_response(backend_response, request_id)
-    except Exception as exc:
-        _handle_httpx_error(exc, target_url, request_id)
-
+    except Exception as exc: _handle_httpx_error(exc, target_url, request_id)
 
 @router.delete("/query/chats/{chat_id}", summary="Delete chat (Query Service)")
-async def query_service_delete_chat(
-    request: Request, # Inject request
-    user_payload: StrictAuth,
-    # client: HttpClientDep, # REMOVE Dependency injection here
-    chat_id: uuid.UUID = Path(...),
-):
-    # --- Get client from app state ---
+async def query_service_delete_chat(request: Request, user_payload: StrictAuth, chat_id: uuid.UUID = Path(...)):
     client = getattr(request.app.state, 'http_client', None)
     if not client or client.is_closed: raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Gateway dependency unavailable.")
-    # --------------------------------
-
     request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
-    target_url = f"{settings.QUERY_SERVICE_URL}{request.url.path}"
+    backend_path = f"/api/v1/query/chats/{chat_id}"
+    target_url = f"{settings.QUERY_SERVICE_URL}{backend_path}"
     headers = _prepare_forwarded_headers(request, user_payload)
     try:
-        backend_response = await client.delete(target_url, headers=headers) # Use the retrieved client
+        backend_response = await client.delete(target_url, headers=headers)
         if backend_response.status_code == status.HTTP_204_NO_CONTENT:
-            await backend_response.aclose()
-            return Response(status_code=status.HTTP_204_NO_CONTENT)
+            await backend_response.aclose(); return Response(status_code=status.HTTP_204_NO_CONTENT)
         else: return await _handle_backend_response(backend_response, request_id)
-    except Exception as exc:
-        _handle_httpx_error(exc, target_url, request_id)
+    except Exception as exc: _handle_httpx_error(exc, target_url, request_id)
 
-
-# --- Endpoints Ingest Service (Get client from request.app.state) ---
+# --- Endpoints Ingest Service ---
 
 @router.post("/ingest/upload", summary="Upload document (Ingest Service)")
-async def ingest_service_upload(
-    request: Request, # Inject request
-    user_payload: StrictAuth,
-    # client: HttpClientDep, # REMOVE Dependency injection here
-):
-    # --- Get client from app state ---
+async def ingest_service_upload(request: Request, user_payload: StrictAuth):
     client = getattr(request.app.state, 'http_client', None)
     if not client or client.is_closed: raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Gateway dependency unavailable.")
-    # --------------------------------
-
     request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
-    target_url = f"{settings.INGEST_SERVICE_URL}{request.url.path}"
+    target_url = f"{settings.INGEST_SERVICE_URL}/api/v1/ingest/upload" # Explicit backend path
     headers = _prepare_forwarded_headers(request, user_payload)
     content_type = request.headers.get('content-type')
-    if not content_type or 'multipart/form-data' not in content_type:
-         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Content-Type multipart/form-data required.")
-    headers['Content-Type'] = content_type
-    headers.pop('transfer-encoding', None)
+    if not content_type or 'multipart/form-data' not in content_type: raise HTTPException(status.HTTP_400_BAD_REQUEST, "Multipart Content-Type required.")
+    headers['Content-Type'] = content_type; headers.pop('transfer-encoding', None)
     try: body_bytes = await request.body(); headers['Content-Length'] = str(len(body_bytes))
     except Exception as read_err: raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Could not read upload body: {read_err}")
     try:
-        backend_response = await client.post(target_url, headers=headers, content=body_bytes) # Use the retrieved client
+        backend_response = await client.post(target_url, headers=headers, content=body_bytes)
         return await _handle_backend_response(backend_response, request_id)
-    except Exception as exc:
-        _handle_httpx_error(exc, target_url, request_id)
-
+    except Exception as exc: _handle_httpx_error(exc, target_url, request_id)
 
 @router.get("/ingest/status/{document_id}", summary="Get document status (Ingest Service)")
-async def ingest_service_get_status(
-    request: Request, # Inject request
-    user_payload: StrictAuth,
-    # client: HttpClientDep, # REMOVE Dependency injection here
-    document_id: uuid.UUID = Path(...),
-):
-    # --- Get client from app state ---
+async def ingest_service_get_status(request: Request, user_payload: StrictAuth, document_id: uuid.UUID = Path(...)):
     client = getattr(request.app.state, 'http_client', None)
     if not client or client.is_closed: raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Gateway dependency unavailable.")
-    # --------------------------------
-
     request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
-    target_url = f"{settings.INGEST_SERVICE_URL}{request.url.path}"
+    backend_path = f"/api/v1/ingest/status/{document_id}"
+    target_url = f"{settings.INGEST_SERVICE_URL}{backend_path}"
     headers = _prepare_forwarded_headers(request, user_payload)
     try:
-        backend_response = await client.get(target_url, headers=headers) # Use the retrieved client
+        backend_response = await client.get(target_url, headers=headers)
         return await _handle_backend_response(backend_response, request_id)
-    except Exception as exc:
-        _handle_httpx_error(exc, target_url, request_id)
-
+    except Exception as exc: _handle_httpx_error(exc, target_url, request_id)
 
 @router.get("/ingest/status", summary="List document statuses (Ingest Service)")
-async def ingest_service_list_statuses(
-    request: Request, # Inject request
-    user_payload: StrictAuth,
-    # client: HttpClientDep, # REMOVE Dependency injection here
-):
-    # --- Get client from app state ---
+async def ingest_service_list_statuses(request: Request, user_payload: StrictAuth):
     client = getattr(request.app.state, 'http_client', None)
     if not client or client.is_closed: raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Gateway dependency unavailable.")
-    # --------------------------------
-
     request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
-    target_url = f"{settings.INGEST_SERVICE_URL}{request.url.path}"
+    target_url = f"{settings.INGEST_SERVICE_URL}/api/v1/ingest/status" # Explicit backend path
     headers = _prepare_forwarded_headers(request, user_payload)
-    params = request.query_params
+    params = request.query_params # Pass original query params
     try:
-        backend_response = await client.get(target_url, headers=headers, params=params) # Use the retrieved client
+        backend_response = await client.get(target_url, headers=headers, params=params)
         return await _handle_backend_response(backend_response, request_id)
-    except Exception as exc:
-        _handle_httpx_error(exc, target_url, request_id)
+    except Exception as exc: _handle_httpx_error(exc, target_url, request_id)
 ```
 
 ## File: `app\routers\user_router.py`
@@ -1442,227 +1294,78 @@ async def ingest_service_list_statuses(
 # File: app/routers/user_router.py
 # api-gateway/app/routers/user_router.py
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Body
-from typing import Dict, Any, Optional, Annotated # Asegúrate de importar Annotated
+from typing import Dict, Any, Optional, Annotated
 import structlog
 import uuid
 
-# Importar dependencias de autenticación y DB
-from app.auth.auth_middleware import InitialAuth # Para ensure-company
+from app.auth.auth_middleware import InitialAuth
 from app.auth.auth_service import authenticate_user, create_access_token
 from app.db import postgres_client
 from app.core.config import settings
-
-# Importar modelos Pydantic para request/response
 from pydantic import BaseModel, EmailStr, Field, validator
 
 log = structlog.get_logger(__name__)
-router = APIRouter(prefix="/api/v1/users", tags=["Users & Authentication"]) # Agrupamos aquí
 
-# --- Modelos Pydantic para la API ---
+# --- REMOVE prefix from router definition ---
+router = APIRouter(tags=["Users & Authentication"]) # No prefix here
 
-class LoginRequest(BaseModel):
-    """Payload esperado para el login."""
-    email: EmailStr
-    password: str = Field(..., min_length=6) # Ajusta min_length si es necesario
-
-class LoginResponse(BaseModel):
-    """Respuesta devuelta en un login exitoso."""
-    access_token: str
-    token_type: str = "bearer"
-    user_id: str # UUID como string
-    email: EmailStr
-    full_name: Optional[str] = None
-    role: Optional[str] = "user" # Rol por defecto
-    company_id: Optional[str] = None # UUID como string, puede ser None
-
+# --- Modelos Pydantic (Sin cambios) ---
+class LoginRequest(BaseModel): email: EmailStr; password: str = Field(..., min_length=6)
+class LoginResponse(BaseModel): access_token: str; token_type: str = "bearer"; user_id: str; email: EmailStr; full_name: Optional[str] = None; role: Optional[str] = "user"; company_id: Optional[str] = None
 class EnsureCompanyRequest(BaseModel):
-    """Payload opcional para forzar una compañía específica en ensure-company."""
-    company_id: Optional[str] = None # UUID como string
-
+    company_id: Optional[str] = None
     @validator('company_id')
     def validate_company_id_format(cls, v):
         if v is not None:
-            try:
-                uuid.UUID(v)
-            except ValueError:
-                raise ValueError("Provided company_id is not a valid UUID")
+            try: uuid.UUID(v)
+            except ValueError: raise ValueError("Provided company_id is not a valid UUID")
         return v
+class EnsureCompanyResponse(BaseModel): user_id: str; company_id: str; message: str; new_access_token: str; token_type: str = "bearer"
 
-class EnsureCompanyResponse(BaseModel):
-    """Respuesta devuelta al asociar/confirmar compañía."""
-    user_id: str # UUID como string
-    company_id: str # UUID como string (la que quedó asociada)
-    message: str
-    # Devolvemos el nuevo token para que el frontend lo use inmediatamente
-    new_access_token: str
-    token_type: str = "bearer"
-
-
-# --- Endpoints ---
-
-@router.post("/login", response_model=LoginResponse)
+# --- Endpoints (Relative paths within this router) ---
+# Paths should be relative to the /api/v1/users prefix added in main.py
+@router.post("/users/login", response_model=LoginResponse) # Path corrected relative to main prefix
 async def login_for_access_token(login_data: LoginRequest):
-    """
-    Autentica un usuario con email y contraseña.
-    Si es exitoso, devuelve un token JWT y datos básicos del usuario.
-    """
     log.info("Login attempt initiated", email=login_data.email)
     user = await authenticate_user(login_data.email, login_data.password)
-
     if not user:
-        log.warning("Login failed: Invalid credentials or inactive user", email=login_data.email)
-        # Devolver error genérico para no dar pistas sobre si el email existe
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        log.warning("Login failed", email=login_data.email)
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Incorrect email or password", headers={"WWW-Authenticate": "Bearer"})
+    user_id = user.get("id"); company_id = user.get("company_id"); email = user.get("email"); full_name = user.get("full_name"); role = user.get("role", "user")
+    if not user_id or not email: log.error("Auth user data missing fields", keys=user.keys()); raise HTTPException(500, "Internal login error")
+    access_token = create_access_token(user_id=user_id, email=email, company_id=company_id)
+    log.info("Login successful", user_id=str(user_id), company_id=str(company_id) if company_id else "None")
+    return LoginResponse(access_token=access_token, user_id=str(user_id), email=email, full_name=full_name, role=role, company_id=str(company_id) if company_id else None)
 
-    # Extraer datos del usuario autenticado para el token y la respuesta
-    user_id = user.get("id")
-    company_id = user.get("company_id") # Puede ser None
-    email = user.get("email")
-    full_name = user.get("full_name")
-    role = user.get("role", "user") # Default a 'user' si no está en DB
-
-    if not user_id or not email:
-         log.error("Critical error: Authenticated user data missing ID or email", user_dict_keys=user.keys())
-         raise HTTPException(status_code=500, detail="Internal server error during login")
-
-    # Crear el token JWT
-    access_token = create_access_token(
-        user_id=user_id,
-        email=email,
-        company_id=company_id # Pasar company_id (puede ser None)
-    )
-    log.info("Login successful, token generated", user_id=str(user_id), company_id=str(company_id) if company_id else "None")
-
-    # Devolver la respuesta
-    return LoginResponse(
-        access_token=access_token,
-        user_id=str(user_id),
-        email=email,
-        full_name=full_name,
-        role=role,
-        company_id=str(company_id) if company_id else None
-    )
-
-
-@router.post("/me/ensure-company", response_model=EnsureCompanyResponse)
-async def ensure_company_association(
-    request: Request, # Necesitamos la request para el log
-    # *** CORRECCIÓN: Parámetro sin default va primero ***
-    # La dependencia se define únicamente a través de la anotación InitialAuth
-    user_payload: InitialAuth,
-    # Cuerpo opcional para especificar company_id, default a vacío si no se envía
-    ensure_request: Optional[EnsureCompanyRequest] = Body(None)
-):
-    """
-    Endpoint para que un usuario autenticado (con token válido)
-    se asocie a una compañía si aún no lo está.
-    1. Usa la company_id del body si se proporciona.
-    2. Si no, usa la company_id por defecto de la configuración.
-    3. Si ya tiene una company_id y no se especifica una nueva, no hace nada.
-    4. Si se asocia/cambia, actualiza la DB y genera un NUEVO token con la company_id.
-    """
-    user_id_str = user_payload.get("sub")
-    req_id = getattr(request.state, 'request_id', 'N/A') # Obtener request_id para logs
-    log_ctx = log.bind(request_id=req_id, user_id=user_id_str)
-
+@router.post("/users/me/ensure-company", response_model=EnsureCompanyResponse) # Path corrected relative to main prefix
+async def ensure_company_association(request: Request, user_payload: InitialAuth, ensure_request: Optional[EnsureCompanyRequest] = Body(None)):
+    user_id_str = user_payload.get("sub"); req_id = getattr(request.state, 'request_id', 'N/A'); log_ctx = log.bind(request_id=req_id, user_id=user_id_str)
     log_ctx.info("Ensure company association requested.")
-
-    if not user_id_str:
-        log_ctx.error("Ensure company failed: User ID ('sub') missing in token payload.")
-        raise HTTPException(status_code=400, detail="User ID not found in token payload.")
-
-    try:
-        user_id = uuid.UUID(user_id_str)
-    except ValueError:
-        log_ctx.error("Ensure company failed: User ID ('sub') in token is not a valid UUID.", sub_value=user_id_str)
-        raise HTTPException(status_code=400, detail="Invalid user ID format in token.")
-
-    # Obtener datos actuales del usuario desde la DB (incluye email, full_name para el nuevo token)
+    if not user_id_str: log_ctx.error("Ensure fail: User ID missing"); raise HTTPException(400, "User ID not found in token.")
+    try: user_id = uuid.UUID(user_id_str)
+    except ValueError: log_ctx.error("Ensure fail: Invalid User ID", sub=user_id_str); raise HTTPException(400, "Invalid user ID format.")
     current_user_data = await postgres_client.get_user_by_id(user_id)
-    if not current_user_data:
-        # Esto no debería pasar si verify_token funciona, pero es una salvaguarda
-        log_ctx.error("Ensure company failed: User found in token but not in database.", user_id=user_id_str)
-        raise HTTPException(status_code=404, detail="User associated with token not found in database.")
-
-    current_company_id = current_user_data.get("company_id")
-    target_company_id_str: Optional[str] = None
-    action_taken = "none"
-
-    # Determinar el company_id objetivo
-    if ensure_request and ensure_request.company_id:
-        target_company_id_str = ensure_request.company_id
-        log_ctx.info("Using company_id provided in request body.", target_company=target_company_id_str)
-    elif not current_company_id and settings.DEFAULT_COMPANY_ID:
-        target_company_id_str = settings.DEFAULT_COMPANY_ID
-        log_ctx.info("User has no company_id, using default from settings.", default_company=target_company_id_str)
-    elif current_company_id:
-        # Ya tiene compañía y no se pidió cambiarla explícitamente
-        target_company_id_str = str(current_company_id) # Usar la actual
-        log_ctx.info("User already associated with a company, no change requested.", current_company=target_company_id_str)
-    else:
-        # No tiene compañía, no se proporcionó una, y no hay default configurado
-        log_ctx.error("Ensure company failed: No target company_id provided or configured.", user_id=user_id_str)
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot associate company: No company ID provided and no default is configured for the gateway."
-        )
-
-    # Validar el formato del target_company_id_str
-    try:
-        target_company_id = uuid.UUID(target_company_id_str)
-    except ValueError:
-        log_ctx.error("Ensure company failed: Target company ID is not a valid UUID.", target_value=target_company_id_str)
-        raise HTTPException(status_code=400, detail="Invalid target company ID format.")
-
-    # Actualizar la DB solo si el target_company_id es diferente del actual (o si el actual es None)
+    if not current_user_data: log_ctx.error("Ensure fail: User not in DB"); raise HTTPException(404, "User not found in database.")
+    current_company_id = current_user_data.get("company_id"); target_company_id_str: Optional[str] = None; action_taken = "none"
+    if ensure_request and ensure_request.company_id: target_company_id_str = ensure_request.company_id; log_ctx.info("Using company_id from body", target=target_company_id_str)
+    elif not current_company_id and settings.DEFAULT_COMPANY_ID: target_company_id_str = settings.DEFAULT_COMPANY_ID; log_ctx.info("Using default company_id", default=target_company_id_str)
+    elif current_company_id: target_company_id_str = str(current_company_id); log_ctx.info("Using current company_id", current=target_company_id_str)
+    else: log_ctx.error("Ensure fail: No target company"); raise HTTPException(400,"Cannot associate company: No ID provided and no default configured.")
+    try: target_company_id = uuid.UUID(target_company_id_str)
+    except ValueError: log_ctx.error("Ensure fail: Invalid target UUID", target=target_company_id_str); raise HTTPException(400, "Invalid target company ID format.")
     if target_company_id != current_company_id:
-        log_ctx.info("Attempting to update user's company in database.", new_company_id=str(target_company_id))
+        log_ctx.info("Updating user company in DB", new_id=str(target_company_id))
         updated = await postgres_client.update_user_company(user_id, target_company_id)
-        if not updated:
-            # Podría fallar si el usuario fue eliminado entre get y update, o error DB
-            log_ctx.error("Failed to update user's company association in database.", user_id=user_id_str)
-            raise HTTPException(status_code=500, detail="Failed to update user's company association.")
-        action_taken = "updated"
-        log_ctx.info("User company association updated successfully in database.", new_company_id=str(target_company_id))
-    else:
-        action_taken = "confirmed"
-        log_ctx.info("User company association already matches target, no database update needed.", company_id=str(target_company_id))
-
-    # Generar un *nuevo* token JWT con la company_id (ya sea la actualizada o la confirmada)
-    # Usar los datos recuperados de la DB para otros claims
+        if not updated: log_ctx.error("DB update failed"); raise HTTPException(500, "Failed to update user company.")
+        action_taken = "updated"; log_ctx.info("DB update successful")
+    else: action_taken = "confirmed"; log_ctx.info("Company association confirmed, no DB update")
     user_email = current_user_data.get("email")
-    user_full_name = current_user_data.get("full_name")
-    if not user_email:
-         log_ctx.error("Critical error: User data from DB missing email, cannot generate new token.", user_id=user_id_str)
-         raise HTTPException(status_code=500, detail="Internal server error generating updated token.")
-
-    new_access_token = create_access_token(
-        user_id=user_id,
-        email=user_email,
-        company_id=target_company_id # ¡Asegurarse de usar el target_company_id!
-        # Podrías añadir full_name, role aquí si los incluyes en create_access_token
-    )
-    log_ctx.info("New access token generated with company association.", company_id=str(target_company_id))
-
-    # Determinar mensaje de respuesta
-    if action_taken == "updated":
-        message = f"Company association successfully updated to {target_company_id}."
-    elif action_taken == "confirmed":
-        message = f"Company association confirmed as {target_company_id}."
-    else: # action_taken == "none" (no debería llegar aquí si la lógica es correcta)
-        message = f"User already associated with company {target_company_id}."
-
-
-    return EnsureCompanyResponse(
-        user_id=str(user_id),
-        company_id=str(target_company_id),
-        message=message,
-        new_access_token=new_access_token
-    )
+    if not user_email: log_ctx.error("Cannot generate token, missing email"); raise HTTPException(500, "Internal error generating token.")
+    new_access_token = create_access_token(user_id=user_id, email=user_email, company_id=target_company_id)
+    log_ctx.info("New token generated", company_id=str(target_company_id))
+    if action_taken == "updated": message = f"Company association updated to {target_company_id}."
+    else: message = f"Company association confirmed as {target_company_id}."
+    return EnsureCompanyResponse(user_id=str(user_id), company_id=str(target_company_id), message=message, new_access_token=new_access_token)
 ```
 
 ## File: `pyproject.toml`
