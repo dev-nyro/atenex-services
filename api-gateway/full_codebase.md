@@ -13,7 +13,6 @@ app/
 │   └── logging_config.py
 ├── db
 │   └── postgres_client.py
-├── dependencies.py
 ├── main.py
 ├── routers
 │   ├── __init__.py
@@ -886,36 +885,6 @@ async def update_user_company(user_id: uuid.UUID, company_id: uuid.UUID) -> bool
 
 ```
 
-## File: `app\dependencies.py`
-```py
-# app/dependencies.py
-import httpx
-from fastapi import HTTPException, status
-import structlog
-from typing import Optional
-
-# --- Importar la variable GLOBAL definida en main.py ---
-# Esto es seguro porque 'main.py' habrá sido cargado por Gunicorn/Uvicorn
-# antes de que esta dependencia sea necesitada por una request.
-from app.main import proxy_http_client
-
-log = structlog.get_logger("atenex_api_gateway.dependencies")
-
-def get_client() -> httpx.AsyncClient:
-    """
-    Dependencia FastAPI para obtener el cliente HTTPX global.
-    Verifica que el cliente haya sido inicializado por el lifespan manager.
-    """
-    if proxy_http_client is None or proxy_http_client.is_closed:
-        # Log crítico porque esto indica un problema en el startup
-        log.critical("API Gateway HTTP client requested but is not available or closed.")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Internal gateway dependency (HTTP Client) unavailable. Service may not have started correctly."
-        )
-    return proxy_http_client
-```
-
 ## File: `app\main.py`
 ```py
 # File: app/main.py
@@ -931,8 +900,8 @@ import structlog
 import uvicorn
 import time
 import uuid
-import logging # Importar logging estándar para configuración inicial
-import re # Importar el módulo de expresiones regulares
+import logging
+import re
 
 # --- Configuración de Logging PRIMERO ---
 from app.core.logging_config import setup_logging
@@ -940,88 +909,86 @@ setup_logging()
 
 # --- Importaciones Core y DB ---
 from app.core.config import settings
-from app.db import postgres_client # Importar cliente DB
+from app.db import postgres_client
 
-# --- !!! Definir la variable global ANTES de importar routers !!! ---
-proxy_http_client: Optional[httpx.AsyncClient] = None
+# --- !!! REMOVE Global HTTP Client Variable !!! ---
+# proxy_http_client: Optional[httpx.AsyncClient] = None # REMOVED
 
-# --- Importar Routers (Ahora es seguro) ---
+# --- Importar Routers ---
 from app.routers import gateway_router, user_router
 
 log = structlog.get_logger("atenex_api_gateway.main")
 
-
-# --- Lifespan Manager (Startup y Shutdown) ---
+# --- Lifespan Manager (Uses app.state) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global proxy_http_client # Indicar que modificaremos la variable global
     log.info("Application startup sequence initiated...")
+    http_client_instance: Optional[httpx.AsyncClient] = None
+    db_pool_ok = False
 
-    # 1. Inicializar Cliente HTTP (usando la variable global)
+    # 1. Initialize HTTP Client
     try:
-        log.info("Initializing global HTTPX client...")
+        log.info("Initializing HTTPX client for application state...")
         limits = httpx.Limits(
             max_keepalive_connections=settings.HTTP_CLIENT_MAX_KEEPALIVE_CONNECTIONS,
             max_connections=settings.HTTP_CLIENT_MAX_CONNECTIONS
         )
         timeout = httpx.Timeout(settings.HTTP_CLIENT_TIMEOUT, connect=10.0)
-        proxy_http_client = httpx.AsyncClient( # Asigna a la variable global
+        http_client_instance = httpx.AsyncClient(
             limits=limits,
             timeout=timeout,
             follow_redirects=False,
             http2=True
         )
-        log.info("HTTPX client initialized successfully.", limits=str(limits), timeout=str(timeout))
+        app.state.http_client = http_client_instance # <-- Attach to app.state
+        log.info("HTTPX client initialized and attached to app.state successfully.")
     except Exception as e:
         log.exception("CRITICAL: Failed to initialize HTTPX client during startup!", error=str(e))
-        proxy_http_client = None # Asegurarse que es None si falla
+        app.state.http_client = None # Ensure state is None if init fails
 
-    # 2. Inicializar y Verificar Conexión a PostgreSQL
+    # 2. Initialize and Verify PostgreSQL Connection
     log.info("Initializing and verifying PostgreSQL connection pool...")
-    db_pool_ok = False
     try:
         pool = await postgres_client.get_db_pool()
         if pool:
-             db_pool_ok = await postgres_client.check_db_connection()
-             if db_pool_ok:
-                 log.info("PostgreSQL connection pool initialized and connection verified.")
-             else:
-                  log.critical("PostgreSQL pool initialized BUT connection check failed!")
-                  await postgres_client.close_db_pool() # Intentar cerrar si falló la verificación
+            db_pool_ok = await postgres_client.check_db_connection()
+            if db_pool_ok:
+                log.info("PostgreSQL connection pool initialized and connection verified.")
+            else:
+                log.critical("PostgreSQL pool initialized BUT connection check failed!")
+                await postgres_client.close_db_pool()
         else:
-             log.critical("PostgreSQL connection pool initialization returned None!")
-
+            log.critical("PostgreSQL connection pool initialization returned None!")
     except Exception as e:
-        log.exception("CRITICAL: Failed to initialize or verify PostgreSQL connection during startup!", error=str(e))
+        log.exception("CRITICAL: Failed to initialize or verify PostgreSQL connection!", error=str(e))
+        db_pool_ok = False # Ensure DB is marked as not OK
 
-    # Verificación final antes de ceder el control
-    if not proxy_http_client:
-        log.error("Startup check failed: HTTP client is not available.")
-        # Podrías lanzar una excepción aquí para detener el inicio si el cliente es crucial
-        # raise RuntimeError("HTTP Client could not be initialized.")
-    if not db_pool_ok:
-        log.error("Startup check failed: PostgreSQL connection is not available.")
-        # Podrías lanzar una excepción aquí
-        # raise RuntimeError("Database connection failed.")
+    # Log final readiness check
+    if getattr(app.state, 'http_client', None) and db_pool_ok:
+        log.info("Application startup sequence complete. Dependencies ready.")
+    else:
+        log.error("Application startup sequence FAILED. Check HTTP Client or DB init.",
+                  http_client_ready=bool(getattr(app.state, 'http_client', None)),
+                  db_ready=db_pool_ok)
+        # Optional: raise an error to prevent startup if critical dependencies failed
+        # raise RuntimeError("Critical dependencies failed to initialize during startup.")
 
-    log.info("Application startup sequence complete. Ready to serve requests (pending checks).")
-    yield # <--- La aplicación se ejecuta aquí
+    yield # <--- Application runs here
 
     log.info("Application shutdown sequence initiated...")
-
-    # 1. Cerrar Cliente HTTP
-    if proxy_http_client and not proxy_http_client.is_closed:
-        log.info("Closing global HTTPX client...")
+    # 1. Close HTTP Client (Retrieve from app.state)
+    client_to_close = getattr(app.state, 'http_client', None)
+    if client_to_close and not client_to_close.is_closed:
+        log.info("Closing HTTPX client from app.state...")
         try:
-            await proxy_http_client.aclose()
+            await client_to_close.aclose()
             log.info("HTTPX client closed successfully.")
         except Exception as e:
             log.exception("Error closing HTTPX client during shutdown.", error=str(e))
     else:
         log.info("HTTPX client was not initialized or already closed.")
 
-
-    # 2. Cerrar Pool de PostgreSQL
+    # 2. Close PostgreSQL Pool
     log.info("Closing PostgreSQL connection pool...")
     try:
         await postgres_client.close_db_pool()
@@ -1031,80 +998,64 @@ async def lifespan(app: FastAPI):
     log.info("Application shutdown sequence complete.")
 
 
-# --- Creación de la App FastAPI ---
+# --- Create FastAPI App Instance ---
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    description="Atenex API Gateway: Single entry point, JWT auth, routing to backend microservices (Ingest, Query).",
-    version="1.0.2", # Version bump
-    lifespan=lifespan,
+    description="Atenex API Gateway: Single entry point, JWT auth, routing via explicit HTTP calls.",
+    version="1.0.3", # Version bump
+    lifespan=lifespan, # Use the updated lifespan manager
 )
 
-# --- Middlewares ---
-
-# 1. CORS Middleware (Lógica sin cambios)
+# --- Middlewares (No changes needed here) ---
+# CORS Configuration (using regex)
 vercel_pattern = ""
 if settings.VERCEL_FRONTEND_URL:
-    base_vercel_url = settings.VERCEL_FRONTEND_URL
+    # Simplified regex derivation (adjust if needed)
+    base_vercel_url = settings.VERCEL_FRONTEND_URL.split("://")[1] # Remove scheme
     base_vercel_url = re.sub(r"(-git-[a-z0-9-]+)?(-[a-z0-9]+)?\.vercel\.app", ".vercel.app", base_vercel_url)
     escaped_base = re.escape(base_vercel_url).replace(r"\.vercel\.app", "")
-    vercel_pattern = rf"({escaped_base}(-[a-z0-9-]+)*\.vercel\.app)"
+    vercel_pattern = rf"(https://{escaped_base}(-[a-z0-9-]+)*\.vercel\.app)" # Re-add scheme
 else:
-    log.warning("VERCEL_FRONTEND_URL not set, CORS for Vercel previews might not work.")
-
+    log.warning("VERCEL_FRONTEND_URL not set for CORS.")
 localhost_pattern = r"(http://localhost:300[0-9])"
 allowed_origin_patterns = [localhost_pattern]
-if vercel_pattern:
-    allowed_origin_patterns.append(vercel_pattern)
+if vercel_pattern: allowed_origin_patterns.append(vercel_pattern)
 final_regex = rf"^{ '|'.join(allowed_origin_patterns) }$"
-
 log.info("Configuring CORS middleware", allow_origin_regex=final_regex)
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=final_regex,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["X-Request-ID", "X-Process-Time"],
-    max_age=600,
+    allow_origin_regex=final_regex, allow_credentials=True, allow_methods=["*"],
+    allow_headers=["*"], expose_headers=["X-Request-ID", "X-Process-Time"], max_age=600,
 )
 
-# 2. Middleware para Request ID, Timing y Logging (Lógica sin cambios)
+# Request Context/Timing/Logging Middleware
 @app.middleware("http")
 async def add_request_context_timing_logging(request: Request, call_next):
     start_time = time.perf_counter()
     request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
-    request.state.request_id = request_id
+    request.state.request_id = request_id # Attach request_id to request state
 
-    request_log = log.bind(
-        request_id=request_id,
-        method=request.method,
-        path=request.url.path,
-        client_ip=request.client.host if request.client else "unknown",
-        origin=request.headers.get("origin", "N/A")
-    )
+    request_log = log.bind(request_id=request_id, method=request.method, path=request.url.path,
+                           client_ip=request.client.host if request.client else "unknown",
+                           origin=request.headers.get("origin", "N/A"))
 
     if request.method == "OPTIONS": request_log.info("OPTIONS preflight request received")
     else: request_log.info("Request received")
 
     response = None
-    status_code = 500
-    process_time_ms = 0
-
+    status_code = 500 # Default
     try:
         response = await call_next(request)
         status_code = response.status_code
     except Exception as e:
         process_time_ms = (time.perf_counter() - start_time) * 1000
-        request_log.exception("Unhandled exception during request processing", error=str(e), status_code=status_code, process_time_ms=round(process_time_ms, 2))
-        response = JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"detail": "Internal Server Error"}
-        )
+        request_log.exception("Unhandled exception", status_code=500, error=str(e), proc_time=round(process_time_ms,2))
+        response = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+        # Add CORS headers to manual error responses if needed
         origin = request.headers.get("Origin")
         if origin and re.match(final_regex, origin):
              response.headers["Access-Control-Allow-Origin"] = origin
              response.headers["Access-Control-Allow-Credentials"] = "true"
-        else: request_log.warning("Origin not allowed/missing for error response CORS", origin=origin)
         response.headers["X-Request-ID"] = request_id
         return response
     finally:
@@ -1114,54 +1065,47 @@ async def add_request_context_timing_logging(request: Request, call_next):
             response.headers["X-Process-Time"] = f"{process_time_ms:.2f}ms"
             log_level = "debug" if request.url.path == "/health" else "info"
             log_func = getattr(request_log.bind(status_code=status_code), log_level)
-            if request.method != "OPTIONS": log_func("Request completed", process_time_ms=round(process_time_ms, 2))
-
+            if request.method != "OPTIONS": log_func("Request completed", proc_time=round(process_time_ms, 2))
     return response
 
 
-# --- Incluir Routers ---
+# --- Include Routers ---
 log.info("Including application routers...")
-app.include_router(user_router.router) # Tags definidos en el router
-app.include_router(gateway_router.router) # Tags definidos en el router
-# Nota: auth_router no se incluye si fue eliminado o no tiene rutas
+app.include_router(user_router.router)
+app.include_router(gateway_router.router)
 log.info("Routers included successfully.")
 
-# --- Endpoint Raíz y Health Check ---
-@app.get("/", tags=["General"], summary="Root endpoint indicating service is running")
+# --- Root & Health Endpoints ---
+@app.get("/", tags=["General"], summary="Root endpoint")
 async def read_root():
     return {"message": f"{settings.PROJECT_NAME} is running!"}
 
-@app.get("/health", tags=["Health"], summary="Basic health check endpoint")
-async def health_check():
-    # Health check podría verificar estado del cliente httpx y db
+@app.get("/health", tags=["Health"], summary="Health check endpoint")
+async def health_check(request: Request): # Inject request to access app.state
     health_status = {"status": "healthy", "service": settings.PROJECT_NAME, "checks": {}}
     db_ok = await postgres_client.check_db_connection()
     health_status["checks"]["database_connection"] = "ok" if db_ok else "failed"
 
-    # Verificar cliente HTTPX
-    global proxy_http_client
-    http_client_ok = proxy_http_client is not None and not proxy_http_client.is_closed
+    # Check HTTP Client from app.state
+    http_client = getattr(request.app.state, 'http_client', None)
+    http_client_ok = http_client is not None and not http_client.is_closed
     health_status["checks"]["http_client"] = "ok" if http_client_ok else "failed"
 
     if not db_ok or not http_client_ok:
         health_status["status"] = "unhealthy"
-        log.warning("Health check failed", checks=health_status["checks"])
-        # No lanzar excepción aquí directamente, dejar que K8s maneje el estado unhealthy
-        # raise HTTPException(status_code=503, detail=health_status)
+        log.warning("Health check determined service unhealthy", checks=health_status["checks"])
         return JSONResponse(content=health_status, status_code=503)
 
+    log.debug("Health check successful", checks=health_status["checks"])
     return health_status
 
 
-# --- Ejecución (para desarrollo local) ---
+# --- Main Execution (for local development) ---
 if __name__ == "__main__":
-    print(f"Starting {settings.PROJECT_NAME} using Uvicorn...")
+    print(f"Starting {settings.PROJECT_NAME} using Uvicorn for local dev...")
     uvicorn.run(
-        "app.main:app",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 8080)),
-        reload=True,
-        log_level=settings.LOG_LEVEL.lower(),
+        "app.main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8080)),
+        reload=True, log_level=settings.LOG_LEVEL.lower(),
     )
 ```
 
@@ -1206,12 +1150,8 @@ import json
 from app.core.config import settings
 # Usar las dependencias de autenticación directamente donde se necesiten
 from app.auth.auth_middleware import StrictAuth
-from app.dependencies import get_client
 
 log = structlog.get_logger("atenex_api_gateway.router.gateway")
-
-# Inyectar httpx client vía dependencia
-HttpClientDep = Annotated[httpx.AsyncClient, Depends(get_client)]
 
 # Instancia del Router
 router = APIRouter(prefix="/api/v1", tags=["Gateway Proxy (Explicit Calls)"]) # Cambiar tags
@@ -1322,206 +1262,179 @@ def _handle_httpx_error(exc: Exception, target_url: str, request_id: str):
 
 # --- Endpoints Query Service (Llamadas Explícitas) ---
 
-@router.post("/query/ask", summary="Ask a question (Query Service)", description="Forwards query to Query Service via POST")
+@router.post("/query/ask", summary="Ask a question (Query Service)")
 async def query_service_ask(
-    request: Request,
+    request: Request, # Inject request
     user_payload: StrictAuth,
-    client: Annotated[httpx.AsyncClient, Depends(get_client)],
+    # client: HttpClientDep, # REMOVE Dependency injection here
 ):
+    # --- Get client from app state ---
+    client = getattr(request.app.state, 'http_client', None)
+    if not client or client.is_closed:
+         log.error("HTTP client unavailable in query_service_ask endpoint.")
+         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Gateway dependency unavailable.")
+    # --------------------------------
+
     request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
     endpoint_log = log.bind(request_id=request_id)
     endpoint_log.info("Forwarding request to Query Service POST /ask")
-
-    target_url = f"{settings.QUERY_SERVICE_URL}{request.url.path}" # request.url.path incluye /api/v1/query/ask
-    headers = _prepare_forwarded_headers(request, user_payload)
-
-    try:
-        request_body = await request.json()
-        headers["Content-Type"] = "application/json" # Establecer content type
-        endpoint_log.debug("Request body parsed for forwarding", body=request_body)
-    except json.JSONDecodeError:
-        endpoint_log.warning("Failed to parse request body as JSON")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON body")
-
-    try:
-        backend_response = await client.post(target_url, headers=headers, json=request_body)
-        return await _handle_backend_response(backend_response, request_id)
-    except Exception as exc:
-        _handle_httpx_error(exc, target_url, request_id)
-
-
-@router.get("/query/chats", summary="List chats (Query Service)", description="Forwards GET request to Query Service")
-async def query_service_get_chats(
-    request: Request,
-    user_payload: StrictAuth,
-    client: Annotated[httpx.AsyncClient, Depends(get_client)],
-    # Query params se pasan directamente
-    limit: int = 50,
-    offset: int = 0,
-):
-    request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
-    endpoint_log = log.bind(request_id=request_id)
-    endpoint_log.info("Forwarding request to Query Service GET /chats")
-
-    target_url = f"{settings.QUERY_SERVICE_URL}{request.url.path}" # includes /api/v1/query/chats
-    headers = _prepare_forwarded_headers(request, user_payload)
-    params = request.query_params # Pasa todos los query params originales
-
-    try:
-        backend_response = await client.get(target_url, headers=headers, params=params)
-        return await _handle_backend_response(backend_response, request_id)
-    except Exception as exc:
-        _handle_httpx_error(exc, target_url, request_id)
-
-
-@router.get("/query/chats/{chat_id}/messages", summary="Get chat messages (Query Service)", description="Forwards GET request for messages")
-async def query_service_get_chat_messages(
-    request: Request,
-    user_payload: StrictAuth,
-    client: Annotated[httpx.AsyncClient, Depends(get_client)],
-    chat_id: uuid.UUID = Path(...),
-    # Query params se pasan directamente
-    limit: int = 100,
-    offset: int = 0,
-):
-    request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
-    endpoint_log = log.bind(request_id=request_id, chat_id=str(chat_id))
-    endpoint_log.info("Forwarding request to Query Service GET /chats/{chat_id}/messages")
-
-    target_url = f"{settings.QUERY_SERVICE_URL}{request.url.path}" # incluye el path completo
-    headers = _prepare_forwarded_headers(request, user_payload)
-    params = request.query_params # Pasa todos los query params originales (limit, offset)
-
-    try:
-        backend_response = await client.get(target_url, headers=headers, params=params)
-        return await _handle_backend_response(backend_response, request_id)
-    except Exception as exc:
-        _handle_httpx_error(exc, target_url, request_id)
-
-
-@router.delete("/query/chats/{chat_id}", summary="Delete chat (Query Service)", description="Forwards DELETE request")
-async def query_service_delete_chat(
-    request: Request,
-    user_payload: StrictAuth,
-    client: Annotated[httpx.AsyncClient, Depends(get_client)],
-    chat_id: uuid.UUID = Path(...),
-):
-    request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
-    endpoint_log = log.bind(request_id=request_id, chat_id=str(chat_id))
-    endpoint_log.info("Forwarding request to Query Service DELETE /chats/{chat_id}")
 
     target_url = f"{settings.QUERY_SERVICE_URL}{request.url.path}"
     headers = _prepare_forwarded_headers(request, user_payload)
 
     try:
-        backend_response = await client.delete(target_url, headers=headers)
-        # DELETE a menudo devuelve 204 No Content, manejarlo
-        if backend_response.status_code == status.HTTP_204_NO_CONTENT:
-            await backend_response.aclose() # Asegurarse de cerrar
-            return Response(status_code=status.HTTP_204_NO_CONTENT)
-        else:
-            # Si devuelve otro código, manejar como respuesta normal
-            return await _handle_backend_response(backend_response, request_id)
+        request_body = await request.json()
+        headers["Content-Type"] = "application/json"
+    except json.JSONDecodeError:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid JSON body")
+
+    try:
+        backend_response = await client.post(target_url, headers=headers, json=request_body) # Use the retrieved client
+        return await _handle_backend_response(backend_response, request_id)
+    except Exception as exc:
+        _handle_httpx_error(exc, target_url, request_id)
+
+@router.get("/query/chats", summary="List chats (Query Service)")
+async def query_service_get_chats(
+    request: Request, # Inject request
+    user_payload: StrictAuth,
+    # client: HttpClientDep, # REMOVE Dependency injection here
+):
+    # --- Get client from app state ---
+    client = getattr(request.app.state, 'http_client', None)
+    if not client or client.is_closed: raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Gateway dependency unavailable.")
+    # --------------------------------
+
+    request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
+    target_url = f"{settings.QUERY_SERVICE_URL}{request.url.path}"
+    headers = _prepare_forwarded_headers(request, user_payload)
+    params = request.query_params
+    try:
+        backend_response = await client.get(target_url, headers=headers, params=params) # Use the retrieved client
+        return await _handle_backend_response(backend_response, request_id)
+    except Exception as exc:
+        _handle_httpx_error(exc, target_url, request_id)
+
+@router.get("/query/chats/{chat_id}/messages", summary="Get chat messages (Query Service)")
+async def query_service_get_chat_messages(
+    request: Request, # Inject request
+    user_payload: StrictAuth,
+    # client: HttpClientDep, # REMOVE Dependency injection here
+    chat_id: uuid.UUID = Path(...),
+):
+    # --- Get client from app state ---
+    client = getattr(request.app.state, 'http_client', None)
+    if not client or client.is_closed: raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Gateway dependency unavailable.")
+    # --------------------------------
+
+    request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
+    target_url = f"{settings.QUERY_SERVICE_URL}{request.url.path}"
+    headers = _prepare_forwarded_headers(request, user_payload)
+    params = request.query_params
+    try:
+        backend_response = await client.get(target_url, headers=headers, params=params) # Use the retrieved client
+        return await _handle_backend_response(backend_response, request_id)
     except Exception as exc:
         _handle_httpx_error(exc, target_url, request_id)
 
 
-# --- Endpoints Ingest Service (Llamadas Explícitas) ---
-
-@router.post("/ingest/upload", summary="Upload document (Ingest Service)", description="Forwards file upload using multipart/form-data")
-async def ingest_service_upload(
-    request: Request,
+@router.delete("/query/chats/{chat_id}", summary="Delete chat (Query Service)")
+async def query_service_delete_chat(
+    request: Request, # Inject request
     user_payload: StrictAuth,
-    client: Annotated[httpx.AsyncClient, Depends(get_client)],
+    # client: HttpClientDep, # REMOVE Dependency injection here
+    chat_id: uuid.UUID = Path(...),
 ):
+    # --- Get client from app state ---
+    client = getattr(request.app.state, 'http_client', None)
+    if not client or client.is_closed: raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Gateway dependency unavailable.")
+    # --------------------------------
+
     request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
-    endpoint_log = log.bind(request_id=request_id)
-    endpoint_log.info("Forwarding request to Ingest Service POST /upload")
-
-    target_url = f"{settings.INGEST_SERVICE_URL}{request.url.path}" # incluye /api/v1/ingest/upload
+    target_url = f"{settings.QUERY_SERVICE_URL}{request.url.path}"
     headers = _prepare_forwarded_headers(request, user_payload)
+    try:
+        backend_response = await client.delete(target_url, headers=headers) # Use the retrieved client
+        if backend_response.status_code == status.HTTP_204_NO_CONTENT:
+            await backend_response.aclose()
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+        else: return await _handle_backend_response(backend_response, request_id)
+    except Exception as exc:
+        _handle_httpx_error(exc, target_url, request_id)
 
-    # Reenviar el header Content-Type ORIGINAL, ya que contiene el boundary
+
+# --- Endpoints Ingest Service (Get client from request.app.state) ---
+
+@router.post("/ingest/upload", summary="Upload document (Ingest Service)")
+async def ingest_service_upload(
+    request: Request, # Inject request
+    user_payload: StrictAuth,
+    # client: HttpClientDep, # REMOVE Dependency injection here
+):
+    # --- Get client from app state ---
+    client = getattr(request.app.state, 'http_client', None)
+    if not client or client.is_closed: raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Gateway dependency unavailable.")
+    # --------------------------------
+
+    request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
+    target_url = f"{settings.INGEST_SERVICE_URL}{request.url.path}"
+    headers = _prepare_forwarded_headers(request, user_payload)
     content_type = request.headers.get('content-type')
     if not content_type or 'multipart/form-data' not in content_type:
-         endpoint_log.warning("Missing or invalid Content-Type for upload")
-         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Content-Type header for multipart/form-data is required.")
+         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Content-Type multipart/form-data required.")
     headers['Content-Type'] = content_type
-    # Eliminar Transfer-Encoding si existe (chunked), ya que leeremos el cuerpo completo
     headers.pop('transfer-encoding', None)
-
+    try: body_bytes = await request.body(); headers['Content-Length'] = str(len(body_bytes))
+    except Exception as read_err: raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Could not read upload body: {read_err}")
     try:
-        # Leer el cuerpo completo tal cual (bytes)
-        body_bytes = await request.body()
-        # Actualizar Content-Length, aunque httpx puede hacerlo
-        headers['Content-Length'] = str(len(body_bytes))
-        endpoint_log.debug("Read multipart body for forwarding", body_length=len(body_bytes))
-    except Exception as read_err:
-        endpoint_log.error("Failed to read request body for upload", error=str(read_err))
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Could not read upload body.")
-
-    try:
-        backend_response = await client.post(
-            target_url,
-            headers=headers,
-            content=body_bytes # Pasar los bytes directamente
-        )
+        backend_response = await client.post(target_url, headers=headers, content=body_bytes) # Use the retrieved client
         return await _handle_backend_response(backend_response, request_id)
     except Exception as exc:
         _handle_httpx_error(exc, target_url, request_id)
 
 
-@router.get("/ingest/status/{document_id}", summary="Get document status (Ingest Service)", description="Forwards GET request for document status")
+@router.get("/ingest/status/{document_id}", summary="Get document status (Ingest Service)")
 async def ingest_service_get_status(
-    request: Request,
+    request: Request, # Inject request
     user_payload: StrictAuth,
-    client: Annotated[httpx.AsyncClient, Depends(get_client)],
+    # client: HttpClientDep, # REMOVE Dependency injection here
     document_id: uuid.UUID = Path(...),
 ):
-    request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
-    endpoint_log = log.bind(request_id=request_id, document_id=str(document_id))
-    endpoint_log.info("Forwarding request to Ingest Service GET /status/{document_id}")
+    # --- Get client from app state ---
+    client = getattr(request.app.state, 'http_client', None)
+    if not client or client.is_closed: raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Gateway dependency unavailable.")
+    # --------------------------------
 
+    request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
     target_url = f"{settings.INGEST_SERVICE_URL}{request.url.path}"
     headers = _prepare_forwarded_headers(request, user_payload)
-
     try:
-        backend_response = await client.get(target_url, headers=headers)
+        backend_response = await client.get(target_url, headers=headers) # Use the retrieved client
         return await _handle_backend_response(backend_response, request_id)
     except Exception as exc:
         _handle_httpx_error(exc, target_url, request_id)
 
 
-@router.get("/ingest/status", summary="List document statuses (Ingest Service)", description="Forwards GET request to list statuses")
+@router.get("/ingest/status", summary="List document statuses (Ingest Service)")
 async def ingest_service_list_statuses(
-    request: Request,
+    request: Request, # Inject request
     user_payload: StrictAuth,
-    client: Annotated[httpx.AsyncClient, Depends(get_client)],
-    limit: int = 100,
-    offset: int = 0,
+    # client: HttpClientDep, # REMOVE Dependency injection here
 ):
-    request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
-    endpoint_log = log.bind(request_id=request_id)
-    endpoint_log.info("Forwarding request to Ingest Service GET /status")
+    # --- Get client from app state ---
+    client = getattr(request.app.state, 'http_client', None)
+    if not client or client.is_closed: raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Gateway dependency unavailable.")
+    # --------------------------------
 
+    request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
     target_url = f"{settings.INGEST_SERVICE_URL}{request.url.path}"
     headers = _prepare_forwarded_headers(request, user_payload)
-    params = request.query_params # Pasa limit, offset, etc.
-
+    params = request.query_params
     try:
-        backend_response = await client.get(target_url, headers=headers, params=params)
+        backend_response = await client.get(target_url, headers=headers, params=params) # Use the retrieved client
         return await _handle_backend_response(backend_response, request_id)
     except Exception as exc:
         _handle_httpx_error(exc, target_url, request_id)
-
-
-# --- Rutas de Healthcheck y Raíz (si estaban aquí) ---
-# No se suelen proxyar, pero las dejamos aquí si tu router anterior las contenía
-
-# Ejemplo (ya definido en main.py, probablemente eliminar de aquí):
-# @router.get("/", include_in_schema=False)
-# async def gateway_root():
-#     return {"message": "Gateway Router Root"}
 ```
 
 ## File: `app\routers\user_router.py`
