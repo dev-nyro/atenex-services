@@ -198,8 +198,9 @@ log = structlog.get_logger(__name__)
 router = APIRouter()
 
 # --- Endpoint Principal Modificado para usar dependencias de X- Headers ---
+# *** RUTA CORREGIDA ***
 @router.post(
-    "/query", # Mantenemos la ruta interna /query
+    "/ask", # Ruta interna estandarizada a /ask
     response_model=schemas.QueryResponse,
     status_code=status.HTTP_200_OK,
     summary="Process a user query using RAG pipeline and manage chat history",
@@ -207,6 +208,7 @@ router = APIRouter()
 )
 async def process_query(
     request_body: schemas.QueryRequest = Body(...),
+    # *** CORRECCIÓN CLAVE: Usar las dependencias importadas/definidas ***
     company_id: uuid.UUID = Depends(get_current_company_id),
     user_id: uuid.UUID = Depends(get_current_user_id),
     request: Request = None
@@ -225,7 +227,7 @@ async def process_query(
     is_new_chat = False
 
     try:
-        # Lógica de Chat ID
+        # Lógica de Chat ID (sin cambios, ya usa los user_id/company_id de Depends)
         if request_body.chat_id:
             if not await postgres_client.check_chat_ownership(request_body.chat_id, user_id, company_id):
                  raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Chat not found or access denied.")
@@ -240,14 +242,14 @@ async def process_query(
             endpoint_log = endpoint_log.bind(chat_id=str(current_chat_id))
             endpoint_log.info("New chat created", title=initial_title)
 
-        # *** LLAMADA CORREGIDA ***
+        # Guardar Mensaje Usuario (sin cambios, usa user_id de Depends)
         endpoint_log.info("Saving user message...")
         await postgres_client.save_message(
             chat_id=current_chat_id, role='user', content=request_body.query
         )
         endpoint_log.info("User message saved")
 
-        # Ejecutar Pipeline RAG
+        # Ejecutar Pipeline RAG (sin cambios, usa user_id/company_id de Depends)
         endpoint_log.info("Running RAG pipeline...")
         answer, retrieved_docs_haystack, log_id = await rag_pipeline.run_rag_pipeline(
             query=request_body.query, company_id=str(company_id), user_id=str(user_id),
@@ -255,7 +257,7 @@ async def process_query(
         )
         endpoint_log.info("RAG pipeline finished")
 
-        # Formatear Documentos y Fuentes
+        # Formatear Documentos y Fuentes (sin cambios)
         response_docs_schema: List[schemas.RetrievedDocument] = []
         assistant_sources: List[Dict[str, Any]] = []
         for doc in retrieved_docs_haystack:
@@ -264,7 +266,7 @@ async def process_query(
             source_info = { "chunk_id": schema_doc.id, "document_id": schema_doc.document_id, "file_name": schema_doc.file_name, "score": schema_doc.score, "preview": schema_doc.content_preview }
             assistant_sources.append(source_info)
 
-        # *** LLAMADA CORREGIDA ***
+        # Guardar Mensaje Asistente (sin cambios)
         endpoint_log.info("Saving assistant message...")
         await postgres_client.save_message(
             chat_id=current_chat_id, role='assistant', content=answer,
@@ -274,13 +276,13 @@ async def process_query(
 
         endpoint_log.info("Query processed successfully", log_id=str(log_id) if log_id else "Log Failed", num_retrieved=len(response_docs_schema))
 
-        # Devolver Respuesta
+        # Devolver Respuesta (sin cambios)
         return schemas.QueryResponse(
             answer=answer, retrieved_documents=response_docs_schema,
             query_log_id=log_id, chat_id=current_chat_id
         )
 
-    # Manejo de Errores
+    # Manejo de Errores (sin cambios)
     except ValueError as ve: endpoint_log.warning("Value error", error=str(ve)); raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
     except ConnectionError as ce: endpoint_log.error("Connection error", error=str(ce), exc_info=True); raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Dependency unavailable: {ce}")
     except HTTPException as http_exc: raise http_exc
@@ -1068,10 +1070,11 @@ async def run_rag_pipeline(
     retriever_filters = {"company_id": company_id}
     run_log.debug("Retriever filters set", filters=retriever_filters, top_k=retriever_top_k)
     pipeline_input = {
-        "text_embedder": {"text": query},
-        "retriever": {"filters": retriever_filters, "top_k": retriever_top_k},
-        "prompt_builder": {"query": query}
+        "text_embedder": {"args": [query], "kwargs": {}},
+        "retriever": {"args": [], "kwargs": {"filters": retriever_filters, "top_k": retriever_top_k}},
+        "prompt_builder": {"args": [query], "kwargs": {}},
     }
+
     try:
         loop = asyncio.get_running_loop()
         pipeline_result = await loop.run_in_executor(None, pipeline.run, pipeline_input)
