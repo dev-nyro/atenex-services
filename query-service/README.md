@@ -21,43 +21,20 @@ Este servicio requiere autenticación (gestionada por el API Gateway) para ident
 ## 2. Arquitectura General del Proyecto
 
 ```mermaid
-%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#d3ffd4', 'edgeLabelBackground':'#fff', 'tertiaryColor': '#dcd0ff'}}}%%
-graph TD
-    A[Usuario/Cliente Externo] -->|HTTPS / REST API<br/>(via API Gateway)| Q["<strong>Atenex Query Service API</strong><br/>(FastAPI)"]
-
-    subgraph KubernetesCluster ["Kubernetes Cluster"]
-
-        subgraph Namespace_nyro_develop ["Namespace: nyro-develop"]
-            direction TB
-            Q -->|Get/Create Chat, Save Msg (User),<br/>Save Msg (Assistant), Save Query Log,<br/>List/Delete Chats| DB[(PostgreSQL<br/>'atenex' DB<br/>Tables: chats, messages, query_logs)]
-
-            %% Conexión a Ingest (no directa, pero usa sus datos)
-            Ingest[Ingest Service] -.-> DB
-            Ingest -.-> MDB_default[(Milvus)]
-            Ingest -.-> S3[(MinIO)]
-
-        end
-
-        subgraph Namespace_default ["Namespace: default"]
-            direction LR
-            %% RAG Pipeline Steps happening logically within Query Service / Haystack call
-            RAG_Pipeline["RAG Pipeline (Haystack)"] -->|Retrieve Chunks (Filtered)| MDB_default
-        end
-
-        Q --> RAG_Pipeline # Query Service ejecuta el pipeline
-        RAG_Pipeline -->|Generate Query Embedding| OpenAI[("OpenAI API<br/>(External)")]
-        RAG_Pipeline -->|Generate Answer| Gemini[("Google Gemini API<br/>(External)")]
-
-
+flowchart LR
+    Frontend["Frontend (Vercel / Cliente)"] -->|HTTPS /api/v1/query/ask<br/>POST & /chats* GET| Gateway["API Gateway"]
+    Gateway -->|/api/v1/query/ask POST| QueryAPI["Query Service API<br/>(FastAPI)"]
+    Gateway -->|/api/v1/query/chats* GET| QueryAPI
+    subgraph QueryService
+      QueryAPI -->|X-Company-ID, X-User-ID headers| QueryAPI
+      QueryAPI -->|Read/Write Chats| PSQL[(PostgreSQL)]
+      QueryAPI -->|Invoke RAG Pipeline| RAG[(RAG Pipeline)]
+      RAG -->|Embeddings| OpenAI[(OpenAI API)]
+      RAG -->|LLM Response| LLM[(LLM API)]
+      QueryAPI -->|Vector Store| Milvus[(Milvus)]
     end
-
-    %% Estilo
-    style Q fill:#f9f,stroke:#333,stroke-width:2px
-    style DB fill:#DBF1C2,stroke:#333,stroke-width:1px
-    style MDB_default fill:#B0E0E6,stroke:#333,stroke-width:1px
-    style RAG_Pipeline fill:#ccf,stroke:#333,stroke-width:1px,stroke-dasharray: 5 5
-
 ```
+
 *Diagrama simplificado enfocándose en las interacciones del Query Service.*
 
 ## 3. Características Clave

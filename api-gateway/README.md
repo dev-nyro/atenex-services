@@ -32,38 +32,24 @@ Este Gateway está diseñado para ser ligero y eficiente, enfocándose en la seg
 ## 2. Arquitectura General del Proyecto (Posición del Gateway)
 
 ```mermaid
-%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#ADD8E6', 'edgeLabelBackground':'#fff', 'tertiaryColor': '#FFFACD'}}}%%
-flowchart TD
-    A["Usuario/Cliente Externo<br/>(e.g., Frontend Vercel)"] -->|HTTPS / REST API<br/>POST /login o<br/>Authorization: Bearer <jwt_token>| C["<strong>API Gateway (FastAPI) - Atenex</strong><br/>(Este Servicio)"]
-
-    subgraph KubernetesCluster ["Kubernetes Cluster (nyro-develop ns)"]
-        direction LR
-        C -- Valida JWT (Requiere company_id) -->|Añade Headers:<br/>X-Company-ID,<br/>X-User-ID,<br/>X-User-Email| I["Ingest Service API"]
-        C -- Valida JWT (Requiere company_id) -->|Añade Headers:<br/>X-Company-ID,<br/>X-User-ID,<br/>X-User-Email| Q["Query Service API"]
-        C -- POST /login -->|Verifica credenciales| DB[(PostgreSQL<br/>Users)]
-        DB -- Devuelve datos usuario --> C
-        C -- Genera JWT --> A # Tras login exitoso
-        C -- POST /ensure-company<br/>(Valida JWT SIN company_id) -->|Actualiza User| DB
-        C -- Verifica JWT 'sub' -->|Consulta User| DB # Durante validación de token
-        C -- Proxy Directo (Opcional) -->|Sin validación JWT en Gateway| Auth["(Opcional) Auth Service"]
-
-        I --> DBi[(PostgreSQL<br/>(Metadata Docs?))]
-        I --> VDBi[(Milvus (Vectores))]
-        I --> S3i[(MinIO (Archivos))]
-        I --> Qi([Redis (Celery Queue)])
-
-        Q --> DBq[(PostgreSQL<br/>(Logs, Chats?))]
-        Q --> VDBq[(Milvus (Vectores))]
-        Q --> LLM[("LLM API<br/>(e.g., Gemini)")]
-        Q --> Emb[("Embedding API<br/>(e.g., OpenAI)")]
-
-        Auth --> DB # Auth Service también usaría la misma DB
+flowchart LR
+    Frontend["Frontend (Vercel / Cliente)"] -->|HTTPS| Gateway["API Gateway\n(FastAPI)"]
+    subgraph Kubernetes Cluster nyro-develop
+      direction LR
+      Gateway -->|/api/v1/ingest/*| Ingest["Ingest Service API"]
+      Gateway -->|/api/v1/query/*| Query["Query Service API"]
+      Gateway -->|DB operations| PSQL[(PostgreSQL)]
     end
-
-    # JWT Secret gestionado por K8s Secrets
-    K8sSecrets[("K8s Secrets<br/>(JWT_SECRET, <br/>PG_PASSWORD)")] --> C
-
+    Gateway -->|JWT Secrets| K8sSecrets[(K8s Secrets)]
+    Ingest -->|Metadata| PSQL
+    Ingest -->|Files| MinIO[(MinIO)]
+    Ingest -->|Tasks| Redis[(Redis/Celery)]
+    Query -->|History| PSQL
+    Query -->|Vectors| Milvus[(Milvus)]
+    Query -->|Embeddings| OpenAI[(OpenAI API)]
+    Query -->|LLM calls| Gemini[(LLM API)]
 ```
+
 *Diagrama actualizado para reflejar PostgreSQL en el clúster y el flujo de autenticación/JWT.*
 
 ## 3. Características Clave
