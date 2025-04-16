@@ -54,13 +54,10 @@ async def lifespan(app: FastAPI):
             follow_redirects=False, # El gateway no debe seguir redirecciones
             http2=True # Habilitar HTTP/2 si los backends lo soportan
         )
-        # Inyectar el cliente en el router del gateway para que lo use
-        gateway_router.http_client = proxy_http_client
         log.info("HTTPX client initialized successfully.", limits=str(limits), timeout=str(timeout))
     except Exception as e:
         log.exception("CRITICAL: Failed to initialize HTTPX client during startup!", error=str(e))
         proxy_http_client = None
-        gateway_router.http_client = None
 
     # 2. Inicializar y Verificar Conexión a PostgreSQL
     log.info("Initializing and verifying PostgreSQL connection pool...")
@@ -281,4 +278,4 @@ if __name__ == "__main__":
         port=int(os.getenv("PORT", 8080)), # Usar PORT de env var si existe, default 8080
         reload=True, # Desactivar reload en producción o al usar Gunicorn con workers
         log_level=settings.LOG_LEVEL.lower(),
-    ) 
+    )

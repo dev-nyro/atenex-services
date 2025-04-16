@@ -4,9 +4,13 @@ from fastapi import Request, HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Optional, Annotated, Dict, Any
 import structlog
+import httpx
 
 # Importar verify_token del nuevo servicio de autenticación
 from app.auth.auth_service import verify_token # <-- Asegúrate que la importación es correcta
+
+# Importar get_client desde el módulo de dependencias centralizado
+from app.dependencies import get_client
 
 log = structlog.get_logger(__name__)
 
