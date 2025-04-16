@@ -26,11 +26,12 @@ HOP_BY_HOP_HEADERS = {
     "content-encoding", "content-length"
 }
 
-def get_client() -> httpx.AsyncClient:
-    if http_client is None or http_client.is_closed:
+def get_client(request: Request) -> httpx.AsyncClient:
+    client = getattr(request.app.state, "http_client", None)
+    if client is None or client.is_closed:
         dep_log.error("Gateway HTTP client dependency check failed: Client not available or closed.")
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Gateway service dependency unavailable (HTTP Client).")
-    return http_client
+    return client
 
 async def logged_strict_auth(user_payload: StrictAuth) -> Dict[str, Any]:
     return user_payload
