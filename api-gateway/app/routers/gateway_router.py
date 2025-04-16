@@ -177,7 +177,6 @@ if settings.AUTH_SERVICE_URL:
 # GET /chats
 @router.get(
     "/query/chats",
-    dependencies=[Depends(LoggedStrictAuth)],
     tags=["Proxy - Query Service"],
     summary="List user's chats (Proxied)"
 )
@@ -193,7 +192,6 @@ async def proxy_get_chats(
 # POST /ask
 @router.post(
     "/query/ask",
-    dependencies=[Depends(LoggedStrictAuth)],
     tags=["Proxy - Query Service"],
     summary="Submit a query or message to a chat (Proxied)"
 )
@@ -213,7 +211,6 @@ async def proxy_post_query(
 # GET /chats/{chat_id}/messages
 @router.get(
     "/query/chats/{chat_id}/messages",
-    dependencies=[Depends(LoggedStrictAuth)],
     tags=["Proxy - Query Service"],
     summary="Get messages for a specific chat (Proxied)"
 )
@@ -230,7 +227,6 @@ async def proxy_get_chat_messages(
 # DELETE /chats/{chat_id}
 @router.delete(
     "/query/chats/{chat_id}",
-    dependencies=[Depends(LoggedStrictAuth)],
     tags=["Proxy - Query Service"],
     summary="Delete a specific chat (Proxied)"
 )
@@ -249,7 +245,6 @@ async def proxy_delete_chat(
 @router.api_route(
     "/ingest/{endpoint_path:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
-    dependencies=[Depends(LoggedStrictAuth)],
     tags=["Proxy - Ingest Service"],
     summary="Generic proxy for Ingest Service endpoints (Authenticated)"
 )
