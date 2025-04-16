@@ -1,26 +1,35 @@
 # app/dependencies.py
 import httpx
-from fastapi import HTTPException, status
+from fastapi import HTTPException, status, Request # <-- Import Request
 import structlog
 from typing import Optional
 
-# --- Importar la variable GLOBAL definida en main.py ---
-# Esto es seguro porque 'main.py' habrá sido cargado por Gunicorn/Uvicorn
-# antes de que esta dependencia sea necesitada por una request.
-from app.main import proxy_http_client
+# --- REMOVE Import from app.main ---
+# from app.main import proxy_http_client # REMOVED
 
 log = structlog.get_logger("atenex_api_gateway.dependencies")
 
-def get_client() -> httpx.AsyncClient:
+# --- Modify get_client to use request.app.state ---
+def get_client(request: Request) -> httpx.AsyncClient:
     """
-    Dependencia FastAPI para obtener el cliente HTTPX global.
+    Dependencia FastAPI para obtener el cliente HTTPX global desde app.state.
     Verifica que el cliente haya sido inicializado por el lifespan manager.
     """
-    if proxy_http_client is None or proxy_http_client.is_closed:
+    http_client = getattr(request.app.state, 'http_client', None)
+
+    if http_client is None:
         # Log crítico porque esto indica un problema en el startup
-        log.critical("API Gateway HTTP client requested but is not available or closed.")
+        log.critical("HTTP client requested but not found in app.state.")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Internal gateway dependency (HTTP Client) unavailable. Service may not have started correctly."
+            detail="Internal gateway dependency (HTTP Client State) unavailable. Service may not have initialized correctly."
         )
-    return proxy_http_client
+
+    if http_client.is_closed:
+         log.error("HTTP client requested but found closed in app.state.")
+         raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Internal gateway dependency (HTTP Client) is closed."
+         )
+
+    return http_client
