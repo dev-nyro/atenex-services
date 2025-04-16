@@ -186,7 +186,7 @@ async def proxy_get_chats(
     user_payload: LoggedStrictAuth,
 ):
     log.info("proxy_get_chats called", headers=dict(request.headers), user_payload=user_payload)
-    backend_path = "/chats"
+    backend_path = f"{settings.API_V1_STR}/chats"
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
 # POST /ask
@@ -205,7 +205,7 @@ async def proxy_post_query(
         log.info("proxy_post_query called", headers=dict(request.headers), user_payload=user_payload, body=body.decode(errors='replace'))
     except Exception as e:
         log.error("Error reading request body in proxy_post_query", error=str(e))
-    backend_path = "/ask"
+    backend_path = f"{settings.API_V1_STR}/ask"
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
 # GET /chats/{chat_id}/messages
@@ -221,7 +221,7 @@ async def proxy_get_chat_messages(
     chat_id: uuid.UUID = Path(...),
 ):
     """Reenvía GET /query/chats/{chat_id}/messages al Query Service."""
-    backend_path = f"/chats/{chat_id}/messages"
+    backend_path = f"{settings.API_V1_STR}/chats/{chat_id}/messages"
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
 # DELETE /chats/{chat_id}
@@ -237,7 +237,7 @@ async def proxy_delete_chat(
     chat_id: uuid.UUID = Path(...),
 ):
     """Reenvía DELETE /query/chats/{chat_id} al Query Service."""
-    backend_path = f"/chats/{chat_id}"
+    backend_path = f"{settings.API_V1_STR}/chats/{chat_id}"
     return await _proxy_request(request, str(settings.QUERY_SERVICE_URL), client, user_payload, backend_path)
 
 # --- Rutas Proxy Genéricas para Ingest Service ---
@@ -255,7 +255,7 @@ async def proxy_ingest_service_generic(
     endpoint_path: str = Path(...),
 ):
     """Reenvía solicitudes autenticadas a `/ingest/*` al Ingest Service."""
-    backend_path = f"/ingest/{endpoint_path}"
+    backend_path = f"{settings.API_V1_STR}/ingest/{endpoint_path}"
     return await _proxy_request(
         request=request,
         target_service_base_url_str=str(settings.INGEST_SERVICE_URL),
