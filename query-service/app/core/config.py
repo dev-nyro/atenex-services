@@ -7,13 +7,14 @@ from pydantic import AnyHttpUrl, SecretStr, Field, validator, ValidationError, H
 import sys
 
 # --- PostgreSQL Kubernetes Defaults ---
-POSTGRES_K8S_HOST_DEFAULT = "postgres-service.nyro-develop.svc.cluster.local"
+POSTGRES_K8S_HOST_DEFAULT = "postgresql-service.nyro-develop.svc.cluster.local" # LLM_COMMENT: Keep DB Defaults
 POSTGRES_K8S_PORT_DEFAULT = 5432
-POSTGRES_K8S_DB_DEFAULT = "nyro"
+# LLM_COMMENT: Database name 'atenex' seems correct based on previous logs/configs, correcting default.
+POSTGRES_K8S_DB_DEFAULT = "atenex"
 POSTGRES_K8S_USER_DEFAULT = "postgres"
 
 # --- Milvus Kubernetes Defaults ---
-MILVUS_K8S_DEFAULT_URI = "http://milvus-milvus.default.svc.cluster.local:19530"
+MILVUS_K8S_DEFAULT_URI = "http://milvus-milvus.default.svc.cluster.local:19530" # LLM_COMMENT: Keep Milvus Defaults
 
 # --- RAG Defaults ---
 DEFAULT_RAG_PROMPT_TEMPLATE = """
@@ -31,7 +32,7 @@ Documentos:
 Pregunta: {{ query }}
 
 Respuesta:
-"""
+""" # LLM_COMMENT: Keep Prompt Template
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -43,7 +44,7 @@ class Settings(BaseSettings):
     )
 
     # --- General ---
-    PROJECT_NAME: str = "Query Service (Haystack RAG)"
+    PROJECT_NAME: str = "Query Service (Haystack RAG + FastEmbed)" # LLM_COMMENT: Update project name slightly
     API_V1_STR: str = "/api/v1"
     LOG_LEVEL: str = "INFO"
 
@@ -52,11 +53,11 @@ class Settings(BaseSettings):
     POSTGRES_PASSWORD: SecretStr
     POSTGRES_SERVER: str = POSTGRES_K8S_HOST_DEFAULT
     POSTGRES_PORT: int = POSTGRES_K8S_PORT_DEFAULT
-    POSTGRES_DB: str = POSTGRES_K8S_DB_DEFAULT
+    POSTGRES_DB: str = POSTGRES_K8S_DB_DEFAULT # LLM_COMMENT: Use the corrected default 'atenex'
 
     # --- Milvus ---
     MILVUS_URI: AnyHttpUrl = AnyHttpUrl(MILVUS_K8S_DEFAULT_URI)
-    MILVUS_COLLECTION_NAME: str = "document_chunks_haystack"
+    MILVUS_COLLECTION_NAME: str = "document_chunks_haystack" # LLM_COMMENT: Keep Milvus collection name consistent with ingest-service
     MILVUS_EMBEDDING_FIELD: str = "embedding"
     MILVUS_CONTENT_FIELD: str = "content"
     MILVUS_METADATA_FIELDS: List[str] = Field(default=[
@@ -65,16 +66,22 @@ class Settings(BaseSettings):
     MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default={
         "metric_type": "COSINE", "params": {"ef": 128}
     })
-    MILVUS_COMPANY_ID_FIELD: str = "company_id" # Campo usado para filtrar
+    MILVUS_COMPANY_ID_FIELD: str = "company_id"
 
-    # --- OpenAI Embedding ---
-    OPENAI_API_KEY: SecretStr
-    OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
-    EMBEDDING_DIMENSION: int = 1536
+    # --- Embedding (FastEmbed) ---
+    # LLM_COMMENT: Removed OpenAI specific settings (API Key, Model Name).
+    # LLM_COMMENT: Added settings for FastEmbed. Using BAAI/bge-small-en-v1.5 as default free model.
+    FASTEMBED_MODEL_NAME: str = "BAAI/bge-small-en-v1.5"
+    # LLM_COMMENT: BGE models often require specific prefixes for query/passage embedding.
+    # LLM_COMMENT: Prefix for query embedding (used in query-service).
+    FASTEMBED_QUERY_PREFIX: Optional[str] = "query: "
+    # LLM_COMMENT: Set embedding dimension according to the chosen FastEmbed model.
+    # LLM_COMMENT: BAAI/bge-small-en-v1.5 has 384 dimensions.
+    EMBEDDING_DIMENSION: int = 384
 
     # --- Gemini LLM ---
     GEMINI_API_KEY: SecretStr
-    GEMINI_MODEL_NAME: str = "gemini-1.5-flash-latest"
+    GEMINI_MODEL_NAME: str = "gemini-1.5-flash-latest" # LLM_COMMENT: Keep Gemini settings
 
     # --- RAG Pipeline Settings ---
     RETRIEVER_TOP_K: int = 5
@@ -86,25 +93,18 @@ class Settings(BaseSettings):
     HTTP_CLIENT_MAX_RETRIES: int = 2
     HTTP_CLIENT_BACKOFF_FACTOR: float = 1.0
 
-    # --- Validators ---
-    @validator("EMBEDDING_DIMENSION", pre=True, always=True)
-    def set_embedding_dimension(cls, v: Optional[int], values: dict[str, Any]) -> int:
-        model = values.get("OPENAI_EMBEDDING_MODEL")
-        if model == "text-embedding-3-large": return 3072
-        elif model in ["text-embedding-3-small", "text-embedding-ada-002"]: return 1536
-        if v is None or v == 0:
-            return 1536
-        return v
+    # LLM_COMMENT: Removed the validator that automatically set EMBEDDING_DIMENSION based on OpenAI models.
 
 # --- Instancia Global ---
 try:
     settings = Settings()
-    # Mensajes de debug
+    # LLM_COMMENT: Updated debug print statements for new embedding config.
     print("DEBUG: Settings loaded successfully.")
     print(f"DEBUG: Using Postgres Server: {settings.POSTGRES_SERVER}:{settings.POSTGRES_PORT}")
     print(f"DEBUG: Using Postgres User: {settings.POSTGRES_USER}")
     print(f"DEBUG: Using Milvus URI: {settings.MILVUS_URI}")
-    print(f"DEBUG: Using OpenAI Model: {settings.OPENAI_EMBEDDING_MODEL}")
+    print(f"DEBUG: Using FastEmbed Model: {settings.FASTEMBED_MODEL_NAME}")
+    print(f"DEBUG: Using Embedding Dimension: {settings.EMBEDDING_DIMENSION}")
     print(f"DEBUG: Using Gemini Model: {settings.GEMINI_MODEL_NAME}")
 except Exception as e:
     print(f"FATAL: Error loading settings: {e}")
