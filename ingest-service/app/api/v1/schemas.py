@@ -24,6 +24,10 @@ class StatusResponse(BaseModel):
     file_name: Optional[str] = None
     file_type: Optional[str] = None
     chunk_count: Optional[int] = None
+    # Estado actual en MinIO
+    minio_exists: Optional[bool] = None
+    # Número de chunks indexados en Milvus
+    milvus_chunk_count: Optional[int] = None
     last_updated: Optional[datetime] = Field(None, alias="updated_at")
     # Mensaje descriptivo añadido en el endpoint, no viene de la DB directamente
     message: Optional[str] = Field(None, exclude=False) # Incluir en respuesta si se añade

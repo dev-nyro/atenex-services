@@ -27,6 +27,7 @@ El **Ingest Service** es un microservicio clave dentro de la plataforma Atenex. 
 7.  **Consulta de Estado:** La API expone endpoints para consultar el estado:
     *   `GET /api/v1/ingest/status/{document_id}`: Estado de un documento específico (requiere `X-Company-ID` coincidente).
     *   `GET /api/v1/ingest/status`: Lista paginada de estados de todos los documentos de la compañía (requiere `X-Company-ID`).
+8.  **Reintento de Ingesta:** Permite reintentar la ingesta de un documento en estado `error` mediante el endpoint `POST /api/v1/ingest/retry/{document_id}`.
 
 Este enfoque asíncrono desacopla la carga y el procesamiento intensivo, mejorando la experiencia del usuario y la escalabilidad.
 
@@ -74,7 +75,7 @@ graph TD
 
 ## 3. Características Clave
 
-*   **API RESTful:** Endpoints para ingesta (`/upload`) y consulta de estado (`/status`, `/status/{id}`).
+*   **API RESTful:** Endpoints para ingesta (`/upload`), consulta de estado (`/status`, `/status/{id}`) y reintento (`/retry/{document_id}`).
 *   **Procesamiento Asíncrono:** Desacoplamiento mediante Celery y Redis (en `nyro-develop`).
 *   **Almacenamiento de Archivos:** Persistencia de originales en MinIO (bucket `atenex` en `nyro-develop`).
 *   **Pipeline Haystack Integrado:** Orquesta conversión, chunking, embedding (OpenAI) y escritura en Milvus.
@@ -84,6 +85,7 @@ graph TD
 *   **Configuración Centralizada:** Uso de ConfigMaps y Secrets en Kubernetes (namespace `nyro-develop`).
 *   **Logging Estructurado:** Logs en JSON con `structlog`.
 *   **Manejo de Errores Robusto:** Distinción entre errores reintentables y no reintentables en tareas Celery.
+*   **Reintento de Ingesta:** Endpoint para reencolar documentos fallidos sin necesidad de volver a subir el archivo.
 
 ## 4. Pila Tecnológica Principal
 
@@ -109,7 +111,7 @@ ingest-service/
 │   │       ├── __init__.py
 │   │       ├── endpoints/
 │   │       │   ├── __init__.py
-│   │       │   └── ingest.py # Endpoints: /upload, /status, /status/{id}
+│   │       │   └── ingest.py # Endpoints: /upload, /status, /status/{id}, /retry/{document_id}
 │   │       └── schemas.py    # Schemas Pydantic: IngestResponse, StatusResponse
 │   ├── core/                 # Configuración, Logging
 │   │   ├── __init__.py
@@ -228,19 +230,24 @@ Prefijo base: `/api/v1/ingest` (definido en `main.py`)
     *   `X-Company-ID`: (String UUID) Identificador de la empresa propietaria.
 *   **Path Parameters:**
     *   `document_id`: (String UUID) ID del documento.
-*   **Respuesta (`200 OK`):** Detalles del estado.
+*   **Respuesta (`200 OK`):** Detalles del estado, incluyendo verificación en MinIO y conteo real en Milvus (útil para refresh).
     ```json
     {
       "document_id": "uuid-del-documento",
-      "status": "processed", // "uploaded", "processing", "processed", "error"
+      "status": "processed",            // "uploaded", "processing", "processed", "error"
       "file_name": "nombre_archivo.pdf",
       "file_type": "application/pdf",
-      "chunk_count": 153,
-      "error_message": null, // o mensaje si status="error"
+      "chunk_count": 153,                 // Contado desde PostgreSQL tras procesamiento
+      "minio_exists": true,               // true si el objeto sigue en MinIO
+      "milvus_chunk_count": 150,          // Chunks realmente indexados en Milvus
+      "error_message": null,              // o mensaje si status="error"
       "last_updated": "2025-03-29T21:30:00.123Z", // Mapeado desde 'updated_at'
       "message": "Documento procesado exitosamente." // Mensaje generado
     }
     ```
+    
+    Nota: Al hacer refresh en el frontend, este endpoint proporciona el estado real en MinIO y Milvus mediante los campos `minio_exists` y `milvus_chunk_count`.
+
 *   **Respuestas Error:**
     *   `404 Not Found`: Si el `document_id` no existe o pertenece a otra compañía.
     *   `500 Internal Server Error`: Si hay problemas al consultar la BD.
@@ -275,6 +282,31 @@ Prefijo base: `/api/v1/ingest` (definido en `main.py`)
     *   `401 Unauthorized`: Si falta `X-Company-ID`.
     *   `400 Bad Request`: Si `X-Company-ID` no es un UUID válido.
     *   `500 Internal Server Error`: Si hay problemas al consultar la BD.
+
+---
+
+### Reintentar Ingesta de Documento con Error
+
+*   **Endpoint:** `POST /retry/{document_id}` (URL completa: `POST /api/v1/ingest/retry/{document_id}`)
+*   **Descripción:** Permite reintentar la ingesta de un documento que falló previamente (estado `error`). Solo disponible si el documento pertenece a la compañía y está en estado `error`.
+*   **Headers Requeridos:**
+    *   `X-Company-ID`: (String UUID) Identificador de la empresa.
+    *   `X-User-ID`: (String UUID) Identificador del usuario que solicita el reintento.
+*   **Path Parameters:**
+    *   `document_id`: (String UUID) ID del documento a reintentar.
+*   **Respuesta (`202 Accepted`):** Confirmación de reencolado.
+    ```json
+    {
+      "document_id": "uuid-del-documento",
+      "task_id": "uuid-de-la-tarea-celery",
+      "status": "processing",
+      "message": "Reintento de ingesta encolado correctamente."
+    }
+    ```
+*   **Respuestas Error:**
+    *   `404 Not Found`: Si el documento no existe o no pertenece a la compañía.
+    *   `409 Conflict`: Si el documento no está en estado `error`.
+    *   `500 Internal Server Error`: Si ocurre un error inesperado.
 
 ---
 

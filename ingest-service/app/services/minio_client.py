@@ -126,3 +126,23 @@ class MinioStorageClient:
         except Exception as e: # Captura IOError u otros errores del sync helper
             download_log.error("Error downloading file via executor", error=str(e), error_type=type(e).__name__, exc_info=True)
             raise IOError(f"Failed to download file via executor: {e}") from e
+
+    async def file_exists(self, object_name: str) -> bool:
+        """Verifica si un objeto existe en MinIO."""
+        check_log = log.bind(bucket=self.bucket_name, object_name=object_name)
+        loop = asyncio.get_running_loop()
+        try:
+            # stat_object es bloqueante
+            await loop.run_in_executor(None, self.client.stat_object, self.bucket_name, object_name)
+            check_log.info("Objeto encontrado en MinIO")
+            return True
+        except S3Error as e:
+            # NoSuchKey indica objeto no encontrado
+            if getattr(e, 'code', None) == 'NoSuchKey':
+                check_log.warning("Objeto no existe en MinIO", code=e.code)
+                return False
+            check_log.error("Error al verificar existencia en MinIO", error=str(e), code=e.code)
+            raise IOError(f"Error al verificar almacenamiento: {e.code}") from e
+        except Exception as e:
+            check_log.error("Error inesperado al verificar existencia en MinIO", error=str(e))
+            raise IOError("Error inesperado verificando almacenamiento") from e

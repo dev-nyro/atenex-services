@@ -91,8 +91,8 @@ async def update_document_status(document_id: uuid.UUID, status: DocumentStatus,
 
 async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]]:
     pool = await get_db_pool(); get_log = log.bind(document_id=str(document_id))
-    # Elimina error_message del SELECT
-    query = "SELECT id, status, file_name, file_type, chunk_count, updated_at, company_id FROM documents WHERE id = $1;"
+    # Seleccionar también file_path para verificar almacenamiento externo
+    query = "SELECT id, status, file_name, file_type, chunk_count, file_path, updated_at, company_id FROM documents WHERE id = $1;"
     try:
         async with pool.acquire() as connection: record = await connection.fetchrow(query, document_id)
         if record: get_log.debug("Document status retrieved"); return dict(record)

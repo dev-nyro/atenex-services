@@ -154,6 +154,13 @@ async def ingest_document_haystack(
         request_log.warning("Invalid metadata JSON received", error=str(json_err))
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid JSON format for metadata: {json_err}")
 
+    # PREVENCIÓN DE DUPLICADOS: Buscar documento existente por company_id y file_name en estado != error
+    existing_docs = await postgres_client.list_documents_by_company(company_id, limit=1000, offset=0)
+    for doc in existing_docs:
+        if doc["file_name"] == file.filename and doc["status"] != DocumentStatus.ERROR.value:
+            request_log.warning("Intento de subida duplicada detectado", filename=file.filename, status=doc["status"])
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Ya existe un documento con el mismo nombre en estado '{doc['status']}'. Elimina o reintenta el anterior antes de subir uno nuevo.")
+
     minio_client = None; minio_object_name = None; document_id = None; task_id = None
     try:
         document_id = await postgres_client.create_document(
@@ -268,6 +275,43 @@ async def list_ingestion_statuses(
     except Exception as e:
         list_log.exception("Error listing document statuses")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error listing document statuses.")
+
+@router.post(
+    "/retry/{document_id}",
+    response_model=schemas.IngestResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Reintentar la ingesta de un documento con error",
+    description="Permite reintentar la ingesta de un documento que falló. Solo disponible si el estado es 'error'."
+)
+async def retry_document_ingest(
+    document_id: uuid.UUID,
+    company_id: uuid.UUID = Depends(get_current_company_id),
+    user_id: uuid.UUID = Depends(get_current_user_id),
+    request: Request = None
+):
+    request_id = request.headers.get("x-request-id", str(uuid.uuid4())) if request else str(uuid.uuid4())
+    retry_log = log.bind(request_id=request_id, company_id=str(company_id), user_id=str(user_id), document_id=str(document_id))
+    # 1. Buscar el documento y validar estado
+    doc = await postgres_client.get_document_status(document_id)
+    if not doc or doc.get("company_id") != str(company_id):
+        retry_log.warning("Documento no encontrado o no pertenece a la compañía")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Documento no encontrado.")
+    if doc["status"] != DocumentStatus.ERROR.value:
+        retry_log.warning("Solo se puede reintentar si el estado es 'error'", current_status=doc["status"])
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Solo se puede reintentar la ingesta si el estado es 'error'.")
+    # 2. Reencolar la tarea Celery
+    task = process_document_haystack_task.delay(
+        document_id_str=str(document_id),
+        company_id_str=str(company_id),
+        minio_object_name=doc["file_path"],
+        file_name=doc["file_name"],
+        content_type=doc["file_type"],
+        original_metadata=doc.get("metadata", {})
+    )
+    retry_log.info("Reintento de ingesta encolado", task_id=task.id)
+    # 3. Actualizar estado a 'processing'
+    await postgres_client.update_document_status(document_id=document_id, status=DocumentStatus.PROCESSING, error_message=None)
+    return schemas.IngestResponse(document_id=document_id, task_id=task.id, status=DocumentStatus.PROCESSING, message="Reintento de ingesta encolado correctamente.")
 ```
 
 ## File: `app\api\v1\schemas.py`
@@ -298,7 +342,6 @@ class StatusResponse(BaseModel):
     file_name: Optional[str] = None
     file_type: Optional[str] = None
     chunk_count: Optional[int] = None
-    error_message: Optional[str] = None # Mensaje de error de la DB
     last_updated: Optional[datetime] = Field(None, alias="updated_at")
     # Mensaje descriptivo añadido en el endpoint, no viene de la DB directamente
     message: Optional[str] = Field(None, exclude=False) # Incluir en respuesta si se añade
@@ -358,7 +401,7 @@ class Settings(BaseSettings):
 
     # --- General ---
     PROJECT_NAME: str = "Atenex Ingest Service"
-    API_V1_STR: str = "/api/v1/ingest"
+    API_V1_STR: str = "/api/v1"
     LOG_LEVEL: str = "INFO"
 
     # --- Celery ---
@@ -638,14 +681,20 @@ async def check_db_connection() -> bool:
 # --- Document Operations (sin cambios) ---
 async def create_document(company_id: uuid.UUID, file_name: str, file_type: str, metadata: Dict[str, Any]) -> uuid.UUID:
     pool = await get_db_pool(); doc_id = uuid.uuid4()
-    query = "INSERT INTO documents (id, company_id, file_name, file_type, metadata, status, uploaded_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC') RETURNING id;"
+    # Incluye file_path como string vacío para cumplir NOT NULL
+    query = "INSERT INTO documents (id, company_id, file_name, file_type, file_path, metadata, status, uploaded_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC') RETURNING id;"
     insert_log = log.bind(company_id=str(company_id), filename=file_name, content_type=file_type, proposed_doc_id=str(doc_id))
     try:
-        async with pool.acquire() as connection: result_id = await connection.fetchval(query, doc_id, company_id, file_name, file_type, json.dumps(metadata), DocumentStatus.UPLOADED.value)
-        if result_id and result_id == doc_id: insert_log.info("Document record created", document_id=str(doc_id)); return result_id
-        else: insert_log.error("Failed to create document record", returned_id=result_id); raise RuntimeError(f"Failed create document, return mismatch ({result_id})")
-    except asyncpg.exceptions.UniqueViolationError as e: insert_log.error("Unique constraint violation", error=str(e), constraint=e.constraint_name); raise ValueError(f"Document creation failed: unique constraint ({e.constraint_name})") from e
-    except Exception as e: insert_log.error("Failed to create document record", error=str(e), exc_info=True); raise
+        async with pool.acquire() as connection:
+            result_id = await connection.fetchval(query, doc_id, company_id, file_name, file_type, '', json.dumps(metadata), DocumentStatus.UPLOADED.value)
+        if result_id and result_id == doc_id:
+            insert_log.info("Document record created", document_id=str(doc_id)); return result_id
+        else:
+            insert_log.error("Failed to create document record", returned_id=result_id); raise RuntimeError(f"Failed create document, return mismatch ({result_id})")
+    except asyncpg.exceptions.UniqueViolationError as e:
+        insert_log.error("Unique constraint violation", error=str(e), constraint=e.constraint_name); raise ValueError(f"Document creation failed: unique constraint ({e.constraint_name})") from e
+    except Exception as e:
+        insert_log.error("Failed to create document record", error=str(e), exc_info=True); raise
 
 async def update_document_status(document_id: uuid.UUID, status: DocumentStatus, file_path: Optional[str] = None, chunk_count: Optional[int] = None, error_message: Optional[str] = None) -> bool:
     pool = await get_db_pool(); update_log = log.bind(document_id=str(document_id), new_status=status.value)
@@ -654,8 +703,7 @@ async def update_document_status(document_id: uuid.UUID, status: DocumentStatus,
     fields_to_set.append(f"updated_at = NOW() AT TIME ZONE 'UTC'")
     if file_path is not None: fields_to_set.append(f"file_path = ${param_index}"); params.append(file_path); param_index += 1
     if chunk_count is not None: fields_to_set.append(f"chunk_count = ${param_index}"); params.append(chunk_count); param_index += 1
-    if status == DocumentStatus.ERROR: safe_error = (error_message or "Unknown error")[:2000]; fields_to_set.append(f"error_message = ${param_index}"); params.append(safe_error); param_index += 1; update_log = update_log.bind(error_message=safe_error)
-    else: fields_to_set.append("error_message = NULL")
+    # Elimina manejo de error_message
     query = f"UPDATE documents SET {', '.join(fields_to_set)} WHERE id = $1;"; update_log.debug("Executing status update", query=query)
     try:
         async with pool.acquire() as connection: result_str = await connection.execute(query, *params)
@@ -667,7 +715,8 @@ async def update_document_status(document_id: uuid.UUID, status: DocumentStatus,
 
 async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]]:
     pool = await get_db_pool(); get_log = log.bind(document_id=str(document_id))
-    query = "SELECT id, status, file_name, file_type, chunk_count, error_message, updated_at, company_id FROM documents WHERE id = $1;"
+    # Elimina error_message del SELECT
+    query = "SELECT id, status, file_name, file_type, chunk_count, updated_at, company_id FROM documents WHERE id = $1;"
     try:
         async with pool.acquire() as connection: record = await connection.fetchrow(query, document_id)
         if record: get_log.debug("Document status retrieved"); return dict(record)
@@ -676,7 +725,8 @@ async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]
 
 async def list_documents_by_company(company_id: uuid.UUID, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
     pool = await get_db_pool(); list_log = log.bind(company_id=str(company_id), limit=limit, offset=offset)
-    query = "SELECT id, status, file_name, file_type, chunk_count, error_message, updated_at FROM documents WHERE company_id = $1 ORDER BY updated_at DESC LIMIT $2 OFFSET $3;"
+    # Elimina error_message del SELECT
+    query = "SELECT id, status, file_name, file_type, chunk_count, updated_at FROM documents WHERE company_id = $1 ORDER BY updated_at DESC LIMIT $2 OFFSET $3;"
     try:
         async with pool.acquire() as connection: records = await connection.fetch(query, company_id, limit, offset)
         result_list = [dict(record) for record in records]; list_log.info(f"Retrieved {len(result_list)} docs")
@@ -743,7 +793,7 @@ async def delete_chat(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.U
 ```py
 # ingest-service/app/main.py
 from fastapi import FastAPI, HTTPException, status as fastapi_status, Request
-from fastapi.exceptions import RequestValidationError
+from fastapi.exceptions import RequestValidationError, ResponseValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 import structlog
 import uvicorn
@@ -844,11 +894,18 @@ async def add_request_context_timing_logging(request: Request, call_next):
     return response
 
 # --- Exception Handlers ---
+@app.exception_handler(ResponseValidationError)
+async def response_validation_exception_handler(request: Request, exc: ResponseValidationError):
+    return JSONResponse(
+        status_code=fastapi_status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": "Error de validación en la respuesta", "errors": exc.errors()},
+    )
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(
         status_code=exc.status_code,
-        content={"detail": exc.detail},
+        content={"detail": exc.detail if isinstance(exc.detail, str) else "Error HTTP"},
         headers=getattr(exc, "headers", None)
     )
 
@@ -856,12 +913,20 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     return JSONResponse(
         status_code=fastapi_status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"detail": "Validation Error", "errors": exc.errors()},
+        content={"detail": "Error de validación en la petición", "errors": exc.errors()},
+    )
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    log.error("Excepción no controlada", error=str(exc))
+    return JSONResponse(
+        status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "Error interno del servidor"}
     )
 
 # --- Router Inclusion ---
-app.include_router(ingest.router, prefix=settings.API_V1_STR, tags=["Ingestion"])
-log.info(f"Included ingestion router with prefix: {settings.API_V1_STR}")
+app.include_router(ingest.router, prefix=f"{settings.API_V1_STR}/ingest", tags=["Ingestion"])
+log.info(f"Included ingestion router with prefix: {settings.API_V1_STR}/ingest")
 
 # --- Root Endpoint / Health Check ---
 # *** CORREGIDO: Verificar DB en cada llamada ***
@@ -1069,44 +1134,34 @@ class MinioStorageClient:
         company_id: uuid.UUID,
         document_id: uuid.UUID,
         file_name: str,
-        file_content_stream: IO[bytes], # Acepta BytesIO u otro stream
+        file_content_stream: IO[bytes],
         content_type: str,
         content_length: int
     ) -> str:
-        """
-        Sube un archivo a MinIO de forma asíncrona usando run_in_executor.
-        El nombre del objeto usa company_id/document_id/filename.
-        Retorna el nombre completo del objeto en MinIO.
-        """
-        # Construir nombre del objeto para organización dentro del bucket 'atenex'
         object_name = f"{str(company_id)}/{str(document_id)}/{file_name}"
         upload_log = log.bind(bucket=self.bucket_name, object_name=object_name, content_type=content_type, length=content_length)
         upload_log.info("Queueing file upload to MinIO executor")
 
         loop = asyncio.get_running_loop()
         try:
-            # Asegurarse que el stream está al inicio antes de pasarlo
             file_content_stream.seek(0)
-            # Ejecutar la operación síncrona put_object en el executor
-            result = await loop.run_in_executor(
-                None, # Default ThreadPoolExecutor
-                self.client.put_object, # La función síncrona
-                # Argumentos para put_object:
-                self.bucket_name,
-                object_name,
-                file_content_stream,
-                content_length, # Pasar longitud explícitamente
-                content_type=content_type,
-            )
+            # Wrapper para pasar argumentos correctamente a put_object
+            def _put_object():
+                return self.client.put_object(
+                    self.bucket_name,
+                    object_name,
+                    file_content_stream,
+                    content_length,
+                    content_type=content_type
+                )
+            result = await loop.run_in_executor(None, _put_object)
             upload_log.info("File uploaded successfully to MinIO via executor", etag=getattr(result, 'etag', None), version_id=getattr(result, 'version_id', None))
             return object_name
         except S3Error as e:
             upload_log.error("Failed to upload file to MinIO via executor", error=str(e), code=e.code, exc_info=True)
-            # Re-lanzar S3Error para que el llamador lo maneje
             raise IOError(f"Failed to upload to storage: {e.code}") from e
         except Exception as e:
             upload_log.error("Unexpected error during file upload via executor", error=str(e), exc_info=True)
-            # Re-lanzar como IOError genérico
             raise IOError(f"Unexpected storage upload error") from e
 
     def download_file_stream_sync(self, object_name: str) -> io.BytesIO:
@@ -1250,7 +1305,7 @@ def _initialize_milvus_store() -> MilvusDocumentStore:
     init_log.info("Attempting to initialize...")
     try:
         store = MilvusDocumentStore(
-            uri=str(settings.MILVUS_URI),
+            connection_args={"uri": str(settings.MILVUS_URI)},
             collection_name=settings.MILVUS_COLLECTION_NAME,
             dim=settings.EMBEDDING_DIMENSION,
             embedding_field=settings.MILVUS_EMBEDDING_FIELD,
@@ -1265,8 +1320,8 @@ def _initialize_milvus_store() -> MilvusDocumentStore:
         init_log.info("Initialization successful.")
         return store
     except MilvusException as me:
-        init_log.error("Milvus connection/initialization failed", code=me.code, message=me.message, exc_info=True)
-        raise ConnectionError(f"Milvus connection failed: {me.message}") from me
+        init_log.error("Milvus connection/initialization failed", code=getattr(me, 'code', None), message=str(me), exc_info=True)
+        raise ConnectionError(f"Milvus connection failed: {me}") from me
     except Exception as e:
         init_log.exception("Unexpected error during MilvusDocumentStore initialization")
         raise RuntimeError(f"Unexpected Milvus init error: {e}") from e
@@ -1308,18 +1363,26 @@ def _initialize_document_writer(store: MilvusDocumentStore) -> DocumentWriter:
     return writer
 
 def get_converter_for_content_type(content_type: str) -> Optional[Type]:
-     """Devuelve la clase del conversor Haystack apropiada."""
-     converters = {
-         "application/pdf": PyPDFToDocument,
-         "application/vnd.openxmlformats-officedocument.wordprocessingml.document": DOCXToDocument,
-         "text/plain": TextFileToDocument,
-         "text/markdown": MarkdownToDocument,
-         "text/html": HTMLToDocument,
-     }
-     converter = converters.get(content_type)
-     if not converter:
-         log.warning("No Haystack converter found for content type", content_type=content_type)
-     return converter
+    """Devuelve la clase del conversor Haystack apropiada para el tipo de archivo."""
+    converters = {
+        "application/pdf": PyPDFToDocument,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": DOCXToDocument,
+        "application/msword": DOCXToDocument,  # Word antiguo
+        "application/vnd.ms-excel": None,  # Excel antiguo (no soportado nativo, requiere integración extra)
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": None,  # Excel moderno (ver nota abajo)
+        "image/png": None,  # Imágenes requieren OCR externo
+        "image/jpeg": None,
+        "image/jpg": None,
+        "text/plain": TextFileToDocument,
+        "text/markdown": MarkdownToDocument,
+        "text/html": HTMLToDocument,
+    }
+    converter = converters.get(content_type)
+    if converter is None:
+        # Mensaje de error claro y en español para el frontend
+        raise ValueError("El tipo de archivo no es soportado actualmente. Solo se permiten PDF, Word, Excel y algunas imágenes. Si necesitas soporte para este tipo de archivo, contacta al administrador.")
+    return converter
+# NOTA: Para Excel e imágenes, devolveremos error claro y en español si se intenta subir uno, hasta que se integre OCR o parser de Excel.
 
 # --- Celery Task Definition ---
 NON_RETRYABLE_ERRORS = (FileNotFoundError, ValueError, TypeError, NotImplementedError, KeyError, AttributeError)
@@ -1480,12 +1543,19 @@ def process_document_haystack_task(
             # No relanzar para que Celery no reintente
 
         except RETRYABLE_ERRORS as e_retry:
-            err_msg = f"Retryable error (attempt {self.request.retries + 1}/{self.request.retries_limit}): {type(e_retry).__name__}: {str(e_retry)[:500]}"
+            # Obtener el número máximo de reintentos de forma segura
+            max_retries = getattr(self, 'max_retries', 3)
+            err_msg = f"Error reintentable (intento {self.request.retries + 1} de {max_retries}): {type(e_retry).__name__}: {str(e_retry)[:500]}"
             formatted_traceback = traceback.format_exc()
+            # Mensaje para el frontend en español
+            frontend_msg = "Ocurrió un error temporal durante el procesamiento. El sistema intentará nuevamente."
             task_log.warning(f"Processing failed, will retry: {err_msg}", traceback=formatted_traceback)
             try:
                 # Actualizar estado a ERROR pero indicando que es parte de un reintento
-                await postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=f"Task Error (Retry Attempt {self.request.retries + 1}): {err_msg}")
+                await postgres_client.update_document_status(
+                    document_id, DocumentStatus.ERROR,
+                    error_message=frontend_msg
+                )
             except Exception as db_err:
                 task_log.error("Failed update status to ERROR during retryable failure!", db_error=str(db_err))
             # Relanzar la excepción para que Celery maneje el reintento
@@ -1500,21 +1570,30 @@ def process_document_haystack_task(
 
     # --- Ejecutar el flujo async ---
     try:
-        # Usar asyncio.run() para ejecutar la corutina principal
-        asyncio.run(async_process_flow())
-        task_log.info("Haystack document processing task completed successfully.")
-        return {"status": "success", "document_id": str(document_id)} # Retornar algo útil
-
+        # Timeout global para el procesamiento (5 minutos)
+        TIMEOUT_SECONDS = 300
+        try:
+            asyncio.run(asyncio.wait_for(async_process_flow(), timeout=TIMEOUT_SECONDS))
+            task_log.info("Haystack document processing task completed successfully.")
+            return {"status": "success", "document_id": str(document_id)}
+        except asyncio.TimeoutError:
+            timeout_msg = f"Processing exceeded timeout of {TIMEOUT_SECONDS} seconds. Marking as ERROR."
+            task_log.error(timeout_msg)
+            # Intentar actualizar el estado en la base de datos
+            try:
+                asyncio.run(postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=timeout_msg))
+            except Exception as db_err:
+                task_log.critical("Failed to update status to ERROR after timeout!", db_error=str(db_err))
+            return {"status": "failure", "document_id": str(document_id), "error": timeout_msg}
     except Exception as top_level_exc:
-        # Esta captura es principalmente para excepciones que podrían ocurrir
-        # *fuera* del bloque try/except principal de async_process_flow,
-        # o si algo se relanza inesperadamente. Celery debería haber manejado
-        # los reintentos basados en las excepciones RETRYABLE relanzadas.
+        # Mensaje para el frontend en español
+        frontend_msg = "Ocurrió un error inesperado durante el procesamiento del documento. Por favor, inténtalo de nuevo o contacta soporte."
         task_log.exception("Haystack processing task failed at top level (after potential retries). This indicates a final failure.", exc_info=top_level_exc)
-        # No es necesario actualizar DB aquí, ya debería estar en ERROR por la última falla retryable o non-retryable.
-        # Celery marcará la tarea como FAILED.
-        # No necesitamos relanzar aquí, ya que asyncio.run() habrá terminado.
-        return {"status": "failure", "document_id": str(document_id), "error": str(top_level_exc)}
+        try:
+            asyncio.run(postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=frontend_msg))
+        except Exception as db_err:
+            task_log.critical("Failed to update status to ERROR after top-level failure!", db_error=str(db_err))
+        return {"status": "failure", "document_id": str(document_id), "error": frontend_msg}
 ```
 
 ## File: `app\utils\__init__.py`

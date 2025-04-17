@@ -4,10 +4,12 @@ from typing import Dict, Any, Optional, List
 import json
 import structlog
 import io
+import asyncio
+from milvus_haystack import MilvusDocumentStore
 
 from fastapi import (
     APIRouter, UploadFile, File, Depends, HTTPException,
-    status, Form, Header, Query, Request # Importar Request
+    status, Form, Header, Query, Request
 )
 from minio.error import S3Error
 
@@ -21,6 +23,24 @@ from app.services.minio_client import MinioStorageClient
 log = structlog.get_logger(__name__)
 
 router = APIRouter()
+
+# Helper para obtención dinámica de estado en Milvus
+async def get_milvus_chunk_count(document_id: uuid.UUID) -> int:
+    """Cuenta los chunks indexados en Milvus para un documento específico."""
+    loop = asyncio.get_running_loop()
+    def _count_chunks():
+        store = MilvusDocumentStore(
+            connection_args={"uri": str(settings.MILVUS_URI)},
+            collection_name=settings.MILVUS_COLLECTION_NAME,
+            search_params=settings.MILVUS_SEARCH_PARAMS,
+            consistency_level="Strong",
+        )
+        docs = store.get_all_documents(filters={"document_id": str(document_id)})
+        return len(docs or [])
+    try:
+        return await loop.run_in_executor(None, _count_chunks)
+    except Exception:
+        return 0
 
 # --- Dependencias CORREGIDAS para usar X- Headers ---
 # Estas dependencias AHORA son la fuente de verdad para ID de compañía y usuario
@@ -156,9 +176,7 @@ async def ingest_document_haystack(
 )
 async def get_ingestion_status(
     document_id: uuid.UUID,
-    # *** CORRECCIÓN CLAVE: Usar la dependencia correcta ***
     company_id: uuid.UUID = Depends(get_current_company_id),
-    # Ya no se depende de Authorization
     request: Request = None
 ):
     request_id = request.headers.get("x-request-id", str(uuid.uuid4())) if request else str(uuid.uuid4())
@@ -174,6 +192,21 @@ async def get_ingestion_status(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
         response_data = schemas.StatusResponse.model_validate(doc_data)
+        # Verificar existencia real en MinIO
+        file_path = doc_data.get("file_path")
+        if file_path:
+            try:
+                minio_client = MinioStorageClient()
+                exists = await minio_client.file_exists(file_path)
+            except Exception:
+                exists = False
+        else:
+            exists = False
+        # Contar chunks en Milvus
+        milvus_count = await get_milvus_chunk_count(document_id)
+        # Asignar campos adicionales
+        response_data.minio_exists = exists
+        response_data.milvus_chunk_count = milvus_count
         status_messages = {
             DocumentStatus.UPLOADED: "Document uploaded, awaiting processing.",
             DocumentStatus.PROCESSING: "Document is currently being processed.",
