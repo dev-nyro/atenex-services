@@ -72,7 +72,9 @@ async def run_rag_pipeline(
 
     # Step 1: Embed query
     try:
-        embedding = get_fastembed_text_embedder().run(query).get("embedding")
+        embedder = get_fastembed_text_embedder()
+        embedder.warm_up()
+        embedding = embedder.run(query).get("embedding")
     except Exception as e:
         run_log.error("Embedding failed", error=str(e), exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Embedding error")
