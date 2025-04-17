@@ -167,14 +167,10 @@ async def add_request_context_timing_logging(request: Request, call_next):
 
 # --- Include Routers ---
 log.info("Including application routers...")
-# User router has its own prefix defined internally (/api/v1/users)
-app.include_router(user_router_instance)
-
-# --- *** CORRECTION: ADD PREFIX HERE *** ---
-# Apply the /api/v1 prefix when including the gateway router
+# User router: ahora con prefijo correcto
+app.include_router(user_router_instance, prefix="/api/v1/users", tags=["users"])
+# Gateway router
 app.include_router(gateway_router_instance, prefix="/api/v1")
-# -------------------------------------------
-
 log.info("Routers included successfully.")
 
 # --- Root & Health Endpoints ---
