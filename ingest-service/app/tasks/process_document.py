@@ -49,7 +49,7 @@ def _initialize_milvus_store() -> MilvusDocumentStore:
     init_log.info("Attempting to initialize...")
     try:
         store = MilvusDocumentStore(
-            uri=str(settings.MILVUS_URI),
+            connection_args={"uri": str(settings.MILVUS_URI)},
             collection_name=settings.MILVUS_COLLECTION_NAME,
             dim=settings.EMBEDDING_DIMENSION,
             embedding_field=settings.MILVUS_EMBEDDING_FIELD,
@@ -64,8 +64,8 @@ def _initialize_milvus_store() -> MilvusDocumentStore:
         init_log.info("Initialization successful.")
         return store
     except MilvusException as me:
-        init_log.error("Milvus connection/initialization failed", code=me.code, message=me.message, exc_info=True)
-        raise ConnectionError(f"Milvus connection failed: {me.message}") from me
+        init_log.error("Milvus connection/initialization failed", code=getattr(me, 'code', None), message=str(me), exc_info=True)
+        raise ConnectionError(f"Milvus connection failed: {me}") from me
     except Exception as e:
         init_log.exception("Unexpected error during MilvusDocumentStore initialization")
         raise RuntimeError(f"Unexpected Milvus init error: {e}") from e
@@ -107,18 +107,26 @@ def _initialize_document_writer(store: MilvusDocumentStore) -> DocumentWriter:
     return writer
 
 def get_converter_for_content_type(content_type: str) -> Optional[Type]:
-     """Devuelve la clase del conversor Haystack apropiada."""
-     converters = {
-         "application/pdf": PyPDFToDocument,
-         "application/vnd.openxmlformats-officedocument.wordprocessingml.document": DOCXToDocument,
-         "text/plain": TextFileToDocument,
-         "text/markdown": MarkdownToDocument,
-         "text/html": HTMLToDocument,
-     }
-     converter = converters.get(content_type)
-     if not converter:
-         log.warning("No Haystack converter found for content type", content_type=content_type)
-     return converter
+    """Devuelve la clase del conversor Haystack apropiada para el tipo de archivo."""
+    converters = {
+        "application/pdf": PyPDFToDocument,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": DOCXToDocument,
+        "application/msword": DOCXToDocument,  # Word antiguo
+        "application/vnd.ms-excel": None,  # Excel antiguo (no soportado nativo, requiere integración extra)
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": None,  # Excel moderno (ver nota abajo)
+        "image/png": None,  # Imágenes requieren OCR externo
+        "image/jpeg": None,
+        "image/jpg": None,
+        "text/plain": TextFileToDocument,
+        "text/markdown": MarkdownToDocument,
+        "text/html": HTMLToDocument,
+    }
+    converter = converters.get(content_type)
+    if converter is None:
+        # Mensaje de error claro y en español para el frontend
+        raise ValueError("El tipo de archivo no es soportado actualmente. Solo se permiten PDF, Word, Excel y algunas imágenes. Si necesitas soporte para este tipo de archivo, contacta al administrador.")
+    return converter
+# NOTA: Para Excel e imágenes, devolveremos error claro y en español si se intenta subir uno, hasta que se integre OCR o parser de Excel.
 
 # --- Celery Task Definition ---
 NON_RETRYABLE_ERRORS = (FileNotFoundError, ValueError, TypeError, NotImplementedError, KeyError, AttributeError)

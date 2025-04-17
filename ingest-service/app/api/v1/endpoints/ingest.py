@@ -92,6 +92,13 @@ async def ingest_document_haystack(
         request_log.warning("Invalid metadata JSON received", error=str(json_err))
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid JSON format for metadata: {json_err}")
 
+    # PREVENCIÓN DE DUPLICADOS: Buscar documento existente por company_id y file_name en estado != error
+    existing_docs = await postgres_client.list_documents_by_company(company_id, limit=1000, offset=0)
+    for doc in existing_docs:
+        if doc["file_name"] == file.filename and doc["status"] != DocumentStatus.ERROR.value:
+            request_log.warning("Intento de subida duplicada detectado", filename=file.filename, status=doc["status"])
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Ya existe un documento con el mismo nombre en estado '{doc['status']}'. Elimina o reintenta el anterior antes de subir uno nuevo.")
+
     minio_client = None; minio_object_name = None; document_id = None; task_id = None
     try:
         document_id = await postgres_client.create_document(
@@ -206,3 +213,40 @@ async def list_ingestion_statuses(
     except Exception as e:
         list_log.exception("Error listing document statuses")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error listing document statuses.")
+
+@router.post(
+    "/retry/{document_id}",
+    response_model=schemas.IngestResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Reintentar la ingesta de un documento con error",
+    description="Permite reintentar la ingesta de un documento que falló. Solo disponible si el estado es 'error'."
+)
+async def retry_document_ingest(
+    document_id: uuid.UUID,
+    company_id: uuid.UUID = Depends(get_current_company_id),
+    user_id: uuid.UUID = Depends(get_current_user_id),
+    request: Request = None
+):
+    request_id = request.headers.get("x-request-id", str(uuid.uuid4())) if request else str(uuid.uuid4())
+    retry_log = log.bind(request_id=request_id, company_id=str(company_id), user_id=str(user_id), document_id=str(document_id))
+    # 1. Buscar el documento y validar estado
+    doc = await postgres_client.get_document_status(document_id)
+    if not doc or doc.get("company_id") != str(company_id):
+        retry_log.warning("Documento no encontrado o no pertenece a la compañía")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Documento no encontrado.")
+    if doc["status"] != DocumentStatus.ERROR.value:
+        retry_log.warning("Solo se puede reintentar si el estado es 'error'", current_status=doc["status"])
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Solo se puede reintentar la ingesta si el estado es 'error'.")
+    # 2. Reencolar la tarea Celery
+    task = process_document_haystack_task.delay(
+        document_id_str=str(document_id),
+        company_id_str=str(company_id),
+        minio_object_name=doc["file_path"],
+        file_name=doc["file_name"],
+        content_type=doc["file_type"],
+        original_metadata=doc.get("metadata", {})
+    )
+    retry_log.info("Reintento de ingesta encolado", task_id=task.id)
+    # 3. Actualizar estado a 'processing'
+    await postgres_client.update_document_status(document_id=document_id, status=DocumentStatus.PROCESSING, error_message=None)
+    return schemas.IngestResponse(document_id=document_id, task_id=task.id, status=DocumentStatus.PROCESSING, message="Reintento de ingesta encolado correctamente.")
