@@ -6,7 +6,7 @@ from typing import Dict, Any, List, Tuple, Optional
 
 from pymilvus.exceptions import MilvusException, ErrorCode
 from fastapi import HTTPException, status
-from haystack import AsyncPipeline, Document
+from haystack import Document
 from haystack_integrations.components.embedders.fastembed.fastembed_text_embedder import FastembedTextEmbedder
 from haystack.components.builders.prompt_builder import PromptBuilder
 from milvus_haystack import MilvusDocumentStore, MilvusEmbeddingRetriever
@@ -46,13 +46,6 @@ def get_fastembed_text_embedder() -> FastembedTextEmbedder:
         prefix=settings.FASTEMBED_QUERY_PREFIX or "",
     )
 
-def get_milvus_retriever(document_store: MilvusDocumentStore) -> MilvusEmbeddingRetriever:
-    log.debug("Initializing MilvusEmbeddingRetriever")
-    return MilvusEmbeddingRetriever(
-        document_store=document_store,
-        top_k=settings.RETRIEVER_TOP_K
-    )
-
 def get_prompt_builder() -> PromptBuilder:
     log.debug("Initializing PromptBuilder")
     return PromptBuilder(template=settings.RAG_PROMPT_TEMPLATE)
@@ -70,38 +63,34 @@ async def run_rag_pipeline(
     Ejecuta el Async RAG pipeline (con FastEmbed) usando el método manual embed->retrieve->prompt steps.
     Llama a Gemini y loguea la interacción.
     """
-    run_log = log.bind(query=query, company_id=company_id,
-                       user_id=user_id or "N/A", chat_id=str(chat_id) if chat_id else "N/A")
-    run_log.info("Running Async RAG pipeline execution flow (FastEmbed)...")
+    run_log = log.bind(query=query, company_id=company_id, user_id=user_id or "N/A", chat_id=str(chat_id) if chat_id else "N/A")
+    run_log.info("Running RAG pipeline (manual flow) with FastEmbed...")
 
-    # Determine top_k and filters
+    # Define retrieval params
     retriever_top_k = top_k or settings.RETRIEVER_TOP_K
-    filters = [{"field": settings.MILVUS_COMPANY_ID_FIELD,
-                "operator": "==",
-                "value": company_id}]
+    filters = [{"field": settings.MILVUS_COMPANY_ID_FIELD, "operator": "==", "value": company_id}]
 
-    # Step 1: Embed the query text with FastEmbed
+    # Step 1: Embed query
     try:
         embedding = get_fastembed_text_embedder().run(query).get("embedding")
     except Exception as e:
-        run_log.error("Embedding error", error=str(e), exc_info=True)
+        run_log.error("Embedding failed", error=str(e), exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Embedding error")
 
-    # Step 2: Retrieve documents from Milvus
+    # Step 2: Retrieve documents
     try:
-        retriever = get_milvus_retriever(document_store=get_milvus_document_store())
-        docs = await asyncio.to_thread(
-            retriever.retrieve, embedding, filters=filters, top_k=retriever_top_k
-        )
+        retriever = MilvusEmbeddingRetriever(document_store=get_milvus_document_store(), filters=filters, top_k=retriever_top_k)
+        docs = await asyncio.to_thread(retriever.run, embedding)
+        docs = docs.get("documents", [])
     except Exception as e:
-        run_log.error("Retrieval error", error=str(e), exc_info=True)
+        run_log.error("Retrieval failed", error=str(e), exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Retrieval error")
 
     # Step 3: Build prompt
     try:
-        prompt_text = get_prompt_builder().run(query=query, documents=docs).get("prompt")
+        prompt_text = PromptBuilder(template=settings.RAG_PROMPT_TEMPLATE).run(query=query, documents=docs).get("prompt")
     except Exception as e:
-        run_log.error("Prompt building error", error=str(e), exc_info=True)
+        run_log.error("Prompt building failed", error=str(e), exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Prompt building error")
 
     try:
