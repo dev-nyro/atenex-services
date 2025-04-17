@@ -58,36 +58,7 @@ def get_prompt_builder() -> PromptBuilder:
     return PromptBuilder(template=settings.RAG_PROMPT_TEMPLATE)
 
 
-# --- Pipeline Construction (Using AsyncPipeline) ---
-_rag_pipeline_instance: Optional[AsyncPipeline] = None
-def build_rag_pipeline() -> AsyncPipeline:
-    global _rag_pipeline_instance
-    if _rag_pipeline_instance:
-        return _rag_pipeline_instance
-    log.info("Building Haystack Async RAG pipeline with FastEmbed...")
-    pipeline = AsyncPipeline()
-
-    try:
-        doc_store = get_milvus_document_store()
-        text_embedder = get_fastembed_text_embedder()
-        retriever = get_milvus_retriever(document_store=doc_store)
-        prompt_builder = get_prompt_builder()
-
-        pipeline.add_component("text_embedder", text_embedder)
-        pipeline.add_component("retriever", retriever)
-        pipeline.add_component("prompt_builder", prompt_builder)
-
-        pipeline.connect("text_embedder.embedding", "retriever.query_embedding")
-        pipeline.connect("retriever.documents", "prompt_builder.documents")
-
-        _rag_pipeline_instance = pipeline
-        log.info("Haystack Async RAG pipeline with FastEmbed built successfully.")
-        return pipeline
-    except Exception as e:
-        log.error("Failed to build Haystack Async RAG pipeline with FastEmbed", error=str(e), exc_info=True)
-        raise RuntimeError("Could not build the Async RAG pipeline with FastEmbed") from e
-
-# --- Pipeline Execution (Using run_async) ---
+# --- Pipeline Execution (Using manual steps) ---
 async def run_rag_pipeline(
     query: str,
     company_id: str,
@@ -96,50 +67,42 @@ async def run_rag_pipeline(
     chat_id: Optional[uuid.UUID] = None
 ) -> Tuple[str, List[Document], Optional[uuid.UUID]]:
     """
-    Ejecuta el Async RAG pipeline (con FastEmbed) usando el método `run_async`.
+    Ejecuta el Async RAG pipeline (con FastEmbed) usando el método manual embed->retrieve->prompt steps.
     Llama a Gemini y loguea la interacción.
     """
     run_log = log.bind(query=query, company_id=company_id,
                        user_id=user_id or "N/A", chat_id=str(chat_id) if chat_id else "N/A")
     run_log.info("Running Async RAG pipeline execution flow (FastEmbed)...")
 
-    try:
-        pipeline = build_rag_pipeline()
-    except Exception as e:
-        run_log.error("Pipeline build failed", error=str(e))
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="RAG pipeline unavailable"
-        )
-
+    # Determine top_k and filters
     retriever_top_k = top_k or settings.RETRIEVER_TOP_K
     filters = [{"field": settings.MILVUS_COMPANY_ID_FIELD,
                 "operator": "==",
                 "value": company_id}]
 
-    # Prepare a single data dict for run_async, including all component inputs
-    pipeline_data = {
-        "text_embedder": {"text": query},
-        "retriever": {"filters": filters, "top_k": retriever_top_k},
-        "prompt_builder": {"query": query}
-    }
-    run_log.debug("Pipeline inputs prepared", data_structure=pipeline_data)
-
+    # Step 1: Embed the query text with FastEmbed
     try:
-        result = await pipeline.run_async(data=pipeline_data)
-        run_log.info("AsyncPipeline executed successfully.")
+        embedding = get_fastembed_text_embedder().run(query).get("embedding")
     except Exception as e:
-        run_log.error("Pipeline execution error", error=str(e), exc_info=True)
-        if "embedding dimension" in str(e).lower():
-            run_log.critical("Potential embedding dimension mismatch!", configured_dim=settings.EMBEDDING_DIMENSION, error_details=str(e))
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error processing query: {type(e).__name__}"
-        )
+        run_log.error("Embedding error", error=str(e), exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Embedding error")
 
-    docs: List[Document] = result.get("retriever", {}).get("documents", [])
-    prompt_out = result.get("prompt_builder", {})
-    prompt_text = prompt_out.get("prompt") or f"Pregunta: {query}\n(no se construyó prompt)"
+    # Step 2: Retrieve documents from Milvus
+    try:
+        retriever = get_milvus_retriever(document_store=get_milvus_document_store())
+        docs = await asyncio.to_thread(
+            retriever.retrieve, embedding, filters=filters, top_k=retriever_top_k
+        )
+    except Exception as e:
+        run_log.error("Retrieval error", error=str(e), exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Retrieval error")
+
+    # Step 3: Build prompt
+    try:
+        prompt_text = get_prompt_builder().run(query=query, documents=docs).get("prompt")
+    except Exception as e:
+        run_log.error("Prompt building error", error=str(e), exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Prompt building error")
 
     try:
         answer = await gemini_client.generate_answer(prompt_text)
