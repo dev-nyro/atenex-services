@@ -19,7 +19,7 @@ log = structlog.get_logger("query_service.main")
 from app.api.v1.endpoints import query as query_router_module
 from app.api.v1.endpoints import chat as chat_router_module
 from app.db import postgres_client
-from app.pipelines.rag_pipeline import build_rag_pipeline, check_pipeline_dependencies
+from app.pipelines.rag_pipeline import run_rag_pipeline
 from app.api.v1 import schemas
 # from app.utils import helpers
 
@@ -41,8 +41,6 @@ async def startup_event():
     global SERVICE_READY, GLOBAL_RAG_PIPELINE
     log.info(f"Starting up {settings.PROJECT_NAME}...")
     db_pool_initialized = False
-    pipeline_built = False
-    milvus_startup_ok = False
     # Intenta inicializar la BD
     try:
         await postgres_client.get_db_pool()
@@ -57,30 +55,13 @@ async def startup_event():
         log.critical("CRITICAL: Failed PostgreSQL pool initialization during startup.", error=str(e), exc_info=True)
         db_pool_initialized = False
 
-    # Intenta construir el pipeline RAG
-    try:
-        GLOBAL_RAG_PIPELINE = build_rag_pipeline()
-        dep_status = await check_pipeline_dependencies()
-        milvus_status = dep_status.get("milvus_connection", "error: check failed")
-        if "ok" in milvus_status: # Aceptar 'ok' u 'ok (collection not found yet)'
-            log.info("Haystack RAG pipeline built and Milvus connection status is OK.", status=milvus_status)
-            pipeline_built = True
-            milvus_startup_ok = True
-        else:
-             log.warning("Haystack RAG pipeline built, but initial Milvus check failed or pending.", status=milvus_status)
-             pipeline_built = True
-             milvus_startup_ok = False
-    except Exception as e:
-        log.error("Failed building Haystack RAG pipeline during startup.", error=str(e), exc_info=True)
-        pipeline_built = False
-
-    # Marcar como listo solo si las dependencias críticas (DB, Pipeline) están OK
-    if db_pool_initialized and pipeline_built:
+    # Marcar como listo si la BD está lista
+    if db_pool_initialized:
         SERVICE_READY = True
-        log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY. Initial Milvus Check: {'OK' if milvus_startup_ok else 'WARN/FAIL'}")
+        log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY.")
     else:
         SERVICE_READY = False
-        log.critical(f"{settings.PROJECT_NAME} startup FAILED critical components. DB OK: {db_pool_initialized}, Pipeline Built: {pipeline_built}. Service NOT READY.")
+        log.critical(f"{settings.PROJECT_NAME} startup FAILED. DB OK: {db_pool_initialized}. Service NOT READY.")
 
 
 @app.on_event("shutdown")
