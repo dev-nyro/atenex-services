@@ -48,44 +48,34 @@ class MinioStorageClient:
         company_id: uuid.UUID,
         document_id: uuid.UUID,
         file_name: str,
-        file_content_stream: IO[bytes], # Acepta BytesIO u otro stream
+        file_content_stream: IO[bytes],
         content_type: str,
         content_length: int
     ) -> str:
-        """
-        Sube un archivo a MinIO de forma asíncrona usando run_in_executor.
-        El nombre del objeto usa company_id/document_id/filename.
-        Retorna el nombre completo del objeto en MinIO.
-        """
-        # Construir nombre del objeto para organización dentro del bucket 'atenex'
         object_name = f"{str(company_id)}/{str(document_id)}/{file_name}"
         upload_log = log.bind(bucket=self.bucket_name, object_name=object_name, content_type=content_type, length=content_length)
         upload_log.info("Queueing file upload to MinIO executor")
 
         loop = asyncio.get_running_loop()
         try:
-            # Asegurarse que el stream está al inicio antes de pasarlo
             file_content_stream.seek(0)
-            # Ejecutar la operación síncrona put_object en el executor
-            result = await loop.run_in_executor(
-                None, # Default ThreadPoolExecutor
-                self.client.put_object, # La función síncrona
-                # Argumentos para put_object:
-                self.bucket_name,
-                object_name,
-                file_content_stream,
-                content_length, # Pasar longitud explícitamente
-                content_type=content_type,
-            )
+            # Wrapper para pasar argumentos correctamente a put_object
+            def _put_object():
+                return self.client.put_object(
+                    self.bucket_name,
+                    object_name,
+                    file_content_stream,
+                    content_length,
+                    content_type=content_type
+                )
+            result = await loop.run_in_executor(None, _put_object)
             upload_log.info("File uploaded successfully to MinIO via executor", etag=getattr(result, 'etag', None), version_id=getattr(result, 'version_id', None))
             return object_name
         except S3Error as e:
             upload_log.error("Failed to upload file to MinIO via executor", error=str(e), code=e.code, exc_info=True)
-            # Re-lanzar S3Error para que el llamador lo maneje
             raise IOError(f"Failed to upload to storage: {e.code}") from e
         except Exception as e:
             upload_log.error("Unexpected error during file upload via executor", error=str(e), exc_info=True)
-            # Re-lanzar como IOError genérico
             raise IOError(f"Unexpected storage upload error") from e
 
     def download_file_stream_sync(self, object_name: str) -> io.BytesIO:
