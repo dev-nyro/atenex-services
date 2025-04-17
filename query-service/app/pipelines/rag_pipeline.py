@@ -124,19 +124,20 @@ async def run_rag_pipeline(
 
     run_log.debug("Pipeline execution parameters set", filters=retriever_filters, top_k=retriever_top_k)
 
-    # Unificamos inputs y configuración en un solo diccionario pipeline_data según Haystack 2.x
+    # Preparar data y params para pipeline.run
     pipeline_data = {
         "text_embedder": {"text": query},
         "retriever": {"filters": [retriever_filters], "top_k": retriever_top_k},
         "prompt_builder": {"query": query}
     }
-    # Ejecutar pipeline en un ThreadPool sin bloquear el event loop,
-    # incluyendo solo los outputs de retriever y prompt_builder
+    pipeline_params = {"retriever": {"filters": [retriever_filters], "top_k": retriever_top_k}}
+
+    # Ejecutar pipeline en ThreadPool, pasando data y params según Haystack 2.x
     loop = asyncio.get_running_loop()
     pipeline_run_partial = functools.partial(
         pipeline.run,
-        pipeline_data,
-        {"retriever", "prompt_builder"}
+        data=pipeline_data,
+        params=pipeline_params
     )
     pipeline_result = await loop.run_in_executor(None, pipeline_run_partial)
 
