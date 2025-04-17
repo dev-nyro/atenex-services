@@ -7,7 +7,7 @@ from typing import Dict, Any, List, Tuple, Optional
 from pymilvus.exceptions import MilvusException, ErrorCode
 from fastapi import HTTPException, status
 from haystack import AsyncPipeline, Document
-from fastembed_haystack.components.embedders import FastembedTextEmbedder
+from haystack_integrations.components.embedders.fastembed.fastembed_text_embedder import FastembedTextEmbedder
 from haystack.components.builders.prompt_builder import PromptBuilder
 from milvus_haystack import MilvusDocumentStore, MilvusEmbeddingRetriever
 from haystack.utils import Secret
