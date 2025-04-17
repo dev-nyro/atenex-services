@@ -57,14 +57,20 @@ async def check_db_connection() -> bool:
 # --- Document Operations (sin cambios) ---
 async def create_document(company_id: uuid.UUID, file_name: str, file_type: str, metadata: Dict[str, Any]) -> uuid.UUID:
     pool = await get_db_pool(); doc_id = uuid.uuid4()
-    query = "INSERT INTO documents (id, company_id, file_name, file_type, metadata, status, uploaded_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC') RETURNING id;"
+    # Incluye file_path como string vacío para cumplir NOT NULL
+    query = "INSERT INTO documents (id, company_id, file_name, file_type, file_path, metadata, status, uploaded_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC') RETURNING id;"
     insert_log = log.bind(company_id=str(company_id), filename=file_name, content_type=file_type, proposed_doc_id=str(doc_id))
     try:
-        async with pool.acquire() as connection: result_id = await connection.fetchval(query, doc_id, company_id, file_name, file_type, json.dumps(metadata), DocumentStatus.UPLOADED.value)
-        if result_id and result_id == doc_id: insert_log.info("Document record created", document_id=str(doc_id)); return result_id
-        else: insert_log.error("Failed to create document record", returned_id=result_id); raise RuntimeError(f"Failed create document, return mismatch ({result_id})")
-    except asyncpg.exceptions.UniqueViolationError as e: insert_log.error("Unique constraint violation", error=str(e), constraint=e.constraint_name); raise ValueError(f"Document creation failed: unique constraint ({e.constraint_name})") from e
-    except Exception as e: insert_log.error("Failed to create document record", error=str(e), exc_info=True); raise
+        async with pool.acquire() as connection:
+            result_id = await connection.fetchval(query, doc_id, company_id, file_name, file_type, '', json.dumps(metadata), DocumentStatus.UPLOADED.value)
+        if result_id and result_id == doc_id:
+            insert_log.info("Document record created", document_id=str(doc_id)); return result_id
+        else:
+            insert_log.error("Failed to create document record", returned_id=result_id); raise RuntimeError(f"Failed create document, return mismatch ({result_id})")
+    except asyncpg.exceptions.UniqueViolationError as e:
+        insert_log.error("Unique constraint violation", error=str(e), constraint=e.constraint_name); raise ValueError(f"Document creation failed: unique constraint ({e.constraint_name})") from e
+    except Exception as e:
+        insert_log.error("Failed to create document record", error=str(e), exc_info=True); raise
 
 async def update_document_status(document_id: uuid.UUID, status: DocumentStatus, file_path: Optional[str] = None, chunk_count: Optional[int] = None, error_message: Optional[str] = None) -> bool:
     pool = await get_db_pool(); update_log = log.bind(document_id=str(document_id), new_status=status.value)
@@ -73,8 +79,7 @@ async def update_document_status(document_id: uuid.UUID, status: DocumentStatus,
     fields_to_set.append(f"updated_at = NOW() AT TIME ZONE 'UTC'")
     if file_path is not None: fields_to_set.append(f"file_path = ${param_index}"); params.append(file_path); param_index += 1
     if chunk_count is not None: fields_to_set.append(f"chunk_count = ${param_index}"); params.append(chunk_count); param_index += 1
-    if status == DocumentStatus.ERROR: safe_error = (error_message or "Unknown error")[:2000]; fields_to_set.append(f"error_message = ${param_index}"); params.append(safe_error); param_index += 1; update_log = update_log.bind(error_message=safe_error)
-    else: fields_to_set.append("error_message = NULL")
+    # Elimina manejo de error_message
     query = f"UPDATE documents SET {', '.join(fields_to_set)} WHERE id = $1;"; update_log.debug("Executing status update", query=query)
     try:
         async with pool.acquire() as connection: result_str = await connection.execute(query, *params)
@@ -86,7 +91,8 @@ async def update_document_status(document_id: uuid.UUID, status: DocumentStatus,
 
 async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]]:
     pool = await get_db_pool(); get_log = log.bind(document_id=str(document_id))
-    query = "SELECT id, status, file_name, file_type, chunk_count, error_message, updated_at, company_id FROM documents WHERE id = $1;"
+    # Elimina error_message del SELECT
+    query = "SELECT id, status, file_name, file_type, chunk_count, updated_at, company_id FROM documents WHERE id = $1;"
     try:
         async with pool.acquire() as connection: record = await connection.fetchrow(query, document_id)
         if record: get_log.debug("Document status retrieved"); return dict(record)
@@ -95,7 +101,8 @@ async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]
 
 async def list_documents_by_company(company_id: uuid.UUID, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
     pool = await get_db_pool(); list_log = log.bind(company_id=str(company_id), limit=limit, offset=offset)
-    query = "SELECT id, status, file_name, file_type, chunk_count, error_message, updated_at FROM documents WHERE company_id = $1 ORDER BY updated_at DESC LIMIT $2 OFFSET $3;"
+    # Elimina error_message del SELECT
+    query = "SELECT id, status, file_name, file_type, chunk_count, updated_at FROM documents WHERE company_id = $1 ORDER BY updated_at DESC LIMIT $2 OFFSET $3;"
     try:
         async with pool.acquire() as connection: records = await connection.fetch(query, company_id, limit, offset)
         result_list = [dict(record) for record in records]; list_log.info(f"Retrieved {len(result_list)} docs")

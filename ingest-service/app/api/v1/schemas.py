@@ -24,7 +24,6 @@ class StatusResponse(BaseModel):
     file_name: Optional[str] = None
     file_type: Optional[str] = None
     chunk_count: Optional[int] = None
-    error_message: Optional[str] = None # Mensaje de error de la DB
     last_updated: Optional[datetime] = Field(None, alias="updated_at")
     # Mensaje descriptivo añadido en el endpoint, no viene de la DB directamente
     message: Optional[str] = Field(None, exclude=False) # Incluir en respuesta si se añade
