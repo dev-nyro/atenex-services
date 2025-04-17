@@ -37,6 +37,9 @@ COPY pyproject.toml ./
 # *** CORRECCIÓN: Llamar a poetry usando la ruta absoluta ***
 RUN /opt/poetry/bin/poetry install --no-root --no-dev --no-interaction --no-ansi
 
+# Asegurar que fastembed-haystack esté disponible para el pipeline
+RUN pip install fastembed-haystack==1.4.1
+
 # Copiar el código de la aplicación al contenedor
 COPY app ./app
 
