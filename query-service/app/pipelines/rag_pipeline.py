@@ -2,13 +2,14 @@
 import structlog
 import asyncio
 import uuid
-import functools # LLM_COMMENT: Import functools to use partial for run_in_executor keyword arguments.
+# LLM_COMMENT: No longer need functools.partial as we will use native AsyncPipeline.run_async
 from typing import Dict, Any, List, Tuple, Optional
 
 from pymilvus.exceptions import MilvusException, ErrorCode
 from fastapi import HTTPException, status
 
-from haystack import Pipeline, Document
+# LLM_COMMENT: Import AsyncPipeline instead of Pipeline
+from haystack import AsyncPipeline, Document # LLM_COMMENT_CHANGE
 from haystack.components.embedders import OpenAITextEmbedder
 from haystack.components.builders.prompt_builder import PromptBuilder
 from milvus_haystack import MilvusDocumentStore, MilvusEmbeddingRetriever
@@ -63,34 +64,38 @@ def get_prompt_builder() -> PromptBuilder:
     return PromptBuilder(template=settings.RAG_PROMPT_TEMPLATE)
 
 
-# --- Pipeline Construction (sin cambios) ---
-_rag_pipeline_instance: Optional[Pipeline] = None
-def build_rag_pipeline() -> Pipeline:
+# --- Pipeline Construction (Using AsyncPipeline) ---
+# LLM_COMMENT: Switched from Pipeline to AsyncPipeline for native async execution.
+_rag_pipeline_instance: Optional[AsyncPipeline] = None # LLM_COMMENT_CHANGE
+def build_rag_pipeline() -> AsyncPipeline: # LLM_COMMENT_CHANGE
     global _rag_pipeline_instance
     if _rag_pipeline_instance: return _rag_pipeline_instance
-    log.info("Building Haystack RAG pipeline...")
-    rag_pipeline = Pipeline()
+    log.info("Building Haystack Async RAG pipeline...") # LLM_COMMENT_CHANGE
+    # LLM_COMMENT: Instantiate AsyncPipeline instead of Pipeline.
+    rag_pipeline = AsyncPipeline() # LLM_COMMENT_CHANGE
     try:
         doc_store = get_milvus_document_store()
         text_embedder = get_openai_text_embedder()
         retriever = get_milvus_retriever(document_store=doc_store)
         prompt_builder = get_prompt_builder()
 
+        # LLM_COMMENT: Adding components remains the same for AsyncPipeline.
         rag_pipeline.add_component("text_embedder", text_embedder)
         rag_pipeline.add_component("retriever", retriever)
         rag_pipeline.add_component("prompt_builder", prompt_builder)
 
+        # LLM_COMMENT: Connecting components remains the same for AsyncPipeline.
         rag_pipeline.connect("text_embedder.embedding", "retriever.query_embedding")
         rag_pipeline.connect("retriever.documents", "prompt_builder.documents")
 
-        log.info("Haystack RAG pipeline built successfully.")
+        log.info("Haystack Async RAG pipeline built successfully.") # LLM_COMMENT_CHANGE
         _rag_pipeline_instance = rag_pipeline
         return rag_pipeline
     except Exception as e:
-        log.error("Failed to build Haystack RAG pipeline", error=str(e), exc_info=True)
-        raise RuntimeError("Could not build the RAG pipeline") from e
+        log.error("Failed to build Haystack Async RAG pipeline", error=str(e), exc_info=True) # LLM_COMMENT_CHANGE
+        raise RuntimeError("Could not build the Async RAG pipeline") from e # LLM_COMMENT_CHANGE
 
-# --- Pipeline Execution ---
+# --- Pipeline Execution (Using run_async) ---
 # *** FUNCIÓN CORREGIDA: run_rag_pipeline ***
 async def run_rag_pipeline(
     query: str,
@@ -100,94 +105,107 @@ async def run_rag_pipeline(
     chat_id: Optional[uuid.UUID] = None
 ) -> Tuple[str, List[Document], Optional[uuid.UUID]]:
     """
-    Ejecuta el pipeline RAG usando `run_in_executor` con `functools.partial`
-    para pasar argumentos de palabra clave `data` y `params` a `pipeline.run`.
-    Luego llama a Gemini y loguea la interacción.
+    Ejecuta el Async RAG pipeline usando el método `run_async`.
+    Llama a Gemini y loguea la interacción.
     """
-    # LLM_COMMENT: This function orchestrates the RAG pipeline execution.
-    # LLM_COMMENT: It takes user query, company/user context, and optional chat info.
-    # LLM_COMMENT: Key step: Calls Haystack's pipeline.run asynchronously using run_in_executor.
+    # LLM_COMMENT: Orchestrates the RAG flow using AsyncPipeline.run_async for native async execution.
     run_log = log.bind(query=query, company_id=company_id, user_id=user_id or "N/A", chat_id=str(chat_id) if chat_id else "N/A")
-    run_log.info("Running RAG pipeline execution flow...")
+    run_log.info("Running Async RAG pipeline execution flow...") # LLM_COMMENT_CHANGE
 
     try:
-        pipeline = build_rag_pipeline() # Obtener/construir el pipeline
-        # LLM_COMMENT: Ensure pipeline instance is available before proceeding.
+        pipeline = build_rag_pipeline() # Obtener/construir el pipeline asíncrono
+        # LLM_COMMENT: Obtain the global AsyncPipeline instance.
     except Exception as build_err:
-         run_log.error("Failed to get or build RAG pipeline for execution", error=str(build_err))
-         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="RAG pipeline is not available.")
+         run_log.error("Failed to get or build Async RAG pipeline for execution", error=str(build_err)) # LLM_COMMENT_CHANGE
+         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Async RAG pipeline is not available.") # LLM_COMMENT_CHANGE
 
     # Determinar parámetros para el retriever
     retriever_top_k = top_k if top_k is not None else settings.RETRIEVER_TOP_K
     retriever_filters = {"field": settings.MILVUS_COMPANY_ID_FIELD, "operator": "==", "value": company_id}
-    # LLM_COMMENT: Filters are prepared for the Milvus retriever component based on company_id.
+    # LLM_COMMENT: Prepare runtime parameters (filters, top_k) for the retriever component.
 
     run_log.debug("Pipeline execution parameters set", filters=retriever_filters, top_k=retriever_top_k)
 
-    # Preparar data y params para pipeline.run
-    pipeline_data = {
+    # Preparar argumentos para pipeline.run_async
+    pipeline_input_data = {
         "text_embedder": {"text": query},
-        "retriever": {"filters": [retriever_filters], "top_k": retriever_top_k},
         "prompt_builder": {"query": query}
     }
-    pipeline_params = {"retriever": {"filters": [retriever_filters], "top_k": retriever_top_k}}
+    pipeline_params = {
+        "retriever": {"filters": [retriever_filters], "top_k": retriever_top_k}
+    }
+    # LLM_COMMENT: Define 'data' and 'params' dictionary structures as expected by run_async.
 
-    # Ejecutar pipeline en ThreadPool, pasando data y params según Haystack 2.x
-    loop = asyncio.get_running_loop()
-    pipeline_run_partial = functools.partial(
-        pipeline.run,
-        data=pipeline_data,
-        params=pipeline_params
-    )
-    pipeline_result = await loop.run_in_executor(None, pipeline_run_partial)
+    run_log.debug("Constructed AsyncPipeline run arguments", data_keys=list(pipeline_input_data.keys()), params_keys=list(pipeline_params.keys()))
 
-    # Ejecutamos el pipeline, LLM y logging dentro de un solo bloque para capturar excepciones:
     try:
-        run_log.info("Haystack pipeline (embed, retrieve, prompt) executed successfully.")
+        # *** CORRECCIÓN: Usar pipeline.run_async directamente ***
+        # LLM_COMMENT: Execute the pipeline asynchronously using run_async, passing data and params directly.
+        # LLM_COMMENT: No need for run_in_executor or functools.partial anymore.
+        pipeline_result = await pipeline.run_async(
+            data=pipeline_input_data,
+            params=pipeline_params
+        )
 
-        # Extraer resultados
+        run_log.info("Haystack AsyncPipeline (embed, retrieve, prompt) executed successfully.") # LLM_COMMENT_CHANGE
+
+        # Extraer resultados (sin cambios en esta parte)
         retrieved_docs: List[Document] = pipeline_result.get("retriever", {}).get("documents", [])
         prompt_builder_output = pipeline_result.get("prompt_builder", {})
-        generated_prompt = prompt_builder_output.get("prompt") if isinstance(prompt_builder_output, dict) else None
+        generated_prompt: Optional[str] = prompt_builder_output.get("prompt") if isinstance(prompt_builder_output, dict) else None
+        # LLM_COMMENT: Process the pipeline output dictionary.
 
         if not retrieved_docs:
-            run_log.warning("No relevant documents found by retriever for the query.")
+             run_log.warning("No relevant documents found by retriever for the query.")
         else:
-            run_log.info(f"Retriever found {len(retrieved_docs)} documents.")
+             run_log.info(f"Retriever found {len(retrieved_docs)} documents.")
 
         if not generated_prompt:
-            run_log.error("Failed to extract prompt from prompt_builder output", component_output=prompt_builder_output)
-            generated_prompt = f"Pregunta: {query}\n\n(No se pudo construir el prompt con documentos recuperados). Por favor responde a la pregunta."
+             run_log.error("Failed to extract prompt from prompt_builder output", component_output=prompt_builder_output)
+             generated_prompt = f"Pregunta: {query}\n\n(No se pudo construir el prompt con documentos recuperados). Por favor responde a la pregunta."
+             # LLM_COMMENT: Fallback prompt generation if prompt_builder fails.
 
         run_log.debug("Generated prompt for LLM", prompt_length=len(generated_prompt))
 
-        # Llamada a Gemini
+        # Llamar a Gemini (sin cambios)
         answer = await gemini_client.generate_answer(generated_prompt)
+        # LLM_COMMENT: Call external LLM (Gemini) with the generated prompt.
         run_log.info("Answer generated by Gemini", answer_length=len(answer))
 
-        # Log en BD
-        formatted_docs_for_log = [
-            RetrievedDocument.from_haystack_doc(doc).model_dump(exclude_none=True)
-            for doc in retrieved_docs
-        ]
-        user_uuid = uuid.UUID(user_id) if user_id and isinstance(user_id, str) else None
-        company_uuid = uuid.UUID(company_id) if isinstance(company_id, str) else company_id
-        log_id = await postgres_client.log_query_interaction(
-            company_id=company_uuid, user_id=user_uuid, query=query, answer=answer,
-            retrieved_documents_data=formatted_docs_for_log, chat_id=chat_id,
-            metadata={"retriever_top_k": retriever_top_k, "llm_model": settings.GEMINI_MODEL_NAME}
-        )
-        run_log.info("Query interaction logged to database", db_log_id=str(log_id))
+        # Loguear la interacción en la BD (sin cambios)
+        log_id: Optional[uuid.UUID] = None
+        try:
+            formatted_docs_for_log = [
+                RetrievedDocument.from_haystack_doc(doc).model_dump(exclude_none=True)
+                for doc in retrieved_docs
+            ]
+            user_uuid = uuid.UUID(user_id) if user_id and isinstance(user_id, str) else None
+            company_uuid = uuid.UUID(company_id) if isinstance(company_id, str) else company_id
 
+            log_id = await postgres_client.log_query_interaction(
+                company_id=company_uuid, user_id=user_uuid, query=query, answer=answer,
+                retrieved_documents_data=formatted_docs_for_log, chat_id=chat_id,
+                metadata={"retriever_top_k": retriever_top_k, "llm_model": settings.GEMINI_MODEL_NAME}
+            )
+            run_log.info("Query interaction logged to database", db_log_id=str(log_id))
+            # LLM_COMMENT: Persist interaction details to the database.
+        except Exception as log_err:
+             run_log.error("Failed to log query interaction to database after successful generation", error=str(log_err), exc_info=True)
+             # LLM_COMMENT: Handle potential database logging errors gracefully.
+
+        # Devolver la respuesta (sin cambios)
         return answer, retrieved_docs, log_id
-    except HTTPException:
-        raise
+
+    # Manejo de errores (sin cambios)
+    # LLM_COMMENT: Error handling block for various potential issues during async pipeline execution.
+    except HTTPException as http_exc:
+        raise http_exc
     except MilvusException as milvus_err:
         run_log.error("Milvus error during pipeline execution", error_code=milvus_err.code, error_message=milvus_err.message, exc_info=True)
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Vector database error: {milvus_err.message}")
     except ValueError as val_err:
-        run_log.error("ValueError during pipeline execution", error=str(val_err), exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Pipeline configuration or input error: {val_err}")
+         run_log.error("ValueError during pipeline execution", error=str(val_err), exc_info=True)
+         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Pipeline configuration or input error: {val_err}")
     except Exception as e:
         run_log.exception("Unexpected error occurred during RAG pipeline execution")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error processing query: {type(e).__name__}")
