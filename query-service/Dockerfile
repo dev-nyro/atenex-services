@@ -30,8 +30,8 @@ RUN curl -sSL https://install.python-poetry.org | python3 -
 # Establecer directorio de trabajo
 WORKDIR /app
 
-# Copiar solo pyproject.toml y poetry.lock primero
-COPY pyproject.toml poetry.lock ./
+# Copiar solo pyproject.toml primero
+COPY pyproject.toml ./
 
 # Instalar dependencias del proyecto usando Poetry
 # *** CORRECCIÓN: Llamar a poetry usando la ruta absoluta ***
