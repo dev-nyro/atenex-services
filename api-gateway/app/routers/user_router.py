@@ -31,7 +31,7 @@ class EnsureCompanyResponse(BaseModel): user_id: str; company_id: str; message: 
 
 # --- Endpoints (Relative paths within this router) ---
 # Paths should be relative to the /api/v1/users prefix added in main.py
-@router.post("/users/login", response_model=LoginResponse) # Path corrected relative to main prefix
+@router.post("/login", response_model=LoginResponse) # Path corrected relative to main prefix
 async def login_for_access_token(login_data: LoginRequest):
     log.info("Login attempt initiated", email=login_data.email)
     user = await authenticate_user(login_data.email, login_data.password)
