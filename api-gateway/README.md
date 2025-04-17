@@ -230,11 +230,46 @@ Este Gateway implementa flujos clave basados en JWT y PostgreSQL:
     *   **Respuesta OK (200):** `EnsureCompanyResponse` (incluye `user_id`, `company_id` final, mensaje, y `new_access_token`).
     *   **Respuesta Error:** 400 (Falta `company_id` si es necesario y no hay default), 401 (Token inválido/ausente), 403 (No debería ocurrir aquí), 404 (Usuario del token no en DB), 500 (Error DB o al generar token).
 
-*   **`/api/v1/ingest/{endpoint_path:path}` (Proxy)**
+*   **`/api/v1/ingest/{endpoint_path:path}` (Proxy genérico)**
     *   **Métodos:** `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS`
-    *   **Descripción:** Reenvía al `Ingest Service` (`ingest-api-service.nyro-develop...`).
-    *   **Autenticación:** **Requerida (StrictAuth).** Token JWT válido con `company_id` en el payload y usuario activo en DB.
-    *   **Headers Inyectados:** `X-Company-ID`, `X-User-ID`, `X-User-Email`, `X-Request-ID`.
+    *   **Descripción:** Reenvía solicitudes a Ingest Service (`ingest-api-service.nyro-develop.svc.cluster.local:80`).
+    *   **Autenticación:** **Requerida (StrictAuth).** Inyecta `X-Company-ID` y `X-User-ID`.
+
+### Ingest Service Proxy - Document State & Retry
+*   **GET `/api/v1/ingest/status/{document_id}`**
+    *   **Descripción:** Proxy al endpoint de estado individual de Ingest Service.
+    *   **Headers:** `X-Company-ID` (UUID) requerido.
+    *   **Respuesta (`200 OK`):** JSON con campos:
+        ```json
+        {
+          "document_id": "uuid",
+          "status": "processed|processing|uploaded|error",
+          "file_name": "...",
+          "file_type": "...",
+          "chunk_count": 123,            // Valor en PostgreSQL
+          "minio_exists": true,          // Flag real en MinIO
+          "milvus_chunk_count": 120,     // Conteo real en Milvus
+          "last_updated": "2025-...Z",
+          "message": "..."            // Mensaje descriptivo
+        }
+        ```
+*   **GET `/api/v1/ingest/status`**
+    *   **Descripción:** Proxy al listado paginado de estados en Ingest Service.
+    *   **Headers:** `X-Company-ID` (UUID) requerido.
+    *   **Query Params:** `limit`, `offset`.
+    *   **Respuesta (`200 OK`):** Lista de objetos con al menos `document_id`, `status`, `chunk_count`, `minio_exists`.
+*   **POST `/api/v1/ingest/retry/{document_id}`**
+    *   **Descripción:** Reintenta la ingesta de un documento en estado `error`.
+    *   **Headers:** `X-Company-ID`, `X-User-ID` (UUID) requeridos.
+    *   **Respuesta (`202 Accepted`):** JSON:
+        ```json
+        {
+          "document_id": "uuid",
+          "task_id": "uuid-celery",
+          "status": "processing",
+          "message": "Reintento de ingesta encolado correctamente."
+        }
+        ```
 
 *   **`/api/v1/query/{path:path}` (Proxy Específico y Rutas Relacionadas)**
     *   **Ejemplos:** `/api/v1/query/chats`, `/api/v1/query`, `/api/v1/query/chats/{chat_id}/messages`

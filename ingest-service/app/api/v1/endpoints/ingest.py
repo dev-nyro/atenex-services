@@ -9,7 +9,7 @@ from milvus_haystack import MilvusDocumentStore
 
 from fastapi import (
     APIRouter, UploadFile, File, Depends, HTTPException,
-    status, Form, Header, Query, Request
+    status, Form, Header, Query, Request, Response
 )
 from minio.error import S3Error
 
@@ -248,8 +248,12 @@ async def list_ingestion_statuses(
             current = DocumentStatus(doc.get("status"))
             count = doc.get("chunk_count") or 0
             if current in (DocumentStatus.UPLOADED, DocumentStatus.PROCESSING) and count > 0:
-                await postgres_client.update_document_status(uuid.UUID(doc["id"]), DocumentStatus.PROCESSED, chunk_count=count)
-                doc["status"] = DocumentStatus.PROCESSED.value
+                # Actualiza estado a PROCESSED si ya tiene chunks
+                await postgres_client.update_document_status(
+                    document_id=doc["id"],
+                    status=DocumentStatus.PROCESSED,
+                    chunk_count=count
+                )
             # Verify MinIO existence, mark error if missing
             file_path = doc.get("file_path")
             try:
@@ -257,8 +261,17 @@ async def list_ingestion_statuses(
             except Exception:
                 exists = False
             if not exists and current not in (DocumentStatus.ERROR,):
-                await postgres_client.update_document_status(uuid.UUID(doc["id"]), DocumentStatus.ERROR, error_message="File missing in MinIO")
-                doc["status"] = DocumentStatus.ERROR.value
+                await postgres_client.update_document_status(
+                    document_id=doc["id"],
+                    status=DocumentStatus.ERROR,
+                    error_message="File missing in MinIO"
+                )
+            # Obtener conteo real de Milvus para lista
+            try:
+                milvus_count = await get_milvus_chunk_count(doc["id"])
+            except Exception:
+                milvus_count = None
+            doc["milvus_chunk_count"] = milvus_count
             # Append enriched response
             doc["minio_exists"] = exists
             response_list.append(schemas.StatusResponse.model_validate(doc))
@@ -304,3 +317,27 @@ async def retry_document_ingest(
     # 3. Actualizar estado a 'processing'
     await postgres_client.update_document_status(document_id=document_id, status=DocumentStatus.PROCESSING, error_message=None)
     return schemas.IngestResponse(document_id=document_id, task_id=task.id, status=DocumentStatus.PROCESSING, message="Reintento de ingesta encolado correctamente.")
+
+@router.delete(
+    "/{document_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Eliminar un documento",
+    description="Elimina un documento y su registro de la BD."
+)
+async def delete_document_endpoint(
+    document_id: uuid.UUID,
+    company_id: uuid.UUID = Depends(get_current_company_id)
+):
+    delete_log = log.bind(document_id=str(document_id), company_id=str(company_id))
+    # Validar existencia y pertenencia
+    doc = await postgres_client.get_document_status(document_id)
+    if not doc or doc.get("company_id") != str(company_id):
+        delete_log.warning("Documento no encontrado o no pertenece a la compañía")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Documento no encontrado.")
+    # Eliminar registro
+    deleted = await postgres_client.delete_document(document_id)
+    if not deleted:
+        delete_log.error("Fallo al eliminar documento en la BD")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error eliminando documento.")
+    delete_log.info("Documento eliminado exitosamente")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

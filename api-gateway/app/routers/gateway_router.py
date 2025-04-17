@@ -60,7 +60,8 @@ async def _proxy_request(
         if not backend_service_path.startswith("/"):
             backend_service_path = "/" + backend_service_path
         # Construir URL: base + path + query original
-        target_url = target_base_url.copy_with(path=backend_service_path, query=request.url.query.encode("utf-8"))
+        # Use raw query string (str) to preserve parameters without encoding issues
+        target_url = target_base_url.copy_with(path=backend_service_path, query=request.url.query)
         proxy_log.debug("Target URL constructed", url=str(target_url))
     except Exception as e:
         proxy_log.error("Failed to construct target URL", error=str(e), exc_info=True)

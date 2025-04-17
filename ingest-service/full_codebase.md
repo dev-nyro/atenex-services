@@ -91,12 +91,14 @@ async def get_milvus_chunk_count(document_id: uuid.UUID) -> int:
     """Cuenta los chunks indexados en Milvus para un documento específico."""
     loop = asyncio.get_running_loop()
     def _count_chunks():
+        # Inicializar conexión con Milvus
         store = MilvusDocumentStore(
             connection_args={"uri": str(settings.MILVUS_URI)},
             collection_name=settings.MILVUS_COLLECTION_NAME,
             search_params=settings.MILVUS_SEARCH_PARAMS,
             consistency_level="Strong",
         )
+        # Recuperar todos los documentos que coincidan con este document_id
         docs = store.get_all_documents(filters={"document_id": str(document_id)})
         return len(docs or [])
     try:
@@ -302,7 +304,26 @@ async def list_ingestion_statuses(
     list_log.info("Received request to list document statuses")
     try:
         documents_data = await postgres_client.list_documents_by_company(company_id, limit=limit, offset=offset)
-        response_list = [schemas.StatusResponse.model_validate(doc) for doc in documents_data]
+        response_list = []
+        for doc in documents_data:
+            # Mark processed if DB chunk_count > 0
+            current = DocumentStatus(doc.get("status"))
+            count = doc.get("chunk_count") or 0
+            if current in (DocumentStatus.UPLOADED, DocumentStatus.PROCESSING) and count > 0:
+                await postgres_client.update_document_status(uuid.UUID(doc["id"]), DocumentStatus.PROCESSED, chunk_count=count)
+                doc["status"] = DocumentStatus.PROCESSED.value
+            # Verify MinIO existence, mark error if missing
+            file_path = doc.get("file_path")
+            try:
+                exists = await MinioStorageClient().file_exists(file_path) if file_path else False
+            except Exception:
+                exists = False
+            if not exists and current not in (DocumentStatus.ERROR,):
+                await postgres_client.update_document_status(uuid.UUID(doc["id"]), DocumentStatus.ERROR, error_message="File missing in MinIO")
+                doc["status"] = DocumentStatus.ERROR.value
+            # Append enriched response
+            doc["minio_exists"] = exists
+            response_list.append(schemas.StatusResponse.model_validate(doc))
         list_log.info(f"Returning status list for {len(response_list)} documents")
         return response_list
     except Exception as e:
@@ -762,8 +783,8 @@ async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]
 
 async def list_documents_by_company(company_id: uuid.UUID, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
     pool = await get_db_pool(); list_log = log.bind(company_id=str(company_id), limit=limit, offset=offset)
-    # Elimina error_message del SELECT
-    query = "SELECT id, status, file_name, file_type, chunk_count, updated_at FROM documents WHERE company_id = $1 ORDER BY updated_at DESC LIMIT $2 OFFSET $3;"
+    # Incluir file_path para permitir validación en MinIO
+    query = "SELECT id, status, file_name, file_type, chunk_count, file_path, updated_at FROM documents WHERE company_id = $1 ORDER BY updated_at DESC LIMIT $2 OFFSET $3;"
     try:
         async with pool.acquire() as connection: records = await connection.fetch(query, company_id, limit, offset)
         result_list = [dict(record) for record in records]; list_log.info(f"Retrieved {len(result_list)} docs")

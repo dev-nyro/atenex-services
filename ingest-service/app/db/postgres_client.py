@@ -101,13 +101,35 @@ async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]
 
 async def list_documents_by_company(company_id: uuid.UUID, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
     pool = await get_db_pool(); list_log = log.bind(company_id=str(company_id), limit=limit, offset=offset)
-    # Elimina error_message del SELECT
-    query = "SELECT id, status, file_name, file_type, chunk_count, updated_at FROM documents WHERE company_id = $1 ORDER BY updated_at DESC LIMIT $2 OFFSET $3;"
+    # Incluir file_path para permitir validación en MinIO
+    query = "SELECT id, status, file_name, file_type, chunk_count, file_path, updated_at FROM documents WHERE company_id = $1 ORDER BY updated_at DESC LIMIT $2 OFFSET $3;"
     try:
         async with pool.acquire() as connection: records = await connection.fetch(query, company_id, limit, offset)
         result_list = [dict(record) for record in records]; list_log.info(f"Retrieved {len(result_list)} docs")
         return result_list
     except Exception as e: list_log.error("Failed to list docs", error=str(e), exc_info=True); raise
+
+async def delete_document(document_id: uuid.UUID) -> bool:
+    """
+    Elimina un documento de la tabla `documents` por su ID.
+    Devuelve True si se eliminó al menos una fila, False si no existía.
+    """
+    pool = await get_db_pool()
+    delete_log = log.bind(document_id=str(document_id))
+    query = "DELETE FROM documents WHERE id = $1;"
+    try:
+        async with pool.acquire() as conn:
+            result = await conn.execute(query, document_id)
+        # result es 'DELETE X'
+        deleted = isinstance(result, str) and result.startswith("DELETE") and int(result.split(" ")[1]) > 0
+        if deleted:
+            delete_log.info("Documento eliminado de PostgreSQL.", result=result)
+        else:
+            delete_log.warning("Intento de eliminar documento no existente.", result=result)
+        return deleted
+    except Exception as e:
+        delete_log.error("Error al eliminar documento", error=str(e), exc_info=True)
+        raise
 
 # --- Funciones de Chat (Nombres Corregidos para consistencia) ---
 # Aunque este servicio no las use directamente, mantenemos los nombres consistentes

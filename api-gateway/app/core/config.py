@@ -9,8 +9,8 @@ import logging
 from typing import Optional, List
 import uuid # Para validar UUID
 
-# URLs por defecto si no se especifican en el entorno (usando el namespace 'atenex-develop')
-K8S_INGEST_SVC_URL_DEFAULT = "http://ingest-api-service.atenex-develop.svc.cluster.local:80"
+# URLs por defecto si no se especifican en el entorno (usando el namespace 'nyro-develop')
+K8S_INGEST_SVC_URL_DEFAULT = "http://ingest-api-service.nyro-develop.svc.cluster.local:80"
 K8S_QUERY_SVC_URL_DEFAULT = "http://query-service.atenex-develop.svc.cluster.local:80"
 K8S_AUTH_SVC_URL_DEFAULT = None # No hay auth service por defecto
 
