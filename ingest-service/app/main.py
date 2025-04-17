@@ -117,8 +117,9 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 # --- Router Inclusion ---
-app.include_router(ingest.router, prefix=settings.API_V1_STR, tags=["Ingestion"])
-log.info(f"Included ingestion router with prefix: {settings.API_V1_STR}")
+ingest_prefix = f"{settings.API_V1_STR}/ingest"
+app.include_router(ingest.router, prefix=ingest_prefix, tags=["Ingestion"])
+log.info(f"Included ingestion router with prefix: {ingest_prefix}")
 
 # --- Root Endpoint / Health Check ---
 # *** CORREGIDO: Verificar DB en cada llamada ***
