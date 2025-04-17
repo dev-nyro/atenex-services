@@ -250,29 +250,31 @@ async def delete_chat(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.U
         return False
 
     async with pool.acquire() as conn:
-        async with conn.transaction(): # Usar transacción
+        async with conn.transaction():
             try:
                 # 1. Eliminar mensajes asociados
                 delete_messages_query = "DELETE FROM messages WHERE chat_id = $1;"
                 await conn.execute(delete_messages_query, chat_id)
                 delete_log.info("Associated messages deleted (if any)")
 
-                # 2. Eliminar el chat
+                # 2. Eliminar logs asociados (query_logs)
+                delete_logs_query = "DELETE FROM query_logs WHERE chat_id = $1;"
+                await conn.execute(delete_logs_query, chat_id)
+                delete_log.info("Associated query_logs deleted (if any)")
+
+                # 3. Eliminar el chat
                 delete_chat_query = "DELETE FROM chats WHERE id = $1 RETURNING id;"
                 deleted_id = await conn.fetchval(delete_chat_query, chat_id)
 
                 success = deleted_id is not None
                 if success:
-                    delete_log.info("Chat deleted successfully after deleting messages")
+                    delete_log.info("Chat deleted successfully after deleting messages and logs")
                 else:
-                    # Esto no debería ocurrir si la verificación de propiedad pasó y estamos en transacción
-                    delete_log.error("Chat deletion failed after deleting messages, despite ownership check")
+                    delete_log.error("Chat deletion failed after deleting messages/logs, despite ownership check")
                 return success
             except Exception as e:
-                # Capturar ForeignKeyViolationError específicamente si ocurre aquí (inesperado)
                 if isinstance(e, asyncpg.exceptions.ForeignKeyViolationError):
-                     delete_log.error("Foreign key violation during chat deletion transaction (unexpected)", error=str(e), exc_info=True)
+                    delete_log.error("Foreign key violation during chat deletion transaction (unexpected)", error=str(e), exc_info=True)
                 else:
-                     delete_log.error("Failed to delete chat within transaction", error=str(e), exc_info=True)
-                # La transacción se revertirá automáticamente al salir del bloque with
-                raise # Relanzar para que el endpoint devuelva 500
+                    delete_log.error("Failed to delete chat within transaction", error=str(e), exc_info=True)
+                raise
