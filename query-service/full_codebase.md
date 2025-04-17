@@ -1092,14 +1092,14 @@ __all__ = ["build_rag_pipeline", "run_rag_pipeline"]
 import structlog
 import asyncio
 import uuid
-# LLM_COMMENT: No longer need functools.partial as we will use native AsyncPipeline.run_async
+# LLM_COMMENT: No longer need functools as AsyncPipeline.run_async is called directly.
 from typing import Dict, Any, List, Tuple, Optional
 
 from pymilvus.exceptions import MilvusException, ErrorCode
 from fastapi import HTTPException, status
 
-# LLM_COMMENT: Import AsyncPipeline instead of Pipeline
-from haystack import AsyncPipeline, Document # LLM_COMMENT_CHANGE
+# LLM_COMMENT: Using AsyncPipeline for native async support.
+from haystack import AsyncPipeline, Document
 from haystack.components.embedders import OpenAITextEmbedder
 from haystack.components.builders.prompt_builder import PromptBuilder
 from milvus_haystack import MilvusDocumentStore, MilvusEmbeddingRetriever
@@ -1154,36 +1154,32 @@ def get_prompt_builder() -> PromptBuilder:
     return PromptBuilder(template=settings.RAG_PROMPT_TEMPLATE)
 
 
-# --- Pipeline Construction (Using AsyncPipeline) ---
-# LLM_COMMENT: Switched from Pipeline to AsyncPipeline for native async execution.
-_rag_pipeline_instance: Optional[AsyncPipeline] = None # LLM_COMMENT_CHANGE
-def build_rag_pipeline() -> AsyncPipeline: # LLM_COMMENT_CHANGE
+# --- Pipeline Construction (Using AsyncPipeline, sin cambios) ---
+_rag_pipeline_instance: Optional[AsyncPipeline] = None
+def build_rag_pipeline() -> AsyncPipeline:
     global _rag_pipeline_instance
     if _rag_pipeline_instance: return _rag_pipeline_instance
-    log.info("Building Haystack Async RAG pipeline...") # LLM_COMMENT_CHANGE
-    # LLM_COMMENT: Instantiate AsyncPipeline instead of Pipeline.
-    rag_pipeline = AsyncPipeline() # LLM_COMMENT_CHANGE
+    log.info("Building Haystack Async RAG pipeline...")
+    rag_pipeline = AsyncPipeline()
     try:
         doc_store = get_milvus_document_store()
         text_embedder = get_openai_text_embedder()
         retriever = get_milvus_retriever(document_store=doc_store)
         prompt_builder = get_prompt_builder()
 
-        # LLM_COMMENT: Adding components remains the same for AsyncPipeline.
         rag_pipeline.add_component("text_embedder", text_embedder)
         rag_pipeline.add_component("retriever", retriever)
         rag_pipeline.add_component("prompt_builder", prompt_builder)
 
-        # LLM_COMMENT: Connecting components remains the same for AsyncPipeline.
         rag_pipeline.connect("text_embedder.embedding", "retriever.query_embedding")
         rag_pipeline.connect("retriever.documents", "prompt_builder.documents")
 
-        log.info("Haystack Async RAG pipeline built successfully.") # LLM_COMMENT_CHANGE
+        log.info("Haystack Async RAG pipeline built successfully.")
         _rag_pipeline_instance = rag_pipeline
         return rag_pipeline
     except Exception as e:
-        log.error("Failed to build Haystack Async RAG pipeline", error=str(e), exc_info=True) # LLM_COMMENT_CHANGE
-        raise RuntimeError("Could not build the Async RAG pipeline") from e # LLM_COMMENT_CHANGE
+        log.error("Failed to build Haystack Async RAG pipeline", error=str(e), exc_info=True)
+        raise RuntimeError("Could not build the Async RAG pipeline") from e
 
 # --- Pipeline Execution (Using run_async) ---
 # *** FUNCIÓN CORREGIDA: run_rag_pipeline ***
@@ -1195,19 +1191,20 @@ async def run_rag_pipeline(
     chat_id: Optional[uuid.UUID] = None
 ) -> Tuple[str, List[Document], Optional[uuid.UUID]]:
     """
-    Ejecuta el Async RAG pipeline usando el método `run_async`.
+    Ejecuta el Async RAG pipeline usando el método `run_async`, pasando
+    todos los inputs y parámetros en el diccionario `data`.
     Llama a Gemini y loguea la interacción.
     """
-    # LLM_COMMENT: Orchestrates the RAG flow using AsyncPipeline.run_async for native async execution.
+    # LLM_COMMENT: Orchestrates the RAG flow using AsyncPipeline.run_async.
     run_log = log.bind(query=query, company_id=company_id, user_id=user_id or "N/A", chat_id=str(chat_id) if chat_id else "N/A")
-    run_log.info("Running Async RAG pipeline execution flow...") # LLM_COMMENT_CHANGE
+    run_log.info("Running Async RAG pipeline execution flow...")
 
     try:
         pipeline = build_rag_pipeline() # Obtener/construir el pipeline asíncrono
         # LLM_COMMENT: Obtain the global AsyncPipeline instance.
     except Exception as build_err:
-         run_log.error("Failed to get or build Async RAG pipeline for execution", error=str(build_err)) # LLM_COMMENT_CHANGE
-         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Async RAG pipeline is not available.") # LLM_COMMENT_CHANGE
+         run_log.error("Failed to get or build Async RAG pipeline for execution", error=str(build_err))
+         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Async RAG pipeline is not available.")
 
     # Determinar parámetros para el retriever
     retriever_top_k = top_k if top_k is not None else settings.RETRIEVER_TOP_K
@@ -1216,28 +1213,26 @@ async def run_rag_pipeline(
 
     run_log.debug("Pipeline execution parameters set", filters=retriever_filters, top_k=retriever_top_k)
 
-    # Preparar argumentos para pipeline.run_async
-    pipeline_input_data = {
+    # *** CORRECCIÓN: Fusionar inputs y parámetros en el diccionario `data` ***
+    # LLM_COMMENT: CORRECTED run_async call structure:
+    # LLM_COMMENT: Pass ALL inputs and component-specific runtime parameters within the 'data' dictionary.
+    # LLM_COMMENT: The keys are component names, and values are dictionaries mapping input/parameter names to values.
+    # LLM_COMMENT: AsyncPipeline.run_async does NOT accept a separate 'params' keyword argument.
+    pipeline_data = {
         "text_embedder": {"text": query},
-        "prompt_builder": {"query": query}
-    }
-    pipeline_params = {
+        "prompt_builder": {"query": query},
+        # LLM_COMMENT: Add retriever's runtime parameters (filters, top_k) under its key here.
         "retriever": {"filters": [retriever_filters], "top_k": retriever_top_k}
     }
-    # LLM_COMMENT: Define 'data' and 'params' dictionary structures as expected by run_async.
 
-    run_log.debug("Constructed AsyncPipeline run arguments", data_keys=list(pipeline_input_data.keys()), params_keys=list(pipeline_params.keys()))
+    run_log.debug("Constructed AsyncPipeline run_async data dictionary", data_structure=pipeline_data)
 
     try:
-        # *** CORRECCIÓN: Usar pipeline.run_async directamente ***
-        # LLM_COMMENT: Execute the pipeline asynchronously using run_async, passing data and params directly.
-        # LLM_COMMENT: No need for run_in_executor or functools.partial anymore.
-        pipeline_result = await pipeline.run_async(
-            data=pipeline_input_data,
-            params=pipeline_params
-        )
+        # *** CORRECCIÓN: Llamar a run_async solo con `data` ***
+        # LLM_COMMENT: Execute the pipeline asynchronously using run_async, passing the combined data dictionary.
+        pipeline_result = await pipeline.run_async(data=pipeline_data)
 
-        run_log.info("Haystack AsyncPipeline (embed, retrieve, prompt) executed successfully.") # LLM_COMMENT_CHANGE
+        run_log.info("Haystack AsyncPipeline (embed, retrieve, prompt) executed successfully.")
 
         # Extraer resultados (sin cambios en esta parte)
         retrieved_docs: List[Document] = pipeline_result.get("retriever", {}).get("documents", [])
