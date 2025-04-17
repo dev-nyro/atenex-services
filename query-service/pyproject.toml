@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "query-service"
-version = "0.1.0" # LLM_COMMENT: Consider bumping version after refactoring
-description = "Query service for SaaS B2B using Haystack RAG"
+version = "0.1.1" # LLM_COMMENT: Increment version after fixing build and embedder refactor
+description = "Query service for SaaS B2B using Haystack RAG with FastEmbed" # LLM_COMMENT: Updated description
 authors = ["Nyro <dev@nyro.com>"]
 readme = "README.md"
 
@@ -20,10 +20,10 @@ structlog = "^24.1.0"
 
 # --- Haystack Dependencies ---
 haystack-ai = "^2.0.1" # Core Haystack
-# openai = "^1.14.3"     # LLM_COMMENT: Removed OpenAI dependency as we switch to FastEmbed
 pymilvus = "^2.4.1"    # Cliente Milvus explícito
 milvus-haystack = "^0.0.6" # Integración Milvus para Haystack 2.x
-fastembed-haystack = "^0.1.1" # LLM_COMMENT: Added FastEmbed Haystack integration
+# LLM_COMMENT: Corrected package name from fastembed-haystack to haystack-fastembed
+haystack-fastembed = "^0.1.1" # LLM_COMMENT_CORRECTION
 
 # --- Gemini Dependency ---
 google-generativeai = "^0.5.4" # Cliente oficial de Google para Gemini
