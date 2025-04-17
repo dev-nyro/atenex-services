@@ -25,7 +25,7 @@ milvus-haystack = "^0.0.6" # Integración Milvus para Haystack 2.x
 # FastEmbed integration for Haystack (PyPI package name and available version)
 fastembed-haystack = "^1.4.1"
 
-# --- Gemini Dependency ---
+# --- Gemini Dependency  ---
 google-generativeai = "^0.5.4" # Cliente oficial de Google para Gemini
 
 [tool.poetry.group.dev.dependencies]
