@@ -7,7 +7,8 @@ from typing import Dict, Any, List, Tuple, Optional
 from pymilvus.exceptions import MilvusException, ErrorCode
 from fastapi import HTTPException, status
 from haystack import AsyncPipeline, Document
-from fastembed_haystack.components.embedders import FastembedTextEmbedder
+# LLM_COMMENT: Corrected import path for FastembedTextEmbedder based on the actual package name 'haystack-fastembed'.
+from haystack_fastembed.components.embedders import FastembedTextEmbedder # LLM_COMMENT_CORRECTION
 from haystack.components.builders.prompt_builder import PromptBuilder
 from milvus_haystack import MilvusDocumentStore, MilvusEmbeddingRetriever
 from haystack.utils import Secret
@@ -22,6 +23,7 @@ log = structlog.get_logger(__name__)
 # --- Component Initialization Functions ---
 
 def get_milvus_document_store() -> MilvusDocumentStore:
+    # LLM_COMMENT: Milvus connection setup remains unchanged.
     connection_uri = str(settings.MILVUS_URI)
     log.debug("Initializing MilvusDocumentStore...", uri=connection_uri,
               collection=settings.MILVUS_COLLECTION_NAME)
@@ -39,14 +41,17 @@ def get_milvus_document_store() -> MilvusDocumentStore:
         log.error("Failed to initialize MilvusDocumentStore", error=str(e), exc_info=True)
         raise RuntimeError(f"Milvus initialization error: {e}")
 
+# LLM_COMMENT: Function correctly instantiates the FastEmbed embedder.
 def get_fastembed_text_embedder() -> FastembedTextEmbedder:
+    # LLM_COMMENT: Instantiate FastembedTextEmbedder using settings from config.py.
     log.debug("Initializing FastembedTextEmbedder", model=settings.FASTEMBED_MODEL_NAME, prefix=settings.FASTEMBED_QUERY_PREFIX)
     return FastembedTextEmbedder(
         model=settings.FASTEMBED_MODEL_NAME,
-        prefix=settings.FASTEMBED_QUERY_PREFIX or "",
+        prefix=settings.FASTEMBED_QUERY_PREFIX or "", # Use prefix from settings, default to empty string if None
     )
 
 def get_milvus_retriever(document_store: MilvusDocumentStore) -> MilvusEmbeddingRetriever:
+    # LLM_COMMENT: Retriever initialization remains the same, depends on DocumentStore.
     log.debug("Initializing MilvusEmbeddingRetriever")
     return MilvusEmbeddingRetriever(
         document_store=document_store,
@@ -54,6 +59,7 @@ def get_milvus_retriever(document_store: MilvusDocumentStore) -> MilvusEmbedding
     )
 
 def get_prompt_builder() -> PromptBuilder:
+    # LLM_COMMENT: PromptBuilder initialization remains the same.
     log.debug("Initializing PromptBuilder")
     return PromptBuilder(template=settings.RAG_PROMPT_TEMPLATE)
 
@@ -69,14 +75,17 @@ def build_rag_pipeline() -> AsyncPipeline:
 
     try:
         doc_store = get_milvus_document_store()
-        text_embedder = get_fastembed_text_embedder()
+        # LLM_COMMENT: Use the function to get FastEmbed instance.
+        text_embedder = get_fastembed_text_embedder() # Correct function name used
         retriever = get_milvus_retriever(document_store=doc_store)
         prompt_builder = get_prompt_builder()
 
+        # LLM_COMMENT: Component names are kept consistent.
         pipeline.add_component("text_embedder", text_embedder)
         pipeline.add_component("retriever", retriever)
         pipeline.add_component("prompt_builder", prompt_builder)
 
+        # LLM_COMMENT: Connections remain the same.
         pipeline.connect("text_embedder.embedding", "retriever.query_embedding")
         pipeline.connect("retriever.documents", "prompt_builder.documents")
 
@@ -99,6 +108,7 @@ async def run_rag_pipeline(
     Ejecuta el Async RAG pipeline (con FastEmbed) usando el método `run_async`.
     Llama a Gemini y loguea la interacción.
     """
+    # LLM_COMMENT: Orchestrates the RAG flow using AsyncPipeline.run_async with FastEmbed.
     run_log = log.bind(query=query, company_id=company_id,
                        user_id=user_id or "N/A", chat_id=str(chat_id) if chat_id else "N/A")
     run_log.info("Running Async RAG pipeline execution flow (FastEmbed)...")
@@ -116,16 +126,20 @@ async def run_rag_pipeline(
     filters = [{"field": settings.MILVUS_COMPANY_ID_FIELD,
                 "operator": "==",
                 "value": company_id}]
+    # LLM_COMMENT: Filters remain the same.
 
+    # Prepare inputs for run_async (single data dictionary)
     pipeline_data = {
         "text_embedder": {"text": query},
         "prompt_builder": {"query": query},
         "retriever": {"filters": filters, "top_k": retriever_top_k}
     }
+    # LLM_COMMENT: Combined data dictionary for run_async, including retriever parameters.
 
     run_log.debug("Pipeline inputs prepared", data_structure=pipeline_data)
 
     try:
+        # LLM_COMMENT: Execute using run_async with the combined data dictionary.
         result = await pipeline.run_async(data=pipeline_data)
         run_log.info("AsyncPipeline executed successfully.")
     except Exception as e:
@@ -137,10 +151,12 @@ async def run_rag_pipeline(
             detail=f"Error processing query: {type(e).__name__}"
         )
 
+    # Extract documents & prompt (Logic remains the same)
     docs: List[Document] = result.get("retriever", {}).get("documents", [])
     prompt_out = result.get("prompt_builder", {})
     prompt_text = prompt_out.get("prompt") or f"Pregunta: {query}\n(no se construyó prompt)"
 
+    # Generate answer via Gemini (Logic remains the same)
     try:
         answer = await gemini_client.generate_answer(prompt_text)
     except Exception as e:
@@ -150,6 +166,7 @@ async def run_rag_pipeline(
             detail="LLM generation error"
         )
 
+    # Log query interaction (Logic remains the same)
     log_id: Optional[uuid.UUID] = None
     try:
         docs_for_log = [RetrievedDocument.from_haystack_doc(d).model_dump(exclude_none=True)
@@ -168,8 +185,10 @@ async def run_rag_pipeline(
     return answer, docs, log_id
 
 # --- Dependency Check Function ---
+# LLM_COMMENT: Updated to remove OpenAI API key check.
 async def check_pipeline_dependencies() -> Dict[str, str]:
-    results = {"milvus_connection": "pending", "gemini_api": "pending"}
+    results = {"milvus_connection": "pending", "gemini_api": "pending"} # LLM_COMMENT_CHANGE: Removed "openai_api"
+    # LLM_COMMENT: Milvus check remains the same.
     try:
         store = get_milvus_document_store()
         count = await asyncio.to_thread(store.count_documents)
@@ -192,6 +211,8 @@ async def check_pipeline_dependencies() -> Dict[str, str]:
         results["milvus_connection"] = f"error: Unexpected {type(e).__name__}"
         log.warning("Milvus dependency check failed with unexpected error", error=str(e), exc_info=True)
 
+    # LLM_COMMENT: Removed OpenAI API key check. FastEmbed runs locally.
+    # LLM_COMMENT: Gemini API key check remains.
     if settings.GEMINI_API_KEY.get_secret_value():
         results["gemini_api"] = "key_present"
     else:
