@@ -1,6 +1,6 @@
 # ingest-service/app/main.py
 from fastapi import FastAPI, HTTPException, status as fastapi_status, Request
-from fastapi.exceptions import RequestValidationError
+from fastapi.exceptions import RequestValidationError, ResponseValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 import structlog
 import uvicorn
@@ -101,11 +101,18 @@ async def add_request_context_timing_logging(request: Request, call_next):
     return response
 
 # --- Exception Handlers ---
+@app.exception_handler(ResponseValidationError)
+async def response_validation_exception_handler(request: Request, exc: ResponseValidationError):
+    return JSONResponse(
+        status_code=fastapi_status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": "Error de validación en la respuesta", "errors": exc.errors()},
+    )
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(
         status_code=exc.status_code,
-        content={"detail": exc.detail},
+        content={"detail": exc.detail if isinstance(exc.detail, str) else "Error HTTP"},
         headers=getattr(exc, "headers", None)
     )
 
@@ -113,13 +120,20 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     return JSONResponse(
         status_code=fastapi_status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"detail": "Validation Error", "errors": exc.errors()},
+        content={"detail": "Error de validación en la petición", "errors": exc.errors()},
+    )
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    log.error("Excepción no controlada", error=str(exc))
+    return JSONResponse(
+        status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "Error interno del servidor"}
     )
 
 # --- Router Inclusion ---
-ingest_prefix = f"{settings.API_V1_STR}/ingest"
-app.include_router(ingest.router, prefix=ingest_prefix, tags=["Ingestion"])
-log.info(f"Included ingestion router with prefix: {ingest_prefix}")
+app.include_router(ingest.router, prefix=f"{settings.API_V1_STR}/ingest", tags=["Ingestion"])
+log.info(f"Included ingestion router with prefix: {settings.API_V1_STR}/ingest")
 
 # --- Root Endpoint / Health Check ---
 # *** CORREGIDO: Verificar DB en cada llamada ***

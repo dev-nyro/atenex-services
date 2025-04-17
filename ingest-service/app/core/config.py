@@ -39,7 +39,7 @@ class Settings(BaseSettings):
 
     # --- General ---
     PROJECT_NAME: str = "Atenex Ingest Service"
-    API_V1_STR: str = "/api/v1/ingest"
+    API_V1_STR: str = "/api/v1"
     LOG_LEVEL: str = "INFO"
 
     # --- Celery ---
