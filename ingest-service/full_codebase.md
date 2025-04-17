@@ -66,10 +66,12 @@ from typing import Dict, Any, Optional, List
 import json
 import structlog
 import io
+import asyncio
+from milvus_haystack import MilvusDocumentStore
 
 from fastapi import (
     APIRouter, UploadFile, File, Depends, HTTPException,
-    status, Form, Header, Query, Request # Importar Request
+    status, Form, Header, Query, Request
 )
 from minio.error import S3Error
 
@@ -83,6 +85,24 @@ from app.services.minio_client import MinioStorageClient
 log = structlog.get_logger(__name__)
 
 router = APIRouter()
+
+# Helper para obtención dinámica de estado en Milvus
+async def get_milvus_chunk_count(document_id: uuid.UUID) -> int:
+    """Cuenta los chunks indexados en Milvus para un documento específico."""
+    loop = asyncio.get_running_loop()
+    def _count_chunks():
+        store = MilvusDocumentStore(
+            connection_args={"uri": str(settings.MILVUS_URI)},
+            collection_name=settings.MILVUS_COLLECTION_NAME,
+            search_params=settings.MILVUS_SEARCH_PARAMS,
+            consistency_level="Strong",
+        )
+        docs = store.get_all_documents(filters={"document_id": str(document_id)})
+        return len(docs or [])
+    try:
+        return await loop.run_in_executor(None, _count_chunks)
+    except Exception:
+        return 0
 
 # --- Dependencias CORREGIDAS para usar X- Headers ---
 # Estas dependencias AHORA son la fuente de verdad para ID de compañía y usuario
@@ -218,9 +238,7 @@ async def ingest_document_haystack(
 )
 async def get_ingestion_status(
     document_id: uuid.UUID,
-    # *** CORRECCIÓN CLAVE: Usar la dependencia correcta ***
     company_id: uuid.UUID = Depends(get_current_company_id),
-    # Ya no se depende de Authorization
     request: Request = None
 ):
     request_id = request.headers.get("x-request-id", str(uuid.uuid4())) if request else str(uuid.uuid4())
@@ -236,6 +254,21 @@ async def get_ingestion_status(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
         response_data = schemas.StatusResponse.model_validate(doc_data)
+        # Verificar existencia real en MinIO
+        file_path = doc_data.get("file_path")
+        if file_path:
+            try:
+                minio_client = MinioStorageClient()
+                exists = await minio_client.file_exists(file_path)
+            except Exception:
+                exists = False
+        else:
+            exists = False
+        # Contar chunks en Milvus
+        milvus_count = await get_milvus_chunk_count(document_id)
+        # Asignar campos adicionales
+        response_data.minio_exists = exists
+        response_data.milvus_chunk_count = milvus_count
         status_messages = {
             DocumentStatus.UPLOADED: "Document uploaded, awaiting processing.",
             DocumentStatus.PROCESSING: "Document is currently being processed.",
@@ -342,6 +375,10 @@ class StatusResponse(BaseModel):
     file_name: Optional[str] = None
     file_type: Optional[str] = None
     chunk_count: Optional[int] = None
+    # Estado actual en MinIO
+    minio_exists: Optional[bool] = None
+    # Número de chunks indexados en Milvus
+    milvus_chunk_count: Optional[int] = None
     last_updated: Optional[datetime] = Field(None, alias="updated_at")
     # Mensaje descriptivo añadido en el endpoint, no viene de la DB directamente
     message: Optional[str] = Field(None, exclude=False) # Incluir en respuesta si se añade
@@ -715,8 +752,8 @@ async def update_document_status(document_id: uuid.UUID, status: DocumentStatus,
 
 async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]]:
     pool = await get_db_pool(); get_log = log.bind(document_id=str(document_id))
-    # Elimina error_message del SELECT
-    query = "SELECT id, status, file_name, file_type, chunk_count, updated_at, company_id FROM documents WHERE id = $1;"
+    # Seleccionar también file_path para verificar almacenamiento externo
+    query = "SELECT id, status, file_name, file_type, chunk_count, file_path, updated_at, company_id FROM documents WHERE id = $1;"
     try:
         async with pool.acquire() as connection: record = await connection.fetchrow(query, document_id)
         if record: get_log.debug("Document status retrieved"); return dict(record)
@@ -1212,6 +1249,26 @@ class MinioStorageClient:
         except Exception as e: # Captura IOError u otros errores del sync helper
             download_log.error("Error downloading file via executor", error=str(e), error_type=type(e).__name__, exc_info=True)
             raise IOError(f"Failed to download file via executor: {e}") from e
+
+    async def file_exists(self, object_name: str) -> bool:
+        """Verifica si un objeto existe en MinIO."""
+        check_log = log.bind(bucket=self.bucket_name, object_name=object_name)
+        loop = asyncio.get_running_loop()
+        try:
+            # stat_object es bloqueante
+            await loop.run_in_executor(None, self.client.stat_object, self.bucket_name, object_name)
+            check_log.info("Objeto encontrado en MinIO")
+            return True
+        except S3Error as e:
+            # NoSuchKey indica objeto no encontrado
+            if getattr(e, 'code', None) == 'NoSuchKey':
+                check_log.warning("Objeto no existe en MinIO", code=e.code)
+                return False
+            check_log.error("Error al verificar existencia en MinIO", error=str(e), code=e.code)
+            raise IOError(f"Error al verificar almacenamiento: {e.code}") from e
+        except Exception as e:
+            check_log.error("Error inesperado al verificar existencia en MinIO", error=str(e))
+            raise IOError("Error inesperado verificando almacenamiento") from e
 ```
 
 ## File: `app\tasks\__init__.py`
