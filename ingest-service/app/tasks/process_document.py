@@ -279,12 +279,19 @@ def process_document_haystack_task(
             # No relanzar para que Celery no reintente
 
         except RETRYABLE_ERRORS as e_retry:
-            err_msg = f"Retryable error (attempt {self.request.retries + 1}/{self.request.max_retries}): {type(e_retry).__name__}: {str(e_retry)[:500]}"
+            # Obtener el número máximo de reintentos de forma segura
+            max_retries = getattr(self, 'max_retries', 3)
+            err_msg = f"Error reintentable (intento {self.request.retries + 1} de {max_retries}): {type(e_retry).__name__}: {str(e_retry)[:500]}"
             formatted_traceback = traceback.format_exc()
+            # Mensaje para el frontend en español
+            frontend_msg = "Ocurrió un error temporal durante el procesamiento. El sistema intentará nuevamente."
             task_log.warning(f"Processing failed, will retry: {err_msg}", traceback=formatted_traceback)
             try:
                 # Actualizar estado a ERROR pero indicando que es parte de un reintento
-                await postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=f"Task Error (Retry Attempt {self.request.retries + 1}): {err_msg}")
+                await postgres_client.update_document_status(
+                    document_id, DocumentStatus.ERROR,
+                    error_message=frontend_msg
+                )
             except Exception as db_err:
                 task_log.error("Failed update status to ERROR during retryable failure!", db_error=str(db_err))
             # Relanzar la excepción para que Celery maneje el reintento
@@ -299,18 +306,27 @@ def process_document_haystack_task(
 
     # --- Ejecutar el flujo async ---
     try:
-        # Usar asyncio.run() para ejecutar la corutina principal
-        asyncio.run(async_process_flow())
-        task_log.info("Haystack document processing task completed successfully.")
-        return {"status": "success", "document_id": str(document_id)} # Retornar algo útil
-
+        # Timeout global para el procesamiento (5 minutos)
+        TIMEOUT_SECONDS = 300
+        try:
+            asyncio.run(asyncio.wait_for(async_process_flow(), timeout=TIMEOUT_SECONDS))
+            task_log.info("Haystack document processing task completed successfully.")
+            return {"status": "success", "document_id": str(document_id)}
+        except asyncio.TimeoutError:
+            timeout_msg = f"Processing exceeded timeout of {TIMEOUT_SECONDS} seconds. Marking as ERROR."
+            task_log.error(timeout_msg)
+            # Intentar actualizar el estado en la base de datos
+            try:
+                asyncio.run(postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=timeout_msg))
+            except Exception as db_err:
+                task_log.critical("Failed to update status to ERROR after timeout!", db_error=str(db_err))
+            return {"status": "failure", "document_id": str(document_id), "error": timeout_msg}
     except Exception as top_level_exc:
-        # Esta captura es principalmente para excepciones que podrían ocurrir
-        # *fuera* del bloque try/except principal de async_process_flow,
-        # o si algo se relanza inesperadamente. Celery debería haber manejado
-        # los reintentos basados en las excepciones RETRYABLE relanzadas.
+        # Mensaje para el frontend en español
+        frontend_msg = "Ocurrió un error inesperado durante el procesamiento del documento. Por favor, inténtalo de nuevo o contacta soporte."
         task_log.exception("Haystack processing task failed at top level (after potential retries). This indicates a final failure.", exc_info=top_level_exc)
-        # No es necesario actualizar DB aquí, ya debería estar en ERROR por la última falla retryable o non-retryable.
-        # Celery marcará la tarea como FAILED.
-        # No necesitamos relanzar aquí, ya que asyncio.run() habrá terminado.
-        return {"status": "failure", "document_id": str(document_id), "error": str(top_level_exc)}
+        try:
+            asyncio.run(postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=frontend_msg))
+        except Exception as db_err:
+            task_log.critical("Failed to update status to ERROR after top-level failure!", db_error=str(db_err))
+        return {"status": "failure", "document_id": str(document_id), "error": frontend_msg}
