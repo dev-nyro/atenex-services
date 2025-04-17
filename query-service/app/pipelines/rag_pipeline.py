@@ -117,16 +117,19 @@ async def run_rag_pipeline(
                 "operator": "==",
                 "value": company_id}]
 
-    pipeline_data = {
+    # Prepare inputs and parameters for run_async
+    data_inputs = {
         "text_embedder": {"text": query},
-        "prompt_builder": {"query": query},
+        "prompt_builder": {"query": query}
+    }
+    params = {
         "retriever": {"filters": filters, "top_k": retriever_top_k}
     }
 
-    run_log.debug("Pipeline inputs prepared", data_structure=pipeline_data)
+    run_log.debug("Pipeline inputs prepared", data_structure=data_inputs)
 
     try:
-        result = await pipeline.run_async(data=pipeline_data)
+        result = await pipeline.run_async(data=data_inputs, params=params)
         run_log.info("AsyncPipeline executed successfully.")
     except Exception as e:
         run_log.error("Pipeline execution error", error=str(e), exc_info=True)
