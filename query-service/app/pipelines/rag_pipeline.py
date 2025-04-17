@@ -124,23 +124,26 @@ async def run_rag_pipeline(
 
     run_log.debug("Pipeline execution parameters set", filters=retriever_filters, top_k=retriever_top_k)
 
-    # Preparamos los inputs y parámetros en un solo diccionario pipeline_data:
-    pipeline_data = {
+    # Preparamos data para text_embedder y params para retriever
+    pipeline_input_data = {
         "text_embedder": {"text": query},
-        "retriever": {"filters": [retriever_filters], "top_k": retriever_top_k},
         "prompt_builder": {"query": query}
     }
+    pipeline_params = {
+        "retriever": {"filters": [retriever_filters], "top_k": retriever_top_k}
+    }
+    # Ejecutar pipeline usando run_in_executor y especificar outputs de interés
+    loop = asyncio.get_running_loop()
+    pipeline_run_partial = functools.partial(
+        pipeline.run,
+        data=pipeline_input_data,
+        params=pipeline_params,
+        include_outputs_from={"retriever", "prompt_builder"}
+    )
+    pipeline_result = await loop.run_in_executor(None, pipeline_run_partial)
 
     # Ejecutamos el pipeline, LLM y logging dentro de un solo bloque para capturar excepciones:
     try:
-        # Ejecutar pipeline en ThreadPool
-        pipeline_run_partial = functools.partial(
-            pipeline.run,
-            pipeline_data,
-            {"retriever", "prompt_builder"}
-        )
-        pipeline_result = await asyncio.get_running_loop().run_in_executor(None, pipeline_run_partial)
-
         run_log.info("Haystack pipeline (embed, retrieve, prompt) executed successfully.")
 
         # Extraer resultados
