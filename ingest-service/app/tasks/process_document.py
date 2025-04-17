@@ -279,7 +279,7 @@ def process_document_haystack_task(
             # No relanzar para que Celery no reintente
 
         except RETRYABLE_ERRORS as e_retry:
-            err_msg = f"Retryable error (attempt {self.request.retries + 1}/{self.request.retries_limit}): {type(e_retry).__name__}: {str(e_retry)[:500]}"
+            err_msg = f"Retryable error (attempt {self.request.retries + 1}/{self.request.max_retries}): {type(e_retry).__name__}: {str(e_retry)[:500]}"
             formatted_traceback = traceback.format_exc()
             task_log.warning(f"Processing failed, will retry: {err_msg}", traceback=formatted_traceback)
             try:
