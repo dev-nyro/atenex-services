@@ -32,12 +32,9 @@ def get_milvus_document_store() -> MilvusDocumentStore:
         store = MilvusDocumentStore(
             connection_args={"uri": connection_uri},
             collection_name=settings.MILVUS_COLLECTION_NAME,
-            embedding_field=settings.MILVUS_EMBEDDING_FIELD,
-            content_field=settings.MILVUS_CONTENT_FIELD,
-            metadata_fields=settings.MILVUS_METADATA_FIELDS,
-            index_params=settings.MILVUS_INDEX_PARAMS, # LLM_COMMENT: Pass index params
-            search_params=settings.MILVUS_SEARCH_PARAMS, # LLM_COMMENT: Pass search params
-            consistency_level="Strong", # LLM_COMMENT: Ensure consistency for RAG
+            index_params=settings.MILVUS_INDEX_PARAMS,
+            search_params=settings.MILVUS_SEARCH_PARAMS,
+            consistency_level="Strong",
         )
         store_log.info("Initialization successful.")
         return store
