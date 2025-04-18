@@ -146,3 +146,20 @@ class MinioStorageClient:
         except Exception as e:
             check_log.error("Error inesperado al verificar existencia en MinIO", error=str(e))
             raise IOError("Error inesperado verificando almacenamiento") from e
+
+    async def delete_file(self, object_name: str) -> None:
+        """Elimina un objeto de MinIO de forma asíncrona."""
+        delete_log = log.bind(bucket=self.bucket_name, object_name=object_name)
+        delete_log.info("Queueing file deletion from MinIO executor")
+        loop = asyncio.get_running_loop()
+        try:
+            def _remove_object():
+                self.client.remove_object(self.bucket_name, object_name)
+            await loop.run_in_executor(None, _remove_object)
+            delete_log.info("File deleted successfully from MinIO via executor")
+        except S3Error as e:
+            delete_log.error("Failed to delete file from MinIO", error=str(e), code=e.code, exc_info=True)
+            raise IOError(f"Failed to delete from storage: {e.code}") from e
+        except Exception as e:
+            delete_log.error("Unexpected error during file deletion via executor", error=str(e), exc_info=True)
+            raise IOError(f"Unexpected storage deletion error") from e
