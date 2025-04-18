@@ -89,6 +89,18 @@ graph TD
 *   **Configuración Centralizada y Logging Estructurado.**
 *   **Manejo de Errores:** Tareas Celery distinguen errores reintentables/no reintentables y almacenan mensajes de error útiles en la DB.
 
+## 3. Requisitos de la base de datos (IMPORTANTE)
+
+> **¡IMPORTANTE!**
+> La tabla `documents` en PostgreSQL **debe tener la columna** `error_message TEXT` para que el servicio funcione correctamente.
+> Si ves errores como `column "error_message" of relation "documents" does not exist`, ejecuta la siguiente migración SQL:
+
+```sql
+ALTER TABLE documents ADD COLUMN error_message TEXT;
+```
+
+Esto es necesario para que los endpoints de estado y manejo de errores funcionen correctamente.
+
 ## 4. Pila Tecnológica Principal (Sin cambios respecto a versión anterior)
 
 *   **Lenguaje:** Python 3.10+

@@ -70,7 +70,9 @@ async def embed_query(query: str) -> List[float]:
     embed_log = log.bind(action="embed_query")
     try:
         embedder = get_fastembed_text_embedder()
-        # LLM_COMMENT: FastEmbed components might be synchronous internally, run in thread
+        # Inicializar el modelo si es necesario
+        await asyncio.to_thread(embedder.warm_up)
+        # FastEmbed components might be synchronous internally, run in thread
         result = await asyncio.to_thread(embedder.run, text=query)
         embedding = result.get("embedding")
         if not embedding:
