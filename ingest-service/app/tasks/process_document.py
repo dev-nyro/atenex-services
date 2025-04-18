@@ -135,14 +135,14 @@ RETRYABLE_ERRORS = (IOError, ConnectionError, TimeoutError, asyncpg.PostgresConn
 
 @celery_app.task(
     bind=True,
-    name="tasks.process_document_haystack",
     autoretry_for=RETRYABLE_ERRORS,
     retry_backoff=True,
     retry_backoff_max=300, # 5 minutos máximo backoff
     retry_jitter=True,
     retry_kwargs={'max_retries': 3}, # Reintentar 3 veces
     reject_on_worker_lost=True,
-    acks_late=True
+    acks_late=True,
+    name="tasks.process_document_haystack"
 )
 def process_document_haystack_task(
     self, # Instancia de la tarea Celery
@@ -166,18 +166,12 @@ def process_document_haystack_task(
         content_type=content_type
     )
     task_log.info("Starting Haystack document processing task execution")
-    # Marcar documento como PROCESSING en DB antes de comenzar el flujo
-    try:
-        asyncio.run(postgres_client.update_document_status(document_id, DocumentStatus.PROCESSING))
-        task_log.info("Document status set to PROCESSING in PostgreSQL before processing.")
-    except Exception as e:
-        task_log.error("Failed to update status to PROCESSING at task start", error=str(e))
 
     # --- Función async interna para orquestar el flujo ---
     async def async_process_flow():
         minio_client = None
         downloaded_file_stream: Optional[io.BytesIO] = None
-        pipeline: Optional[Pipeline] = None
+        pipeline: Optional[Pipeline] = None # Inicializar pipeline como None
 
         try:
             # 0. Marcar como PROCESSING en DB

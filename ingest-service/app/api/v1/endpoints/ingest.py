@@ -151,12 +151,6 @@ async def ingest_document_haystack(
         )
         task_id = task.id
         request_log.info("Haystack processing task queued", task_id=task_id)
-        # Marcar el estado como PROCESSING en la base de datos
-        try:
-            await postgres_client.update_document_status(document_id=document_id, status=DocumentStatus.PROCESSING)
-            request_log.info("Document status updated to PROCESSING after enqueuing task")
-        except Exception as db_err:
-            request_log.error("Failed to update status to PROCESSING after queuing task", error=str(db_err))
         return schemas.IngestResponse(document_id=document_id, task_id=task_id, status=DocumentStatus.UPLOADED, message="Document received and queued.")
 
     except HTTPException as http_exc: raise http_exc
@@ -277,11 +271,18 @@ async def list_ingestion_statuses(
                 count = await get_milvus_chunk_count(status_obj.document_id)
                 status_obj.milvus_chunk_count = count
                 status_obj.chunk_count = count
+                # Si hay chunks, actualizar estado y mensaje
                 if count > 0 and status_obj.status != DocumentStatus.ERROR:
                     status_obj.status = DocumentStatus.PROCESSED
                     status_obj.message = "Document processed successfully."
+                # Persistir estado real en la DB para mantener datos actualizados
+                await postgres_client.update_document_status(
+                    document_id=status_obj.document_id,
+                    status=status_obj.status,
+                    chunk_count=count
+                )
             except Exception as ex:
-                list_log.error("Milvus count failed", document_id=str(status_obj.document_id), error=str(ex))
+                list_log.error("Error enriching/persisting status", document_id=str(status_obj.document_id), error=str(ex))
             return status_obj
         # Lanzar verificaciones en paralelo
         tasks = [asyncio.create_task(enrich(st, doc)) for st, doc in zip(base_statuses, docs)]
