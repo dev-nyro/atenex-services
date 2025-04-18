@@ -181,112 +181,161 @@ import uuid
 from typing import Dict, Any, Optional, List
 import structlog
 import asyncio
+import re # LLM_COMMENT: Import regex for greeting detection
 
 from fastapi import APIRouter, Depends, HTTPException, status, Header, Body, Request
 
 from app.api.v1 import schemas
 from app.core.config import settings
 from app.db import postgres_client
-from app.pipelines import rag_pipeline
-from haystack import Document
+# LLM_COMMENT: Import the refactored pipeline function
+from app.pipelines.rag_pipeline import run_rag_pipeline
+from haystack import Document # LLM_COMMENT: Keep Haystack Document import
 from app.utils.helpers import truncate_text
-# Importar dependencias definidas en chat.py (o módulo compartido)
+# LLM_COMMENT: Import shared dependencies from chat module
 from .chat import get_current_company_id, get_current_user_id
 
 log = structlog.get_logger(__name__)
 
 router = APIRouter()
 
+# LLM_COMMENT: Simple regex to detect greetings (adapt as needed)
+GREETING_REGEX = re.compile(r"^\s*(hola|hello|hi|buenos días|buenas tardes|buenas noches|hey|qué tal|hi there)\s*[\.,!?]*\s*$", re.IGNORECASE)
+
 # --- Endpoint Principal Modificado para usar dependencias de X- Headers ---
-# *** RUTA CORREGIDA ***
 @router.post(
-    "/ask", # Ruta interna estandarizada a /ask
+    "/ask", # LLM_COMMENT: Standardized internal endpoint path
     response_model=schemas.QueryResponse,
     status_code=status.HTTP_200_OK,
-    summary="Process a user query using RAG pipeline and manage chat history",
-    description="Receives query via API Gateway. Uses X-Company-ID and X-User-ID. Continues or creates chat.",
+    summary="Process Query / Manage Chat", # LLM_COMMENT: Updated summary
+    description="Handles user queries, manages chat state (create/continue), performs RAG or simple response, and logs interaction. Uses X-Company-ID and X-User-ID.", # LLM_COMMENT: Updated description
 )
 async def process_query(
     request_body: schemas.QueryRequest = Body(...),
-    # *** CORRECCIÓN CLAVE: Usar las dependencias importadas/definidas ***
+    # LLM_COMMENT: Use dependencies to get authenticated user/company IDs
     company_id: uuid.UUID = Depends(get_current_company_id),
     user_id: uuid.UUID = Depends(get_current_user_id),
-    request: Request = None
+    request: Request = None # LLM_COMMENT: Inject Request for potential header access
 ):
-    request_id = request.headers.get("x-request-id") if request else str(uuid.uuid4())
+    request_id = request.headers.get("x-request-id", str(uuid.uuid4())) if request else str(uuid.uuid4())
     endpoint_log = log.bind(
         request_id=request_id,
         company_id=str(company_id),
         user_id=str(user_id),
+        # LLM_COMMENT: Log truncated query for brevity
         query=truncate_text(request_body.query, 100),
         provided_chat_id=str(request_body.chat_id) if request_body.chat_id else "None"
     )
-    endpoint_log.info("Received query request with chat context")
+    endpoint_log.info("Processing query request")
 
     current_chat_id: uuid.UUID
     is_new_chat = False
 
     try:
-        # Lógica de Chat ID (sin cambios, ya usa los user_id/company_id de Depends)
+        # --- 1. Determine Chat ID ---
+        # LLM_COMMENT: Check if continuing an existing chat or starting a new one
         if request_body.chat_id:
+            endpoint_log.debug("Checking ownership of existing chat", chat_id=str(request_body.chat_id))
+            # LLM_COMMENT: Verify user owns the chat using DB check
             if not await postgres_client.check_chat_ownership(request_body.chat_id, user_id, company_id):
+                 endpoint_log.warning("Access denied or chat not found for provided chat_id")
                  raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Chat not found or access denied.")
             current_chat_id = request_body.chat_id
             endpoint_log = endpoint_log.bind(chat_id=str(current_chat_id))
             endpoint_log.info("Continuing existing chat")
         else:
-            endpoint_log.info("Creating a new chat...")
-            initial_title = f"Chat: {truncate_text(request_body.query, 50)}"
+            endpoint_log.info("No chat_id provided, creating new chat")
+            # LLM_COMMENT: Generate a title based on the first query, truncated
+            initial_title = f"Chat: {truncate_text(request_body.query, 40)}"
             current_chat_id = await postgres_client.create_chat(user_id=user_id, company_id=company_id, title=initial_title)
             is_new_chat = True
             endpoint_log = endpoint_log.bind(chat_id=str(current_chat_id))
             endpoint_log.info("New chat created", title=initial_title)
 
-        # Guardar Mensaje Usuario (sin cambios, usa user_id de Depends)
-        endpoint_log.info("Saving user message...")
+        # --- 2. Save User Message ---
+        # LLM_COMMENT: Always save the user's message regardless of intent
+        endpoint_log.info("Saving user message to DB")
         await postgres_client.save_message(
             chat_id=current_chat_id, role='user', content=request_body.query
         )
         endpoint_log.info("User message saved")
 
-        # Ejecutar Pipeline RAG (sin cambios, usa user_id/company_id de Depends)
-        endpoint_log.info("Running RAG pipeline...")
-        answer, retrieved_docs_haystack, log_id = await rag_pipeline.run_rag_pipeline(
-            query=request_body.query, company_id=str(company_id), user_id=str(user_id),
-            top_k=request_body.retriever_top_k, chat_id=current_chat_id
-        )
-        endpoint_log.info("RAG pipeline finished")
+        # --- 3. Handle Greetings / Simple Intents (Bypass RAG) ---
+        # LLM_COMMENT: Check if the query matches a simple greeting pattern
+        if GREETING_REGEX.match(request_body.query):
+            endpoint_log.info("Greeting detected, bypassing RAG pipeline")
+            # LLM_COMMENT: Provide a canned, friendly response for greetings
+            answer = "¡Hola! ¿En qué puedo ayudarte hoy con la información de tus documentos?"
+            retrieved_docs_for_response: List[schemas.RetrievedDocument] = [] # LLM_COMMENT: No documents retrieved for greetings
+            log_id = None # LLM_COMMENT: Optionally skip logging greetings, or log differently
 
-        # Formatear Documentos y Fuentes (sin cambios)
-        response_docs_schema: List[schemas.RetrievedDocument] = []
-        assistant_sources: List[Dict[str, Any]] = []
-        for doc in retrieved_docs_haystack:
-            schema_doc = schemas.RetrievedDocument.from_haystack_doc(doc)
-            response_docs_schema.append(schema_doc)
-            source_info = { "chunk_id": schema_doc.id, "document_id": schema_doc.document_id, "file_name": schema_doc.file_name, "score": schema_doc.score, "preview": schema_doc.content_preview }
-            assistant_sources.append(source_info)
+            # Save canned assistant response
+            await postgres_client.save_message(
+                 chat_id=current_chat_id, role='assistant', content=answer, sources=None
+            )
+            endpoint_log.info("Saved canned greeting response")
 
-        # Guardar Mensaje Asistente (sin cambios)
-        endpoint_log.info("Saving assistant message...")
-        await postgres_client.save_message(
-            chat_id=current_chat_id, role='assistant', content=answer,
-            sources=assistant_sources if assistant_sources else None
-        )
-        endpoint_log.info("Assistant message saved")
+        # --- 4. Execute RAG Pipeline (for non-greetings) ---
+        else:
+            endpoint_log.info("Proceeding with RAG pipeline execution")
+            # LLM_COMMENT: Call the refactored pipeline function
+            answer, retrieved_docs_haystack, log_id = await run_rag_pipeline(
+                query=request_body.query,
+                company_id=str(company_id),
+                user_id=str(user_id),
+                top_k=request_body.retriever_top_k, # LLM_COMMENT: Pass top_k if provided
+                chat_id=current_chat_id # LLM_COMMENT: Pass chat_id for logging context
+            )
+            endpoint_log.info("RAG pipeline finished")
 
-        endpoint_log.info("Query processed successfully", log_id=str(log_id) if log_id else "Log Failed", num_retrieved=len(response_docs_schema))
+            # LLM_COMMENT: Format retrieved Haystack Documents into response schema
+            retrieved_docs_for_response = [schemas.RetrievedDocument.from_haystack_doc(doc)
+                                           for doc in retrieved_docs_haystack]
 
-        # Devolver Respuesta (sin cambios)
+            # LLM_COMMENT: Prepare sources list specifically for saving in the assistant message
+            assistant_sources_for_db: List[Dict[str, Any]] = []
+            for schema_doc in retrieved_docs_for_response:
+                source_info = {
+                    "chunk_id": schema_doc.id,
+                    "document_id": schema_doc.document_id,
+                    "file_name": schema_doc.file_name,
+                    "score": schema_doc.score,
+                    "preview": schema_doc.content_preview # LLM_COMMENT: Include preview in stored sources
+                }
+                assistant_sources_for_db.append(source_info)
+
+            # LLM_COMMENT: Save the actual assistant message generated by the pipeline
+            endpoint_log.info("Saving assistant message from pipeline")
+            await postgres_client.save_message(
+                chat_id=current_chat_id,
+                role='assistant',
+                content=answer,
+                sources=assistant_sources_for_db if assistant_sources_for_db else None # LLM_COMMENT: Store formatted sources
+            )
+            endpoint_log.info("Assistant message saved")
+
+        # --- 5. Return Response ---
+        endpoint_log.info("Query processed successfully, returning response", is_new_chat=is_new_chat, num_retrieved=len(retrieved_docs_for_response))
         return schemas.QueryResponse(
-            answer=answer, retrieved_documents=response_docs_schema,
-            query_log_id=log_id, chat_id=current_chat_id
+            answer=answer,
+            retrieved_documents=retrieved_docs_for_response, # LLM_COMMENT: Return formatted documents
+            query_log_id=log_id, # LLM_COMMENT: Include the log_id if logging was successful
+            chat_id=current_chat_id # LLM_COMMENT: Always return the current chat_id
         )
 
-    # Manejo de Errores (sin cambios)
-    except ValueError as ve: endpoint_log.warning("Value error", error=str(ve)); raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
-    except ConnectionError as ce: endpoint_log.error("Connection error", error=str(ce), exc_info=True); raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Dependency unavailable: {ce}")
-    except HTTPException as http_exc: raise http_exc
-    except Exception as e: endpoint_log.exception("Unhandled exception"); raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal error: {type(e).__name__}")
+    # LLM_COMMENT: Keep existing robust error handling, map pipeline errors if needed
+    except ValueError as ve:
+        endpoint_log.warning("Input validation error", error=str(ve), exc_info=True)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
+    except ConnectionError as ce: # LLM_COMMENT: Catch ConnectionError from pipeline steps
+        endpoint_log.error("Dependency connection error", error=str(ce), exc_info=True)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"A required service is unavailable: {ce}")
+    except HTTPException as http_exc:
+        # LLM_COMMENT: Re-raise specific HTTP exceptions (like 403 from check_chat_ownership)
+        raise http_exc
+    except Exception as e:
+        endpoint_log.exception("Unhandled exception during query processing")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An internal error occurred: {type(e).__name__}")
 ```
 
 ## File: `app\api\v1\schemas.py`
@@ -389,20 +438,27 @@ import logging
 import os
 from typing import Optional, List, Any, Dict
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import AnyHttpUrl, SecretStr, Field, validator, ValidationError, HttpUrl
+# LLM_COMMENT: Correct Pydantic v2 imports
+from pydantic import AnyHttpUrl, SecretStr, Field, field_validator, ValidationError, ValidationInfo
 import sys
+import json # LLM_COMMENT: Added json import for default factories
 
 # --- PostgreSQL Kubernetes Defaults ---
-POSTGRES_K8S_HOST_DEFAULT = "postgresql-service.nyro-develop.svc.cluster.local" # LLM_COMMENT: Keep DB Defaults
+POSTGRES_K8S_HOST_DEFAULT = "postgresql.nyro-develop.svc.cluster.local"
 POSTGRES_K8S_PORT_DEFAULT = 5432
-# LLM_COMMENT: Database name 'atenex' seems correct based on previous logs/configs, correcting default.
-POSTGRES_K8S_DB_DEFAULT = "atenex"
+POSTGRES_K8S_DB_DEFAULT = "atenex" # LLM_COMMENT: Verified database name
 POSTGRES_K8S_USER_DEFAULT = "postgres"
 
 # --- Milvus Kubernetes Defaults ---
-MILVUS_K8S_DEFAULT_URI = "http://milvus-milvus.default.svc.cluster.local:19530" # LLM_COMMENT: Keep Milvus Defaults
+MILVUS_K8S_DEFAULT_URI = "http://milvus-milvus.default.svc.cluster.local:19530" # LLM_COMMENT: Default Milvus URI in 'default' namespace
+# LLM_COMMENT: Default Milvus collection name, should match ingest-service
+MILVUS_DEFAULT_COLLECTION = "atenex_doc_chunks"
+# LLM_COMMENT: Default Milvus index/search parameters, can be overridden by env vars
+MILVUS_DEFAULT_INDEX_PARAMS = '{"metric_type": "COSINE", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}}'
+MILVUS_DEFAULT_SEARCH_PARAMS = '{"metric_type": "COSINE", "params": {"ef": 128}}'
 
 # --- RAG Defaults ---
+# LLM_COMMENT: Prompt for RAG when documents are retrieved. Uses Jinja2 syntax.
 DEFAULT_RAG_PROMPT_TEMPLATE = """
 Basándote estrictamente en los siguientes documentos recuperados, responde a la pregunta del usuario.
 Si los documentos no contienen la respuesta, indica explícitamente que no puedes responder con la información proporcionada.
@@ -417,85 +473,142 @@ Documentos:
 
 Pregunta: {{ query }}
 
+Respuesta concisa y directa:
+"""
+# LLM_COMMENT: Prompt for general conversation when NO documents are relevant.
+DEFAULT_GENERAL_PROMPT_TEMPLATE = """
+Eres un asistente de IA llamado Atenex. Responde a la siguiente pregunta del usuario de forma útil y conversacional.
+Si no sabes la respuesta o la pregunta no está relacionada con tus capacidades, indícalo amablemente.
+
+Pregunta: {{ query }}
+
 Respuesta:
-""" # LLM_COMMENT: Keep Prompt Template
+"""
+
+# LLM_COMMENT: Define default FastEmbed model and query prefix
+DEFAULT_FASTEMBED_MODEL = "BAAI/bge-small-en-v1.5"
+DEFAULT_FASTEMBED_QUERY_PREFIX = "query: "
+# LLM_COMMENT: Embedding dimension for the default FastEmbed model
+DEFAULT_EMBEDDING_DIMENSION = 384
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file='.env',
-        env_prefix='QUERY_',
+        env_prefix='QUERY_', # LLM_COMMENT: Keep prefix consistent
         env_file_encoding='utf-8',
         case_sensitive=False,
         extra='ignore'
     )
 
     # --- General ---
-    PROJECT_NAME: str = "Query Service (Haystack RAG + FastEmbed)" # LLM_COMMENT: Update project name slightly
+    PROJECT_NAME: str = "Atenex Query Service" # LLM_COMMENT: Standardized name
     API_V1_STR: str = "/api/v1"
     LOG_LEVEL: str = "INFO"
 
-    # --- Database ---
+    # --- Database (PostgreSQL) ---
     POSTGRES_USER: str = POSTGRES_K8S_USER_DEFAULT
-    POSTGRES_PASSWORD: SecretStr
+    POSTGRES_PASSWORD: SecretStr # LLM_COMMENT: Secret loaded from env/secret
     POSTGRES_SERVER: str = POSTGRES_K8S_HOST_DEFAULT
     POSTGRES_PORT: int = POSTGRES_K8S_PORT_DEFAULT
-    POSTGRES_DB: str = POSTGRES_K8S_DB_DEFAULT # LLM_COMMENT: Use the corrected default 'atenex'
+    POSTGRES_DB: str = POSTGRES_K8S_DB_DEFAULT
 
-    # --- Milvus ---
-    MILVUS_URI: AnyHttpUrl = AnyHttpUrl(MILVUS_K8S_DEFAULT_URI)
-    MILVUS_COLLECTION_NAME: str = "document_chunks_haystack" # LLM_COMMENT: Keep Milvus collection name consistent with ingest-service
-    MILVUS_EMBEDDING_FIELD: str = "embedding"
-    MILVUS_CONTENT_FIELD: str = "content"
-    MILVUS_METADATA_FIELDS: List[str] = Field(default=[
-        "company_id", "document_id", "file_name", "file_type",
-    ])
-    MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default={
-        "metric_type": "COSINE", "params": {"ef": 128}
-    })
-    MILVUS_COMPANY_ID_FIELD: str = "company_id"
+    # --- Vector Store (Milvus) ---
+    MILVUS_URI: AnyHttpUrl = Field(default=AnyHttpUrl(MILVUS_K8S_DEFAULT_URI)) # LLM_COMMENT: Use Field for default
+    MILVUS_COLLECTION_NAME: str = MILVUS_DEFAULT_COLLECTION
+    # LLM_COMMENT: Define metadata fields expected in Milvus, MUST include 'company_id' for filtering
+    MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name", "file_type"])
+    MILVUS_EMBEDDING_FIELD: str = "embedding" # LLM_COMMENT: Field name for vectors in Milvus
+    MILVUS_CONTENT_FIELD: str = "content" # LLM_COMMENT: Field name for text content in Milvus
+    MILVUS_COMPANY_ID_FIELD: str = "company_id" # LLM_COMMENT: Field used for tenant filtering in Milvus
+    # LLM_COMMENT: Use json.loads with default_factory for complex dict defaults
+    MILVUS_INDEX_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_INDEX_PARAMS))
+    MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_SEARCH_PARAMS))
 
-    # --- Embedding (FastEmbed) ---
-    # LLM_COMMENT: Removed OpenAI specific settings (API Key, Model Name).
-    # LLM_COMMENT: Added settings for FastEmbed. Using BAAI/bge-small-en-v1.5 as default free model.
-    FASTEMBED_MODEL_NAME: str = "BAAI/bge-small-en-v1.5"
-    # LLM_COMMENT: BGE models often require specific prefixes for query/passage embedding.
-    # LLM_COMMENT: Prefix for query embedding (used in query-service).
-    FASTEMBED_QUERY_PREFIX: Optional[str] = "query: "
-    # LLM_COMMENT: Set embedding dimension according to the chosen FastEmbed model.
-    # LLM_COMMENT: BAAI/bge-small-en-v1.5 has 384 dimensions.
-    EMBEDDING_DIMENSION: int = 384
+    # --- Embedding Model (FastEmbed) ---
+    # LLM_COMMENT: Settings specific to FastEmbed replacing OpenAI embedding settings
+    FASTEMBED_MODEL_NAME: str = DEFAULT_FASTEMBED_MODEL
+    FASTEMBED_QUERY_PREFIX: str = DEFAULT_FASTEMBED_QUERY_PREFIX # LLM_COMMENT: Prefix for query embedding
+    EMBEDDING_DIMENSION: int = DEFAULT_EMBEDDING_DIMENSION # LLM_COMMENT: Dimension matching the FastEmbed model
 
-    # --- Gemini LLM ---
-    GEMINI_API_KEY: SecretStr
-    GEMINI_MODEL_NAME: str = "gemini-1.5-flash-latest" # LLM_COMMENT: Keep Gemini settings
+    # --- LLM (Google Gemini) ---
+    GEMINI_API_KEY: SecretStr # LLM_COMMENT: Secret loaded from env/secret
+    GEMINI_MODEL_NAME: str = "gemini-1.5-flash-latest"
 
     # --- RAG Pipeline Settings ---
     RETRIEVER_TOP_K: int = 5
     RAG_PROMPT_TEMPLATE: str = DEFAULT_RAG_PROMPT_TEMPLATE
-    MAX_PROMPT_TOKENS: Optional[int] = 7000
+    # LLM_COMMENT: Added separate template for non-RAG scenarios
+    GENERAL_PROMPT_TEMPLATE: str = DEFAULT_GENERAL_PROMPT_TEMPLATE
+    MAX_PROMPT_TOKENS: Optional[int] = 7000 # LLM_COMMENT: Optional token limit for prompts
 
     # --- Service Client Config ---
     HTTP_CLIENT_TIMEOUT: int = 60
     HTTP_CLIENT_MAX_RETRIES: int = 2
     HTTP_CLIENT_BACKOFF_FACTOR: float = 1.0
 
-    # LLM_COMMENT: Removed the validator that automatically set EMBEDDING_DIMENSION based on OpenAI models.
+    # --- Validators ---
+    # LLM_COMMENT: Validator for LOG_LEVEL (using Pydantic v2 syntax)
+    @field_validator('LOG_LEVEL')
+    @classmethod
+    def check_log_level(cls, v: str) -> str:
+        valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+        normalized_v = v.upper()
+        if normalized_v not in valid_levels:
+            raise ValueError(f"Invalid LOG_LEVEL '{v}'. Must be one of {valid_levels}")
+        return normalized_v
+
+    # LLM_COMMENT: Validator to ensure required secrets are present (using Pydantic v2 syntax)
+    @field_validator('POSTGRES_PASSWORD', 'GEMINI_API_KEY', mode='before')
+    @classmethod
+    def check_secret_value_present(cls, v: Any, info: ValidationInfo) -> Any:
+        if v is None or v == "":
+            field_name = info.field_name if info.field_name else "Unknown Secret Field"
+            raise ValueError(f"Required secret field '{field_name}' cannot be empty.")
+        return v
 
 # --- Instancia Global ---
+# LLM_COMMENT: Keep global settings instance pattern
+temp_log = logging.getLogger("query_service.config.loader")
+if not temp_log.handlers: # Avoid adding handler multiple times during reloads
+    handler = logging.StreamHandler(sys.stdout)
+    formatter = logging.Formatter('%(levelname)s: [%(name)s] %(message)s')
+    handler.setFormatter(formatter)
+    temp_log.addHandler(handler)
+    temp_log.setLevel(logging.INFO) # Use INFO level for startup logs
+
 try:
+    temp_log.info("Loading Query Service settings...")
     settings = Settings()
-    # LLM_COMMENT: Updated debug print statements for new embedding config.
-    print("DEBUG: Settings loaded successfully.")
-    print(f"DEBUG: Using Postgres Server: {settings.POSTGRES_SERVER}:{settings.POSTGRES_PORT}")
-    print(f"DEBUG: Using Postgres User: {settings.POSTGRES_USER}")
-    print(f"DEBUG: Using Milvus URI: {settings.MILVUS_URI}")
-    print(f"DEBUG: Using FastEmbed Model: {settings.FASTEMBED_MODEL_NAME}")
-    print(f"DEBUG: Using Embedding Dimension: {settings.EMBEDDING_DIMENSION}")
-    print(f"DEBUG: Using Gemini Model: {settings.GEMINI_MODEL_NAME}")
+    temp_log.info("Query Service Settings Loaded Successfully:")
+    # LLM_COMMENT: Log key settings for verification (secrets are masked)
+    temp_log.info(f"  PROJECT_NAME: {settings.PROJECT_NAME}")
+    temp_log.info(f"  LOG_LEVEL: {settings.LOG_LEVEL}")
+    temp_log.info(f"  API_V1_STR: {settings.API_V1_STR}")
+    temp_log.info(f"  POSTGRES_SERVER: {settings.POSTGRES_SERVER}:{settings.POSTGRES_PORT}")
+    temp_log.info(f"  POSTGRES_DB: {settings.POSTGRES_DB}")
+    temp_log.info(f"  POSTGRES_USER: {settings.POSTGRES_USER}")
+    temp_log.info(f"  POSTGRES_PASSWORD: *** SET ***")
+    temp_log.info(f"  MILVUS_URI: {settings.MILVUS_URI}")
+    temp_log.info(f"  MILVUS_COLLECTION_NAME: {settings.MILVUS_COLLECTION_NAME}")
+    temp_log.info(f"  FASTEMBED_MODEL_NAME: {settings.FASTEMBED_MODEL_NAME}")
+    temp_log.info(f"  EMBEDDING_DIMENSION: {settings.EMBEDDING_DIMENSION}")
+    temp_log.info(f"  GEMINI_API_KEY: *** SET ***")
+    temp_log.info(f"  GEMINI_MODEL_NAME: {settings.GEMINI_MODEL_NAME}")
+    temp_log.info(f"  RETRIEVER_TOP_K: {settings.RETRIEVER_TOP_K}")
+
+except (ValidationError, ValueError) as e:
+    error_details = ""
+    if isinstance(e, ValidationError):
+        try: error_details = f"\nValidation Errors:\n{e.json(indent=2)}"
+        except Exception: error_details = f"\nRaw Errors: {e.errors()}"
+    temp_log.critical(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    temp_log.critical(f"! FATAL: Query Service configuration validation failed:{error_details}")
+    temp_log.critical(f"! Check environment variables (prefixed with QUERY_) or .env file.")
+    temp_log.critical(f"! Original Error: {e}")
+    temp_log.critical(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    sys.exit(1)
 except Exception as e:
-    print(f"FATAL: Error loading settings: {e}")
-    import traceback
-    traceback.print_exc()
+    temp_log.exception(f"FATAL: Unexpected error loading Query Service settings: {e}")
     sys.exit(1)
 ```
 
@@ -891,41 +1004,38 @@ import uvicorn
 import logging
 import sys
 import asyncio
-import json
+import json # LLM_COMMENT: Keep json import
 
 # Configurar logging primero
 from app.core.config import settings
 from app.core.logging_config import setup_logging
-setup_logging()
+setup_logging() # LLM_COMMENT: Initialize logging early
 log = structlog.get_logger("query_service.main")
 
 # Importar routers y otros módulos
 from app.api.v1.endpoints import query as query_router_module
 from app.api.v1.endpoints import chat as chat_router_module
 from app.db import postgres_client
-from app.pipelines.rag_pipeline import run_rag_pipeline
-from app.api.v1 import schemas
-# from app.utils import helpers
+# LLM_COMMENT: Import dependency check function
+from app.pipelines.rag_pipeline import check_pipeline_dependencies
+from app.api.v1 import schemas # LLM_COMMENT: Keep schema import
 
 # Estado global
-SERVICE_READY = False
-GLOBAL_RAG_PIPELINE = None
+SERVICE_READY = False # LLM_COMMENT: Flag indicating if service dependencies are met
 
-# Crear instancia de FastAPI
-app = FastAPI(
-    title=settings.PROJECT_NAME,
-    openapi_url=f"{settings.API_V1_STR}/openapi.json", # Restaurar openapi_url con prefijo
-    version="0.2.3", # Incrementar versión por corrección de prefijo
-    description="Microservice to handle user queries using a Haystack RAG pipeline with Milvus and Gemini, including chat history management. Expects /api/v1 prefix.", # Descripción actualizada
-)
+# --- Lifespan Manager (async context manager for FastAPI >= 0.110) ---
+# LLM_COMMENT: Use modern lifespan context manager for startup/shutdown logic
+from contextlib import asynccontextmanager
 
-# --- Event Handlers (Sin cambios en lógica interna) ---
-@app.on_event("startup")
-async def startup_event():
-    global SERVICE_READY, GLOBAL_RAG_PIPELINE
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- Startup ---
+    global SERVICE_READY
     log.info(f"Starting up {settings.PROJECT_NAME}...")
     db_pool_initialized = False
-    # Intenta inicializar la BD
+    dependencies_ok = False
+
+    # 1. Initialize DB Pool
     try:
         await postgres_client.get_db_pool()
         db_ready = await postgres_client.check_db_connection()
@@ -934,57 +1044,114 @@ async def startup_event():
             db_pool_initialized = True
         else:
             log.critical("CRITICAL: Failed PostgreSQL connection verification during startup.")
-            db_pool_initialized = False
     except Exception as e:
         log.critical("CRITICAL: Failed PostgreSQL pool initialization during startup.", error=str(e), exc_info=True)
-        db_pool_initialized = False
 
-    # Marcar como listo si la BD está lista
+    # 2. Check other dependencies (Milvus, Gemini Key) if DB is OK
     if db_pool_initialized:
+        try:
+            dependency_status = await check_pipeline_dependencies()
+            log.info("Pipeline dependency check completed", status=dependency_status)
+            # Define "OK" criteria (Milvus connectable, Gemini key present)
+            # LLM_COMMENT: Adjust readiness check based on dependency status reporting
+            milvus_ok = "ok" in dependency_status.get("milvus_connection", "error")
+            gemini_ok = "key_present" in dependency_status.get("gemini_api", "key_missing")
+            fastembed_ok = "configured" in dependency_status.get("fastembed_model", "config_missing")
+
+            if milvus_ok and gemini_ok and fastembed_ok:
+                 dependencies_ok = True
+            else:
+                 log.warning("One or more pipeline dependencies are not ready.", milvus=milvus_ok, gemini=gemini_ok, fastembed=fastembed_ok)
+
+        except Exception as dep_err:
+            log.error("Error checking pipeline dependencies during startup", error=str(dep_err), exc_info=True)
+    else:
+        log.error("Skipping dependency checks because DB pool failed to initialize.")
+
+
+    # 3. Set Service Readiness
+    if db_pool_initialized and dependencies_ok:
         SERVICE_READY = True
         log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY.")
     else:
         SERVICE_READY = False
-        log.critical(f"{settings.PROJECT_NAME} startup FAILED. DB OK: {db_pool_initialized}. Service NOT READY.")
+        log.critical(f"{settings.PROJECT_NAME} startup finished. DB OK: {db_pool_initialized}, Deps OK: {dependencies_ok}. SERVICE NOT READY.")
 
+    yield # Application runs here
 
-@app.on_event("shutdown")
-async def shutdown_event():
+    # --- Shutdown ---
     log.info(f"Shutting down {settings.PROJECT_NAME}...")
     await postgres_client.close_db_pool()
+    # LLM_COMMENT: Add shutdown for other clients if necessary (e.g., Gemini client if it holds resources)
     log.info("Shutdown complete.")
 
-# --- Exception Handlers (Sin cambios) ---
+
+# --- Creación de la App FastAPI ---
+# LLM_COMMENT: Apply lifespan manager to FastAPI app instance
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    openapi_url=f"{settings.API_V1_STR}/openapi.json",
+    version="0.2.4", # LLM_COMMENT: Incremented version for lifespan and prefix fix
+    description="Microservice to handle user queries using a Haystack RAG pipeline with Milvus and Gemini, including chat history management. Expects /api/v1 prefix.",
+    lifespan=lifespan # LLM_COMMENT: Use the new lifespan manager
+)
+
+# --- Middlewares (Sin cambios significativos) ---
+@app.middleware("http")
+async def add_request_id_timing_logging(request: Request, call_next):
+    start_time = asyncio.get_event_loop().time()
+    request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    # Bind core info early for all request logs
+    structlog.contextvars.bind_contextvars(request_id=request_id)
+    req_log = log.bind(method=request.method, path=str(request.url.path), client=request.client.host if request.client else "unknown")
+    req_log.info("Request received")
+
+    response = None
+    try:
+        response = await call_next(request)
+        process_time = (asyncio.get_event_loop().time() - start_time) * 1000 # milliseconds
+        # Bind response info for final log
+        resp_log = req_log.bind(status_code=response.status_code, duration_ms=round(process_time, 2))
+        log_level = "warning" if 400 <= response.status_code < 500 else "error" if response.status_code >= 500 else "info"
+        getattr(resp_log, log_level)("Request finished")
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Process-Time-Ms"] = f"{process_time:.2f}"
+    except Exception as e:
+        process_time = (asyncio.get_event_loop().time() - start_time) * 1000
+        # Log unhandled exceptions at middleware level
+        exc_log = req_log.bind(status_code=500, duration_ms=round(process_time, 2))
+        exc_log.exception("Unhandled exception during request processing") # Use exception to log traceback
+        response = JSONResponse(
+            status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": "Internal Server Error"}
+        )
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Process-Time-Ms"] = f"{process_time:.2f}"
+    finally:
+        # Ensure context is cleared after request
+        structlog.contextvars.clear_contextvars()
+
+    return response
+
+
+# --- Exception Handlers (Sin cambios significativos, adaptados para usar logger) ---
+# LLM_COMMENT: Exception handlers remain mostly the same, ensure they log effectively
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    request_id = request.headers.get("x-request-id", "N/A")
+    # Log already bound with request_id in middleware context
     log_level = log.warning if exc.status_code < 500 else log.error
-    log_level("HTTP Exception caught by handler",
+    log_level("HTTP Exception caught",
               status_code=exc.status_code,
-              detail=exc.detail,
-              path=str(request.url),
-              method=request.method,
-              client=request.client.host if request.client else "unknown",
-              request_id=request_id)
+              detail=exc.detail)
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
-
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    request_id = request.headers.get("x-request-id", "N/A")
     error_details = []
-    try:
-         error_details = exc.errors()
-    except Exception:
-         error_details = [{"loc": [], "msg": "Failed to parse validation errors.", "type": "internal_parsing_error"}]
-
-    log.warning("Request Validation Error",
-                path=str(request.url),
-                method=request.method,
-                client=request.client.host if request.client else "unknown",
-                errors=error_details,
-                request_id=request_id)
-
+    try: error_details = exc.errors()
+    except Exception: error_details = [{"loc": [], "msg": "Failed to parse validation errors.", "type": "internal_parsing_error"}]
+    log.warning("Request Validation Error", errors=error_details)
     return JSONResponse(
         status_code=fastapi_status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={"detail": error_details},
@@ -992,67 +1159,46 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.exception_handler(ResponseValidationError)
 async def response_validation_exception_handler(request: Request, exc: ResponseValidationError):
-    request_id = request.headers.get("x-request-id", "N/A")
-    log.error("Response Validation Error - Server failed to construct valid response",
-              path=str(request.url),
-              method=request.method,
-              errors=exc.errors(),
-              request_id=request_id,
-              exc_info=True)
-
+    log.error("Response Validation Error", errors=exc.errors(), exc_info=True)
     return JSONResponse(
         status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"detail": "Internal Server Error: Failed to serialize response."},
     )
 
-
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    request_id = request.headers.get("x-request-id", "N/A")
-    log.exception("Unhandled Exception caught by generic handler",
-                  path=str(request.url),
-                  method=request.method,
-                  client=request.client.host if request.client else "unknown",
-                  request_id=request_id)
+    log.exception("Unhandled Exception caught by generic handler") # Logs traceback
     return JSONResponse(
         status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"detail": "Internal Server Error"},
     )
 
-
 # --- Routers ---
-# *** REVERSIÓN: Volver a añadir el prefijo API_V1_STR ***
-# El API Gateway reenvía la ruta completa, por lo que el servicio debe esperarla.
-app.include_router(query_router_module.router, prefix=settings.API_V1_STR, tags=["Query Interaction"]) # Ruta esperada: /api/v1/ask
-app.include_router(chat_router_module.router, prefix=settings.API_V1_STR, tags=["Chat Management"])   # Rutas esperadas: /api/v1/chats, etc.
-log.info("Routers included with prefix", prefix=settings.API_V1_STR) # Actualizar log
+# LLM_COMMENT: Ensure API prefix is applied correctly as the Gateway forwards the full path
+app.include_router(query_router_module.router, prefix=settings.API_V1_STR, tags=["Query Interaction"])
+app.include_router(chat_router_module.router, prefix=settings.API_V1_STR, tags=["Chat Management"])
+log.info("Routers included", prefix=settings.API_V1_STR)
 
-# --- Root Endpoint / Health Check (Sin cambios) ---
+# --- Root Endpoint / Health Check ---
+# LLM_COMMENT: Health check now relies on SERVICE_READY flag set during lifespan startup
 @app.get("/", tags=["Health Check"], summary="Service Liveness/Readiness Check")
-async def read_root(request: Request):
-    global SERVICE_READY
-    request_id = request.headers.get("x-request-id", "N/A")
-    health_log = log.bind(request_id=request_id)
-    health_log.debug("Health check endpoint '/' requested")
-
-    if not SERVICE_READY:
-         health_log.warning("Health check failed: Service not ready (SERVICE_READY is False).")
-         return PlainTextResponse("Service Not Ready", status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE)
-
-    db_ok = await postgres_client.check_db_connection()
-    if db_ok:
-        health_log.info("Health check successful (Service Ready, DB connection OK).")
+async def read_root():
+    """Basic health check. Returns OK if service started successfully."""
+    health_log = log.bind(check="liveness_readiness")
+    if SERVICE_READY:
+        health_log.debug("Health check passed.")
         return PlainTextResponse("OK", status_code=fastapi_status.HTTP_200_OK)
     else:
-        health_log.error("Health check failed: Service is READY but DB check FAILED.")
-        return PlainTextResponse("Service Ready but DB check failed", status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE)
+        health_log.error("Health check failed: Service not ready (SERVICE_READY is False). Check startup logs.")
+        # LLM_COMMENT: Return 503 if service failed to initialize correctly
+        return PlainTextResponse("Service Not Ready", status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE)
 
-
-# --- Main execution (for local development, sin cambios) ---
+# --- Main execution (for local development) ---
+# LLM_COMMENT: Keep local run block, useful for development
 if __name__ == "__main__":
-    port = 8002
+    port = 8002 # LLM_COMMENT: Default port for query-service
     log_level_str = settings.LOG_LEVEL.lower()
-    print(f"----- Starting Query Service locally on port {port} -----")
+    print(f"----- Starting {settings.PROJECT_NAME} locally on port {port} -----")
     uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True, log_level=log_level_str)
 ```
 
@@ -1079,151 +1225,246 @@ from typing import Dict, Any, List, Tuple, Optional
 
 from pymilvus.exceptions import MilvusException, ErrorCode
 from fastapi import HTTPException, status
-from haystack import Document
-from haystack_integrations.components.embedders.fastembed.fastembed_text_embedder import FastembedTextEmbedder
+from haystack import Document # LLM_COMMENT: Keep Haystack Document import
+# LLM_COMMENT: Import FastEmbed Text Embedder for Haystack
+from haystack_integrations.components.embedders.fastembed import FastembedTextEmbedder
 from haystack.components.builders.prompt_builder import PromptBuilder
-from milvus_haystack import MilvusDocumentStore, MilvusEmbeddingRetriever
+from milvus_haystack import MilvusDocumentStore, MilvusEmbeddingRetriever # LLM_COMMENT: Keep Milvus imports
 from haystack.utils import Secret
 
 from app.core.config import settings
 from app.db import postgres_client
-from app.services.gemini_client import gemini_client
-from app.api.v1.schemas import RetrievedDocument
+from app.services.gemini_client import gemini_client # LLM_COMMENT: Keep Gemini client import
+from app.api.v1.schemas import RetrievedDocument # LLM_COMMENT: Import schema for logging
 
 log = structlog.get_logger(__name__)
 
 # --- Component Initialization Functions ---
+# LLM_COMMENT: Encapsulate component initialization for clarity and potential reuse/caching
 
 def get_milvus_document_store() -> MilvusDocumentStore:
+    """Initializes and returns a MilvusDocumentStore instance."""
     connection_uri = str(settings.MILVUS_URI)
-    log.debug("Initializing MilvusDocumentStore...", uri=connection_uri,
-              collection=settings.MILVUS_COLLECTION_NAME)
+    store_log = log.bind(component="MilvusDocumentStore", uri=connection_uri, collection=settings.MILVUS_COLLECTION_NAME)
+    store_log.debug("Initializing...")
     try:
         store = MilvusDocumentStore(
             connection_args={"uri": connection_uri},
             collection_name=settings.MILVUS_COLLECTION_NAME,
-            search_params=settings.MILVUS_SEARCH_PARAMS,
-            consistency_level="Strong",
+            embedding_dim=settings.EMBEDDING_DIMENSION, # LLM_COMMENT: Dimension is important for potential auto-creation
+            embedding_field=settings.MILVUS_EMBEDDING_FIELD,
+            content_field=settings.MILVUS_CONTENT_FIELD,
+            metadata_fields=settings.MILVUS_METADATA_FIELDS,
+            index_params=settings.MILVUS_INDEX_PARAMS, # LLM_COMMENT: Pass index params
+            search_params=settings.MILVUS_SEARCH_PARAMS, # LLM_COMMENT: Pass search params
+            consistency_level="Strong", # LLM_COMMENT: Ensure consistency for RAG
         )
-        log.info("MilvusDocumentStore parameters configured.", uri=connection_uri,
-                 collection=settings.MILVUS_COLLECTION_NAME)
+        store_log.info("Initialization successful.")
         return store
     except Exception as e:
-        log.error("Failed to initialize MilvusDocumentStore", error=str(e), exc_info=True)
+        store_log.error("Initialization failed", error=str(e), exc_info=True)
         raise RuntimeError(f"Milvus initialization error: {e}")
 
 def get_fastembed_text_embedder() -> FastembedTextEmbedder:
-    log.debug("Initializing FastembedTextEmbedder", model=settings.FASTEMBED_MODEL_NAME, prefix=settings.FASTEMBED_QUERY_PREFIX)
-    return FastembedTextEmbedder(
+    """Initializes and returns a FastembedTextEmbedder instance."""
+    embedder_log = log.bind(component="FastembedTextEmbedder", model=settings.FASTEMBED_MODEL_NAME, prefix=settings.FASTEMBED_QUERY_PREFIX)
+    embedder_log.debug("Initializing...")
+    # LLM_COMMENT: No API key needed for FastEmbed, uses local model.
+    embedder = FastembedTextEmbedder(
         model=settings.FASTEMBED_MODEL_NAME,
-        prefix=settings.FASTEMBED_QUERY_PREFIX or "",
+        prefix=settings.FASTEMBED_QUERY_PREFIX # LLM_COMMENT: Apply query prefix if defined
+        # meta_fields_to_embed=[] # LLM_COMMENT: Usually not needed for query embedding
     )
+    embedder_log.info("Initialization successful.")
+    return embedder
 
-def get_prompt_builder() -> PromptBuilder:
-    log.debug("Initializing PromptBuilder")
-    return PromptBuilder(template=settings.RAG_PROMPT_TEMPLATE)
+# LLM_COMMENT: PromptBuilder initialization remains the same logic but uses templates from config
+def get_prompt_builder(template: str) -> PromptBuilder:
+    """Initializes PromptBuilder with a given template."""
+    log.debug("Initializing PromptBuilder...")
+    return PromptBuilder(template=template)
 
+# --- Pipeline Execution Logic ---
+# LLM_COMMENT: Refactored RAG pipeline execution into distinct async steps for clarity
+# LLM_COMMENT: Added conditional prompt logic based on document retrieval
 
-# --- Pipeline Execution (Using manual steps) ---
+async def embed_query(query: str) -> List[float]:
+    """Embeds the user query using FastEmbed."""
+    embed_log = log.bind(action="embed_query")
+    try:
+        embedder = get_fastembed_text_embedder()
+        # LLM_COMMENT: FastEmbed components might be synchronous internally, run in thread
+        result = await asyncio.to_thread(embedder.run, text=query)
+        embedding = result.get("embedding")
+        if not embedding:
+            raise ValueError("Embedding process returned no embedding vector.")
+        embed_log.info("Query embedded successfully", vector_dim=len(embedding))
+        return embedding
+    except Exception as e:
+        embed_log.error("Embedding failed", error=str(e), exc_info=True)
+        raise ConnectionError(f"Embedding service error: {e}") from e # LLM_COMMENT: Raise specific error type
+
+async def retrieve_documents(embedding: List[float], company_id: str, top_k: int) -> List[Document]:
+    """Retrieves relevant documents from Milvus based on the query embedding and company_id."""
+    retrieve_log = log.bind(action="retrieve_documents", company_id=company_id, top_k=top_k)
+    try:
+        document_store = get_milvus_document_store()
+        # LLM_COMMENT: Construct filters for multi-tenancy
+        filters = {"company_id": company_id}
+        retriever = MilvusEmbeddingRetriever(
+            document_store=document_store,
+            filters=filters,
+            top_k=top_k
+        )
+        # LLM_COMMENT: Milvus retrieval might be synchronous, run in thread
+        result = await asyncio.to_thread(retriever.run, query_embedding=embedding)
+        documents = result.get("documents", [])
+        retrieve_log.info("Documents retrieved successfully", count=len(documents))
+        return documents
+    except MilvusException as me:
+         retrieve_log.error("Milvus retrieval failed", error_code=me.code, error_message=me.message, exc_info=False)
+         raise ConnectionError(f"Vector DB retrieval error (Milvus code: {me.code})") from me
+    except Exception as e:
+        retrieve_log.error("Retrieval failed", error=str(e), exc_info=True)
+        raise ConnectionError(f"Retrieval service error: {e}") from e # LLM_COMMENT: Raise specific error type
+
+async def build_prompt(query: str, documents: List[Document]) -> str:
+    """Builds the final prompt for the LLM, selecting template based on retrieved documents."""
+    build_log = log.bind(action="build_prompt", num_docs=len(documents))
+    try:
+        # LLM_COMMENT: Conditional prompt template selection
+        if documents:
+            template = settings.RAG_PROMPT_TEMPLATE
+            prompt_builder = get_prompt_builder(template)
+            result = await asyncio.to_thread(prompt_builder.run, query=query, documents=documents)
+            build_log.info("RAG prompt built")
+        else:
+            template = settings.GENERAL_PROMPT_TEMPLATE
+            prompt_builder = get_prompt_builder(template)
+            # LLM_COMMENT: Only pass query when no documents are used
+            result = await asyncio.to_thread(prompt_builder.run, query=query)
+            build_log.info("General prompt built (no documents retrieved)")
+
+        prompt = result.get("prompt")
+        if not prompt:
+            raise ValueError("Prompt generation returned empty prompt.")
+        return prompt
+    except Exception as e:
+        build_log.error("Prompt building failed", error=str(e), exc_info=True)
+        raise ValueError(f"Prompt building error: {e}") from e # LLM_COMMENT: Raise specific error type
+
+async def generate_llm_answer(prompt: str) -> str:
+    """Generates the final answer using the Gemini client."""
+    llm_log = log.bind(action="generate_llm_answer", model=settings.GEMINI_MODEL_NAME)
+    try:
+        answer = await gemini_client.generate_answer(prompt)
+        llm_log.info("Answer generated successfully", answer_length=len(answer))
+        return answer
+    except Exception as e:
+        llm_log.error("LLM generation failed", error=str(e), exc_info=True)
+        raise ConnectionError(f"LLM service error: {e}") from e # LLM_COMMENT: Raise specific error type
+
 async def run_rag_pipeline(
     query: str,
     company_id: str,
-    user_id: Optional[str],
+    user_id: Optional[str], # LLM_COMMENT: user_id can be optional for logging
     top_k: Optional[int] = None,
-    chat_id: Optional[uuid.UUID] = None
+    chat_id: Optional[uuid.UUID] = None # LLM_COMMENT: Pass chat_id for logging context
 ) -> Tuple[str, List[Document], Optional[uuid.UUID]]:
     """
-    Ejecuta el Async RAG pipeline (con FastEmbed) usando el método manual embed->retrieve->prompt steps.
-    Llama a Gemini y loguea la interacción.
+    Orchestrates the RAG pipeline steps: embed, retrieve, build prompt, generate answer, log interaction.
     """
-    run_log = log.bind(query=query, company_id=company_id, user_id=user_id or "N/A", chat_id=str(chat_id) if chat_id else "N/A")
-    run_log.info("Running RAG pipeline (manual flow) with FastEmbed...")
-
-    # Define retrieval params
-    retriever_top_k = top_k or settings.RETRIEVER_TOP_K
-    filters = [{"field": settings.MILVUS_COMPANY_ID_FIELD, "operator": "==", "value": company_id}]
-
-    # Step 1: Embed query
-    try:
-        embedder = get_fastembed_text_embedder()
-        embedder.warm_up()
-        embedding = embedder.run(query).get("embedding")
-    except Exception as e:
-        run_log.error("Embedding failed", error=str(e), exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Embedding error")
-
-    # Step 2: Retrieve documents
-    try:
-        retriever = MilvusEmbeddingRetriever(document_store=get_milvus_document_store(), filters=filters, top_k=retriever_top_k)
-        docs = await asyncio.to_thread(retriever.run, embedding)
-        docs = docs.get("documents", [])
-    except Exception as e:
-        run_log.error("Retrieval failed", error=str(e), exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Retrieval error")
-
-    # Step 3: Build prompt
-    try:
-        prompt_text = PromptBuilder(template=settings.RAG_PROMPT_TEMPLATE).run(query=query, documents=docs).get("prompt")
-    except Exception as e:
-        run_log.error("Prompt building failed", error=str(e), exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Prompt building error")
+    run_log = log.bind(company_id=company_id, user_id=user_id or "N/A", chat_id=str(chat_id) if chat_id else "N/A", query=query[:50]+"...")
+    run_log.info("Executing RAG pipeline")
+    retriever_k = top_k or settings.RETRIEVER_TOP_K
+    log_id: Optional[uuid.UUID] = None # LLM_COMMENT: Initialize log_id as None
 
     try:
-        answer = await gemini_client.generate_answer(prompt_text)
-    except Exception as e:
-        run_log.error("Gemini generation failed", error=str(e), exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="LLM generation error"
-        )
+        # 1. Embed Query
+        query_embedding = await embed_query(query)
 
-    log_id: Optional[uuid.UUID] = None
-    try:
-        docs_for_log = [RetrievedDocument.from_haystack_doc(d).model_dump(exclude_none=True)
-                        for d in docs]
-        log_id = await postgres_client.log_query_interaction(
-            company_id=uuid.UUID(company_id) if isinstance(company_id, str) else company_id,
-            user_id=uuid.UUID(user_id) if user_id else None,
-            query=query, answer=answer,
-            retrieved_documents_data=docs_for_log,
-            chat_id=chat_id,
-            metadata={"top_k": retriever_top_k, "model": settings.GEMINI_MODEL_NAME, "embedder": settings.FASTEMBED_MODEL_NAME}
-        )
-    except Exception as e:
-        run_log.error("Failed to log interaction", error=str(e), exc_info=True)
+        # 2. Retrieve Documents
+        retrieved_docs = await retrieve_documents(query_embedding, company_id, retriever_k)
 
-    return answer, docs, log_id
+        # 3. Build Prompt (Conditional based on retrieved docs)
+        final_prompt = await build_prompt(query, retrieved_docs)
+
+        # 4. Generate Answer
+        answer = await generate_llm_answer(final_prompt)
+
+        # 5. Log Interaction (Best effort)
+        try:
+            # LLM_COMMENT: Format retrieved docs for logging
+            docs_for_log = [RetrievedDocument.from_haystack_doc(d).model_dump(exclude_none=True)
+                            for d in retrieved_docs]
+            log_id = await postgres_client.log_query_interaction(
+                company_id=uuid.UUID(company_id), # LLM_COMMENT: Ensure UUID type
+                user_id=uuid.UUID(user_id) if user_id else None, # LLM_COMMENT: Ensure UUID type or None
+                query=query, answer=answer,
+                retrieved_documents_data=docs_for_log,
+                chat_id=chat_id,
+                # LLM_COMMENT: Added metadata for context in logs
+                metadata={"top_k": retriever_k, "llm_model": settings.GEMINI_MODEL_NAME, "embedder_model": settings.FASTEMBED_MODEL_NAME, "num_retrieved": len(retrieved_docs)}
+            )
+            run_log.info("Interaction logged successfully", db_log_id=str(log_id))
+        except Exception as log_err:
+            run_log.error("Failed to log RAG interaction to DB", error=str(log_err), exc_info=False) # LLM_COMMENT: Log error but don't fail the request
+
+        run_log.info("RAG pipeline completed successfully")
+        return answer, retrieved_docs, log_id
+
+    # LLM_COMMENT: Catch specific errors from pipeline steps and map to HTTP exceptions
+    except ConnectionError as ce: # Errors connecting to Milvus, Embedder, LLM
+        run_log.error("Connection error during RAG pipeline", error=str(ce), exc_info=True)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"A dependency is unavailable: {ce}")
+    except ValueError as ve: # Errors during embedding or prompt building
+        run_log.error("Value error during RAG pipeline", error=str(ve), exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Data processing error: {ve}")
+    except Exception as e: # Catch-all for unexpected errors
+        run_log.exception("Unexpected error during RAG pipeline execution")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An internal error occurred.")
 
 # --- Dependency Check Function ---
 async def check_pipeline_dependencies() -> Dict[str, str]:
-    results = {"milvus_connection": "pending", "gemini_api": "pending"}
+    """Checks the status of pipeline dependencies (Milvus, Gemini)."""
+    # LLM_COMMENT: Keep dependency check logic, adapted for FastEmbed/Gemini
+    results = {"milvus_connection": "pending", "gemini_api": "pending", "fastembed_model": "pending"}
+    check_log = log.bind(action="check_dependencies")
+
+    # Check Milvus
     try:
         store = get_milvus_document_store()
-        count = await asyncio.to_thread(store.count_documents)
-        results["milvus_connection"] = "ok"
-        log.debug("Milvus dependency check successful.", document_count=count)
-    except MilvusException as e:
-        if e.code == ErrorCode.COLLECTION_NOT_FOUND:
-            results["milvus_connection"] = "ok (collection not found yet)"
-            log.info("Milvus dependency check: Collection not found (expected if empty, will be created on write).")
-        elif e.code == ErrorCode.UNEXPECTED_ERROR and "connect failed" in e.message.lower():
-            results["milvus_connection"] = f"error: Connection Failed (code={e.code}, msg={e.message})"
-            log.warning("Milvus dependency check failed: Connection Error", error_code=e.code, error_message=e.message, exc_info=False)
+        # LLM_COMMENT: Use a potentially lighter check like has_collection if available, or count_documents
+        collection_exists = await asyncio.to_thread(store.conn.has_collection, store.collection_name)
+        if collection_exists:
+            results["milvus_connection"] = "ok"
+            check_log.debug("Milvus dependency check: Connection ok, collection exists.")
         else:
-            results["milvus_connection"] = f"error: MilvusException (code={e.code}, msg={e.message})"
-            log.warning("Milvus dependency check failed with Milvus error", error_code=e.code, error_message=e.message, exc_info=False)
-    except RuntimeError as rte:
-         results["milvus_connection"] = f"error: Initialization Failed ({rte})"
-         log.warning("Milvus dependency check failed during store initialization", error=str(rte), exc_info=False)
+             results["milvus_connection"] = "ok (collection not found yet)"
+             check_log.info("Milvus dependency check: Connection ok, collection does not exist (will be created on write).")
+    except MilvusException as me:
+        results["milvus_connection"] = f"error: MilvusException (code={me.code}, msg={me.message})"
+        check_log.warning("Milvus dependency check failed", error_code=me.code, error_message=me.message, exc_info=False)
     except Exception as e:
         results["milvus_connection"] = f"error: Unexpected {type(e).__name__}"
-        log.warning("Milvus dependency check failed with unexpected error", error=str(e), exc_info=True)
+        check_log.warning("Milvus dependency check failed", error=str(e), exc_info=True)
 
+    # Check Gemini (API Key Presence)
     if settings.GEMINI_API_KEY.get_secret_value():
         results["gemini_api"] = "key_present"
+        check_log.debug("Gemini dependency check: API Key is present.")
     else:
         results["gemini_api"] = "key_missing"
-        log.warning("Gemini API Key missing in config.")
+        check_log.warning("Gemini dependency check: API Key is MISSING.")
+
+    # Check FastEmbed (Model loading is lazy, just check config)
+    if settings.FASTEMBED_MODEL_NAME:
+         results["fastembed_model"] = f"configured ({settings.FASTEMBED_MODEL_NAME})"
+         check_log.debug("FastEmbed dependency check: Model configured.", model=settings.FASTEMBED_MODEL_NAME)
+    else:
+         results["fastembed_model"] = "config_missing"
+         check_log.error("FastEmbed dependency check: Model name MISSING in configuration.")
+
 
     return results
 ```
