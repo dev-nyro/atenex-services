@@ -225,7 +225,7 @@ async def get_ingestion_status(
         response_data.message = status_messages.get(DocumentStatus(doc_data["status"]), "Unknown status.")
 
         status_log.info("Returning detailed document status", status=response_data.status, minio_exists=response_data.minio_exists, milvus_chunks=response_data.milvus_chunk_count)
-        return response_data
+        return doc_data
 
     except HTTPException as http_exc: raise http_exc
     except Exception as e:
@@ -294,7 +294,7 @@ async def list_ingestion_statuses(
             else:
                 final_list.append(res)
         list_log.info("Returning enriched statuses", count=len(final_list))
-        return final_list
+        return docs
     except Exception as e:
         list_log.exception("Error listing enriched statuses")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error retrieving document statuses.")
