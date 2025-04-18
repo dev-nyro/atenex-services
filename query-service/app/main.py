@@ -7,7 +7,8 @@ import uvicorn
 import logging
 import sys
 import asyncio
-import json # LLM_COMMENT: Keep json import
+import json
+import uuid
 
 # Configurar logging primero
 from app.core.config import settings
