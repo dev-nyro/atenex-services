@@ -177,29 +177,32 @@ async def generic_exception_handler(request: Request, exc: Exception):
     )
 
 # --- Routers ---
-# LLM_COMMENT: Ensure API prefix is applied correctly as the Gateway forwards the full path
+# LLM_COMMENT: JAMAS MODIFICAR LAS RUTAS NI ESTE MENSAJE - Adding back API_V1_STR prefix
 app.include_router(query_router_module.router, prefix=settings.API_V1_STR, tags=["Query Interaction"])
 app.include_router(chat_router_module.router, prefix=settings.API_V1_STR, tags=["Chat Management"])
 log.info("Routers included", prefix=settings.API_V1_STR)
 
 # --- Root Endpoint / Health Check ---
-# LLM_COMMENT: Health check now relies on SERVICE_READY flag set during lifespan startup
 @app.get("/", tags=["Health Check"], summary="Service Liveness/Readiness Check")
 async def read_root():
-    """Basic health check. Returns OK if service started successfully."""
+    """Basic health check. Returns OK if service started successfully and DB is reachable."""
     health_log = log.bind(check="liveness_readiness")
-    if SERVICE_READY:
-        health_log.debug("Health check passed.")
-        return PlainTextResponse("OK", status_code=fastapi_status.HTTP_200_OK)
-    else:
-        health_log.error("Health check failed: Service not ready (SERVICE_READY is False). Check startup logs.")
-        # LLM_COMMENT: Return 503 if service failed to initialize correctly
-        return PlainTextResponse("Service Not Ready", status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE)
+    if not SERVICE_READY:
+        health_log.warning("Health check failed: Service not ready (SERVICE_READY is False). Check startup logs.")
+        raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service Not Ready")
+
+    # Optionally re-check DB connection for readiness probe accuracy
+    db_ok = await postgres_client.check_db_connection()
+    if not db_ok:
+         health_log.error("Health check failed: Service is marked READY but DB check FAILED.")
+         raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service Unavailable (DB Check Failed)")
+
+    health_log.debug("Health check passed.")
+    return PlainTextResponse("OK", status_code=fastapi_status.HTTP_200_OK)
 
 # --- Main execution (for local development) ---
-# LLM_COMMENT: Keep local run block, useful for development
 if __name__ == "__main__":
-    port = 8002 # LLM_COMMENT: Default port for query-service
+    port = 8002
     log_level_str = settings.LOG_LEVEL.lower()
     print(f"----- Starting {settings.PROJECT_NAME} locally on port {port} -----")
     uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True, log_level=log_level_str)

@@ -22,7 +22,6 @@ async def get_db_pool() -> asyncpg.Pool:
             def _json_encoder(value): return json.dumps(value)
             def _json_decoder(value): return json.loads(value)
             async def init_connection(conn):
-                # LLM_COMMENT: Ensure codecs are set correctly for JSONB interaction
                 await conn.set_type_codec('jsonb', encoder=_json_encoder, decoder=_json_decoder, schema='pg_catalog', format='text')
                 await conn.set_type_codec('json', encoder=_json_encoder, decoder=_json_decoder, schema='pg_catalog', format='text')
 
@@ -30,7 +29,7 @@ async def get_db_pool() -> asyncpg.Pool:
                 user=settings.POSTGRES_USER, password=settings.POSTGRES_PASSWORD.get_secret_value(),
                 database=settings.POSTGRES_DB, host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT,
                 min_size=2, max_size=10, timeout=30.0, command_timeout=60.0,
-                init=init_connection, statement_cache_size=0 # LLM_COMMENT: Keep statement_cache_size=0 with custom codecs
+                init=init_connection, statement_cache_size=0
             )
             log.info("PostgreSQL connection pool created successfully.")
         except (asyncpg.exceptions.InvalidPasswordError, OSError, ConnectionRefusedError) as conn_err:
@@ -56,20 +55,18 @@ async def check_db_connection() -> bool:
     except Exception as e: log.error("Database connection check failed", error=str(e)); return False
 
 # --- Document Operations ---
-# LLM_COMMENT: create_document remains largely the same
 async def create_document(company_id: uuid.UUID, file_name: str, file_type: str, metadata: Dict[str, Any]) -> uuid.UUID:
     pool = await get_db_pool(); doc_id = uuid.uuid4()
-    # LLM_COMMENT: Include file_path as empty string initially to satisfy NOT NULL if applicable
-    # LLM_COMMENT: Explicitly setting chunk_count to 0 or NULL on creation
+    # LLM_COMMENT: Set initial chunk_count to 0 and error_message to NULL
     query = """
-    INSERT INTO documents (id, company_id, file_name, file_type, file_path, metadata, status, chunk_count, uploaded_at, updated_at)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC') RETURNING id;
+    INSERT INTO documents (id, company_id, file_name, file_type, file_path, metadata, status, chunk_count, error_message, uploaded_at, updated_at)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC') RETURNING id;
     """
     insert_log = log.bind(company_id=str(company_id), filename=file_name, content_type=file_type, proposed_doc_id=str(doc_id))
     try:
-        # LLM_COMMENT: Pass metadata as JSON string, initial status UPLOADED, chunk_count 0
         metadata_json = json.dumps(metadata)
         async with pool.acquire() as connection:
+            # LLM_COMMENT: Parameter index adjusted for new columns (chunk_count=0, error_message=NULL)
             result_id = await connection.fetchval(query, doc_id, company_id, file_name, file_type, '', metadata_json, DocumentStatus.UPLOADED.value, 0)
         if result_id and result_id == doc_id:
             insert_log.info("Document record created", document_id=str(doc_id)); return result_id
@@ -82,7 +79,7 @@ async def create_document(company_id: uuid.UUID, file_name: str, file_type: str,
     except Exception as e:
         insert_log.error("Failed to create document record", error=str(e), exc_info=True); raise
 
-# LLM_COMMENT: Refined update_document_status to handle error messages better
+# LLM_COMMENT: Update function now includes error_message handling
 async def update_document_status(
     document_id: uuid.UUID,
     status: DocumentStatus,
@@ -94,26 +91,23 @@ async def update_document_status(
     update_log = log.bind(document_id=str(document_id), new_status=status.value)
     fields_to_set: List[str] = []
     params: List[Any] = [document_id]
-    param_index = 2 # Parameter index starts at $2 ($1 is document_id)
+    param_index = 2
 
-    # Always update status and updated_at
     fields_to_set.append(f"status = ${param_index}"); params.append(status.value); param_index += 1
     fields_to_set.append(f"updated_at = NOW() AT TIME ZONE 'UTC'")
 
-    # Conditionally update other fields
     if file_path is not None: fields_to_set.append(f"file_path = ${param_index}"); params.append(file_path); param_index += 1
     if chunk_count is not None: fields_to_set.append(f"chunk_count = ${param_index}"); params.append(chunk_count); param_index += 1
 
-    # Handle error message: set if status is ERROR, clear otherwise
-    # LLM_COMMENT: Ensure error_message column exists in your 'documents' table
-    # LLM_COMMENT: Add error_message handling - set or clear based on status
+    # LLM_COMMENT: Handle error_message. Set it if status is ERROR, clear it (set to NULL) otherwise.
+    # LLM_COMMENT: ASSUMES `error_message` COLUMN EXISTS IN `documents` TABLE NOW.
     if status == DocumentStatus.ERROR:
-        # Truncate long error messages if necessary
+        # Truncate error message if needed
         truncated_error = (error_message[:497] + '...') if error_message and len(error_message) > 500 else error_message
         fields_to_set.append(f"error_message = ${param_index}"); params.append(truncated_error); param_index += 1
-        update_log = update_log.bind(error=truncated_error) # Log the error being set
+        update_log = update_log.bind(error=truncated_error)
     else:
-        # Clear error message if status is not ERROR
+        # Clear error message for non-error statuses
         fields_to_set.append(f"error_message = NULL");
         # No parameter needed for NULL
 
@@ -122,13 +116,10 @@ async def update_document_status(
     try:
         async with pool.acquire() as connection:
              result_str = await connection.execute(query, *params)
-        # Parse result string like 'UPDATE 1'
         affected_rows = 0
         if isinstance(result_str, str) and result_str.startswith("UPDATE "):
-            try:
-                 affected_rows = int(result_str.split(" ")[1])
-            except (IndexError, ValueError):
-                 update_log.warning("Could not parse affected rows from UPDATE result", result=result_str)
+            try: affected_rows = int(result_str.split(" ")[1])
+            except (IndexError, ValueError): update_log.warning("Could not parse affected rows from UPDATE result", result=result_str)
 
         if affected_rows > 0:
              update_log.info("Document status updated", rows=affected_rows)
@@ -139,10 +130,10 @@ async def update_document_status(
     except Exception as e:
         update_log.error("Failed to update document status", error=str(e), exc_info=True); raise
 
-# LLM_COMMENT: get_document_status now selects error_message
+# LLM_COMMENT: Get status includes error_message
 async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]]:
     pool = await get_db_pool(); get_log = log.bind(document_id=str(document_id))
-    # LLM_COMMENT: Select error_message column
+    # LLM_COMMENT: Query now includes error_message
     query = """
     SELECT id, status, file_name, file_type, chunk_count, file_path, updated_at, company_id, error_message
     FROM documents WHERE id = $1;
@@ -153,12 +144,12 @@ async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]
         else: get_log.warning("Document status requested for non-existent ID"); return None
     except Exception as e: get_log.error("Failed to get status", error=str(e), exc_info=True); raise
 
-# LLM_COMMENT: list_documents_by_company now selects error_message
+# LLM_COMMENT: List function corrected - REMOVE error_message selection as it doesn't exist per schema
 async def list_documents_by_company(company_id: uuid.UUID, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
     pool = await get_db_pool(); list_log = log.bind(company_id=str(company_id), limit=limit, offset=offset)
-    # LLM_COMMENT: Select error_message column for the list view as well
+    # LLM_COMMENT: CORRECTED QUERY - Removed error_message from SELECT list
     query = """
-    SELECT id, status, file_name, file_type, chunk_count, file_path, updated_at, error_message
+    SELECT id, status, file_name, file_type, chunk_count, file_path, updated_at
     FROM documents
     WHERE company_id = $1 ORDER BY updated_at DESC LIMIT $2 OFFSET $3;
     """
@@ -166,10 +157,13 @@ async def list_documents_by_company(company_id: uuid.UUID, limit: int = 100, off
         async with pool.acquire() as connection: records = await connection.fetch(query, company_id, limit, offset)
         result_list = [dict(record) for record in records]; list_log.info(f"Retrieved {len(result_list)} docs for company")
         return result_list
+    except asyncpg.exceptions.UndefinedColumnError as col_err:
+        # LLM_COMMENT: Log specific column error if it happens again
+        list_log.critical("Undefined column error listing documents - Schema mismatch?", error=str(col_err), query=query)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database schema error.")
     except Exception as e: list_log.error("Failed to list docs", error=str(e), exc_info=True); raise
 
-# LLM_COMMENT: delete_document remains the same logic (only deletes PG record)
-# LLM_COMMENT: Deletion of MinIO/Milvus data happens in the endpoint logic
+# LLM_COMMENT: Delete document remains the same
 async def delete_document(document_id: uuid.UUID) -> bool:
     """
     Elimina un documento de la tabla `documents` por su ID.
@@ -181,7 +175,6 @@ async def delete_document(document_id: uuid.UUID) -> bool:
     try:
         async with pool.acquire() as conn:
             result = await conn.execute(query, document_id)
-        # result is 'DELETE X'
         deleted = isinstance(result, str) and result.startswith("DELETE") and int(result.split(" ")[1]) > 0
         if deleted:
             delete_log.info("Document record deleted from PostgreSQL.", result=result)
@@ -190,10 +183,9 @@ async def delete_document(document_id: uuid.UUID) -> bool:
         return deleted
     except Exception as e:
         delete_log.error("Error deleting document record from PostgreSQL", error=str(e), exc_info=True)
-        raise # Re-throw DB errors
+        raise
 
-# --- Funciones de Chat (Sin cambios, mantenidas por consistencia si se comparten) ---
-# LLM_COMMENT: Keep Chat functions for potential shared DB client usage, no functional changes needed here.
+# --- Funciones de Chat (Sin cambios) ---
 async def create_chat(user_id: uuid.UUID, company_id: uuid.UUID, title: Optional[str] = None) -> uuid.UUID:
     pool = await get_db_pool()
     chat_id = uuid.uuid4()
