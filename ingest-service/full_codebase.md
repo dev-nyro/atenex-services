@@ -333,11 +333,18 @@ async def list_ingestion_statuses(
                 count = await get_milvus_chunk_count(status_obj.document_id)
                 status_obj.milvus_chunk_count = count
                 status_obj.chunk_count = count
+                # Si hay chunks, actualizar estado y mensaje
                 if count > 0 and status_obj.status != DocumentStatus.ERROR:
                     status_obj.status = DocumentStatus.PROCESSED
                     status_obj.message = "Document processed successfully."
+                # Persistir estado real en la DB para mantener datos actualizados
+                await postgres_client.update_document_status(
+                    document_id=status_obj.document_id,
+                    status=status_obj.status,
+                    chunk_count=count
+                )
             except Exception as ex:
-                list_log.error("Milvus count failed", document_id=str(status_obj.document_id), error=str(ex))
+                list_log.error("Error enriching/persisting status", document_id=str(status_obj.document_id), error=str(ex))
             return status_obj
         # Lanzar verificaciones en paralelo
         tasks = [asyncio.create_task(enrich(st, doc)) for st, doc in zip(base_statuses, docs)]

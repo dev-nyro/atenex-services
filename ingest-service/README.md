@@ -75,7 +75,7 @@ graph TD
 
 ## 3. Características Clave
 
-*   **API RESTful:** Endpoints para ingesta (`/upload`), consulta de estado (`/status`, `/status/{id}`) y reintento (`/retry/{document_id}`).
+*   **API RESTful:** Endpoints para ingesta (`/upload`), consulta de estado (`/status`, `/status/{id}`), reintento (`/retry/{document_id}`) y eliminación (`/{document_id}`).
 *   **Procesamiento Asíncrono:** Desacoplamiento mediante Celery y Redis (en `nyro-develop`).
 *   **Almacenamiento de Archivos:** Persistencia de originales en MinIO (bucket `atenex` en `nyro-develop`).
 *   **Pipeline Haystack Integrado:** Orquesta conversión, chunking, embedding (OpenAI) y escritura en Milvus.
@@ -111,7 +111,7 @@ ingest-service/
 │   │       ├── __init__.py
 │   │       ├── endpoints/
 │   │       │   ├── __init__.py
-│   │       │   └── ingest.py # Endpoints: /upload, /status, /status/{id}, /retry/{document_id}
+│   │       │   └── ingest.py # Endpoints: /upload, /status, /status/{id}, /retry/{document_id}, /{document_id}
 │   │       └── schemas.py    # Schemas Pydantic: IngestResponse, StatusResponse
 │   ├── core/                 # Configuración, Logging
 │   │   ├── __init__.py
@@ -307,6 +307,21 @@ Prefijo base: `/api/v1/ingest` (definido en `main.py`)
     *   `404 Not Found`: Si el documento no existe o no pertenece a la compañía.
     *   `409 Conflict`: Si el documento no está en estado `error`.
     *   `500 Internal Server Error`: Si ocurre un error inesperado.
+
+---
+
+### Eliminar Documento
+
+* **Endpoint:** `DELETE /{document_id}` (URL completa: `DELETE /api/v1/ingest/{document_id}`)
+* **Descripción:** Elimina un documento junto con sus chunks de Milvus, el archivo en MinIO y su registro en PostgreSQL.
+* **Headers Requeridos:**
+  * `X-Company-ID`: (String UUID) Identificador de la empresa propietaria.
+* **Path Parameters:**
+  * `document_id`: (String UUID) ID del documento a eliminar.
+* **Respuesta Exitosa (`204 No Content`):** Indica que la eliminación se completó correctamente.
+* **Respuestas Error:**
+  * `404 Not Found`: Si el documento no existe o no pertenece a la compañía.
+  * `500 Internal Server Error`: Si ocurre un error inesperado durante la eliminación.
 
 ---
 
