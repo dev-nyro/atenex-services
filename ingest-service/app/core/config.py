@@ -41,7 +41,10 @@ class Settings(BaseSettings):
 
     # --- General ---
     PROJECT_NAME: str = "Atenex Ingest Service"
-    API_V1_STR: str = "/api/v1"
+    # ¡¡¡¡NUNCA MODIFICAR ESTA RUTA!!!
+    # Esta ruta DEBE ser exactamente '/api/v1/ingest' para que el API Gateway funcione correctamente.
+    # Si la cambias, romperás la integración y el proxy de rutas. Si tienes dudas, consulta con el equipo de plataforma.
+    API_V1_STR: str = "/api/v1/ingest"
     LOG_LEVEL: str = "INFO"
 
     # --- Celery ---

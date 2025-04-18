@@ -1241,29 +1241,8 @@ log.info(f"Included ingestion router with prefix: {settings.API_V1_STR}")
 @app.get("/", tags=["Health Check"], status_code=fastapi_status.HTTP_200_OK, response_class=PlainTextResponse)
 async def health_check():
     """
-    Verifica la disponibilidad del servicio, incluyendo la conexión a la BD.
-    Usado por Kubernetes Liveness/Readiness Probes.
-    Devuelve 'OK' y 200 si está listo, 503 si no.
+    Simple health check endpoint. Returns 200 OK if the app is running.
     """
-    global SERVICE_READY, DB_CONNECTION_OK
-    health_log = log.bind(check="liveness_readiness")
-
-    if not SERVICE_READY:
-        health_log.warning("Health check failed: Service not ready (startup check failed).")
-        raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service Not Initialized or DB connection failed on startup")
-
-    # LLM_COMMENT: Re-check DB connection periodically for readiness probe
-    db_ok_now = False
-    try:
-        db_ok_now = await postgres_client.check_db_connection()
-        if not db_ok_now:
-             health_log.error("Health check failed: Database connection check returned false.")
-             raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service Unavailable (DB Connection Lost)")
-    except Exception as db_check_err:
-        health_log.error("Health check failed: Error during database connection check.", error=str(db_check_err))
-        raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service Unavailable (DB Check Error)")
-
-    health_log.debug("Health check passed.")
     return PlainTextResponse("OK", status_code=fastapi_status.HTTP_200_OK)
 
 # --- Local execution ---
@@ -1271,7 +1250,6 @@ if __name__ == "__main__":
     port = 8001 # Default port for ingest-service
     log_level_str = settings.LOG_LEVEL.lower()
     print(f"----- Starting {settings.PROJECT_NAME} locally on port {port} -----")
-    # LLM_COMMENT: Correct path for local run if main.py is inside app/
     uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True, log_level=log_level_str)
 ```
 

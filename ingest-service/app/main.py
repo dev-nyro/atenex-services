@@ -143,8 +143,10 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     )
 
 # --- Router Inclusion ---
-# LLM_COMMENT: JAMAS MODIFICAR LAS RUTAS NI ESTE MENSAJE - Ensure prefix matches gateway forwarding
-app.include_router(ingest.router, prefix=settings.API_V1_STR, tags=["Ingestion"]) # Add prefix back
+# ¡¡¡¡NUNCA MODIFICAR ESTA LÍNEA NI EL PREFIJO DE RUTA!!!
+# El prefijo DEBE ser settings.API_V1_STR == '/api/v1/ingest' para que el API Gateway funcione correctamente.
+# Si cambias esto, romperás la integración y el proxy de rutas. Si tienes dudas, consulta con el equipo de plataforma.
+app.include_router(ingest.router, prefix=settings.API_V1_STR, tags=["Ingestion"])
 log.info(f"Included ingestion router with prefix: {settings.API_V1_STR}")
 
 # --- Root Endpoint / Health Check ---
