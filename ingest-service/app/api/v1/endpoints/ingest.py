@@ -151,6 +151,12 @@ async def ingest_document_haystack(
         )
         task_id = task.id
         request_log.info("Haystack processing task queued", task_id=task_id)
+        # Marcar el estado como PROCESSING en la base de datos
+        try:
+            await postgres_client.update_document_status(document_id=document_id, status=DocumentStatus.PROCESSING)
+            request_log.info("Document status updated to PROCESSING after enqueuing task")
+        except Exception as db_err:
+            request_log.error("Failed to update status to PROCESSING after queuing task", error=str(db_err))
         return schemas.IngestResponse(document_id=document_id, task_id=task_id, status=DocumentStatus.UPLOADED, message="Document received and queued.")
 
     except HTTPException as http_exc: raise http_exc
