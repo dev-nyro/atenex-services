@@ -234,7 +234,6 @@ async def get_ingestion_status(
 
 @router.get(
     "/status",
-    # Devolvemos una lista del mismo schema, pero minio_exists y milvus_chunk_count serán None
     response_model=List[schemas.StatusResponse],
     status_code=status.HTTP_200_OK,
     summary="Listar estados de ingesta para la compañía (desde DB)",
@@ -252,36 +251,49 @@ async def list_ingestion_statuses(
     try:
         # 1. Obtener documentos de PostgreSQL
         documents_data = await postgres_client.list_documents_by_company(company_id, limit=limit, offset=offset)
-
-        response_list = []
+        response_list: List[schemas.StatusResponse] = []
         for doc_dict in documents_data:
-            # 2. Validar/Mapear cada documento con el schema Pydantic
-            # Los campos minio_exists y milvus_chunk_count serán None por defecto
-            # ya que no los estamos consultando aquí.
             try:
+                # Mapear campos base
                 status_response = schemas.StatusResponse.model_validate(doc_dict)
-
-                # 3. (Opcional pero recomendado) Añadir mensaje genérico basado en estado DB
+                # Mensaje genérico inicial
                 status_messages = {
                     DocumentStatus.UPLOADED: "Document uploaded, awaiting processing.",
                     DocumentStatus.PROCESSING: "Document is currently being processed.",
-                    DocumentStatus.PROCESSED: "Document processed.", # Mensaje más genérico para la lista
-                    DocumentStatus.INDEXED: "Document indexed.",    # Si se usa
+                    DocumentStatus.PROCESSED: "Document processed successfully.",
+                    DocumentStatus.INDEXED: "Document processed and indexed.",
                     DocumentStatus.ERROR: f"Processing error: {doc_dict.get('error_message') or 'Check details'}",
                 }
                 status_response.message = status_messages.get(status_response.status, "Unknown status.")
-
+                # Verificar MinIO
+                minio_exists = False
+                file_path = doc_dict.get("file_path")
+                if file_path:
+                    try:
+                        minio_exists = await MinioStorageClient().file_exists(file_path)
+                    except Exception as ex:
+                        list_log.error("Error checking MinIO existence", object_path=file_path, error=str(ex))
+                status_response.minio_exists = minio_exists
+                # Contar chunks en Milvus
+                milvus_count = 0
+                try:
+                    milvus_count = await get_milvus_chunk_count(status_response.document_id)
+                except Exception as ex:
+                    list_log.error("Error counting Milvus chunks", document_id=str(status_response.document_id), error=str(ex))
+                status_response.milvus_chunk_count = milvus_count
+                # Ajustar conteo de chunks y estado si ya fue indexado
+                status_response.chunk_count = milvus_count
+                if milvus_count > 0 and status_response.status != DocumentStatus.ERROR:
+                    status_response.status = DocumentStatus.PROCESSED
+                    status_response.message = status_messages.get(DocumentStatus.PROCESSED)
                 response_list.append(status_response)
             except Exception as validation_err:
-                list_log.error("Error validating document data from DB", doc_id=doc_dict.get("id"), error=str(validation_err), data=doc_dict)
-                # Opcionalmente, podrías continuar y omitir este documento o retornar error 500
-
-        list_log.info(f"Returning status list (from DB) for {len(response_list)} documents")
+                list_log.error("Error validating/enriching document status", doc_id=doc_dict.get("id"), error=str(validation_err))
+        list_log.info(f"Returning enriched status list for {len(response_list)} documents")
         return response_list
     except Exception as e:
-        list_log.exception("Error listing document statuses from DB")
+        list_log.exception("Error listing document statuses from DB with enrichment")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error listing document statuses.")
-
 
 @router.post(
     "/retry/{document_id}",
