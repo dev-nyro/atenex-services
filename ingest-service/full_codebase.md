@@ -600,7 +600,10 @@ class Settings(BaseSettings):
 
     # --- General ---
     PROJECT_NAME: str = "Atenex Ingest Service"
-    API_V1_STR: str = "/api/v1"
+    # ¡¡¡¡NUNCA MODIFICAR ESTA RUTA!!!
+    # Esta ruta DEBE ser exactamente '/api/v1/ingest' para que el API Gateway funcione correctamente.
+    # Si la cambias, romperás la integración y el proxy de rutas. Si tienes dudas, consulta con el equipo de plataforma.
+    API_V1_STR: str = "/api/v1/ingest"
     LOG_LEVEL: str = "INFO"
 
     # --- Celery ---
@@ -1233,8 +1236,10 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     )
 
 # --- Router Inclusion ---
-# LLM_COMMENT: JAMAS MODIFICAR LAS RUTAS NI ESTE MENSAJE - Ensure prefix matches gateway forwarding
-app.include_router(ingest.router, prefix=settings.API_V1_STR, tags=["Ingestion"]) # Add prefix back
+# ¡¡¡¡NUNCA MODIFICAR ESTA LÍNEA NI EL PREFIJO DE RUTA!!!
+# El prefijo DEBE ser settings.API_V1_STR == '/api/v1/ingest' para que el API Gateway funcione correctamente.
+# Si cambias esto, romperás la integración y el proxy de rutas. Si tienes dudas, consulta con el equipo de plataforma.
+app.include_router(ingest.router, prefix=settings.API_V1_STR, tags=["Ingestion"])
 log.info(f"Included ingestion router with prefix: {settings.API_V1_STR}")
 
 # --- Root Endpoint / Health Check ---
@@ -1325,41 +1330,29 @@ class BaseServiceClient:
         headers: Optional[Dict[str, str]] = None,
     ) -> httpx.Response:
         """Realiza una petición HTTP con reintentos."""
-        log.debug(f"Requesting {self.service_name}", method=method, endpoint=endpoint, params=params, json_keys=list(json.keys()) if json else None)
+        log.debug(f"Requesting {self.service_name}", method=method, endpoint=endpoint, params=params)
         try:
             response = await self.client.request(
-                method,
-                endpoint,
+                method=method,
+                url=endpoint,
                 params=params,
                 json=json,
                 data=data,
                 files=files,
-                headers=headers
+                headers=headers,
             )
-            response.raise_for_status() # Lanza HTTPStatusError para 4xx/5xx
-            log.debug(f"{self.service_name} request successful", method=method, endpoint=endpoint, status_code=response.status_code)
+            response.raise_for_status()
+            log.info(f"Received response from {self.service_name}", status_code=response.status_code)
             return response
         except httpx.HTTPStatusError as e:
-            log.error(
-                f"{self.service_name} request failed with status code",
-                method=method, endpoint=endpoint, status_code=e.response.status_code, response_text=e.response.text,
-                exc_info=False # No mostrar traceback completo para errores HTTP esperados
-            )
-            raise # Re-lanzar para que tenacity lo capture si es necesario
+            log.error(f"HTTP error from {self.service_name}", status_code=e.response.status_code, detail=e.response.text)
+            raise
         except (httpx.TimeoutException, httpx.NetworkError) as e:
-            log.error(
-                f"{self.service_name} request failed due to network/timeout issue",
-                method=method, endpoint=endpoint, error=type(e).__name__,
-                exc_info=True
-            )
-            raise # Re-lanzar para que tenacity lo capture
+            log.error(f"Network error when calling {self.service_name}", error=str(e))
+            raise
         except Exception as e:
-             log.error(
-                f"An unexpected error occurred during {self.service_name} request",
-                method=method, endpoint=endpoint, error=e,
-                exc_info=True
-            )
-             raise
+            log.error(f"Unexpected error when calling {self.service_name}", error=str(e), exc_info=True)
+            raise
 ```
 
 ## File: `app\services\minio_client.py`
@@ -1408,7 +1401,6 @@ class MinioStorageClient:
             log.error(f"Error checking/creating MinIO bucket '{self.bucket_name}'", error=str(e), exc_info=True)
             raise
 
-    # LLM_COMMENT: upload_file remains the same
     async def upload_file(
         self,
         company_id: uuid.UUID,
@@ -1423,27 +1415,26 @@ class MinioStorageClient:
         upload_log.info("Queueing file upload to MinIO executor")
 
         loop = asyncio.get_running_loop()
-        try:
+        def _upload():
             file_content_stream.seek(0)
-            def _put_object():
-                return self.client.put_object(
-                    self.bucket_name,
-                    object_name,
-                    file_content_stream,
-                    content_length,
-                    content_type=content_type
-                )
-            result = await loop.run_in_executor(None, _put_object)
-            upload_log.info("File uploaded successfully to MinIO via executor", etag=getattr(result, 'etag', None), version_id=getattr(result, 'version_id', None))
+            return self.client.put_object(
+                bucket_name=self.bucket_name,
+                object_name=object_name,
+                data=file_content_stream,
+                length=content_length,
+                content_type=content_type
+            )
+        try:
+            await loop.run_in_executor(None, _upload)
+            upload_log.info("File uploaded successfully to MinIO via executor")
             return object_name
         except S3Error as e:
-            upload_log.error("Failed to upload file to MinIO via executor", error=str(e), code=e.code, exc_info=True)
+            upload_log.error("Failed to upload file to MinIO", error=str(e), code=e.code)
             raise IOError(f"Failed to upload to storage: {e.code}") from e
         except Exception as e:
-            upload_log.error("Unexpected error during file upload via executor", error=str(e), exc_info=True)
-            raise IOError(f"Unexpected storage upload error") from e
+            upload_log.error("Unexpected error during file upload", error=str(e), exc_info=True)
+            raise IOError("Unexpected storage upload error") from e
 
-    # LLM_COMMENT: download_file_stream_sync remains the same
     def download_file_stream_sync(self, object_name: str) -> io.BytesIO:
         """Operación SÍNCRONA para descargar un archivo a BytesIO."""
         download_log = log.bind(bucket=self.bucket_name, object_name=object_name)
@@ -1470,7 +1461,6 @@ class MinioStorageClient:
                 response.close()
                 response.release_conn()
 
-    # LLM_COMMENT: download_file_stream remains the same
     async def download_file_stream(self, object_name: str) -> io.BytesIO:
         """Descarga un archivo de MinIO como BytesIO de forma asíncrona."""
         download_log = log.bind(bucket=self.bucket_name, object_name=object_name)
@@ -1487,51 +1477,39 @@ class MinioStorageClient:
             download_log.error("Error downloading file via executor", error=str(e), error_type=type(e).__name__, exc_info=True)
             raise IOError(f"Failed to download file via executor: {e}") from e
 
-    # LLM_COMMENT: file_exists remains the same
     async def file_exists(self, object_name: str) -> bool:
-        """Verifica si un objeto existe en MinIO."""
         check_log = log.bind(bucket=self.bucket_name, object_name=object_name)
         loop = asyncio.get_running_loop()
-        try:
-            def _stat_object():
-                return self.client.stat_object(self.bucket_name, object_name)
-            await loop.run_in_executor(None, _stat_object)
-            check_log.debug("Object found in MinIO")
+        def _stat():
+            self.client.stat_object(self.bucket_name, object_name)
             return True
+        try:
+            return await loop.run_in_executor(None, _stat)
         except S3Error as e:
-            if getattr(e, 'code', None) == 'NoSuchKey':
-                check_log.debug("Object does not exist in MinIO", code=e.code)
+            if getattr(e, 'code', None) in ('NoSuchKey', 'NoSuchBucket'):
+                check_log.warning("Object not found in MinIO", code=e.code)
                 return False
-            check_log.error("Error checking MinIO object existence (S3Error)", error=str(e), code=e.code)
+            check_log.error("Error checking MinIO object existence", error=str(e), code=e.code)
             raise IOError(f"Error checking storage existence: {e.code}") from e
         except Exception as e:
             check_log.error("Unexpected error checking MinIO object existence", error=str(e), exc_info=True)
             raise IOError("Unexpected error checking storage existence") from e
 
-    # LLM_COMMENT: Added delete_file method
     async def delete_file(self, object_name: str) -> None:
-        """Elimina un objeto de MinIO de forma asíncrona."""
         delete_log = log.bind(bucket=self.bucket_name, object_name=object_name)
         delete_log.info("Queueing file deletion from MinIO executor")
         loop = asyncio.get_running_loop()
+        def _remove():
+            self.client.remove_object(self.bucket_name, object_name)
         try:
-            def _remove_object():
-                # LLM_COMMENT: Use remove_object for the synchronous call
-                self.client.remove_object(self.bucket_name, object_name)
-            await loop.run_in_executor(None, _remove_object)
-            delete_log.info("File deleted successfully from MinIO via executor")
+            await loop.run_in_executor(None, _remove)
+            delete_log.info("File deleted successfully from MinIO")
         except S3Error as e:
-            # LLM_COMMENT: Log error but don't necessarily fail if object was already gone
-            if getattr(e, 'code', None) == 'NoSuchKey':
-                 delete_log.warning("Attempted to delete non-existent object from MinIO", code=e.code)
-                 # Optionally return success or specific indicator? For now, just log.
-            else:
-                 delete_log.error("Failed to delete file from MinIO", error=str(e), code=e.code, exc_info=True)
-                 # LLM_COMMENT: Re-raise as IOError to signal failure to the caller
-                 raise IOError(f"Failed to delete from storage: {e.code}") from e
+            delete_log.error("Failed to delete file from MinIO", error=str(e), code=e.code)
+            # No raise para que eliminación parcial no bloquee flujo
         except Exception as e:
-            delete_log.error("Unexpected error during file deletion via executor", error=str(e), exc_info=True)
-            raise IOError(f"Unexpected storage deletion error") from e
+            delete_log.error("Unexpected error during file deletion", error=str(e), exc_info=True)
+            raise IOError("Unexpected storage deletion error") from e
 ```
 
 ## File: `app\tasks\__init__.py`

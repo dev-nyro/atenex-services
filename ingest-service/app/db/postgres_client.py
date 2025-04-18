@@ -42,7 +42,7 @@ async def get_db_pool() -> asyncpg.Pool:
 
 async def close_db_pool():
     global _pool
-    if _pool and not _pool._closed: log.info("Closing PostgreSQL connection pool..."); await _pool.close(); _pool = None; log.info("PostgreSQL connection pool closed.")
+    if (_pool and not _pool._closed): log.info("Closing PostgreSQL connection pool..."); await _pool.close(); _pool = None; log.info("PostgreSQL connection pool closed.")
     elif _pool and _pool._closed: log.warning("Attempted to close an already closed PostgreSQL pool."); _pool = None
     else: log.info("No active PostgreSQL connection pool to close.")
 
@@ -56,30 +56,23 @@ async def check_db_connection() -> bool:
 
 # --- Document Operations ---
 async def create_document(company_id: uuid.UUID, file_name: str, file_type: str, metadata: Dict[str, Any]) -> uuid.UUID:
-    pool = await get_db_pool(); doc_id = uuid.uuid4()
-    # LLM_COMMENT: Set initial chunk_count to 0 and error_message to NULL
+    pool = await get_db_pool()
+    doc_id = uuid.uuid4()
     query = """
     INSERT INTO documents (id, company_id, file_name, file_type, file_path, metadata, status, chunk_count, error_message, uploaded_at, updated_at)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC') RETURNING id;
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC');
     """
-    insert_log = log.bind(company_id=str(company_id), filename=file_name, content_type=file_type, proposed_doc_id=str(doc_id))
+    params = [doc_id, company_id, file_name, file_type, None, json.dumps(metadata), DocumentStatus.UPLOADED.value, 0]
+    insert_log = log.bind(company_id=str(company_id), filename=file_name, doc_id=str(doc_id))
     try:
-        metadata_json = json.dumps(metadata)
-        async with pool.acquire() as connection:
-            # LLM_COMMENT: Parameter index adjusted for new columns (chunk_count=0, error_message=NULL)
-            result_id = await connection.fetchval(query, doc_id, company_id, file_name, file_type, '', metadata_json, DocumentStatus.UPLOADED.value, 0)
-        if result_id and result_id == doc_id:
-            insert_log.info("Document record created", document_id=str(doc_id)); return result_id
-        else:
-            insert_log.error("Failed to create document record, ID mismatch or no ID returned", returned_id=result_id)
-            raise RuntimeError(f"Failed create document, return mismatch ({result_id})")
-    except asyncpg.exceptions.UniqueViolationError as e:
-        insert_log.error("Unique constraint violation on document creation", error=str(e), constraint=e.constraint_name)
-        raise ValueError(f"Document creation failed: unique constraint ({e.constraint_name})") from e
+        async with pool.acquire() as conn:
+            await conn.execute(query, *params)
+        insert_log.info("Document record created in PostgreSQL")
+        return doc_id
     except Exception as e:
-        insert_log.error("Failed to create document record", error=str(e), exc_info=True); raise
+        insert_log.error("Failed to create document record", error=str(e), exc_info=True)
+        raise
 
-# LLM_COMMENT: Update function now includes error_message handling
 async def update_document_status(
     document_id: uuid.UUID,
     status: DocumentStatus,
@@ -87,102 +80,75 @@ async def update_document_status(
     chunk_count: Optional[int] = None,
     error_message: Optional[str] = None
 ) -> bool:
-    pool = await get_db_pool();
-    update_log = log.bind(document_id=str(document_id), new_status=status.value)
-    fields_to_set: List[str] = []
-    params: List[Any] = [document_id]
-    param_index = 2
-
-    fields_to_set.append(f"status = ${param_index}"); params.append(status.value); param_index += 1
-    fields_to_set.append(f"updated_at = NOW() AT TIME ZONE 'UTC'")
-
-    if file_path is not None: fields_to_set.append(f"file_path = ${param_index}"); params.append(file_path); param_index += 1
-    if chunk_count is not None: fields_to_set.append(f"chunk_count = ${param_index}"); params.append(chunk_count); param_index += 1
-
-    # LLM_COMMENT: Handle error_message. Set it if status is ERROR, clear it (set to NULL) otherwise.
-    # LLM_COMMENT: ASSUMES `error_message` COLUMN EXISTS IN `documents` TABLE NOW.
-    if status == DocumentStatus.ERROR:
-        # Truncate error message if needed
-        truncated_error = (error_message[:497] + '...') if error_message and len(error_message) > 500 else error_message
-        fields_to_set.append(f"error_message = ${param_index}"); params.append(truncated_error); param_index += 1
-        update_log = update_log.bind(error=truncated_error)
-    else:
-        # Clear error message for non-error statuses
-        fields_to_set.append(f"error_message = NULL");
-        # No parameter needed for NULL
-
-    query = f"UPDATE documents SET {', '.join(fields_to_set)} WHERE id = $1;";
-    update_log.debug("Executing status update", query=query, params_count=len(params))
-    try:
-        async with pool.acquire() as connection:
-             result_str = await connection.execute(query, *params)
-        affected_rows = 0
-        if isinstance(result_str, str) and result_str.startswith("UPDATE "):
-            try: affected_rows = int(result_str.split(" ")[1])
-            except (IndexError, ValueError): update_log.warning("Could not parse affected rows from UPDATE result", result=result_str)
-
-        if affected_rows > 0:
-             update_log.info("Document status updated", rows=affected_rows)
-             return True
-        else:
-             update_log.warning("Document status update affected 0 rows (document might not exist?)")
-             return False
-    except Exception as e:
-        update_log.error("Failed to update document status", error=str(e), exc_info=True); raise
-
-# LLM_COMMENT: Get status includes error_message
-async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]]:
-    pool = await get_db_pool(); get_log = log.bind(document_id=str(document_id))
-    # LLM_COMMENT: Query now includes error_message
-    query = """
-    SELECT id, status, file_name, file_type, chunk_count, file_path, updated_at, company_id, error_message
-    FROM documents WHERE id = $1;
-    """
-    try:
-        async with pool.acquire() as connection: record = await connection.fetchrow(query, document_id)
-        if record: get_log.debug("Document status retrieved"); return dict(record)
-        else: get_log.warning("Document status requested for non-existent ID"); return None
-    except Exception as e: get_log.error("Failed to get status", error=str(e), exc_info=True); raise
-
-# LLM_COMMENT: List function corrected - REMOVE error_message selection as it doesn't exist per schema
-async def list_documents_by_company(company_id: uuid.UUID, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-    pool = await get_db_pool(); list_log = log.bind(company_id=str(company_id), limit=limit, offset=offset)
-    # LLM_COMMENT: CORRECTED QUERY - Removed error_message from SELECT list
-    query = """
-    SELECT id, status, file_name, file_type, chunk_count, file_path, updated_at
-    FROM documents
-    WHERE company_id = $1 ORDER BY updated_at DESC LIMIT $2 OFFSET $3;
-    """
-    try:
-        async with pool.acquire() as connection: records = await connection.fetch(query, company_id, limit, offset)
-        result_list = [dict(record) for record in records]; list_log.info(f"Retrieved {len(result_list)} docs for company")
-        return result_list
-    except asyncpg.exceptions.UndefinedColumnError as col_err:
-        # LLM_COMMENT: Log specific column error if it happens again
-        list_log.critical("Undefined column error listing documents - Schema mismatch?", error=str(col_err), query=query)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database schema error.")
-    except Exception as e: list_log.error("Failed to list docs", error=str(e), exc_info=True); raise
-
-# LLM_COMMENT: Delete document remains the same
-async def delete_document(document_id: uuid.UUID) -> bool:
-    """
-    Elimina un documento de la tabla `documents` por su ID.
-    Devuelve True si se eliminó al menos una fila, False si no existía.
-    """
     pool = await get_db_pool()
-    delete_log = log.bind(document_id=str(document_id))
-    query = "DELETE FROM documents WHERE id = $1;"
+    params: List[Any] = [document_id]
+    fields: List[str] = ["status = $2", "updated_at = NOW() AT TIME ZONE 'UTC'"]
+    params.append(status.value)
+    param_index = 3
+    if file_path is not None:
+        fields.append(f"file_path = ${param_index}"); params.append(file_path); param_index += 1
+    if chunk_count is not None:
+        fields.append(f"chunk_count = ${param_index}"); params.append(chunk_count); param_index += 1
+    if status == DocumentStatus.ERROR:
+        fields.append(f"error_message = ${param_index}"); params.append(error_message)
+    else:
+        fields.append("error_message = NULL")
+    set_clause = ", ".join(fields)
+    query = f"UPDATE documents SET {set_clause} WHERE id = $1;"
+    update_log = log.bind(document_id=str(document_id), new_status=status.value)
     try:
         async with pool.acquire() as conn:
-            result = await conn.execute(query, document_id)
-        deleted = isinstance(result, str) and result.startswith("DELETE") and int(result.split(" ")[1]) > 0
-        if deleted:
-            delete_log.info("Document record deleted from PostgreSQL.", result=result)
-        else:
-            delete_log.warning("Attempted to delete non-existent document record.", result=result)
-        return deleted
+            await conn.execute(query, *params)
+        update_log.info("Document status updated in PostgreSQL")
+        return True
     except Exception as e:
-        delete_log.error("Error deleting document record from PostgreSQL", error=str(e), exc_info=True)
+        update_log.error("Failed to update document status", error=str(e), exc_info=True)
+        raise
+
+async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+    pool = await get_db_pool()
+    query = """
+    SELECT id, company_id, file_name, file_type, file_path, metadata, status, chunk_count, error_message, uploaded_at, updated_at
+    FROM documents WHERE id = $1;
+    """
+    get_log = log.bind(document_id=str(document_id))
+    try:
+        async with pool.acquire() as conn:
+            record = await conn.fetchrow(query, document_id)
+        if not record:
+            get_log.warning("Queried non-existent document_id")
+            return None
+        return dict(record)
+    except Exception as e:
+        get_log.error("Failed to get document status", error=str(e), exc_info=True)
+        raise
+
+async def list_documents_by_company(company_id: uuid.UUID, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+    pool = await get_db_pool()
+    query = """
+    SELECT id, company_id, file_name, file_type, file_path, metadata, status, chunk_count, error_message, uploaded_at, updated_at
+    FROM documents WHERE company_id = $1 ORDER BY updated_at DESC LIMIT $2 OFFSET $3;
+    """
+    list_log = log.bind(company_id=str(company_id), limit=limit, offset=offset)
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(query, company_id, limit, offset)
+        return [dict(r) for r in rows]
+    except Exception as e:
+        list_log.error("Failed to list documents by company", error=str(e), exc_info=True)
+        raise
+
+async def delete_document(document_id: uuid.UUID) -> bool:
+    pool = await get_db_pool()
+    query = "DELETE FROM documents WHERE id = $1 RETURNING id;"
+    delete_log = log.bind(document_id=str(document_id))
+    try:
+        async with pool.acquire() as conn:
+            deleted_id = await conn.fetchval(query, document_id)
+        delete_log.info("Document deleted from PostgreSQL", deleted_id=str(deleted_id))
+        return deleted_id is not None
+    except Exception as e:
+        delete_log.error("Error deleting document record", error=str(e), exc_info=True)
         raise
 
 # --- Funciones de Chat (Sin cambios) ---

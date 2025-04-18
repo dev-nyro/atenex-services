@@ -120,50 +120,23 @@ async def ingest_document_haystack(
             request_log.warning("Intento de subida duplicada detectado", filename=file.filename, status=doc["status"])
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Ya existe un documento con el mismo nombre en estado '{doc['status']}'. Elimina o reintenta el anterior antes de subir uno nuevo.")
 
-    minio_client = None; minio_object_name = None; document_id = None; task_id = None
-    try:
-        document_id = await postgres_client.create_document(
-            company_id=company_id,
-            file_name=file.filename or "untitled",
-            file_type=content_type,
-            metadata=metadata
-        )
-        request_log = request_log.bind(document_id=str(document_id))
-
-        file_content = await file.read(); content_length = len(file_content)
-        if content_length == 0:
-            await postgres_client.update_document_status(document_id=document_id, status=DocumentStatus.ERROR, error_message="Uploaded file is empty.")
-            request_log.warning("Uploaded file is empty")
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file cannot be empty.")
-
-        file_stream = io.BytesIO(file_content)
-        minio_client = MinioStorageClient()
-        minio_object_name = await minio_client.upload_file(company_id=company_id, document_id=document_id, file_name=file.filename or "untitled", file_content_stream=file_stream, content_type=content_type, content_length=content_length)
-        await postgres_client.update_document_status(document_id=document_id, status=DocumentStatus.UPLOADED, file_path=minio_object_name)
-
-        task = process_document_haystack_task.delay(
-            document_id_str=str(document_id),
-            company_id_str=str(company_id),
-            minio_object_name=minio_object_name,
-            file_name=file.filename or "untitled",
-            content_type=content_type,
-            original_metadata=metadata
-        )
-        task_id = task.id
-        request_log.info("Haystack processing task queued", task_id=task_id)
-        return schemas.IngestResponse(document_id=document_id, task_id=task_id, status=DocumentStatus.UPLOADED, message="Document received and queued.")
-
-    except HTTPException as http_exc: raise http_exc
-    except (IOError, S3Error) as storage_err:
-        request_log.error("Storage error during upload", error=str(storage_err))
-        if document_id: await postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=f"Storage upload failed: {storage_err}")
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Storage service error.")
-    except Exception as e:
-        request_log.exception("Unexpected error during document ingestion")
-        if document_id: await postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=f"Ingestion error: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error during ingestion.")
-    finally:
-        if file: await file.close()
+    minio_client = MinioStorageClient()
+    # 1) Persistir registro inicial en DB
+    document_id = await postgres_client.create_document(company_id, file.filename, file.content_type, metadata)
+    request_log = request_log.bind(document_id=str(document_id))
+    # 2) Subir archivo a MinIO
+    file_bytes = await file.read()
+    file_stream = io.BytesIO(file_bytes)
+    object_name = await minio_client.upload_file(company_id, document_id, file.filename, file_stream, file.content_type, len(file_bytes))
+    # 3) Actualizar file_path en DB
+    await postgres_client.update_document_status(document_id, DocumentStatus.UPLOADED, file_path=object_name)
+    # 4) Encolar tarea Celery
+    task = process_document_haystack_task.delay(
+        str(document_id), str(company_id), object_name, file.filename, file.content_type, metadata
+    )
+    # 5) Actualizar estado a processing
+    await postgres_client.update_document_status(document_id, DocumentStatus.PROCESSING)
+    return schemas.IngestResponse(document_id=document_id, task_id=task.id, status=DocumentStatus.PROCESSING, message="Document upload received and queued for processing.")
 
 @router.get(
     "/status/{document_id}",
@@ -181,18 +154,18 @@ async def get_ingestion_status(
     status_log = log.bind(request_id=request_id, document_id=str(document_id), company_id=str(company_id))
     status_log.info("Received request for single document status")
     try:
-        doc_data = await postgres_client.get_document_status(document_id)
-        if not doc_data:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-        if doc_data.get("company_id") != company_id:
-            status_log.warning("Attempt to access document status from another company", owner_company=str(doc_data.get('company_id')))
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+        record = await postgres_client.get_document_status(document_id)
+        if not record:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Documento no encontrado.")
+        if record.get("company_id") != company_id:
+            status_log.warning("Attempt to access document status from another company", owner_company=str(record.get('company_id')))
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Documento no encontrado.")
 
         # Convertir a Pydantic ANTES de añadir campos extra
-        response_data = schemas.StatusResponse.model_validate(doc_data)
+        response_data = schemas.StatusResponse.model_validate(record)
 
         # Verificar existencia real en MinIO
-        file_path = doc_data.get("file_path")
+        file_path = record.get("file_path")
         minio_exists_check = False # Default a False
         if file_path:
             try:
@@ -220,12 +193,12 @@ async def get_ingestion_status(
             DocumentStatus.PROCESSING: "Document is currently being processed.",
             DocumentStatus.PROCESSED: "Document processed successfully.",
             DocumentStatus.INDEXED: "Document processed and indexed.", # Si se usa
-            DocumentStatus.ERROR: f"Processing error: {doc_data.get('error_message') or 'Unknown error'}", # Usar error_message de doc_data
+            DocumentStatus.ERROR: f"Processing error: {record.get('error_message') or 'Unknown error'}", # Usar error_message de record
         }
-        response_data.message = status_messages.get(DocumentStatus(doc_data["status"]), "Unknown status.")
+        response_data.message = status_messages.get(DocumentStatus(record["status"]), "Unknown status.")
 
         status_log.info("Returning detailed document status", status=response_data.status, minio_exists=response_data.minio_exists, milvus_chunks=response_data.milvus_chunk_count)
-        return doc_data
+        return response_data
 
     except HTTPException as http_exc: raise http_exc
     except Exception as e:
@@ -249,18 +222,18 @@ async def list_ingestion_statuses(
     list_log = log.bind(request_id=request_id, company_id=str(company_id), limit=limit, offset=offset)
     list_log.info("Listing document statuses with real-time checks")
     try:
-        docs = await postgres_client.list_documents_by_company(company_id, limit=limit, offset=offset)
+        records = await postgres_client.list_documents_by_company(company_id, limit=limit, offset=offset)
         # Mapear datos base a Pydantic
         base_statuses: List[schemas.StatusResponse] = []
-        for doc in docs:
+        for record in records:
             try:
-                base_statuses.append(schemas.StatusResponse.model_validate(doc))
+                base_statuses.append(schemas.StatusResponse.model_validate(record))
             except Exception as e:
-                list_log.error("Error validating base status", doc_id=doc.get("id"), error=str(e))
+                list_log.error("Error validating base status", doc_id=record.get("id"), error=str(e))
         # Función para enriquecer cada status en paralelo
-        async def enrich(status_obj: schemas.StatusResponse, doc: Dict[str, Any]) -> schemas.StatusResponse:
+        async def enrich(status_obj: schemas.StatusResponse, record: Dict[str, Any]) -> schemas.StatusResponse:
             # Verificar MinIO
-            file_path = doc.get("file_path")
+            file_path = record.get("file_path")
             try:
                 status_obj.minio_exists = await MinioStorageClient().file_exists(file_path) if file_path else False
             except Exception as ex:
@@ -285,7 +258,7 @@ async def list_ingestion_statuses(
                 list_log.error("Error enriching/persisting status", document_id=str(status_obj.document_id), error=str(ex))
             return status_obj
         # Lanzar verificaciones en paralelo
-        tasks = [asyncio.create_task(enrich(st, doc)) for st, doc in zip(base_statuses, docs)]
+        tasks = [asyncio.create_task(enrich(st, record)) for st, record in zip(base_statuses, records)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         final_list: List[schemas.StatusResponse] = []
         for res in results:
@@ -294,7 +267,7 @@ async def list_ingestion_statuses(
             else:
                 final_list.append(res)
         list_log.info("Returning enriched statuses", count=len(final_list))
-        return docs
+        return final_list
     except Exception as e:
         list_log.exception("Error listing enriched statuses")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error retrieving document statuses.")
