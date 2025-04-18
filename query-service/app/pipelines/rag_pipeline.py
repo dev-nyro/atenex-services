@@ -32,7 +32,6 @@ def get_milvus_document_store() -> MilvusDocumentStore:
         store = MilvusDocumentStore(
             connection_args={"uri": connection_uri},
             collection_name=settings.MILVUS_COLLECTION_NAME,
-            embedding_dim=settings.EMBEDDING_DIMENSION, # LLM_COMMENT: Dimension is important for potential auto-creation
             embedding_field=settings.MILVUS_EMBEDDING_FIELD,
             content_field=settings.MILVUS_CONTENT_FIELD,
             metadata_fields=settings.MILVUS_METADATA_FIELDS,
@@ -245,6 +244,5 @@ async def check_pipeline_dependencies() -> Dict[str, str]:
     else:
          results["fastembed_model"] = "config_missing"
          check_log.error("FastEmbed dependency check: Model name MISSING in configuration.")
-
 
     return results
