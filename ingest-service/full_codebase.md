@@ -182,50 +182,23 @@ async def ingest_document_haystack(
             request_log.warning("Intento de subida duplicada detectado", filename=file.filename, status=doc["status"])
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Ya existe un documento con el mismo nombre en estado '{doc['status']}'. Elimina o reintenta el anterior antes de subir uno nuevo.")
 
-    minio_client = None; minio_object_name = None; document_id = None; task_id = None
-    try:
-        document_id = await postgres_client.create_document(
-            company_id=company_id,
-            file_name=file.filename or "untitled",
-            file_type=content_type,
-            metadata=metadata
-        )
-        request_log = request_log.bind(document_id=str(document_id))
-
-        file_content = await file.read(); content_length = len(file_content)
-        if content_length == 0:
-            await postgres_client.update_document_status(document_id=document_id, status=DocumentStatus.ERROR, error_message="Uploaded file is empty.")
-            request_log.warning("Uploaded file is empty")
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file cannot be empty.")
-
-        file_stream = io.BytesIO(file_content)
-        minio_client = MinioStorageClient()
-        minio_object_name = await minio_client.upload_file(company_id=company_id, document_id=document_id, file_name=file.filename or "untitled", file_content_stream=file_stream, content_type=content_type, content_length=content_length)
-        await postgres_client.update_document_status(document_id=document_id, status=DocumentStatus.UPLOADED, file_path=minio_object_name)
-
-        task = process_document_haystack_task.delay(
-            document_id_str=str(document_id),
-            company_id_str=str(company_id),
-            minio_object_name=minio_object_name,
-            file_name=file.filename or "untitled",
-            content_type=content_type,
-            original_metadata=metadata
-        )
-        task_id = task.id
-        request_log.info("Haystack processing task queued", task_id=task_id)
-        return schemas.IngestResponse(document_id=document_id, task_id=task_id, status=DocumentStatus.UPLOADED, message="Document received and queued.")
-
-    except HTTPException as http_exc: raise http_exc
-    except (IOError, S3Error) as storage_err:
-        request_log.error("Storage error during upload", error=str(storage_err))
-        if document_id: await postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=f"Storage upload failed: {storage_err}")
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Storage service error.")
-    except Exception as e:
-        request_log.exception("Unexpected error during document ingestion")
-        if document_id: await postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=f"Ingestion error: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error during ingestion.")
-    finally:
-        if file: await file.close()
+    minio_client = MinioStorageClient()
+    # 1) Persistir registro inicial en DB
+    document_id = await postgres_client.create_document(company_id, file.filename, file.content_type, metadata)
+    request_log = request_log.bind(document_id=str(document_id))
+    # 2) Subir archivo a MinIO
+    file_bytes = await file.read()
+    file_stream = io.BytesIO(file_bytes)
+    object_name = await minio_client.upload_file(company_id, document_id, file.filename, file_stream, file.content_type, len(file_bytes))
+    # 3) Actualizar file_path en DB
+    await postgres_client.update_document_status(document_id, DocumentStatus.UPLOADED, file_path=object_name)
+    # 4) Encolar tarea Celery
+    task = process_document_haystack_task.delay(
+        str(document_id), str(company_id), object_name, file.filename, file.content_type, metadata
+    )
+    # 5) Actualizar estado a processing
+    await postgres_client.update_document_status(document_id, DocumentStatus.PROCESSING)
+    return schemas.IngestResponse(document_id=document_id, task_id=task.id, status=DocumentStatus.PROCESSING, message="Document upload received and queued for processing.")
 
 @router.get(
     "/status/{document_id}",
@@ -243,18 +216,18 @@ async def get_ingestion_status(
     status_log = log.bind(request_id=request_id, document_id=str(document_id), company_id=str(company_id))
     status_log.info("Received request for single document status")
     try:
-        doc_data = await postgres_client.get_document_status(document_id)
-        if not doc_data:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-        if doc_data.get("company_id") != company_id:
-            status_log.warning("Attempt to access document status from another company", owner_company=str(doc_data.get('company_id')))
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+        record = await postgres_client.get_document_status(document_id)
+        if not record:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Documento no encontrado.")
+        if record.get("company_id") != company_id:
+            status_log.warning("Attempt to access document status from another company", owner_company=str(record.get('company_id')))
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Documento no encontrado.")
 
         # Convertir a Pydantic ANTES de añadir campos extra
-        response_data = schemas.StatusResponse.model_validate(doc_data)
+        response_data = schemas.StatusResponse.model_validate(record)
 
         # Verificar existencia real en MinIO
-        file_path = doc_data.get("file_path")
+        file_path = record.get("file_path")
         minio_exists_check = False # Default a False
         if file_path:
             try:
@@ -282,9 +255,9 @@ async def get_ingestion_status(
             DocumentStatus.PROCESSING: "Document is currently being processed.",
             DocumentStatus.PROCESSED: "Document processed successfully.",
             DocumentStatus.INDEXED: "Document processed and indexed.", # Si se usa
-            DocumentStatus.ERROR: f"Processing error: {doc_data.get('error_message') or 'Unknown error'}", # Usar error_message de doc_data
+            DocumentStatus.ERROR: f"Processing error: {record.get('error_message') or 'Unknown error'}", # Usar error_message de record
         }
-        response_data.message = status_messages.get(DocumentStatus(doc_data["status"]), "Unknown status.")
+        response_data.message = status_messages.get(DocumentStatus(record["status"]), "Unknown status.")
 
         status_log.info("Returning detailed document status", status=response_data.status, minio_exists=response_data.minio_exists, milvus_chunks=response_data.milvus_chunk_count)
         return response_data
@@ -311,18 +284,18 @@ async def list_ingestion_statuses(
     list_log = log.bind(request_id=request_id, company_id=str(company_id), limit=limit, offset=offset)
     list_log.info("Listing document statuses with real-time checks")
     try:
-        docs = await postgres_client.list_documents_by_company(company_id, limit=limit, offset=offset)
+        records = await postgres_client.list_documents_by_company(company_id, limit=limit, offset=offset)
         # Mapear datos base a Pydantic
         base_statuses: List[schemas.StatusResponse] = []
-        for doc in docs:
+        for record in records:
             try:
-                base_statuses.append(schemas.StatusResponse.model_validate(doc))
+                base_statuses.append(schemas.StatusResponse.model_validate(record))
             except Exception as e:
-                list_log.error("Error validating base status", doc_id=doc.get("id"), error=str(e))
+                list_log.error("Error validating base status", doc_id=record.get("id"), error=str(e))
         # Función para enriquecer cada status en paralelo
-        async def enrich(status_obj: schemas.StatusResponse, doc: Dict[str, Any]) -> schemas.StatusResponse:
+        async def enrich(status_obj: schemas.StatusResponse, record: Dict[str, Any]) -> schemas.StatusResponse:
             # Verificar MinIO
-            file_path = doc.get("file_path")
+            file_path = record.get("file_path")
             try:
                 status_obj.minio_exists = await MinioStorageClient().file_exists(file_path) if file_path else False
             except Exception as ex:
@@ -347,7 +320,7 @@ async def list_ingestion_statuses(
                 list_log.error("Error enriching/persisting status", document_id=str(status_obj.document_id), error=str(ex))
             return status_obj
         # Lanzar verificaciones en paralelo
-        tasks = [asyncio.create_task(enrich(st, doc)) for st, doc in zip(base_statuses, docs)]
+        tasks = [asyncio.create_task(enrich(st, record)) for st, record in zip(base_statuses, records)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         final_list: List[schemas.StatusResponse] = []
         for res in results:
@@ -521,33 +494,59 @@ from datetime import datetime
 #     pass
 
 class IngestResponse(BaseModel):
-    """Respuesta devuelta al iniciar la ingesta."""
     document_id: uuid.UUID
-    task_id: Optional[str] = None # ID de la tarea Celery
-    status: DocumentStatus = DocumentStatus.UPLOADED # Estado inicial UPLOADED
+    task_id: str
+    status: str
     message: str = "Document upload received and queued for processing."
 
-class StatusResponse(BaseModel):
-    """Schema para representar el estado de un documento."""
-    # Usar alias para mapear nombres de columnas de DB a nombres de campo API
-    document_id: uuid.UUID = Field(..., alias="id")
-    status: DocumentStatus # El enum se valida automáticamente
-    file_name: Optional[str] = None
-    file_type: Optional[str] = None
-    chunk_count: Optional[int] = None
-    # Estado actual en MinIO
-    minio_exists: Optional[bool] = None
-    # Número de chunks indexados en Milvus
-    milvus_chunk_count: Optional[int] = None
-    last_updated: Optional[datetime] = Field(None, alias="updated_at")
-    # Mensaje descriptivo añadido en el endpoint, no viene de la DB directamente
-    message: Optional[str] = Field(None, exclude=False) # Incluir en respuesta si se añade
+    class Config:
+        schema_extra = {
+            "example": {
+                "document_id": "123e4567-e89b-12d3-a456-426614174000",
+                "task_id": "abcd1234efgh",
+                "status": "processing",
+                "message": "Document upload received and queued for processing."
+            }
+        }
 
-    # Configuración Pydantic v2 para mapeo y creación desde atributos
-    model_config = {
-        "populate_by_name": True, # Permite usar 'alias' para mapear desde nombres de DB/dict
-        "from_attributes": True   # Permite crear instancia desde un objeto con atributos (como asyncpg.Record)
-    }
+class StatusResponse(BaseModel):
+    document_id: uuid.UUID = Field(..., alias="id")
+    company_id: uuid.UUID
+    file_name: str
+    file_type: str
+    file_path: Optional[str]
+    metadata: Optional[Dict[str, Any]]
+    status: str
+    chunk_count: int
+    error_message: Optional[str]
+    uploaded_at: datetime
+    updated_at: datetime
+
+    # Fields added by status endpoints
+    minio_exists: bool
+    milvus_chunk_count: int
+    message: str
+
+    class Config:
+        allow_population_by_field_name = True
+        schema_extra = {
+            "example": {
+                "id": "123e4567-e89b-12d3-a456-426614174000",
+                "company_id": "51a66c8f-f6b1-43bd-8038-8768471a8b09",
+                "file_name": "document.pdf",
+                "file_type": "application/pdf",
+                "file_path": "51a66c8f-f6b1-43bd-8038-8768471a8b09/123e4567-e89b-12d3-a456-426614174000/document.pdf",
+                "metadata": {},
+                "status": "processed",
+                "chunk_count": 10,
+                "error_message": None,
+                "uploaded_at": "2025-04-18T20:00:00Z",
+                "updated_at": "2025-04-18T20:30:00Z",
+                "minio_exists": True,
+                "milvus_chunk_count": 10,
+                "message": "Document processed successfully."
+            }
+        }
 ```
 
 ## File: `app\core\__init__.py`
@@ -573,7 +572,8 @@ import json
 # --- Service Names en K8s ---
 POSTGRES_K8S_SVC = "postgresql.nyro-develop.svc.cluster.local"
 MINIO_K8S_SVC = "minio-service.nyro-develop.svc.cluster.local"
-MILVUS_K8S_SVC = "milvus-milvus.default.svc.cluster.local" # Milvus en default ns
+# Correct service and port; use standard host:port format (no http scheme)
+MILVUS_K8S_SVC = "milvus-service.nyro-develop.svc.cluster.local"
 REDIS_K8S_SVC = "redis-service-master.nyro-develop.svc.cluster.local"
 
 # --- Defaults ---
@@ -618,7 +618,8 @@ class Settings(BaseSettings):
     POSTGRES_DB: str = POSTGRES_K8S_DB_DEFAULT
 
     # --- Milvus ---
-    MILVUS_URI: str = Field(default=f"http://{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}")
+    # Connect via host:port string; no HTTP prefix
+    MILVUS_URI: str = Field(default=f"{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}")
     MILVUS_COLLECTION_NAME: str = MILVUS_DEFAULT_COLLECTION
     # LLM_COMMENT: Ensure metadata fields include filtering keys and display keys
     MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name", "file_type"])
@@ -866,7 +867,7 @@ _pool: Optional[asyncpg.Pool] = None
 # --- Pool Management (Sin cambios) ---
 async def get_db_pool() -> asyncpg.Pool:
     global _pool
-    if _pool is None or _pool._closed:
+    if (_pool is None or _pool._closed):
         log.info("Creating PostgreSQL connection pool...", host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT, user=settings.POSTGRES_USER, db=settings.POSTGRES_DB)
         try:
             def _json_encoder(value): return json.dumps(value)
@@ -892,7 +893,7 @@ async def get_db_pool() -> asyncpg.Pool:
 
 async def close_db_pool():
     global _pool
-    if _pool and not _pool._closed: log.info("Closing PostgreSQL connection pool..."); await _pool.close(); _pool = None; log.info("PostgreSQL connection pool closed.")
+    if (_pool and not _pool._closed): log.info("Closing PostgreSQL connection pool..."); await _pool.close(); _pool = None; log.info("PostgreSQL connection pool closed.")
     elif _pool and _pool._closed: log.warning("Attempted to close an already closed PostgreSQL pool."); _pool = None
     else: log.info("No active PostgreSQL connection pool to close.")
 
@@ -906,30 +907,24 @@ async def check_db_connection() -> bool:
 
 # --- Document Operations ---
 async def create_document(company_id: uuid.UUID, file_name: str, file_type: str, metadata: Dict[str, Any]) -> uuid.UUID:
-    pool = await get_db_pool(); doc_id = uuid.uuid4()
-    # LLM_COMMENT: Set initial chunk_count to 0 and error_message to NULL
+    pool = await get_db_pool()
+    doc_id = uuid.uuid4()
     query = """
     INSERT INTO documents (id, company_id, file_name, file_type, file_path, metadata, status, chunk_count, error_message, uploaded_at, updated_at)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC') RETURNING id;
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC');
     """
-    insert_log = log.bind(company_id=str(company_id), filename=file_name, content_type=file_type, proposed_doc_id=str(doc_id))
+    # Use empty string for file_path to satisfy NOT NULL constraint
+    params = [doc_id, company_id, file_name, file_type, "", json.dumps(metadata), DocumentStatus.UPLOADED.value, 0]
+    insert_log = log.bind(company_id=str(company_id), filename=file_name, doc_id=str(doc_id))
     try:
-        metadata_json = json.dumps(metadata)
-        async with pool.acquire() as connection:
-            # LLM_COMMENT: Parameter index adjusted for new columns (chunk_count=0, error_message=NULL)
-            result_id = await connection.fetchval(query, doc_id, company_id, file_name, file_type, '', metadata_json, DocumentStatus.UPLOADED.value, 0)
-        if result_id and result_id == doc_id:
-            insert_log.info("Document record created", document_id=str(doc_id)); return result_id
-        else:
-            insert_log.error("Failed to create document record, ID mismatch or no ID returned", returned_id=result_id)
-            raise RuntimeError(f"Failed create document, return mismatch ({result_id})")
-    except asyncpg.exceptions.UniqueViolationError as e:
-        insert_log.error("Unique constraint violation on document creation", error=str(e), constraint=e.constraint_name)
-        raise ValueError(f"Document creation failed: unique constraint ({e.constraint_name})") from e
+        async with pool.acquire() as conn:
+            await conn.execute(query, *params)
+        insert_log.info("Document record created in PostgreSQL")
+        return doc_id
     except Exception as e:
-        insert_log.error("Failed to create document record", error=str(e), exc_info=True); raise
+        insert_log.error("Failed to create document record", error=str(e), exc_info=True)
+        raise
 
-# LLM_COMMENT: Update function now includes error_message handling
 async def update_document_status(
     document_id: uuid.UUID,
     status: DocumentStatus,
@@ -937,102 +932,75 @@ async def update_document_status(
     chunk_count: Optional[int] = None,
     error_message: Optional[str] = None
 ) -> bool:
-    pool = await get_db_pool();
-    update_log = log.bind(document_id=str(document_id), new_status=status.value)
-    fields_to_set: List[str] = []
-    params: List[Any] = [document_id]
-    param_index = 2
-
-    fields_to_set.append(f"status = ${param_index}"); params.append(status.value); param_index += 1
-    fields_to_set.append(f"updated_at = NOW() AT TIME ZONE 'UTC'")
-
-    if file_path is not None: fields_to_set.append(f"file_path = ${param_index}"); params.append(file_path); param_index += 1
-    if chunk_count is not None: fields_to_set.append(f"chunk_count = ${param_index}"); params.append(chunk_count); param_index += 1
-
-    # LLM_COMMENT: Handle error_message. Set it if status is ERROR, clear it (set to NULL) otherwise.
-    # LLM_COMMENT: ASSUMES `error_message` COLUMN EXISTS IN `documents` TABLE NOW.
-    if status == DocumentStatus.ERROR:
-        # Truncate error message if needed
-        truncated_error = (error_message[:497] + '...') if error_message and len(error_message) > 500 else error_message
-        fields_to_set.append(f"error_message = ${param_index}"); params.append(truncated_error); param_index += 1
-        update_log = update_log.bind(error=truncated_error)
-    else:
-        # Clear error message for non-error statuses
-        fields_to_set.append(f"error_message = NULL");
-        # No parameter needed for NULL
-
-    query = f"UPDATE documents SET {', '.join(fields_to_set)} WHERE id = $1;";
-    update_log.debug("Executing status update", query=query, params_count=len(params))
-    try:
-        async with pool.acquire() as connection:
-             result_str = await connection.execute(query, *params)
-        affected_rows = 0
-        if isinstance(result_str, str) and result_str.startswith("UPDATE "):
-            try: affected_rows = int(result_str.split(" ")[1])
-            except (IndexError, ValueError): update_log.warning("Could not parse affected rows from UPDATE result", result=result_str)
-
-        if affected_rows > 0:
-             update_log.info("Document status updated", rows=affected_rows)
-             return True
-        else:
-             update_log.warning("Document status update affected 0 rows (document might not exist?)")
-             return False
-    except Exception as e:
-        update_log.error("Failed to update document status", error=str(e), exc_info=True); raise
-
-# LLM_COMMENT: Get status includes error_message
-async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]]:
-    pool = await get_db_pool(); get_log = log.bind(document_id=str(document_id))
-    # LLM_COMMENT: Query now includes error_message
-    query = """
-    SELECT id, status, file_name, file_type, chunk_count, file_path, updated_at, company_id, error_message
-    FROM documents WHERE id = $1;
-    """
-    try:
-        async with pool.acquire() as connection: record = await connection.fetchrow(query, document_id)
-        if record: get_log.debug("Document status retrieved"); return dict(record)
-        else: get_log.warning("Document status requested for non-existent ID"); return None
-    except Exception as e: get_log.error("Failed to get status", error=str(e), exc_info=True); raise
-
-# LLM_COMMENT: List function corrected - REMOVE error_message selection as it doesn't exist per schema
-async def list_documents_by_company(company_id: uuid.UUID, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-    pool = await get_db_pool(); list_log = log.bind(company_id=str(company_id), limit=limit, offset=offset)
-    # LLM_COMMENT: CORRECTED QUERY - Removed error_message from SELECT list
-    query = """
-    SELECT id, status, file_name, file_type, chunk_count, file_path, updated_at
-    FROM documents
-    WHERE company_id = $1 ORDER BY updated_at DESC LIMIT $2 OFFSET $3;
-    """
-    try:
-        async with pool.acquire() as connection: records = await connection.fetch(query, company_id, limit, offset)
-        result_list = [dict(record) for record in records]; list_log.info(f"Retrieved {len(result_list)} docs for company")
-        return result_list
-    except asyncpg.exceptions.UndefinedColumnError as col_err:
-        # LLM_COMMENT: Log specific column error if it happens again
-        list_log.critical("Undefined column error listing documents - Schema mismatch?", error=str(col_err), query=query)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database schema error.")
-    except Exception as e: list_log.error("Failed to list docs", error=str(e), exc_info=True); raise
-
-# LLM_COMMENT: Delete document remains the same
-async def delete_document(document_id: uuid.UUID) -> bool:
-    """
-    Elimina un documento de la tabla `documents` por su ID.
-    Devuelve True si se eliminó al menos una fila, False si no existía.
-    """
     pool = await get_db_pool()
-    delete_log = log.bind(document_id=str(document_id))
-    query = "DELETE FROM documents WHERE id = $1;"
+    params: List[Any] = [document_id]
+    fields: List[str] = ["status = $2", "updated_at = NOW() AT TIME ZONE 'UTC'"]
+    params.append(status.value)
+    param_index = 3
+    if file_path is not None:
+        fields.append(f"file_path = ${param_index}"); params.append(file_path); param_index += 1
+    if chunk_count is not None:
+        fields.append(f"chunk_count = ${param_index}"); params.append(chunk_count); param_index += 1
+    if status == DocumentStatus.ERROR:
+        fields.append(f"error_message = ${param_index}"); params.append(error_message)
+    else:
+        fields.append("error_message = NULL")
+    set_clause = ", ".join(fields)
+    query = f"UPDATE documents SET {set_clause} WHERE id = $1;"
+    update_log = log.bind(document_id=str(document_id), new_status=status.value)
     try:
         async with pool.acquire() as conn:
-            result = await conn.execute(query, document_id)
-        deleted = isinstance(result, str) and result.startswith("DELETE") and int(result.split(" ")[1]) > 0
-        if deleted:
-            delete_log.info("Document record deleted from PostgreSQL.", result=result)
-        else:
-            delete_log.warning("Attempted to delete non-existent document record.", result=result)
-        return deleted
+            await conn.execute(query, *params)
+        update_log.info("Document status updated in PostgreSQL")
+        return True
     except Exception as e:
-        delete_log.error("Error deleting document record from PostgreSQL", error=str(e), exc_info=True)
+        update_log.error("Failed to update document status", error=str(e), exc_info=True)
+        raise
+
+async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+    pool = await get_db_pool()
+    query = """
+    SELECT id, company_id, file_name, file_type, file_path, metadata, status, chunk_count, error_message, uploaded_at, updated_at
+    FROM documents WHERE id = $1;
+    """
+    get_log = log.bind(document_id=str(document_id))
+    try:
+        async with pool.acquire() as conn:
+            record = await conn.fetchrow(query, document_id)
+        if not record:
+            get_log.warning("Queried non-existent document_id")
+            return None
+        return dict(record)
+    except Exception as e:
+        get_log.error("Failed to get document status", error=str(e), exc_info=True)
+        raise
+
+async def list_documents_by_company(company_id: uuid.UUID, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+    pool = await get_db_pool()
+    query = """
+    SELECT id, company_id, file_name, file_type, file_path, metadata, status, chunk_count, error_message, uploaded_at, updated_at
+    FROM documents WHERE company_id = $1 ORDER BY updated_at DESC LIMIT $2 OFFSET $3;
+    """
+    list_log = log.bind(company_id=str(company_id), limit=limit, offset=offset)
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(query, company_id, limit, offset)
+        return [dict(r) for r in rows]
+    except Exception as e:
+        list_log.error("Failed to list documents by company", error=str(e), exc_info=True)
+        raise
+
+async def delete_document(document_id: uuid.UUID) -> bool:
+    pool = await get_db_pool()
+    query = "DELETE FROM documents WHERE id = $1 RETURNING id;"
+    delete_log = log.bind(document_id=str(document_id))
+    try:
+        async with pool.acquire() as conn:
+            deleted_id = await conn.fetchval(query, document_id)
+        delete_log.info("Document deleted from PostgreSQL", deleted_id=str(deleted_id))
+        return deleted_id is not None
+    except Exception as e:
+        delete_log.error("Error deleting document record", error=str(e), exc_info=True)
         raise
 
 # --- Funciones de Chat (Sin cambios) ---
@@ -1309,15 +1277,8 @@ class BaseServiceClient:
 
     @retry(
         stop=stop_after_attempt(settings.HTTP_CLIENT_MAX_RETRIES),
-        wait=wait_exponential(multiplier=1, min=settings.HTTP_CLIENT_BACKOFF_FACTOR, max=10),
-        retry=retry_if_exception_type((httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError)),
-        reraise=True, # Vuelve a lanzar la excepción después de los reintentos
-        before_sleep=lambda retry_state: log.warning(
-            f"Retrying {retry_state.fn.__name__} for {self.service_name}",
-            attempt=retry_state.attempt_number,
-            wait_time=retry_state.next_action.sleep,
-            error=retry_state.outcome.exception()
-        )
+        wait=wait_exponential(multiplier=settings.HTTP_CLIENT_BACKOFF_FACTOR),
+        retry=retry_if_exception_type(httpx.RequestError)
     )
     async def _request(
         self,
