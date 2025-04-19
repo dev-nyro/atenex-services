@@ -1,6 +1,6 @@
 # ingest-service/app/db/postgres_client.py
 import uuid
-from typing import Any, Optional, Dict, List, Tuple # Añadir Tuple
+from typing import Any, Optional, Dict, List, Tuple
 import asyncpg
 import structlog
 import json
@@ -64,11 +64,13 @@ async def create_document_record(
     conn: asyncpg.Connection, # Pasar conexión explícita
     doc_id: uuid.UUID,
     company_id: uuid.UUID,
-    user_id: uuid.UUID, # Añadido user_id
+    user_id: uuid.UUID,
     filename: str,
     file_type: str,
     minio_object_name: str,
-    status: DocumentStatus = DocumentStatus.PENDING,
+    # --- FIX: Move default argument into function signature ---
+    status: DocumentStatus = DocumentStatus.PENDING, # Default status set here
+    # --- END FIX ---
     metadata: Optional[Dict[str, Any]] = None
 ) -> None:
     """Crea un registro inicial para un documento en la base de datos."""
@@ -76,19 +78,20 @@ async def create_document_record(
     INSERT INTO documents (id, company_id, user_id, file_name, file_type, minio_object_name, metadata, status, chunk_count, error_message, uploaded_at, updated_at)
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC');
     """
-    # Usar minio_object_name directamente
-    # Metadata puede ser None, convertir a JSON
     metadata_db = json.dumps(metadata) if metadata else None
+    # Use status.value from the parameter (which now has a default)
     params = [doc_id, company_id, user_id, filename, file_type, minio_object_name, metadata_db, status.value, 0]
     insert_log = log.bind(company_id=str(company_id), filename=filename, doc_id=str(doc_id))
     try:
-        # Ejecutar en la conexión proporcionada
         await conn.execute(query, *params)
         insert_log.info("Document record created in PostgreSQL")
     except Exception as e:
         insert_log.error("Failed to create document record", error=str(e), exc_info=True)
-        raise # Re-lanzar para que el llamador maneje el error
+        raise
 
+# --- REMOVE incorrect module-level line ---
+# status: DocumentStatus = DocumentStatus.PENDING, # <-- DELETE THIS LINE
+# --- END REMOVE ---
 
 # LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH find_document_by_name_and_company DB logic lightly
 async def find_document_by_name_and_company(conn: asyncpg.Connection, filename: str, company_id: uuid.UUID) -> Optional[Dict[str, Any]]:
@@ -114,14 +117,14 @@ async def find_document_by_name_and_company(conn: asyncpg.Connection, filename: 
 async def update_document_status(
     document_id: uuid.UUID,
     status: DocumentStatus,
-    pool: Optional[asyncpg.Pool] = None, # Hacer pool opcional
-    conn: Optional[asyncpg.Connection] = None, # Permitir pasar conexión
+    pool: Optional[asyncpg.Pool] = None,
+    conn: Optional[asyncpg.Connection] = None,
     chunk_count: Optional[int] = None,
     error_message: Optional[str] = None
 ) -> bool:
     """Actualiza el estado, chunk_count y/o error_message de un documento."""
     if not pool and not conn:
-        pool = await get_db_pool() # Obtener pool si no se pasa conexión
+        pool = await get_db_pool()
 
     params: List[Any] = [document_id]
     fields: List[str] = ["status = $2", "updated_at = NOW() AT TIME ZONE 'UTC'"]
@@ -142,9 +145,9 @@ async def update_document_status(
     update_log = log.bind(document_id=str(document_id), new_status=status.value)
 
     try:
-        if conn: # Usar conexión existente si se pasó
+        if conn:
             result = await conn.execute(query, *params)
-        else: # Adquirir conexión del pool
+        else:
              async with pool.acquire() as connection:
                 result = await connection.execute(query, *params)
 
@@ -176,7 +179,7 @@ async def get_document_by_id(conn: asyncpg.Connection, doc_id: uuid.UUID, compan
         get_log.error("Failed to get document by ID", error=str(e), exc_info=True)
         raise
 
-# --- NUEVA FUNCIÓN ---
+# LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH list_documents_paginated DB logic lightly
 async def list_documents_paginated(
     conn: asyncpg.Connection,
     company_id: uuid.UUID,
@@ -201,22 +204,20 @@ async def list_documents_paginated(
         total = 0
         results = []
         if rows:
-            total = rows[0]['total_count'] # Obtener total del primer registro (es el mismo para todos)
-            # Convertir asyncpg.Record a dict y quitar el campo 'total_count'
+            total = rows[0]['total_count']
             results = [dict(r) for r in rows]
             for r in results:
-                r.pop('total_count', None) # Eliminar el campo auxiliar
+                r.pop('total_count', None)
 
         list_log.debug("Fetched paginated documents", count=len(results), total=total)
         return results, total
     except Exception as e:
         list_log.error("Failed to list paginated documents", error=str(e), exc_info=True)
-        raise # Relanzar para manejo en el endpoint
+        raise
 
 # LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH delete_document DB logic lightly
 async def delete_document(conn: asyncpg.Connection, doc_id: uuid.UUID, company_id: uuid.UUID) -> bool:
     """Elimina un documento verificando la compañía."""
-    # Solo permitir borrar si el ID y company_id coinciden
     query = "DELETE FROM documents WHERE id = $1 AND company_id = $2 RETURNING id;"
     delete_log = log.bind(document_id=str(doc_id), company_id=str(company_id))
     try:
@@ -225,9 +226,8 @@ async def delete_document(conn: asyncpg.Connection, doc_id: uuid.UUID, company_i
             delete_log.info("Document deleted from PostgreSQL", deleted_id=str(deleted_id))
             return True
         else:
-            # No se encontró el documento O no pertenecía a la compañía
             delete_log.warning("Document not found or company mismatch during delete attempt.")
-            return False # Opcionalmente, podría lanzar un error aquí si se prefiere
+            return False
     except Exception as e:
         delete_log.error("Error deleting document record", error=str(e), exc_info=True)
         raise
