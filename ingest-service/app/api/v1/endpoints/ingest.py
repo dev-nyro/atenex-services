@@ -49,10 +49,13 @@ async def get_milvus_chunk_count(document_id: uuid.UUID) -> int:
             milvus_log.info("Milvus count result", count=count)
             return count
         except MilvusException as me:
-             milvus_log.error("Milvus connection/query error in get_milvus_chunk_count", error=str(me), code=getattr(me, 'code', None), exc_info=True)
+             milvus_log.error("Milvus connection/query error in get_milvus_chunk_count", error=str(me), code=getattr(me, 'code', None), exc_info=False) # No loguear traceback completo aquí
              return -1 # Indicar error en el conteo
+        except TypeError as te:
+             # Capturar específicamente el TypeError visto en los logs
+             milvus_log.error(f"MilvusDocumentStore init TypeError in count check: {te}. Check arguments.", exc_info=False)
+             return -1 # Indicar error
         except Exception as e:
-            # Captura el TypeError si el argumento es incorrecto u otros errores
             milvus_log.error(f"Error connecting to or querying Milvus in get_milvus_chunk_count: {type(e).__name__}", error=str(e), exc_info=True)
             return -1 # Indicar error en el conteo
 
@@ -255,8 +258,8 @@ async def get_ingestion_status(
                  new_error_message = "Error: Procesamiento no generó contenido indexable o falló inesperadamente."
                  new_chunk_count = 0
                  needs_db_update = True
-             elif milvus_count != original_chunk_count and current_status == DocumentStatus.PROCESSED:
-                  # Si está procesado pero el conteo no coincide, actualizar el conteo
+             elif milvus_count >= 0 and current_status != DocumentStatus.ERROR and original_chunk_count != milvus_count:
+                  # Si el conteo de Milvus es válido y difiere del de la DB (y no estamos ya en Error)
                   status_log.warning("DB chunk count mismatch. Updating DB count.", db_count=original_chunk_count, milvus_count=milvus_count)
                   new_chunk_count = milvus_count
                   needs_db_update = True # Solo actualiza count si status ya es correcto
@@ -538,6 +541,9 @@ async def delete_document_endpoint(
         delete_log.info("Successfully deleted chunks from Milvus.")
     except Exception as milvus_err:
         error_msg = f"Failed to delete chunks from Milvus: {milvus_err}"
+        # Capturar el TypeError específico aquí también
+        if isinstance(milvus_err, TypeError) and 'embedding_dim' in str(milvus_err):
+             error_msg = f"Milvus TypeError on delete (check arguments like embedding_dim): {milvus_err}"
         delete_log.error(error_msg, exc_info=True)
         errors.append(error_msg)
 
@@ -556,27 +562,38 @@ async def delete_document_endpoint(
     else:
         delete_log.warning("No file_path found in DB, skipping MinIO deletion.")
 
-    # 4. Eliminar registro de PostgreSQL
-    delete_log.info("Attempting to delete record from PostgreSQL...")
-    try:
-        deleted = await postgres_client.delete_document(document_id)
-        if not deleted:
-             error_msg = "Failed to delete document from PostgreSQL (record not found during deletion)."
-             delete_log.error(error_msg)
-             errors.append(error_msg)
-        else:
-             delete_log.info("Document record deleted successfully from PostgreSQL")
-    except Exception as db_err:
-        error_msg = f"Error deleting document record from PostgreSQL: {db_err}"
-        delete_log.exception(error_msg)
-        errors.append(error_msg)
+    # 4. Eliminar registro de PostgreSQL (Solo si no hubo error crítico en Milvus/Minio, opcional)
+    #    Considerar borrar siempre el registro de PG para que no aparezca en la UI,
+    #    incluso si la limpieza en Milvus/Minio falla (dejando datos huérfanos).
+    delete_pg_record = True # Por defecto, intentar borrar de PG
+    if any("Failed to delete" in err for err in errors): # Si hubo error en Milvus o Minio
+        delete_log.warning("Proceeding with PostgreSQL deletion despite errors in other systems.")
+        # Podrías cambiar delete_pg_record a False si prefieres no borrar si algo falló antes
 
-    # Si hubo errores, devolver 500, si no, 204
-    if errors:
-        delete_log.error("Document deletion completed with errors", errors=errors)
-        # Aunque falle algo, devolvemos 204 para no bloquear UI, pero logueamos el error
-        # Si se requiere comportamiento estricto, cambiar a HTTPException 500
-        # raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Document deletion failed for some components: {'; '.join(errors)}")
+    if delete_pg_record:
+        delete_log.info("Attempting to delete record from PostgreSQL...")
+        try:
+            deleted = await postgres_client.delete_document(document_id)
+            if not deleted:
+                 error_msg = "Failed to delete document from PostgreSQL (record not found during deletion)."
+                 delete_log.error(error_msg)
+                 errors.append(error_msg)
+            else:
+                 delete_log.info("Document record deleted successfully from PostgreSQL")
+        except Exception as db_err:
+            error_msg = f"Error deleting document record from PostgreSQL: {db_err}"
+            delete_log.exception(error_msg)
+            errors.append(error_msg)
+
+    # Si hubo errores *críticos* (opcionalmente, puedes decidir qué errores impiden el 204)
+    if errors and any("Failed to delete document from PostgreSQL" in err for err in errors):
+        # Solo lanzar 500 si falla la eliminación de PG (el registro principal)
+        delete_log.error("Document deletion failed critically (PostgreSQL)", errors=errors)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Document deletion failed for critical components: {'; '.join(errors)}")
+    elif errors:
+         # Si falló Milvus o Minio pero PG sí, loguear pero devolver 204
+         delete_log.warning("Document deletion completed with non-critical errors", errors=errors)
+
 
     delete_log.info("Document deletion process finished.")
     return Response(status_code=status.HTTP_204_NO_CONTENT)

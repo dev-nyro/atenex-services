@@ -42,11 +42,11 @@ def _initialize_milvus_store() -> MilvusDocumentStore:
     init_log = log.bind(component="MilvusDocumentStore")
     init_log.info("Attempting to initialize MilvusDocumentStore...")
     try:
-        # *** CORRECCIÓN DEFINITIVA: Usar embedding_dim consistentemente ***
+        # *** CORRECCIÓN DEFINITIVA (REVISADA): Usar embedding_dim ***
         store = MilvusDocumentStore(
             connection_args={"uri": str(settings.MILVUS_URI)},
             collection_name=settings.MILVUS_COLLECTION_NAME,
-            embedding_dim=settings.EMBEDDING_DIMENSION, # CORREGIDO
+            embedding_dim=settings.EMBEDDING_DIMENSION, # CORREGIDO (Debe ser el parámetro correcto para v0.0.6)
             embedding_field=settings.MILVUS_EMBEDDING_FIELD,
             content_field=settings.MILVUS_CONTENT_FIELD,
             metadata_fields=settings.MILVUS_METADATA_FIELDS,
@@ -58,18 +58,20 @@ def _initialize_milvus_store() -> MilvusDocumentStore:
         return store
     except MilvusException as me:
         init_log.error("Milvus connection/initialization failed", code=getattr(me, 'code', None), message=str(me), exc_info=True)
+        # Re-lanzar como ConnectionError para que sea reintentable por Celery
         raise ConnectionError(f"Milvus connection failed: {me}") from me
     except TypeError as te:
-        # Capturar el error específico de argumento inesperado
+        # Este es el error específico visto en los logs
         init_log.error(f"MilvusDocumentStore init TypeError: {te}. Check arguments (e.g., 'embedding_dim').", exc_info=True)
+        # Re-lanzar como RuntimeError para que NO sea reintentable (error de código/config)
         raise RuntimeError(f"Milvus TypeError (check arguments like embedding_dim): {te}") from te
     except Exception as e:
         init_log.exception("Unexpected error during MilvusDocumentStore initialization")
+        # Re-lanzar como RuntimeError para que NO sea reintentable
         raise RuntimeError(f"Unexpected Milvus init error: {e}") from e
 
 # --- (El resto de helpers _initialize_* no cambian) ---
 def _initialize_openai_embedder() -> OpenAIDocumentEmbedder:
-    """Función interna SÍNCRONA para inicializar OpenAIDocumentEmbedder."""
     init_log = log.bind(component="OpenAIDocumentEmbedder")
     init_log.info("Initializing...")
     api_key_value = settings.OPENAI_API_KEY.get_secret_value()
@@ -85,7 +87,6 @@ def _initialize_openai_embedder() -> OpenAIDocumentEmbedder:
     return embedder
 
 def _initialize_splitter() -> DocumentSplitter:
-    """Función interna SÍNCRONA para inicializar DocumentSplitter."""
     init_log = log.bind(component="DocumentSplitter")
     init_log.info("Initializing...")
     splitter = DocumentSplitter(
@@ -97,7 +98,6 @@ def _initialize_splitter() -> DocumentSplitter:
     return splitter
 
 def _initialize_document_writer(store: MilvusDocumentStore) -> DocumentWriter:
-    """Función interna SÍNCRONA para inicializar DocumentWriter."""
     init_log = log.bind(component="DocumentWriter")
     init_log.info("Initializing...")
     writer = DocumentWriter(document_store=store, policy="OVERWRITE")
@@ -105,7 +105,6 @@ def _initialize_document_writer(store: MilvusDocumentStore) -> DocumentWriter:
     return writer
 
 def get_converter_for_content_type(content_type: str) -> Optional[Type]:
-    """Devuelve la clase del conversor Haystack apropiada para el tipo de archivo."""
     converters = {
         "application/pdf": PyPDFToDocument,
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document": DOCXToDocument,
@@ -229,6 +228,7 @@ def process_document_haystack_task(
             # 2. Inicializar componentes Haystack y construir pipeline
             task_log.info("Initializing Haystack components and building pipeline via executor...")
             loop = asyncio.get_running_loop()
+            # --- Ejecutar inicializaciones síncronas en executor ---
             store = await loop.run_in_executor(None, _initialize_milvus_store) # Puede lanzar error
             embedder = await loop.run_in_executor(None, _initialize_openai_embedder)
             splitter = await loop.run_in_executor(None, _initialize_splitter)
@@ -328,6 +328,17 @@ def process_document_haystack_task(
             # Re-levantar la excepción ORIGINAL para que Celery la capture y reintente
             raise e_retry
 
+        except Exception as e_generic: # Capturar cualquier otra excepción inesperada
+             err_type = type(e_generic).__name__
+             err_msg_detail = str(e_generic)[:500]
+             user_error_msg = f"Error inesperado durante el procesamiento ({err_type}). Contacte a soporte."
+             formatted_traceback = traceback.format_exc()
+             task_log.error(f"Unexpected processing error: {err_type}: {err_msg_detail}", traceback=formatted_traceback)
+             final_status = DocumentStatus.ERROR
+             final_error_message = user_error_msg
+             # Considerar esto NO reintentable por defecto
+             raise RuntimeError(user_error_msg) from e_generic
+
         finally:
             if downloaded_file_stream:
                 downloaded_file_stream.close()
@@ -341,14 +352,13 @@ def process_document_haystack_task(
         task_log.error(f"Processing timed out after {TIMEOUT_SECONDS} seconds.")
         final_status = DocumentStatus.ERROR
         final_error_message = "El procesamiento del documento tardó demasiado."
-        task_exception = toe
+        task_exception = toe # Guardar para posible re-raise
     except Exception as outer_exc:
         task_log.exception("Exception caught after running async_process_flow.", exc_info=outer_exc)
-        # El estado y mensaje ya deberían estar seteados dentro del flujo
         if final_status != DocumentStatus.ERROR:
              final_error_message = final_error_message or f"Error inesperado: {outer_exc}"
              final_status = DocumentStatus.ERROR
-        task_exception = outer_exc
+        task_exception = outer_exc # Guardar excepción original
 
     # --- Actualización Final de Estado (Robusta) ---
     task_log.info("Attempting final status update in DB.", status=final_status.value, chunks=processed_chunk_count, error=final_error_message)
@@ -364,12 +374,17 @@ def process_document_haystack_task(
         task_log.info("Haystack document processing task completed successfully.")
         return {"status": "success", "document_id": str(document_id), "chunk_count": processed_chunk_count}
     else:
-        # Si hubo una excepción guardada Y no es una de las que Celery reintenta,
-        # la levantamos para que Celery la marque como FAILED.
+        # Si la tarea falló (final_status es ERROR) y la excepción original
+        # NO es una de las que Celery reintenta automáticamente, la levantamos.
+        # Esto asegura que los errores no reintentables (como ValueError, TypeError, RuntimeError)
+        # marquen la tarea como FAILED en Celery y no se reintenten innecesariamente.
+        # Celery ya maneja el reintento de las excepciones en RETRYABLE_ERRORS.
         if task_exception and not isinstance(task_exception, tuple(celery_app.conf.task_autoretry_for.keys())):
-             task_log.error("Raising final non-retryable exception to Celery.", exception_type=type(task_exception).__name__)
-             raise task_exception
-        # Si no hubo excepción explícita O era reintentable (y este es el último intento),
-        # simplemente devolvemos fallo sin levantar excepción.
+            task_log.error("Raising final non-auto-retryable exception to Celery.", exception_type=type(task_exception).__name__)
+            raise task_exception # Marcar como FAILED en Celery
+
+        # Si llegamos aquí, o bien el estado final es ERROR sin una excepción explícita no reintentable,
+        # o la excepción era reintentable pero ya se agotaron los reintentos (Celery no levantará la excepción de nuevo).
+        # En ambos casos, devolvemos 'failure'.
         task_log.error("Task finished with error status.", final_db_status=final_status.value, error_msg=final_error_message)
         return {"status": "failure", "document_id": str(document_id), "error": final_error_message or "Error desconocido"}
