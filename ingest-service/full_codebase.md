@@ -99,6 +99,7 @@ router = APIRouter()
 
 # --- Helper Functions ---
 
+# LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH get_minio_client dependency setup
 def get_minio_client():
     """Dependency to get Minio client instance."""
     # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Minio Client Dependency
@@ -117,6 +118,7 @@ def get_minio_client():
     # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Minio Client Dependency
 
 # Define retry strategy for database operations within API requests
+# LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH api_db_retry_strategy logic
 # LLM_FLAG: SENSITIVE_RETRY_LOGIC - API DB Retry Strategy
 api_db_retry_strategy = retry(
     stop=stop_after_attempt(2), # Fewer retries for API context
@@ -126,6 +128,7 @@ api_db_retry_strategy = retry(
     before_sleep=before_sleep_log(log, logging.WARNING) # Correct usage
 )
 
+# LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH get_db_conn context manager
 @asynccontextmanager
 async def get_db_conn():
     """Provides a single connection from the pool for API request context."""
@@ -145,6 +148,7 @@ async def get_db_conn():
 
 # Helper for Milvus interactions (Count and Delete)
 # These run synchronously within asyncio's executor
+# LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH Milvus Sync Helpers unless explicitly told to
 def _initialize_milvus_store_sync() -> MilvusDocumentStore:
     """Synchronously initializes MilvusDocumentStore for API helpers."""
     # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Milvus Sync Init Helper
@@ -177,13 +181,13 @@ def _get_milvus_chunk_count_sync(document_id: str, company_id: str) -> int:
         filters = {
             "operator": "AND", # Top-level operator
             "conditions": [
-                 # Assuming meta fields are directly searchable
+                 # Assuming meta fields are directly searchable using dot notation
                 {"field": "meta.document_id", "operator": "==", "value": document_id},
                 {"field": "meta.company_id", "operator": "==", "value": company_id},
             ]
         }
-        # Alternative filter structure if meta fields are nested differently
-        # filters = {"document_id": document_id, "company_id": company_id} # Check MilvusDocumentStore expected format
+        # Note: Ensure the field names 'meta.document_id' and 'meta.company_id' match exactly
+        # how they are stored by the DocumentWriter in Milvus. Check Milvus schema if unsure.
 
         count = store.count_documents(filters=filters)
         count_log.info("Milvus chunk count successful", count=count)
@@ -193,6 +197,8 @@ def _get_milvus_chunk_count_sync(document_id: str, company_id: str) -> int:
         return -1 # Indicate error with -1
     except Exception as e:
         count_log.exception("Error counting documents in Milvus", error=str(e))
+        # Consider logging the filter used for debugging
+        count_log.debug("Filter used for Milvus count", filter_details=json.dumps(filters))
         return -1 # Indicate error with -1
     # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Milvus Sync Count Helper
 
@@ -211,6 +217,7 @@ def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
                 {"field": "meta.company_id", "operator": "==", "value": company_id},
             ]
         }
+        # Note: Ensure field names match storage schema.
         store.delete_documents(filters=filters)
         delete_log.info("Milvus delete operation executed.")
         return True
@@ -219,6 +226,7 @@ def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
         return False
     except Exception as e:
         delete_log.exception("Error deleting documents from Milvus", error=str(e))
+        delete_log.debug("Filter used for Milvus delete", filter_details=json.dumps(filters))
         return False
     # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Milvus Sync Delete Helper
 
@@ -233,6 +241,7 @@ def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
         400: {"model": ErrorDetail, "description": "Bad Request (e.g., invalid metadata, type, duplicate)"},
         415: {"model": ErrorDetail, "description": "Unsupported Media Type"},
         409: {"model": ErrorDetail, "description": "Conflict (Duplicate file)"},
+        422: {"model": ErrorDetail, "description": "Validation Error (Missing Headers)"}, # Added 422
         500: {"model": ErrorDetail, "description": "Internal Server Error"},
         503: {"model": ErrorDetail, "description": "Service Unavailable (DB or MinIO)"},
     }
@@ -242,8 +251,11 @@ async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     metadata_json: Optional[str] = Form(None),
-    company_id: str = Header(..., description="Company ID associated with the document"),
-    user_id: str = Header(..., description="User ID initiating the upload"),
+    # --- HEADER CORRECTION ---
+    # LLM_FLAG: HEADER_FIX - Use alias to match headers sent by gateway
+    company_id: str = Header(..., alias="X-Company-ID", description="Company ID associated with the document"),
+    user_id: str = Header(..., alias="X-User-ID", description="User ID initiating the upload"),
+    # --- END HEADER CORRECTION ---
     minio_client: MinioClient = Depends(get_minio_client),
 ):
     """
@@ -251,13 +263,14 @@ async def upload_document(
     creates a record in PostgreSQL, and queues a Celery task for processing.
     Prevents upload if a non-error document with the same name exists for the company.
     """
-    # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Upload Endpoint Logic
+    # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Upload Endpoint Logic (Functional Part)
     req_id = getattr(request.state, 'request_id', 'N/A')
+    # Log received headers for debugging if needed
     endpoint_log = log.bind(request_id=req_id, company_id=company_id, user_id=user_id,
-                            filename=file.filename, content_type=file.content_type)
+                            filename=file.filename, content_type=file.content_type)#, received_headers=dict(request.headers))
     endpoint_log.info("Processing document ingestion request from gateway")
 
-    # 1. Validate Content-Type
+    # 1. Validate Content-Type (Functional - DO NOT TOUCH unless type support changes)
     if file.content_type not in settings.SUPPORTED_CONTENT_TYPES:
         endpoint_log.warning("Unsupported content type received")
         raise HTTPException(
@@ -265,8 +278,8 @@ async def upload_document(
             detail=f"Unsupported file type: {file.content_type}. Supported types: {', '.join(settings.SUPPORTED_CONTENT_TYPES)}"
         )
 
-    # 2. Validate Metadata JSON (if provided)
-    metadata = {} # Default to empty dict if not provided
+    # 2. Validate Metadata JSON (Functional - DO NOT TOUCH unless metadata handling changes)
+    metadata = {} # Default to empty dict
     if metadata_json:
         try:
             metadata = json.loads(metadata_json)
@@ -279,7 +292,7 @@ async def upload_document(
              endpoint_log.warning(f"Invalid metadata content: {e}")
              raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid metadata content: {e}")
 
-    # 3. Check for Duplicates (in PostgreSQL)
+    # 3. Check for Duplicates (Functional - DO NOT TOUCH DB logic lightly)
     try:
         company_uuid = uuid.UUID(company_id)
         async with get_db_conn() as conn:
@@ -298,6 +311,7 @@ async def upload_document(
                  pass # Allow creation of new record
 
     except ValueError:
+        # This error can happen if company_id from header is not a valid UUID
         endpoint_log.error("Invalid Company ID format provided", company_id_received=company_id)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Company ID format.")
     except HTTPException as http_exc:
@@ -306,7 +320,7 @@ async def upload_document(
         endpoint_log.exception("Error checking for duplicate document", error=str(e))
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error checking for duplicates.")
 
-    # 4. Create Initial Document Record (PostgreSQL)
+    # 4. Create Initial Document Record (Functional - DO NOT TOUCH DB logic lightly)
     document_id = uuid.uuid4()
     object_name = f"{company_id}/{document_id}/{file.filename}"
 
@@ -322,18 +336,19 @@ async def upload_document(
                 filename=file.filename,
                 file_type=file.content_type,
                 minio_object_name=object_name,
-                status=DocumentStatus.PENDING, # Start as PENDING before upload
-                metadata=metadata # Pass parsed metadata
+                status=DocumentStatus.PENDING,
+                metadata=metadata
             )
         endpoint_log.info("Document record created in PostgreSQL", document_id=str(document_id))
     except ValueError:
+        # This error can happen if user_id from header is not a valid UUID
         endpoint_log.error("Invalid User ID format provided", user_id_received=user_id)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid User ID format.")
     except Exception as e:
         endpoint_log.exception("Failed to create document record in PostgreSQL", error=str(e))
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error creating record.")
 
-    # 5. Upload to MinIO
+    # 5. Upload to MinIO (Functional - DO NOT TOUCH MinIO logic lightly)
     try:
         file_content = await file.read()
         await file.seek(0)
@@ -345,19 +360,17 @@ async def upload_document(
         )
         endpoint_log.info("File uploaded successfully to MinIO", object_name=object_name)
 
-        # 6. Update DB status to 'uploaded'
+        # 6. Update DB status to 'uploaded' (Functional - DO NOT TOUCH DB logic lightly)
         async with get_db_conn() as conn:
              # LLM_FLAG: CRITICAL_DB_WRITE - Update status after upload
              await api_db_retry_strategy(db_client.update_document_status)(
                  document_id=document_id,
                  status=DocumentStatus.UPLOADED
-                 # Pool is handled by context manager
              )
         endpoint_log.info("Document status updated to 'uploaded'", document_id=str(document_id))
 
     except MinioError as me:
         endpoint_log.error("Failed to upload file to MinIO", object_name=object_name, error=str(me))
-        # Attempt to mark document as error in DB
         try:
             async with get_db_conn() as conn:
                 await db_client.update_document_status(
@@ -368,7 +381,6 @@ async def upload_document(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Storage service error: {me}")
     except Exception as e:
          endpoint_log.exception("Unexpected error during file upload or DB update", error=str(e))
-         # Attempt to mark document as error in DB
          try:
              async with get_db_conn() as conn:
                  await db_client.update_document_status(
@@ -380,7 +392,7 @@ async def upload_document(
     finally:
          await file.close()
 
-    # 7. Queue Celery Task
+    # 7. Queue Celery Task (Functional - DO NOT TOUCH Celery logic lightly)
     try:
         task_payload = {
             "document_id": str(document_id),
@@ -394,7 +406,6 @@ async def upload_document(
         endpoint_log.info("Document ingestion task queued successfully", task_id=task.id)
     except Exception as e:
         endpoint_log.exception("Failed to queue Celery task", error=str(e))
-        # Attempt to mark document as error
         try:
             async with get_db_conn() as conn:
                 await db_client.update_document_status(
@@ -419,6 +430,7 @@ async def upload_document(
     summary="Get the status of a specific document",
     responses={
         404: {"model": ErrorDetail, "description": "Document not found"},
+        422: {"model": ErrorDetail, "description": "Validation Error (Missing Headers)"}, # Added 422
         500: {"model": ErrorDetail, "description": "Internal Server Error"},
         503: {"model": ErrorDetail, "description": "Service Unavailable (DB, MinIO, Milvus)"},
     }
@@ -426,7 +438,10 @@ async def upload_document(
 async def get_document_status(
     request: Request,
     document_id: uuid.UUID = Path(..., description="The UUID of the document"),
-    company_id: str = Header(..., description="Company ID"),
+    # --- HEADER CORRECTION ---
+    # LLM_FLAG: HEADER_FIX - Use alias to match headers sent by gateway
+    company_id: str = Header(..., alias="X-Company-ID", description="Company ID"),
+    # --- END HEADER CORRECTION ---
     minio_client: MinioClient = Depends(get_minio_client),
 ):
     """
@@ -436,7 +451,7 @@ async def get_document_status(
     - Counts chunks in Milvus (via executor).
     - Updates the DB status if inconsistencies are found (e.g., chunks exist but status is 'uploaded').
     """
-    # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Get Status Endpoint Logic
+    # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Get Status Endpoint Logic (Functional Part)
     req_id = getattr(request.state, 'request_id', 'N/A')
     status_log = log.bind(request_id=req_id, document_id=str(document_id), company_id=company_id)
     status_log.info("Request received for document status")
@@ -453,7 +468,7 @@ async def get_document_status(
     updated_chunk_count = None
     final_error_message = None
 
-    # 1. Get Base Status from DB
+    # 1. Get Base Status from DB (Functional - DO NOT TOUCH DB logic lightly)
     try:
         async with get_db_conn() as conn:
              # LLM_FLAG: CRITICAL_DB_READ - Get document by ID
@@ -464,11 +479,9 @@ async def get_document_status(
             status_log.warning("Document not found in DB")
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
         status_log.info("Retrieved base document data from DB", status=doc_data['status'])
-        # Store initial values for comparison
         updated_status = DocumentStatus(doc_data['status'])
-        updated_chunk_count = doc_data.get('chunk_count') # Can be None
+        updated_chunk_count = doc_data.get('chunk_count')
         final_error_message = doc_data.get('error_message')
-
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
@@ -480,7 +493,7 @@ async def get_document_status(
          status_log.warning("MinIO object name missing in DB record", db_id=doc_data['id'])
          minio_exists = False
     else:
-        # 2. Check MinIO Existence (Async)
+        # 2. Check MinIO Existence (Functional - DO NOT TOUCH MinIO logic lightly)
         status_log.debug("Checking MinIO for file existence", object_name=minio_path)
         minio_exists = await minio_client.check_file_exists_async(minio_path)
         status_log.info("MinIO existence check complete", exists=minio_exists)
@@ -491,7 +504,7 @@ async def get_document_status(
                  updated_status = DocumentStatus.ERROR
                  final_error_message = "File missing from storage."
 
-    # 3. Check Milvus Chunk Count (Sync in Executor)
+    # 3. Check Milvus Chunk Count (Functional - DO NOT TOUCH Milvus logic lightly)
     status_log.debug("Checking Milvus for chunk count...")
     loop = asyncio.get_running_loop()
     milvus_chunk_count = -1 # Default to error state
@@ -501,8 +514,7 @@ async def get_document_status(
             None, _get_milvus_chunk_count_sync, str(document_id), company_id
         )
         status_log.info("Milvus chunk count check complete", count=milvus_chunk_count)
-
-        # --- Logic for handling inconsistencies ---
+        # Inconsistency Logic (Functional - Needs care if status logic changes)
         if milvus_chunk_count == -1:
             status_log.error("Milvus count check failed (returned -1). Treating as error.")
             if updated_status != DocumentStatus.ERROR:
@@ -513,8 +525,8 @@ async def get_document_status(
             status_log.warning("Inconsistency: Chunks found in Milvus but DB status is 'uploaded'. Correcting to 'processed'.")
             needs_update = True
             updated_status = DocumentStatus.PROCESSED
-            updated_chunk_count = milvus_chunk_count # Store the count we found
-            final_error_message = None # Clear error if we are now processed
+            updated_chunk_count = milvus_chunk_count
+            final_error_message = None
         elif milvus_chunk_count == 0 and updated_status == DocumentStatus.PROCESSED:
              status_log.warning("Inconsistency: DB status is 'processed' but no chunks found in Milvus. Correcting to 'error'.")
              needs_update = True
@@ -522,22 +534,19 @@ async def get_document_status(
              updated_chunk_count = 0
              final_error_message = (final_error_message or "") + " Processed data missing (Milvus count is 0)."
         elif updated_status == DocumentStatus.PROCESSED:
-            # If status is already processed, update DB chunk count if it differs from live count
-            # or if DB count was null/zero initially.
             if updated_chunk_count is None or updated_chunk_count != milvus_chunk_count:
                  updated_chunk_count = milvus_chunk_count
                  if doc_data.get('chunk_count') != updated_chunk_count:
-                      needs_update = True # Need to update DB chunk count
-
+                      needs_update = True
     except Exception as e:
         status_log.exception("Unexpected error during Milvus count check", error=str(e))
-        milvus_chunk_count = -1 # Indicate error
+        milvus_chunk_count = -1
         if updated_status != DocumentStatus.ERROR:
             needs_update = True
             updated_status = DocumentStatus.ERROR
             final_error_message = (final_error_message or "") + f" Error checking processed data: {e}."
 
-    # 4. Update DB if inconsistencies were found
+    # 4. Update DB if inconsistencies found (Functional - DO NOT TOUCH DB logic lightly)
     if needs_update:
         status_log.warning("Inconsistency detected, updating document status in DB",
                           new_status=updated_status.value, new_count=updated_chunk_count, new_error=final_error_message)
@@ -551,29 +560,28 @@ async def get_document_status(
                      error_message=final_error_message
                  )
              status_log.info("Document status updated successfully in DB due to inconsistency check.")
-             # Update local data for response
              doc_data['status'] = updated_status.value
              if updated_chunk_count is not None: doc_data['chunk_count'] = updated_chunk_count
              if final_error_message is not None: doc_data['error_message'] = final_error_message
-             else: doc_data['error_message'] = None # Clear if resolved
+             else: doc_data['error_message'] = None
         except Exception as e:
              status_log.exception("Failed to update document status in DB after inconsistency check", error=str(e))
 
-    # 5. Construct and Return Response
+    # 5. Construct and Return Response (Functional - Response structure)
     status_log.info("Returning final document status")
     return StatusResponse(
         document_id=str(doc_data['id']),
-        company_id=doc_data.get('company_id'), # Include company_id
+        company_id=doc_data.get('company_id'),
         status=doc_data['status'],
         file_name=doc_data['file_name'],
         file_type=doc_data['file_type'],
         file_path=doc_data.get('file_path'),
-        chunk_count=doc_data.get('chunk_count', 0), # Use DB value (potentially updated)
-        minio_exists=minio_exists, # Live check result
-        milvus_chunk_count=milvus_chunk_count, # Live check result (or -1 for error)
+        chunk_count=doc_data.get('chunk_count', 0),
+        minio_exists=minio_exists,
+        milvus_chunk_count=milvus_chunk_count,
         last_updated=doc_data['updated_at'],
         uploaded_at=doc_data.get('uploaded_at'),
-        error_message=doc_data.get('error_message'), # Use DB value (potentially updated)
+        error_message=doc_data.get('error_message'),
         metadata=doc_data.get('metadata')
     )
     # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Get Status Endpoint Logic
@@ -584,13 +592,17 @@ async def get_document_status(
     response_model=PaginatedStatusResponse,
     summary="List document statuses with pagination and live checks",
     responses={
+        422: {"model": ErrorDetail, "description": "Validation Error (Missing Headers)"}, # Added 422
         500: {"model": ErrorDetail, "description": "Internal Server Error"},
         503: {"model": ErrorDetail, "description": "Service Unavailable (DB, MinIO, Milvus)"},
     }
 )
 async def list_document_statuses(
     request: Request,
-    company_id: str = Header(..., description="Company ID"),
+    # --- HEADER CORRECTION ---
+    # LLM_FLAG: HEADER_FIX - Use alias to match headers sent by gateway
+    company_id: str = Header(..., alias="X-Company-ID", description="Company ID"),
+    # --- END HEADER CORRECTION ---
     limit: int = Query(30, ge=1, le=100, description="Number of documents per page"),
     offset: int = Query(0, ge=0, description="Offset for pagination"),
     minio_client: MinioClient = Depends(get_minio_client),
@@ -601,7 +613,7 @@ async def list_document_statuses(
     Updates the DB status/chunk_count if inconsistencies are found.
     Returns the potentially updated status information.
     """
-    # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - List Statuses Endpoint Logic
+    # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - List Statuses Endpoint Logic (Functional Part)
     req_id = getattr(request.state, 'request_id', 'N/A')
     list_log = log.bind(request_id=req_id, company_id=company_id, limit=limit, offset=offset)
     list_log.info("Listing document statuses with real-time checks")
@@ -615,7 +627,7 @@ async def list_document_statuses(
     documents_db: List[Dict[str, Any]] = []
     total_count: int = 0
 
-    # 1. Get paginated list from DB
+    # 1. Get paginated list from DB (Functional - DO NOT TOUCH DB logic lightly)
     try:
         async with get_db_conn() as conn:
              # LLM_FLAG: CRITICAL_DB_READ - List documents paginated
@@ -630,7 +642,7 @@ async def list_document_statuses(
     if not documents_db:
         return PaginatedStatusResponse(items=[], total=0, limit=limit, offset=offset)
 
-    # --- Perform Live Checks in Parallel ---
+    # --- Perform Live Checks in Parallel (Functional - DO NOT TOUCH concurrency logic lightly) ---
     async def check_single_document(doc_db_data: Dict[str, Any]) -> Dict[str, Any]:
         """Async helper to check MinIO/Milvus for one document."""
         # LLM_FLAG: SENSITIVE_SUB_LOGIC - Parallel check for single document
@@ -640,7 +652,6 @@ async def list_document_statuses(
         minio_exists_live = False
         milvus_count_live = -1
         doc_needs_update = False
-        # Start with current DB values
         doc_updated_status_val = doc_db_data['status']
         doc_updated_chunk_count = doc_db_data.get('chunk_count')
         doc_final_error_msg = doc_db_data.get('error_message')
@@ -707,40 +718,30 @@ async def list_document_statuses(
                 doc_updated_status_val = DocumentStatus.ERROR.value
                 doc_final_error_msg = (doc_final_error_msg or "") + f" Error checking processed data: {e}."
 
-        # Return results including whether an update is needed
         return {
-            "db_data": doc_db_data,
-            "needs_update": doc_needs_update,
-            "updated_status": doc_updated_status_val,
-            "updated_chunk_count": doc_updated_chunk_count,
-            "final_error_message": doc_final_error_msg,
-            "live_minio_exists": minio_exists_live,
+            "db_data": doc_db_data, "needs_update": doc_needs_update,
+            "updated_status": doc_updated_status_val, "updated_chunk_count": doc_updated_chunk_count,
+            "final_error_message": doc_final_error_msg, "live_minio_exists": minio_exists_live,
             "live_milvus_chunk_count": milvus_count_live,
         }
         # LLM_FLAG: SENSITIVE_SUB_LOGIC_END - Parallel check
 
-    # Run checks concurrently
     check_tasks = [check_single_document(doc) for doc in documents_db]
     check_results = await asyncio.gather(*check_tasks)
 
-    # Update DB for inconsistent documents
+    # Update DB (Functional - DO NOT TOUCH DB logic lightly)
     updated_doc_data_map = {}
     docs_to_update_in_db = []
     for result in check_results:
         doc_id_str = str(result["db_data"]["id"])
         if result["needs_update"]:
             docs_to_update_in_db.append({
-                "id": result["db_data"]["id"],
-                "status": DocumentStatus(result["updated_status"]),
-                "chunk_count": result["updated_chunk_count"],
-                "error_message": result["final_error_message"],
+                "id": result["db_data"]["id"], "status": DocumentStatus(result["updated_status"]),
+                "chunk_count": result["updated_chunk_count"], "error_message": result["final_error_message"],
             })
-        # Store potentially updated data for response construction
         updated_doc_data_map[doc_id_str] = {
-             **result["db_data"],
-             "status": result["updated_status"],
-             "chunk_count": result["updated_chunk_count"],
-             "error_message": result["final_error_message"],
+             **result["db_data"], "status": result["updated_status"],
+             "chunk_count": result["updated_chunk_count"], "error_message": result["final_error_message"],
         }
 
     if docs_to_update_in_db:
@@ -751,10 +752,8 @@ async def list_document_statuses(
                      try:
                          # LLM_FLAG: CRITICAL_DB_WRITE - Update status based on checks (List)
                          await api_db_retry_strategy(db_client.update_document_status)(
-                             document_id=update_info["id"],
-                             status=update_info["status"],
-                             chunk_count=update_info["chunk_count"],
-                             error_message=update_info["error_message"]
+                             document_id=update_info["id"], status=update_info["status"],
+                             chunk_count=update_info["chunk_count"], error_message=update_info["error_message"]
                          )
                          list_log.info("Successfully updated DB status", document_id=str(update_info["id"]), new_status=update_info["status"].value)
                      except Exception as single_update_err:
@@ -763,24 +762,18 @@ async def list_document_statuses(
         except Exception as bulk_update_err:
             list_log.exception("Error during bulk DB status update process", error=str(bulk_update_err))
 
-    # Construct final response using potentially updated data
+    # Construct final response (Functional - Response structure)
     final_items = []
     for result in check_results:
          doc_id_str = str(result["db_data"]["id"])
          current_data = updated_doc_data_map.get(doc_id_str, result["db_data"])
          final_items.append(StatusResponse(
-            document_id=doc_id_str,
-            company_id=current_data.get('company_id'),
-            status=current_data['status'],
-            file_name=current_data['file_name'],
-            file_type=current_data['file_type'],
-            file_path=current_data.get('file_path'),
-            chunk_count=current_data.get('chunk_count', 0),
-            minio_exists=result["live_minio_exists"],
-            milvus_chunk_count=result["live_milvus_chunk_count"],
-            last_updated=current_data['updated_at'],
-            uploaded_at=current_data.get('uploaded_at'),
-            error_message=current_data.get('error_message'),
+            document_id=doc_id_str, company_id=current_data.get('company_id'),
+            status=current_data['status'], file_name=current_data['file_name'],
+            file_type=current_data['file_type'], file_path=current_data.get('file_path'),
+            chunk_count=current_data.get('chunk_count', 0), minio_exists=result["live_minio_exists"],
+            milvus_chunk_count=result["live_milvus_chunk_count"], last_updated=current_data['updated_at'],
+            uploaded_at=current_data.get('uploaded_at'), error_message=current_data.get('error_message'),
             metadata=current_data.get('metadata')
          ))
 
@@ -797,6 +790,7 @@ async def list_document_statuses(
     responses={
         404: {"model": ErrorDetail, "description": "Document not found"},
         409: {"model": ErrorDetail, "description": "Document is not in 'error' state"},
+        422: {"model": ErrorDetail, "description": "Validation Error (Missing Headers)"}, # Added 422
         500: {"model": ErrorDetail, "description": "Internal Server Error"},
         503: {"model": ErrorDetail, "description": "Service Unavailable (DB or Celery)"},
     }
@@ -804,13 +798,16 @@ async def list_document_statuses(
 async def retry_ingestion(
     request: Request,
     document_id: uuid.UUID = Path(..., description="The UUID of the document to retry"),
-    company_id: str = Header(..., description="Company ID"),
-    user_id: str = Header(..., description="User ID initiating the retry"),
+    # --- HEADER CORRECTION ---
+    # LLM_FLAG: HEADER_FIX - Use alias to match headers sent by gateway
+    company_id: str = Header(..., alias="X-Company-ID", description="Company ID"),
+    user_id: str = Header(..., alias="X-User-ID", description="User ID initiating the retry"),
+    # --- END HEADER CORRECTION ---
 ):
     """
     Allows retrying the ingestion process for a document that previously failed.
     """
-    # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Retry Endpoint Logic
+    # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Retry Endpoint Logic (Functional Part)
     req_id = getattr(request.state, 'request_id', 'N/A')
     retry_log = log.bind(request_id=req_id, document_id=str(document_id), company_id=company_id, user_id=user_id)
     retry_log.info("Received request to retry document ingestion")
@@ -821,7 +818,7 @@ async def retry_ingestion(
         retry_log.warning("Invalid Company ID format")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Company ID format.")
 
-    # 1. Get document and verify state
+    # 1. Get document and verify state (Functional - DO NOT TOUCH DB logic lightly)
     doc_data: Optional[Dict[str, Any]] = None
     try:
          async with get_db_conn() as conn:
@@ -847,7 +844,7 @@ async def retry_ingestion(
         retry_log.exception("Error fetching document for retry", error=str(e))
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error checking document for retry.")
 
-    # 2. Update status to 'processing' (clear error message)
+    # 2. Update status to 'processing' (Functional - DO NOT TOUCH DB logic lightly)
     try:
         async with get_db_conn() as conn:
             # LLM_FLAG: CRITICAL_DB_WRITE - Update status for retry
@@ -859,7 +856,7 @@ async def retry_ingestion(
         retry_log.exception("Failed to update document status to 'processing' for retry", error=str(e))
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error updating status for retry.")
 
-    # 3. Re-queue Celery task
+    # 3. Re-queue Celery task (Functional - DO NOT TOUCH Celery logic lightly)
     try:
         task_payload = {
             "document_id": str(document_id),
@@ -873,8 +870,6 @@ async def retry_ingestion(
         retry_log.info("Document reprocessing task queued successfully", task_id=task.id)
     except Exception as e:
         retry_log.exception("Failed to re-queue Celery task for retry", error=str(e))
-        # Attempt to revert status back to 'error'? Could lead to inconsistent state if task was already picked up.
-        # Best to leave in 'processing' and rely on monitoring/manual intervention if queueing fails persistently.
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to queue reprocessing task: {e}")
 
     return IngestResponse(
@@ -892,6 +887,7 @@ async def retry_ingestion(
     summary="Delete a document and its associated data",
     responses={
         404: {"model": ErrorDetail, "description": "Document not found"},
+        422: {"model": ErrorDetail, "description": "Validation Error (Missing Headers)"}, # Added 422
         500: {"model": ErrorDetail, "description": "Internal Server Error"},
         503: {"model": ErrorDetail, "description": "Service Unavailable (DB, MinIO, Milvus)"},
     }
@@ -899,7 +895,10 @@ async def retry_ingestion(
 async def delete_document_endpoint(
     request: Request,
     document_id: uuid.UUID = Path(..., description="The UUID of the document to delete"),
-    company_id: str = Header(..., description="Company ID"),
+    # --- HEADER CORRECTION ---
+    # LLM_FLAG: HEADER_FIX - Use alias to match headers sent by gateway
+    company_id: str = Header(..., alias="X-Company-ID", description="Company ID"),
+    # --- END HEADER CORRECTION ---
     minio_client: MinioClient = Depends(get_minio_client),
 ):
     """
@@ -909,7 +908,7 @@ async def delete_document_endpoint(
     - Removes the record from PostgreSQL.
     Verifies ownership before deletion.
     """
-    # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Delete Endpoint Logic
+    # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Delete Endpoint Logic (Functional Part)
     req_id = getattr(request.state, 'request_id', 'N/A')
     delete_log = log.bind(request_id=req_id, document_id=str(document_id), company_id=company_id)
     delete_log.info("Received request to delete document")
@@ -920,7 +919,7 @@ async def delete_document_endpoint(
         delete_log.warning("Invalid Company ID format")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Company ID format.")
 
-    # 1. Verify document exists and belongs to company
+    # 1. Verify document exists and belongs to company (Functional - DO NOT TOUCH DB logic lightly)
     doc_data: Optional[Dict[str, Any]] = None
     try:
         async with get_db_conn() as conn:
@@ -940,7 +939,7 @@ async def delete_document_endpoint(
 
     errors = [] # Collect non-critical errors
 
-    # 2. Delete from Milvus (Sync in Executor)
+    # 2. Delete from Milvus (Functional - DO NOT TOUCH Milvus logic lightly)
     delete_log.info("Attempting to delete chunks from Milvus...")
     loop = asyncio.get_running_loop()
     try:
@@ -958,7 +957,7 @@ async def delete_document_endpoint(
         errors.append(f"Unexpected error during Milvus delete: {e}")
 
 
-    # 3. Delete from MinIO (Async)
+    # 3. Delete from MinIO (Functional - DO NOT TOUCH MinIO logic lightly)
     minio_path = doc_data.get('minio_object_name')
     if minio_path:
         delete_log.info("Attempting to delete file from MinIO...", object_name=minio_path)
@@ -976,7 +975,7 @@ async def delete_document_endpoint(
         delete_log.warning("Skipping MinIO delete: object name not found in DB record.")
         errors.append("Could not delete from storage: path unknown.")
 
-    # 4. Delete from PostgreSQL (Critical step)
+    # 4. Delete from PostgreSQL (Functional - DO NOT TOUCH DB logic lightly)
     delete_log.info("Attempting to delete record from PostgreSQL...")
     try:
          async with get_db_conn() as conn:

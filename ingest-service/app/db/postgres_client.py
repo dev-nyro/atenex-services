@@ -1,11 +1,12 @@
 # ingest-service/app/db/postgres_client.py
 import uuid
-from typing import Any, Optional, Dict, List
+from typing import Any, Optional, Dict, List, Tuple # Añadir Tuple
 import asyncpg
 import structlog
 import json
 from datetime import datetime, timezone
 
+# LLM_FLAG: FUNCTIONAL_CODE - Imports (DO NOT TOUCH)
 from app.core.config import settings
 from app.models.domain import DocumentStatus
 
@@ -13,7 +14,8 @@ log = structlog.get_logger(__name__)
 
 _pool: Optional[asyncpg.Pool] = None
 
-# --- Pool Management (Sin cambios) ---
+# --- Pool Management (Functional - DO NOT TOUCH) ---
+# LLM_FLAG: SENSITIVE_CODE_BLOCK_START - DB Pool Management
 async def get_db_pool() -> asyncpg.Pool:
     global _pool
     if (_pool is None or _pool._closed):
@@ -53,117 +55,185 @@ async def check_db_connection() -> bool:
             async with conn.transaction(): result = await conn.fetchval("SELECT 1")
         return result == 1
     except Exception as e: log.error("Database connection check failed", error=str(e)); return False
+# LLM_FLAG: SENSITIVE_CODE_BLOCK_END - DB Pool Management
 
 # --- Document Operations ---
-async def create_document(document_id: uuid.UUID, company_id: uuid.UUID, file_name: str, file_type: str, metadata: Dict[str, Any]) -> None:
+
+# LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH create_document DB logic lightly
+async def create_document_record(
+    conn: asyncpg.Connection, # Pasar conexión explícita
+    doc_id: uuid.UUID,
+    company_id: uuid.UUID,
+    user_id: uuid.UUID, # Añadido user_id
+    filename: str,
+    file_type: str,
+    minio_object_name: str,
+    status: DocumentStatus = DocumentStatus.PENDING,
+    metadata: Optional[Dict[str, Any]] = None
+) -> None:
     """Crea un registro inicial para un documento en la base de datos."""
-    pool = await get_db_pool()
     query = """
-    INSERT INTO documents (id, company_id, file_name, file_type, file_path, metadata, status, chunk_count, error_message, uploaded_at, updated_at)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC');
+    INSERT INTO documents (id, company_id, user_id, file_name, file_type, minio_object_name, metadata, status, chunk_count, error_message, uploaded_at, updated_at)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC');
     """
-    # Usar "" como placeholder inicial para file_path y DocumentStatus.UPLOADED
-    params = [document_id, company_id, file_name, file_type, "", json.dumps(metadata), DocumentStatus.UPLOADED.value, 0]
-    insert_log = log.bind(company_id=str(company_id), filename=file_name, doc_id=str(document_id))
+    # Usar minio_object_name directamente
+    # Metadata puede ser None, convertir a JSON
+    metadata_db = json.dumps(metadata) if metadata else None
+    params = [doc_id, company_id, user_id, filename, file_type, minio_object_name, metadata_db, status.value, 0]
+    insert_log = log.bind(company_id=str(company_id), filename=filename, doc_id=str(doc_id))
     try:
-        async with pool.acquire() as conn:
-            await conn.execute(query, *params)
+        # Ejecutar en la conexión proporcionada
+        await conn.execute(query, *params)
         insert_log.info("Document record created in PostgreSQL")
     except Exception as e:
         insert_log.error("Failed to create document record", error=str(e), exc_info=True)
+        raise # Re-lanzar para que el llamador maneje el error
+
+
+# LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH find_document_by_name_and_company DB logic lightly
+async def find_document_by_name_and_company(conn: asyncpg.Connection, filename: str, company_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+    """Busca un documento por nombre y compañía."""
+    query = """
+    SELECT id, status FROM documents
+    WHERE file_name = $1 AND company_id = $2;
+    """
+    find_log = log.bind(company_id=str(company_id), filename=filename)
+    try:
+        record = await conn.fetchrow(query, filename, company_id)
+        if record:
+            find_log.debug("Found existing document record")
+            return dict(record)
+        else:
+            find_log.debug("No existing document record found")
+            return None
+    except Exception as e:
+        find_log.error("Failed to find document by name and company", error=str(e), exc_info=True)
         raise
 
+# LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH update_document_status DB logic lightly
 async def update_document_status(
     document_id: uuid.UUID,
     status: DocumentStatus,
-    file_path: Optional[str] = None,
+    pool: Optional[asyncpg.Pool] = None, # Hacer pool opcional
+    conn: Optional[asyncpg.Connection] = None, # Permitir pasar conexión
     chunk_count: Optional[int] = None,
     error_message: Optional[str] = None
 ) -> bool:
-    """Actualiza el estado, file_path, chunk_count y/o error_message de un documento."""
-    pool = await get_db_pool()
+    """Actualiza el estado, chunk_count y/o error_message de un documento."""
+    if not pool and not conn:
+        pool = await get_db_pool() # Obtener pool si no se pasa conexión
+
     params: List[Any] = [document_id]
     fields: List[str] = ["status = $2", "updated_at = NOW() AT TIME ZONE 'UTC'"]
     params.append(status.value)
     param_index = 3
-    if file_path is not None:
-        fields.append(f"file_path = ${param_index}"); params.append(file_path); param_index += 1
+
     if chunk_count is not None:
         fields.append(f"chunk_count = ${param_index}"); params.append(chunk_count); param_index += 1
 
-    # Manejo de error_message: Limpiar si no es estado ERROR, setear si es ERROR y se provee
     if status == DocumentStatus.ERROR:
-        # Solo añadir/actualizar error_message si se proporciona uno
         if error_message is not None:
             fields.append(f"error_message = ${param_index}"); params.append(error_message); param_index += 1
-        # Si status es ERROR pero no viene mensaje, se mantiene el existente (no añadir "error_message = NULL")
     else:
-        # Si el status NO es ERROR, limpiar el mensaje de error explícitamente
         fields.append("error_message = NULL")
 
     set_clause = ", ".join(fields)
     query = f"UPDATE documents SET {set_clause} WHERE id = $1;"
     update_log = log.bind(document_id=str(document_id), new_status=status.value)
+
     try:
-        async with pool.acquire() as conn:
+        if conn: # Usar conexión existente si se pasó
             result = await conn.execute(query, *params)
-            # Check if update affected any row
-            if result == 'UPDATE 0':
-                 update_log.warning("Attempted to update status for non-existent document_id")
-                 return False
+        else: # Adquirir conexión del pool
+             async with pool.acquire() as connection:
+                result = await connection.execute(query, *params)
+
+        if result == 'UPDATE 0':
+             update_log.warning("Attempted to update status for non-existent document_id")
+             return False
         update_log.info("Document status updated in PostgreSQL")
         return True
     except Exception as e:
         update_log.error("Failed to update document status", error=str(e), exc_info=True)
         raise
 
-async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]]:
-    pool = await get_db_pool()
+# LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH get_document_by_id DB logic lightly
+async def get_document_by_id(conn: asyncpg.Connection, doc_id: uuid.UUID, company_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+    """Obtiene un documento por ID y verifica la compañía."""
     query = """
-    SELECT id, company_id, file_name, file_type, file_path, metadata, status, chunk_count, error_message, uploaded_at, updated_at
-    FROM documents WHERE id = $1;
+    SELECT id, company_id, file_name, file_type, minio_object_name, metadata, status, chunk_count, error_message, uploaded_at, updated_at
+    FROM documents
+    WHERE id = $1 AND company_id = $2;
     """
-    get_log = log.bind(document_id=str(document_id))
+    get_log = log.bind(document_id=str(doc_id), company_id=str(company_id))
     try:
-        async with pool.acquire() as conn:
-            record = await conn.fetchrow(query, document_id)
+        record = await conn.fetchrow(query, doc_id, company_id)
         if not record:
-            get_log.warning("Queried non-existent document_id")
+            get_log.warning("Document not found or company mismatch")
             return None
         return dict(record)
     except Exception as e:
-        get_log.error("Failed to get document status", error=str(e), exc_info=True)
+        get_log.error("Failed to get document by ID", error=str(e), exc_info=True)
         raise
 
-async def list_documents_by_company(company_id: uuid.UUID, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-    pool = await get_db_pool()
+# --- NUEVA FUNCIÓN ---
+async def list_documents_paginated(
+    conn: asyncpg.Connection,
+    company_id: uuid.UUID,
+    limit: int,
+    offset: int
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Lista documentos paginados para una compañía y devuelve el conteo total."""
+    # LLM_FLAG: NEW_FUNCTION - List documents with pagination and total count
     query = """
-    SELECT id, company_id, file_name, file_type, file_path, metadata, status, chunk_count, error_message, uploaded_at, updated_at
-    FROM documents WHERE company_id = $1 ORDER BY updated_at DESC LIMIT $2 OFFSET $3;
+    SELECT
+        id, company_id, file_name, file_type, minio_object_name, metadata, status,
+        chunk_count, error_message, uploaded_at, updated_at,
+        COUNT(*) OVER() AS total_count
+    FROM documents
+    WHERE company_id = $1
+    ORDER BY updated_at DESC
+    LIMIT $2 OFFSET $3;
     """
     list_log = log.bind(company_id=str(company_id), limit=limit, offset=offset)
     try:
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(query, company_id, limit, offset)
-        return [dict(r) for r in rows]
-    except Exception as e:
-        list_log.error("Failed to list documents by company", error=str(e), exc_info=True)
-        raise
+        rows = await conn.fetch(query, company_id, limit, offset)
+        total = 0
+        results = []
+        if rows:
+            total = rows[0]['total_count'] # Obtener total del primer registro (es el mismo para todos)
+            # Convertir asyncpg.Record a dict y quitar el campo 'total_count'
+            results = [dict(r) for r in rows]
+            for r in results:
+                r.pop('total_count', None) # Eliminar el campo auxiliar
 
-async def delete_document(document_id: uuid.UUID) -> bool:
-    pool = await get_db_pool()
-    query = "DELETE FROM documents WHERE id = $1 RETURNING id;"
-    delete_log = log.bind(document_id=str(document_id))
+        list_log.debug("Fetched paginated documents", count=len(results), total=total)
+        return results, total
+    except Exception as e:
+        list_log.error("Failed to list paginated documents", error=str(e), exc_info=True)
+        raise # Relanzar para manejo en el endpoint
+
+# LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH delete_document DB logic lightly
+async def delete_document(conn: asyncpg.Connection, doc_id: uuid.UUID, company_id: uuid.UUID) -> bool:
+    """Elimina un documento verificando la compañía."""
+    # Solo permitir borrar si el ID y company_id coinciden
+    query = "DELETE FROM documents WHERE id = $1 AND company_id = $2 RETURNING id;"
+    delete_log = log.bind(document_id=str(doc_id), company_id=str(company_id))
     try:
-        async with pool.acquire() as conn:
-            deleted_id = await conn.fetchval(query, document_id)
-        delete_log.info("Document deleted from PostgreSQL", deleted_id=str(deleted_id))
-        return deleted_id is not None
+        deleted_id = await conn.fetchval(query, doc_id, company_id)
+        if deleted_id:
+            delete_log.info("Document deleted from PostgreSQL", deleted_id=str(deleted_id))
+            return True
+        else:
+            # No se encontró el documento O no pertenecía a la compañía
+            delete_log.warning("Document not found or company mismatch during delete attempt.")
+            return False # Opcionalmente, podría lanzar un error aquí si se prefiere
     except Exception as e:
         delete_log.error("Error deleting document record", error=str(e), exc_info=True)
         raise
 
-# --- Funciones de Chat (Se mantienen, sin cambios) ---
+# --- Chat Functions (NO TOCAR - Asumiendo que funcionan) ---
+# LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Chat Functions (DO NOT MODIFY)
 async def create_chat(user_id: uuid.UUID, company_id: uuid.UUID, title: Optional[str] = None) -> uuid.UUID:
     pool = await get_db_pool()
     chat_id = uuid.uuid4()
@@ -215,3 +285,4 @@ async def delete_chat(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.U
     try:
         async with pool.acquire() as conn: deleted_id = await conn.fetchval(query, chat_id, user_id, company_id); return deleted_id is not None
     except Exception as e: delete_log.error("Failed to delete chat (ingest context)", error=str(e)); raise
+# LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Chat Functions
