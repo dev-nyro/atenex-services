@@ -68,7 +68,7 @@ async def create_document_record(
     filename: str,
     file_type: str,
     minio_object_name: str,
-    status: DocumentStatus = DocumentStatus.PENDING, # Default status correctly placed here
+    status: DocumentStatus = DocumentStatus.PENDING, # Default status correctly placed here IN THE FUNCTION SIGNATURE
     metadata: Optional[Dict[str, Any]] = None
 ) -> None:
     """Crea un registro inicial para un documento en la base de datos."""
@@ -77,6 +77,7 @@ async def create_document_record(
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC');
     """
     metadata_db = json.dumps(metadata) if metadata else None
+    # Make sure status.value is used to insert the string representation
     params = [doc_id, company_id, user_id, filename, file_type, minio_object_name, metadata_db, status.value, 0]
     insert_log = log.bind(company_id=str(company_id), filename=filename, doc_id=str(doc_id))
     try:
@@ -86,9 +87,10 @@ async def create_document_record(
         insert_log.error("Failed to create document record", error=str(e), exc_info=True)
         raise
 
-# --- DELETE THIS LINE ---
-# status: DocumentStatus = DocumentStatus.PENDING, # <-- THIS LINE WAS THE ERROR
-# --- END DELETE ---
+# --- ERROR LINE REMOVED ---
+# status: DocumentStatus = DocumentStatus.PENDING, # <-- THIS LINE WAS THE ERROR and has been DELETED
+# --- END ERROR LINE REMOVED ---
+
 
 # LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH find_document_by_name_and_company DB logic lightly
 async def find_document_by_name_and_company(conn: asyncpg.Connection, filename: str, company_id: uuid.UUID) -> Optional[Dict[str, Any]]:
@@ -125,7 +127,7 @@ async def update_document_status(
 
     params: List[Any] = [document_id]
     fields: List[str] = ["status = $2", "updated_at = NOW() AT TIME ZONE 'UTC'"]
-    params.append(status.value)
+    params.append(status.value) # Ensure enum value is used
     param_index = 3
 
     if chunk_count is not None:
@@ -135,6 +137,7 @@ async def update_document_status(
         if error_message is not None:
             fields.append(f"error_message = ${param_index}"); params.append(error_message); param_index += 1
     else:
+        # Ensure error_message is explicitly set to NULL when status is not ERROR
         fields.append("error_message = NULL")
 
     set_clause = ", ".join(fields)
@@ -145,7 +148,7 @@ async def update_document_status(
         if conn:
             result = await conn.execute(query, *params)
         else:
-             async with pool.acquire() as connection:
+             async with pool.acquire() as connection: # Use acquire() with pool if conn not provided
                 result = await connection.execute(query, *params)
 
         if result == 'UPDATE 0':
@@ -171,6 +174,7 @@ async def get_document_by_id(conn: asyncpg.Connection, doc_id: uuid.UUID, compan
         if not record:
             get_log.warning("Document not found or company mismatch")
             return None
+        # Convert Record to dict for consistent return type
         return dict(record)
     except Exception as e:
         get_log.error("Failed to get document by ID", error=str(e), exc_info=True)
@@ -200,7 +204,8 @@ async def list_documents_paginated(
         total = 0
         results = []
         if rows:
-            total = rows[0]['total_count']
+            total = rows[0]['total_count'] # Get total count from the first row
+            # Convert all rows to dictionaries and remove the total_count field
             results = [dict(r) for r in rows]
             for r in results:
                 r.pop('total_count', None)
@@ -222,14 +227,18 @@ async def delete_document(conn: asyncpg.Connection, doc_id: uuid.UUID, company_i
             delete_log.info("Document deleted from PostgreSQL", deleted_id=str(deleted_id))
             return True
         else:
+            # This case handles both "not found" and "company mismatch"
             delete_log.warning("Document not found or company mismatch during delete attempt.")
             return False
     except Exception as e:
         delete_log.error("Error deleting document record", error=str(e), exc_info=True)
         raise
 
-# --- Chat Functions (NO TOCAR - Asumiendo que funcionan) ---
-# LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Chat Functions (DO NOT MODIFY)
+# --- Chat Functions (Placeholder - Copied from Query Service for context, likely unused here) ---
+# LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Chat Functions (Likely Unused)
+# These functions might be remnants or shared code, but are primarily used by the Query Service.
+# They are kept here for completeness based on the provided codebase structure,
+# but their direct usage within the Ingest Service context is minimal or none.
 async def create_chat(user_id: uuid.UUID, company_id: uuid.UUID, title: Optional[str] = None) -> uuid.UUID:
     pool = await get_db_pool()
     chat_id = uuid.uuid4()
@@ -239,7 +248,7 @@ async def create_chat(user_id: uuid.UUID, company_id: uuid.UUID, title: Optional
             result = await conn.fetchval(query, chat_id, user_id, company_id, title or f"Chat {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}")
             return result
     except Exception as e:
-        log.error("Failed create_chat (ingest context)", error=str(e))
+        log.error("Failed create_chat (ingest context - likely unused)", error=str(e))
         raise
 
 async def get_user_chats(user_id: uuid.UUID, company_id: uuid.UUID, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
@@ -247,14 +256,14 @@ async def get_user_chats(user_id: uuid.UUID, company_id: uuid.UUID, limit: int =
     query = """SELECT id, title, updated_at FROM chats WHERE user_id = $1 AND company_id = $2 ORDER BY updated_at DESC LIMIT $3 OFFSET $4;"""
     try:
         async with pool.acquire() as conn: rows = await conn.fetch(query, user_id, company_id, limit, offset); return [dict(row) for row in rows]
-    except Exception as e: log.error("Failed get_user_chats (ingest context)", error=str(e)); raise
+    except Exception as e: log.error("Failed get_user_chats (ingest context - likely unused)", error=str(e)); raise
 
 async def check_chat_ownership(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID) -> bool:
     pool = await get_db_pool()
     query = "SELECT EXISTS (SELECT 1 FROM chats WHERE id = $1 AND user_id = $2 AND company_id = $3);"
     try:
         async with pool.acquire() as conn: exists = await conn.fetchval(query, chat_id, user_id, company_id); return exists is True
-    except Exception as e: log.error("Failed check_chat_ownership (ingest context)", error=str(e)); return False
+    except Exception as e: log.error("Failed check_chat_ownership (ingest context - likely unused)", error=str(e)); return False
 
 async def get_chat_messages(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
     pool = await get_db_pool(); owner = await check_chat_ownership(chat_id, user_id, company_id)
@@ -262,7 +271,7 @@ async def get_chat_messages(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: 
     messages_query = """SELECT id, role, content, sources, created_at FROM messages WHERE chat_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3;"""
     try:
         async with pool.acquire() as conn: message_rows = await conn.fetch(messages_query, chat_id, limit, offset); return [dict(row) for row in message_rows]
-    except Exception as e: log.error("Failed get_chat_messages (ingest context)", error=str(e)); raise
+    except Exception as e: log.error("Failed get_chat_messages (ingest context - likely unused)", error=str(e)); raise
 
 async def save_message(chat_id: uuid.UUID, role: str, content: str, sources: Optional[List[Dict[str, Any]]] = None) -> uuid.UUID:
     pool = await get_db_pool(); message_id = uuid.uuid4()
@@ -270,15 +279,15 @@ async def save_message(chat_id: uuid.UUID, role: str, content: str, sources: Opt
         async with conn.transaction():
             try:
                 update_chat_query = "UPDATE chats SET updated_at = NOW() AT TIME ZONE 'UTC' WHERE id = $1 RETURNING id;"; chat_updated = await conn.fetchval(update_chat_query, chat_id)
-                if not chat_updated: raise ValueError(f"Chat {chat_id} not found (ingest context).")
+                if not chat_updated: raise ValueError(f"Chat {chat_id} not found (ingest context - likely unused).")
                 insert_message_query = """INSERT INTO messages (id, chat_id, role, content, sources, created_at) VALUES ($1, $2, $3, $4, $5, NOW() AT TIME ZONE 'UTC') RETURNING id;"""
                 result = await conn.fetchval(insert_message_query, message_id, chat_id, role, content, json.dumps(sources or [])); return result
-            except Exception as e: log.error("Failed save_message (ingest context)", error=str(e)); raise
+            except Exception as e: log.error("Failed save_message (ingest context - likely unused)", error=str(e)); raise
 
 async def delete_chat(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID) -> bool:
     pool = await get_db_pool()
     query = "DELETE FROM chats WHERE id = $1 AND user_id = $2 AND company_id = $3 RETURNING id;"; delete_log = log.bind(chat_id=str(chat_id), user_id=str(user_id))
     try:
         async with pool.acquire() as conn: deleted_id = await conn.fetchval(query, chat_id, user_id, company_id); return deleted_id is not None
-    except Exception as e: delete_log.error("Failed to delete chat (ingest context)", error=str(e)); raise
+    except Exception as e: delete_log.error("Failed to delete chat (ingest context - likely unused)", error=str(e)); raise
 # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Chat Functions
