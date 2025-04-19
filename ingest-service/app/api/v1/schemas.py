@@ -55,10 +55,10 @@ class StatusResponse(BaseModel):
                 "metadata": {},
                 "status": "processed",
                 "chunk_count": 10,
-                "error_message": null,
+                "error_message": None,
                 "uploaded_at": "2025-04-18T20:00:00Z",
                 "updated_at": "2025-04-18T20:30:00Z",
-                "minio_exists": true,
+                "minio_exists": True,
                 "milvus_chunk_count": 10,
                 "message": "Document processed successfully."
             }
