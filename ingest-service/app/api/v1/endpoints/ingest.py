@@ -5,7 +5,6 @@ import json
 import structlog
 import io
 import asyncio
-# --- CORRECCIÓN: Importar MilvusDocumentStore y count_documents ---
 from milvus_haystack import MilvusDocumentStore
 from pymilvus.exceptions import MilvusException
 import traceback
@@ -37,16 +36,14 @@ async def get_milvus_chunk_count(document_id: uuid.UUID) -> int:
         store = None # Inicializar fuera del try
         try:
             milvus_log.info("Initializing Milvus store for counting...")
-            # --- CORRECCIÓN: Usar embedding_dim y manejar posible inicialización ---
+            # *** CORRECCIÓN DEFINITIVA: Usar embedding_dim aquí también ***
             store = MilvusDocumentStore(
                 connection_args={"uri": str(settings.MILVUS_URI)},
                 collection_name=settings.MILVUS_COLLECTION_NAME,
-                embedding_dim=settings.EMBEDDING_DIMENSION, # Asegurar que se pasa la dimensión
-                # No se necesitan index/search params para contar
+                embedding_dim=settings.EMBEDDING_DIMENSION, # CORREGIDO
                 consistency_level="Strong",
             )
             milvus_log.info("Milvus store initialized for counting.")
-            # --- CORRECCIÓN: Usar count_documents con filtros ---
             milvus_log.info("Counting documents in Milvus...")
             count = store.count_documents(filters={"document_id": str(document_id)})
             milvus_log.info("Milvus count result", count=count)
@@ -55,8 +52,8 @@ async def get_milvus_chunk_count(document_id: uuid.UUID) -> int:
              milvus_log.error("Milvus connection/query error in get_milvus_chunk_count", error=str(me), code=getattr(me, 'code', None), exc_info=True)
              return -1 # Indicar error en el conteo
         except Exception as e:
-            # Captura AttributeError si el método no existe o cualquier otro error
-            milvus_log.error("Error connecting to or querying Milvus in get_milvus_chunk_count", error=str(e), exc_info=True)
+            # Captura el TypeError si el argumento es incorrecto u otros errores
+            milvus_log.error(f"Error connecting to or querying Milvus in get_milvus_chunk_count: {type(e).__name__}", error=str(e), exc_info=True)
             return -1 # Indicar error en el conteo
 
     try:
@@ -214,6 +211,7 @@ async def get_ingestion_status(
         if file_path:
             try:
                 minio_exists = await MinioStorageClient().file_exists(file_path)
+                status_log.debug("MinIO existence check result", object_path=file_path, exists=minio_exists)
             except Exception as minio_err: status_log.error("Error checking MinIO", error=str(minio_err))
         enriched_data['minio_exists'] = minio_exists
 
@@ -223,12 +221,13 @@ async def get_ingestion_status(
              status_log.debug("Checking chunk count in Milvus...")
              milvus_count = await get_milvus_chunk_count(document_id)
              status_log.debug("Milvus chunk count result", count=milvus_count)
-        enriched_data['milvus_chunk_count'] = milvus_count
+        enriched_data['milvus_chunk_count'] = milvus_count if milvus_count != -1 else None # None si hubo error al contar
 
         # --- Lógica de Actualización de Estado Basada en Verificaciones ---
         needs_db_update = False
         new_status = current_status
-        new_chunk_count = enriched_data.get('chunk_count', 0)
+        # Usar milvus_count si es válido, sino el de la DB
+        new_chunk_count = milvus_count if milvus_count >= 0 else enriched_data.get('chunk_count', 0)
         new_error_message = enriched_data.get('error_message')
 
         if not minio_exists and current_status != DocumentStatus.ERROR:
@@ -236,35 +235,47 @@ async def get_ingestion_status(
              new_status = DocumentStatus.ERROR
              new_error_message = "Error: Archivo original no encontrado en almacenamiento."
              needs_db_update = True
-        elif milvus_count > 0 and current_status not in [DocumentStatus.PROCESSED, DocumentStatus.INDEXED, DocumentStatus.ERROR]:
+        # Si Milvus tiene chunks y DB dice UPLOADED o PROCESSING -> Corregir a PROCESSED
+        elif milvus_count > 0 and current_status in [DocumentStatus.UPLOADED, DocumentStatus.PROCESSING]:
              status_log.warning("DB status mismatch, chunks found in Milvus. Updating DB.", db_status=current_status_str, milvus_count=milvus_count)
              new_status = DocumentStatus.PROCESSED # Usar PROCESSED como estado canónico post-worker
              new_chunk_count = milvus_count
              needs_db_update = True
-        elif milvus_count == 0 and current_status == DocumentStatus.PROCESSING:
-             status_log.warning("Milvus has 0 chunks but DB status is PROCESSING. Potential worker issue or empty doc. Updating DB to ERROR.", db_status=current_status_str)
+        # Si Milvus NO tiene chunks (0 o error) y DB dice PROCESSING -> Marcar como Error
+        elif milvus_count <= 0 and current_status == DocumentStatus.PROCESSING:
+             milvus_info = f"Milvus count: {milvus_count}" if milvus_count == 0 else "Milvus count check failed"
+             status_log.warning(f"DB status is PROCESSING but {milvus_info}. Updating DB to ERROR.", db_status=current_status_str)
              new_status = DocumentStatus.ERROR
              new_error_message = "Error: Procesamiento no generó contenido indexable o falló."
              needs_db_update = True
+        # Si el conteo de Milvus es válido y difiere del de la DB (y no estamos ya en Error)
+        elif milvus_count >= 0 and current_status != DocumentStatus.ERROR and enriched_data.get('chunk_count') != milvus_count:
+             status_log.warning("DB chunk count mismatch. Updating DB.", db_count=enriched_data.get('chunk_count'), milvus_count=milvus_count)
+             new_chunk_count = milvus_count
+             needs_db_update = True # Solo actualiza count si status ya es correcto (e.g. PROCESSED)
 
         # Si se necesita actualizar la DB
         if needs_db_update:
              status_log.info("Updating document status in DB based on real-time checks.", new_status=new_status.value, new_chunk_count=new_chunk_count)
-             await postgres_client.update_document_status(
-                 document_id, new_status, chunk_count=new_chunk_count, error_message=new_error_message
-             )
-             # Actualizar los datos locales para la respuesta
-             enriched_data["status"] = new_status.value
-             enriched_data["chunk_count"] = new_chunk_count
-             enriched_data["error_message"] = new_error_message
+             try:
+                 await postgres_client.update_document_status(
+                     document_id, new_status, chunk_count=new_chunk_count, error_message=new_error_message
+                 )
+                 # Actualizar los datos locales para la respuesta
+                 enriched_data["status"] = new_status.value
+                 enriched_data["chunk_count"] = new_chunk_count
+                 enriched_data["error_message"] = new_error_message
+             except Exception as db_update_err:
+                  status_log.error("Failed to update DB status during consistency check", error=str(db_update_err))
+                  # Continuar con los datos originales de la DB si la actualización falla
 
-        # Generar mensaje descriptivo basado en el estado *actualizado*
+        # Generar mensaje descriptivo basado en el estado *final*
         final_status = DocumentStatus(enriched_data["status"])
         status_messages = {
             DocumentStatus.UPLOADED: "Documento subido, pendiente de procesamiento.",
             DocumentStatus.PROCESSING: "Documento está siendo procesado.",
             DocumentStatus.PROCESSED: "Documento procesado correctamente.",
-            DocumentStatus.INDEXED: "Documento procesado e indexado.", # Mantener por si se usa
+            DocumentStatus.INDEXED: "Documento procesado e indexado.",
             DocumentStatus.ERROR: f"Error de procesamiento: {enriched_data.get('error_message') or 'Error desconocido'}",
         }
         enriched_data['message'] = status_messages.get(final_status, "Estado desconocido.")
@@ -331,20 +342,23 @@ async def list_ingestion_statuses(
             if current_status not in [DocumentStatus.UPLOADED, DocumentStatus.ERROR]:
                  try: milvus_count = await get_milvus_chunk_count(doc_id)
                  except Exception as ex: enrich_log.error("Milvus check failed", error=str(ex))
-            enriched_data['milvus_chunk_count'] = milvus_count
+            enriched_data['milvus_chunk_count'] = milvus_count if milvus_count != -1 else None
 
             # Lógica de Actualización de Estado Basada en Verificaciones
             needs_db_update = False
             new_status = current_status
-            new_chunk_count = enriched_data.get('chunk_count', 0)
+            new_chunk_count = milvus_count if milvus_count >= 0 else enriched_data.get('chunk_count', 0)
             new_error_message = enriched_data.get('error_message')
 
             if not minio_exists and current_status != DocumentStatus.ERROR:
                  new_status = DocumentStatus.ERROR; new_error_message = "Error: Archivo original no encontrado."; needs_db_update = True
-            elif milvus_count > 0 and current_status not in [DocumentStatus.PROCESSED, DocumentStatus.INDEXED, DocumentStatus.ERROR]:
+            elif milvus_count > 0 and current_status in [DocumentStatus.UPLOADED, DocumentStatus.PROCESSING]:
                  new_status = DocumentStatus.PROCESSED; new_chunk_count = milvus_count; needs_db_update = True
-            elif milvus_count == 0 and current_status == DocumentStatus.PROCESSING:
+            elif milvus_count <= 0 and current_status == DocumentStatus.PROCESSING:
                  new_status = DocumentStatus.ERROR; new_error_message = "Error: Procesamiento sin resultado indexable."; needs_db_update = True
+            elif milvus_count >= 0 and current_status != DocumentStatus.ERROR and enriched_data.get('chunk_count') != milvus_count:
+                 new_chunk_count = milvus_count
+                 needs_db_update = True # Solo actualiza count si status ya es correcto
 
             if needs_db_update:
                  enrich_log.info("Updating document status in DB based on real-time checks.", new_status=new_status.value, new_chunk_count=new_chunk_count)
@@ -373,11 +387,10 @@ async def list_ingestion_statuses(
             try:
                 return schemas.StatusResponse.model_validate(enriched_data)
             except ValidationError as val_err:
-                # Loguear el error de validación específico que se veía en los logs originales
                 enrich_log.error(
-                     "Error validating status after enrichment", # Mensaje más descriptivo
-                     error=str(val_err), # Formato similar al log original
-                     data_validated=enriched_data # Mostrar qué datos fallaron la validación
+                     "Error validating status after enrichment",
+                     error=str(val_err),
+                     data_validated=enriched_data
                  )
                 return None # Excluir de la lista final
 
@@ -492,10 +505,11 @@ async def delete_document_endpoint(
     delete_log.info("Attempting to delete chunks from Milvus...")
     try:
         def _delete_milvus_sync():
+            # *** CORRECCIÓN DEFINITIVA: Usar embedding_dim aquí también ***
             store = MilvusDocumentStore(
                 connection_args={"uri": str(settings.MILVUS_URI)},
                 collection_name=settings.MILVUS_COLLECTION_NAME,
-                embedding_dim=settings.EMBEDDING_DIMENSION, # Necesario para conectar
+                embedding_dim=settings.EMBEDDING_DIMENSION, # CORREGIDO
                 consistency_level="Strong"
             )
             store.delete_documents(filters={"document_id": str(document_id)})

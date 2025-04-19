@@ -42,7 +42,7 @@ def _initialize_milvus_store() -> MilvusDocumentStore:
     init_log = log.bind(component="MilvusDocumentStore")
     init_log.info("Attempting to initialize...")
     try:
-        # --- CORRECCIÓN: Usar embedding_dim en lugar de dim ---
+        # *** CORRECCIÓN DEFINITIVA: Usar embedding_dim aquí ***
         store = MilvusDocumentStore(
             connection_args={"uri": str(settings.MILVUS_URI)},
             collection_name=settings.MILVUS_COLLECTION_NAME,
@@ -60,9 +60,12 @@ def _initialize_milvus_store() -> MilvusDocumentStore:
         init_log.error("Milvus connection/initialization failed", code=getattr(me, 'code', None), message=str(me), exc_info=True)
         raise ConnectionError(f"Milvus connection failed: {me}") from me
     except Exception as e:
-        init_log.exception("Unexpected error during MilvusDocumentStore initialization")
+        # Captura el TypeError específico si el argumento es incorrecto
+        init_log.exception(f"Unexpected error during MilvusDocumentStore initialization: {type(e).__name__}")
         raise RuntimeError(f"Unexpected Milvus init error: {e}") from e
 
+# --- (El resto de helpers _initialize_openai_embedder, _initialize_splitter,
+#      _initialize_document_writer, get_converter_for_content_type no cambian) ---
 def _initialize_openai_embedder() -> OpenAIDocumentEmbedder:
     """Función interna SÍNCRONA para inicializar OpenAIDocumentEmbedder."""
     init_log = log.bind(component="OpenAIDocumentEmbedder")
@@ -95,7 +98,6 @@ def _initialize_document_writer(store: MilvusDocumentStore) -> DocumentWriter:
     """Función interna SÍNCRONA para inicializar DocumentWriter."""
     init_log = log.bind(component="DocumentWriter")
     init_log.info("Initializing...")
-    # Usar política OVERWRITE para permitir reintentos sobre el mismo ID
     writer = DocumentWriter(document_store=store, policy="OVERWRITE")
     init_log.info("Initialization successful.")
     return writer
@@ -105,7 +107,7 @@ def get_converter_for_content_type(content_type: str) -> Optional[Type]:
     converters = {
         "application/pdf": PyPDFToDocument,
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document": DOCXToDocument,
-        "application/msword": DOCXToDocument, # Asume que DOCX puede manejar .doc antiguos
+        "application/msword": DOCXToDocument,
         "text/plain": TextFileToDocument,
         "text/markdown": MarkdownToDocument,
         "text/html": HTMLToDocument,
@@ -124,7 +126,8 @@ def get_converter_for_content_type(content_type: str) -> Optional[Type]:
 
 # --- Celery Task Definition ---
 NON_RETRYABLE_ERRORS = (FileNotFoundError, ValueError, TypeError, NotImplementedError, KeyError, AttributeError, asyncpg.exceptions.DataError, asyncpg.exceptions.IntegrityConstraintViolationError)
-RETRYABLE_ERRORS = (IOError, ConnectionError, TimeoutError, S3Error, MilvusException, asyncpg.exceptions.PostgresConnectionError, asyncpg.exceptions.InterfaceError, asyncio.TimeoutError)
+# Asegurarse que ConnectionError y RuntimeError están aquí para capturar fallos de inicialización
+RETRYABLE_ERRORS = (IOError, TimeoutError, S3Error, MilvusException, asyncpg.exceptions.PostgresConnectionError, asyncpg.exceptions.InterfaceError, asyncio.TimeoutError, ConnectionError, RuntimeError)
 
 @celery_app.task(
     bind=True,
@@ -186,7 +189,8 @@ def process_document_haystack_task(
             # 2. Inicializar componentes Haystack y construir pipeline
             task_log.info("Initializing Haystack components and building pipeline via executor...")
             loop = asyncio.get_running_loop()
-            store = await loop.run_in_executor(None, _initialize_milvus_store)
+            # --- Ejecutar inicializaciones síncronas en executor ---
+            store = await loop.run_in_executor(None, _initialize_milvus_store) # Puede fallar aquí
             embedder = await loop.run_in_executor(None, _initialize_openai_embedder)
             splitter = await loop.run_in_executor(None, _initialize_splitter)
             writer = await loop.run_in_executor(None, _initialize_document_writer, store)
@@ -269,9 +273,10 @@ def process_document_haystack_task(
             try:
                 await postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=user_error_msg)
             except Exception as db_err:
-                task_log.critical("Failed update status to ERROR after non-retryable failure!", db_error=str(db_err))
-            # Esta excepción NO se re-levanta para que Celery marque como FAILED
-            raise # Re-levantar para que Celery vea el fallo
+                # Log CRITICAL si incluso la actualización a ERROR falla
+                task_log.critical("Failed update status to ERROR after non-retryable failure!", db_error=str(db_err), original_error=user_error_msg)
+            # Esta excepción NO se re-levanta para que Celery marque como FAILED directamente
+            raise # Re-levantar para marcar la tarea como fallida
 
         # Manejo de errores REINTENTABLES (Celery se encargará del reintento)
         except RETRYABLE_ERRORS as e_retry:
@@ -279,7 +284,12 @@ def process_document_haystack_task(
             err_msg_detail = str(e_retry)[:500]
             max_retries = self.max_retries if hasattr(self, 'max_retries') else 3
             current_attempt = self.request.retries + 1
-            user_error_msg = f"Error temporal ({err_type} - Intento {current_attempt}/{max_retries+1}). Reintentando..."
+            # Mensaje más específico para el error de Milvus init
+            if isinstance(e_retry, RuntimeError) and "Milvus init error" in err_msg_detail:
+                user_error_msg = f"Error temporal conectando con base vectorial ({err_type} - Intento {current_attempt}/{max_retries+1}). Reintentando..."
+            else:
+                user_error_msg = f"Error temporal ({err_type} - Intento {current_attempt}/{max_retries+1}). Reintentando..."
+
             task_log.warning(f"Processing failed, will retry: {err_type}: {err_msg_detail}", traceback=traceback.format_exc())
             try:
                 # Actualizar estado a ERROR con mensaje temporal
@@ -299,7 +309,6 @@ def process_document_haystack_task(
         TIMEOUT_SECONDS = 600 # 10 minutos
         asyncio.run(asyncio.wait_for(async_process_flow(), timeout=TIMEOUT_SECONDS))
         task_log.info("Haystack document processing task completed successfully.")
-        # Devolver un resultado consistente en éxito
         return {"status": "success", "document_id": str(document_id), "chunk_count": processed_chunk_count}
     except asyncio.TimeoutError:
         timeout_msg = f"Procesamiento excedió el tiempo límite de {TIMEOUT_SECONDS} segundos."
@@ -307,17 +316,20 @@ def process_document_haystack_task(
         user_error_msg = "El procesamiento del documento tardó demasiado."
         try: asyncio.run(postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=user_error_msg))
         except Exception as db_err: task_log.critical("Failed to update status to ERROR after timeout!", db_error=str(db_err))
-        # Indicar fallo a Celery devolviendo un error claro o levantando una excepción no reintentable
-        # (Levantar excepción aquí es más explícito para Celery)
-        raise TimeoutError(user_error_msg) # Levantar para marcar como fallo final
+        # Levantar para que Celery marque como fallo
+        raise TimeoutError(user_error_msg)
     except Exception as top_level_exc:
-        # Captura cualquier excepción que async_process_flow levantó (incluso las ya manejadas y re-levantadas)
-        # O errores inesperados en la sincronización asyncio.run
+        # Captura excepciones re-levantadas por async_process_flow o errores inesperados
+        # Si fue un error no reintentable, ya se actualizó a ERROR con mensaje específico
+        # Si fue un error reintentable que agotó reintentos, Celery lo marcará como FAILED
+        # Aquí solo logueamos si algo inesperado ocurre en la capa síncrona
         user_error_msg = "Ocurrió un error final inesperado durante el procesamiento. Contacte a soporte."
         task_log.exception("Haystack processing task failed at top level (after retries or unexpected error). Final failure.", exc_info=top_level_exc)
         try:
-            # Último intento de marcar como error
-            asyncio.run(postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=user_error_msg))
+            # Intenta actualizar a ERROR como último recurso si no se hizo antes
+            current_status_info = asyncio.run(postgres_client.get_document_status(document_id))
+            if current_status_info and current_status_info.get('status') != DocumentStatus.ERROR.value:
+                 asyncio.run(postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=user_error_msg))
         except Exception as db_err:
             task_log.critical("Failed to update status to ERROR after top-level failure!", db_error=str(db_err))
         # Devolver resultado de fallo explícito para Celery
