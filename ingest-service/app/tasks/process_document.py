@@ -42,11 +42,11 @@ def _initialize_milvus_store() -> MilvusDocumentStore:
     init_log = log.bind(component="MilvusDocumentStore")
     init_log.info("Attempting to initialize MilvusDocumentStore...")
     try:
-        # *** CORRECCIÓN DEFINITIVA (REVISADA): Usar embedding_dim ***
+        # *** RE-VERIFICACIÓN: Usar embedding_dim consistentemente ***
         store = MilvusDocumentStore(
             connection_args={"uri": str(settings.MILVUS_URI)},
             collection_name=settings.MILVUS_COLLECTION_NAME,
-            embedding_dim=settings.EMBEDDING_DIMENSION, # CORREGIDO (Debe ser el parámetro correcto para v0.0.6)
+            embedding_dim=settings.EMBEDDING_DIMENSION, # CORREGIDO
             embedding_field=settings.MILVUS_EMBEDDING_FIELD,
             content_field=settings.MILVUS_CONTENT_FIELD,
             metadata_fields=settings.MILVUS_METADATA_FIELDS,
@@ -58,16 +58,13 @@ def _initialize_milvus_store() -> MilvusDocumentStore:
         return store
     except MilvusException as me:
         init_log.error("Milvus connection/initialization failed", code=getattr(me, 'code', None), message=str(me), exc_info=True)
-        # Re-lanzar como ConnectionError para que sea reintentable por Celery
         raise ConnectionError(f"Milvus connection failed: {me}") from me
     except TypeError as te:
         # Este es el error específico visto en los logs
         init_log.error(f"MilvusDocumentStore init TypeError: {te}. Check arguments (e.g., 'embedding_dim').", exc_info=True)
-        # Re-lanzar como RuntimeError para que NO sea reintentable (error de código/config)
         raise RuntimeError(f"Milvus TypeError (check arguments like embedding_dim): {te}") from te
     except Exception as e:
         init_log.exception("Unexpected error during MilvusDocumentStore initialization")
-        # Re-lanzar como RuntimeError para que NO sea reintentable
         raise RuntimeError(f"Unexpected Milvus init error: {e}") from e
 
 # --- (El resto de helpers _initialize_* no cambian) ---
@@ -137,16 +134,14 @@ async def _robust_update_status(doc_id: uuid.UUID, status: DocumentStatus, messa
     update_log = log.bind(document_id=str(doc_id), target_status=status.value)
     for attempt in range(2): # Intentar 2 veces
         try:
-            # Asegurarse de tener una conexión fresca si la anterior falló
-            await postgres_client.get_db_pool() # Re-asegura que el pool esté vivo (no lanza error si ya existe)
+            await postgres_client.get_db_pool() # Re-asegura que el pool esté vivo
             success = await postgres_client.update_document_status(doc_id, status, error_message=message, chunk_count=chunk_count)
             if success:
                  update_log.info("Successfully updated final document status.", attempt=attempt+1)
                  return True
             else:
-                 # Si update_document_status devuelve False, el documento no existía
                  update_log.error("Document not found during final status update attempt.", attempt=attempt+1)
-                 return False # No tiene sentido reintentar si no existe
+                 return False
         except (asyncpg.exceptions.PostgresConnectionError, asyncpg.exceptions.InterfaceError, asyncpg.exceptions.ConnectionDoesNotExistError) as db_conn_err:
             update_log.warning("Connection error during final status update", attempt=attempt+1, error=str(db_conn_err))
             if attempt == 0:
@@ -328,17 +323,6 @@ def process_document_haystack_task(
             # Re-levantar la excepción ORIGINAL para que Celery la capture y reintente
             raise e_retry
 
-        except Exception as e_generic: # Capturar cualquier otra excepción inesperada
-             err_type = type(e_generic).__name__
-             err_msg_detail = str(e_generic)[:500]
-             user_error_msg = f"Error inesperado durante el procesamiento ({err_type}). Contacte a soporte."
-             formatted_traceback = traceback.format_exc()
-             task_log.error(f"Unexpected processing error: {err_type}: {err_msg_detail}", traceback=formatted_traceback)
-             final_status = DocumentStatus.ERROR
-             final_error_message = user_error_msg
-             # Considerar esto NO reintentable por defecto
-             raise RuntimeError(user_error_msg) from e_generic
-
         finally:
             if downloaded_file_stream:
                 downloaded_file_stream.close()
@@ -355,6 +339,7 @@ def process_document_haystack_task(
         task_exception = toe # Guardar para posible re-raise
     except Exception as outer_exc:
         task_log.exception("Exception caught after running async_process_flow.", exc_info=outer_exc)
+        # El estado y mensaje ya deberían estar seteados dentro del flujo
         if final_status != DocumentStatus.ERROR:
              final_error_message = final_error_message or f"Error inesperado: {outer_exc}"
              final_status = DocumentStatus.ERROR
@@ -374,17 +359,13 @@ def process_document_haystack_task(
         task_log.info("Haystack document processing task completed successfully.")
         return {"status": "success", "document_id": str(document_id), "chunk_count": processed_chunk_count}
     else:
-        # Si la tarea falló (final_status es ERROR) y la excepción original
-        # NO es una de las que Celery reintenta automáticamente, la levantamos.
-        # Esto asegura que los errores no reintentables (como ValueError, TypeError, RuntimeError)
-        # marquen la tarea como FAILED en Celery y no se reintenten innecesariamente.
-        # Celery ya maneja el reintento de las excepciones en RETRYABLE_ERRORS.
-        if task_exception and not isinstance(task_exception, tuple(celery_app.conf.task_autoretry_for.keys())):
-            task_log.error("Raising final non-auto-retryable exception to Celery.", exception_type=type(task_exception).__name__)
-            raise task_exception # Marcar como FAILED en Celery
-
-        # Si llegamos aquí, o bien el estado final es ERROR sin una excepción explícita no reintentable,
-        # o la excepción era reintentable pero ya se agotaron los reintentos (Celery no levantará la excepción de nuevo).
-        # En ambos casos, devolvemos 'failure'.
+        # *** CORRECCIÓN: Usar RETRYABLE_ERRORS para la comparación ***
+        # Si la excepción original guardada NO es una de las que Celery reintenta automáticamente
+        # (definidas en RETRYABLE_ERRORS), la levantamos para marcar como FAILED.
+        if task_exception and not isinstance(task_exception, RETRYABLE_ERRORS):
+            task_log.error("Raising final non-retryable exception to Celery.", exception_type=type(task_exception).__name__)
+            raise task_exception
+        # Si no hubo excepción O era reintentable (y Celery ya no reintentará más),
+        # simplemente devolvemos 'failure'.
         task_log.error("Task finished with error status.", final_db_status=final_status.value, error_msg=final_error_message)
         return {"status": "failure", "document_id": str(document_id), "error": final_error_message or "Error desconocido"}

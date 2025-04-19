@@ -111,10 +111,13 @@ async def get_milvus_chunk_count(document_id: uuid.UUID) -> int:
             milvus_log.info("Milvus count result", count=count)
             return count
         except MilvusException as me:
-             milvus_log.error("Milvus connection/query error in get_milvus_chunk_count", error=str(me), code=getattr(me, 'code', None), exc_info=True)
+             milvus_log.error("Milvus connection/query error in get_milvus_chunk_count", error=str(me), code=getattr(me, 'code', None), exc_info=False) # No loguear traceback completo aquí
              return -1 # Indicar error en el conteo
+        except TypeError as te:
+             # Capturar específicamente el TypeError visto en los logs
+             milvus_log.error(f"MilvusDocumentStore init TypeError in count check: {te}. Check arguments.", exc_info=False)
+             return -1 # Indicar error
         except Exception as e:
-            # Captura el TypeError si el argumento es incorrecto u otros errores
             milvus_log.error(f"Error connecting to or querying Milvus in get_milvus_chunk_count: {type(e).__name__}", error=str(e), exc_info=True)
             return -1 # Indicar error en el conteo
 
@@ -317,8 +320,8 @@ async def get_ingestion_status(
                  new_error_message = "Error: Procesamiento no generó contenido indexable o falló inesperadamente."
                  new_chunk_count = 0
                  needs_db_update = True
-             elif milvus_count != original_chunk_count and current_status == DocumentStatus.PROCESSED:
-                  # Si está procesado pero el conteo no coincide, actualizar el conteo
+             elif milvus_count >= 0 and current_status != DocumentStatus.ERROR and original_chunk_count != milvus_count:
+                  # Si el conteo de Milvus es válido y difiere del de la DB (y no estamos ya en Error)
                   status_log.warning("DB chunk count mismatch. Updating DB count.", db_count=original_chunk_count, milvus_count=milvus_count)
                   new_chunk_count = milvus_count
                   needs_db_update = True # Solo actualiza count si status ya es correcto
@@ -600,6 +603,9 @@ async def delete_document_endpoint(
         delete_log.info("Successfully deleted chunks from Milvus.")
     except Exception as milvus_err:
         error_msg = f"Failed to delete chunks from Milvus: {milvus_err}"
+        # Capturar el TypeError específico aquí también
+        if isinstance(milvus_err, TypeError) and 'embedding_dim' in str(milvus_err):
+             error_msg = f"Milvus TypeError on delete (check arguments like embedding_dim): {milvus_err}"
         delete_log.error(error_msg, exc_info=True)
         errors.append(error_msg)
 
@@ -618,27 +624,38 @@ async def delete_document_endpoint(
     else:
         delete_log.warning("No file_path found in DB, skipping MinIO deletion.")
 
-    # 4. Eliminar registro de PostgreSQL
-    delete_log.info("Attempting to delete record from PostgreSQL...")
-    try:
-        deleted = await postgres_client.delete_document(document_id)
-        if not deleted:
-             error_msg = "Failed to delete document from PostgreSQL (record not found during deletion)."
-             delete_log.error(error_msg)
-             errors.append(error_msg)
-        else:
-             delete_log.info("Document record deleted successfully from PostgreSQL")
-    except Exception as db_err:
-        error_msg = f"Error deleting document record from PostgreSQL: {db_err}"
-        delete_log.exception(error_msg)
-        errors.append(error_msg)
+    # 4. Eliminar registro de PostgreSQL (Solo si no hubo error crítico en Milvus/Minio, opcional)
+    #    Considerar borrar siempre el registro de PG para que no aparezca en la UI,
+    #    incluso si la limpieza en Milvus/Minio falla (dejando datos huérfanos).
+    delete_pg_record = True # Por defecto, intentar borrar de PG
+    if any("Failed to delete" in err for err in errors): # Si hubo error en Milvus o Minio
+        delete_log.warning("Proceeding with PostgreSQL deletion despite errors in other systems.")
+        # Podrías cambiar delete_pg_record a False si prefieres no borrar si algo falló antes
 
-    # Si hubo errores, devolver 500, si no, 204
-    if errors:
-        delete_log.error("Document deletion completed with errors", errors=errors)
-        # Aunque falle algo, devolvemos 204 para no bloquear UI, pero logueamos el error
-        # Si se requiere comportamiento estricto, cambiar a HTTPException 500
-        # raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Document deletion failed for some components: {'; '.join(errors)}")
+    if delete_pg_record:
+        delete_log.info("Attempting to delete record from PostgreSQL...")
+        try:
+            deleted = await postgres_client.delete_document(document_id)
+            if not deleted:
+                 error_msg = "Failed to delete document from PostgreSQL (record not found during deletion)."
+                 delete_log.error(error_msg)
+                 errors.append(error_msg)
+            else:
+                 delete_log.info("Document record deleted successfully from PostgreSQL")
+        except Exception as db_err:
+            error_msg = f"Error deleting document record from PostgreSQL: {db_err}"
+            delete_log.exception(error_msg)
+            errors.append(error_msg)
+
+    # Si hubo errores *críticos* (opcionalmente, puedes decidir qué errores impiden el 204)
+    if errors and any("Failed to delete document from PostgreSQL" in err for err in errors):
+        # Solo lanzar 500 si falla la eliminación de PG (el registro principal)
+        delete_log.error("Document deletion failed critically (PostgreSQL)", errors=errors)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Document deletion failed for critical components: {'; '.join(errors)}")
+    elif errors:
+         # Si falló Milvus o Minio pero PG sí, loguear pero devolver 204
+         delete_log.warning("Document deletion completed with non-critical errors", errors=errors)
+
 
     delete_log.info("Document deletion process finished.")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -1727,11 +1744,11 @@ def _initialize_milvus_store() -> MilvusDocumentStore:
     init_log = log.bind(component="MilvusDocumentStore")
     init_log.info("Attempting to initialize MilvusDocumentStore...")
     try:
-        # *** CORRECCIÓN DEFINITIVA: Usar embedding_dim consistentemente ***
+        # *** CORRECCIÓN DEFINITIVA (REVISADA): Usar embedding_dim ***
         store = MilvusDocumentStore(
             connection_args={"uri": str(settings.MILVUS_URI)},
             collection_name=settings.MILVUS_COLLECTION_NAME,
-            embedding_dim=settings.EMBEDDING_DIMENSION, # CORREGIDO
+            embedding_dim=settings.EMBEDDING_DIMENSION, # CORREGIDO (Debe ser el parámetro correcto para v0.0.6)
             embedding_field=settings.MILVUS_EMBEDDING_FIELD,
             content_field=settings.MILVUS_CONTENT_FIELD,
             metadata_fields=settings.MILVUS_METADATA_FIELDS,
@@ -1743,18 +1760,20 @@ def _initialize_milvus_store() -> MilvusDocumentStore:
         return store
     except MilvusException as me:
         init_log.error("Milvus connection/initialization failed", code=getattr(me, 'code', None), message=str(me), exc_info=True)
+        # Re-lanzar como ConnectionError para que sea reintentable por Celery
         raise ConnectionError(f"Milvus connection failed: {me}") from me
     except TypeError as te:
-        # Capturar el error específico de argumento inesperado
+        # Este es el error específico visto en los logs
         init_log.error(f"MilvusDocumentStore init TypeError: {te}. Check arguments (e.g., 'embedding_dim').", exc_info=True)
+        # Re-lanzar como RuntimeError para que NO sea reintentable (error de código/config)
         raise RuntimeError(f"Milvus TypeError (check arguments like embedding_dim): {te}") from te
     except Exception as e:
         init_log.exception("Unexpected error during MilvusDocumentStore initialization")
+        # Re-lanzar como RuntimeError para que NO sea reintentable
         raise RuntimeError(f"Unexpected Milvus init error: {e}") from e
 
 # --- (El resto de helpers _initialize_* no cambian) ---
 def _initialize_openai_embedder() -> OpenAIDocumentEmbedder:
-    """Función interna SÍNCRONA para inicializar OpenAIDocumentEmbedder."""
     init_log = log.bind(component="OpenAIDocumentEmbedder")
     init_log.info("Initializing...")
     api_key_value = settings.OPENAI_API_KEY.get_secret_value()
@@ -1770,7 +1789,6 @@ def _initialize_openai_embedder() -> OpenAIDocumentEmbedder:
     return embedder
 
 def _initialize_splitter() -> DocumentSplitter:
-    """Función interna SÍNCRONA para inicializar DocumentSplitter."""
     init_log = log.bind(component="DocumentSplitter")
     init_log.info("Initializing...")
     splitter = DocumentSplitter(
@@ -1782,7 +1800,6 @@ def _initialize_splitter() -> DocumentSplitter:
     return splitter
 
 def _initialize_document_writer(store: MilvusDocumentStore) -> DocumentWriter:
-    """Función interna SÍNCRONA para inicializar DocumentWriter."""
     init_log = log.bind(component="DocumentWriter")
     init_log.info("Initializing...")
     writer = DocumentWriter(document_store=store, policy="OVERWRITE")
@@ -1790,7 +1807,6 @@ def _initialize_document_writer(store: MilvusDocumentStore) -> DocumentWriter:
     return writer
 
 def get_converter_for_content_type(content_type: str) -> Optional[Type]:
-    """Devuelve la clase del conversor Haystack apropiada para el tipo de archivo."""
     converters = {
         "application/pdf": PyPDFToDocument,
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document": DOCXToDocument,
@@ -1914,6 +1930,7 @@ def process_document_haystack_task(
             # 2. Inicializar componentes Haystack y construir pipeline
             task_log.info("Initializing Haystack components and building pipeline via executor...")
             loop = asyncio.get_running_loop()
+            # --- Ejecutar inicializaciones síncronas en executor ---
             store = await loop.run_in_executor(None, _initialize_milvus_store) # Puede lanzar error
             embedder = await loop.run_in_executor(None, _initialize_openai_embedder)
             splitter = await loop.run_in_executor(None, _initialize_splitter)
@@ -2013,6 +2030,17 @@ def process_document_haystack_task(
             # Re-levantar la excepción ORIGINAL para que Celery la capture y reintente
             raise e_retry
 
+        except Exception as e_generic: # Capturar cualquier otra excepción inesperada
+             err_type = type(e_generic).__name__
+             err_msg_detail = str(e_generic)[:500]
+             user_error_msg = f"Error inesperado durante el procesamiento ({err_type}). Contacte a soporte."
+             formatted_traceback = traceback.format_exc()
+             task_log.error(f"Unexpected processing error: {err_type}: {err_msg_detail}", traceback=formatted_traceback)
+             final_status = DocumentStatus.ERROR
+             final_error_message = user_error_msg
+             # Considerar esto NO reintentable por defecto
+             raise RuntimeError(user_error_msg) from e_generic
+
         finally:
             if downloaded_file_stream:
                 downloaded_file_stream.close()
@@ -2026,14 +2054,13 @@ def process_document_haystack_task(
         task_log.error(f"Processing timed out after {TIMEOUT_SECONDS} seconds.")
         final_status = DocumentStatus.ERROR
         final_error_message = "El procesamiento del documento tardó demasiado."
-        task_exception = toe
+        task_exception = toe # Guardar para posible re-raise
     except Exception as outer_exc:
         task_log.exception("Exception caught after running async_process_flow.", exc_info=outer_exc)
-        # El estado y mensaje ya deberían estar seteados dentro del flujo
         if final_status != DocumentStatus.ERROR:
              final_error_message = final_error_message or f"Error inesperado: {outer_exc}"
              final_status = DocumentStatus.ERROR
-        task_exception = outer_exc
+        task_exception = outer_exc # Guardar excepción original
 
     # --- Actualización Final de Estado (Robusta) ---
     task_log.info("Attempting final status update in DB.", status=final_status.value, chunks=processed_chunk_count, error=final_error_message)
@@ -2049,13 +2076,18 @@ def process_document_haystack_task(
         task_log.info("Haystack document processing task completed successfully.")
         return {"status": "success", "document_id": str(document_id), "chunk_count": processed_chunk_count}
     else:
-        # Si hubo una excepción guardada Y no es una de las que Celery reintenta,
-        # la levantamos para que Celery la marque como FAILED.
+        # Si la tarea falló (final_status es ERROR) y la excepción original
+        # NO es una de las que Celery reintenta automáticamente, la levantamos.
+        # Esto asegura que los errores no reintentables (como ValueError, TypeError, RuntimeError)
+        # marquen la tarea como FAILED en Celery y no se reintenten innecesariamente.
+        # Celery ya maneja el reintento de las excepciones en RETRYABLE_ERRORS.
         if task_exception and not isinstance(task_exception, tuple(celery_app.conf.task_autoretry_for.keys())):
-             task_log.error("Raising final non-retryable exception to Celery.", exception_type=type(task_exception).__name__)
-             raise task_exception
-        # Si no hubo excepción explícita O era reintentable (y este es el último intento),
-        # simplemente devolvemos fallo sin levantar excepción.
+            task_log.error("Raising final non-auto-retryable exception to Celery.", exception_type=type(task_exception).__name__)
+            raise task_exception # Marcar como FAILED en Celery
+
+        # Si llegamos aquí, o bien el estado final es ERROR sin una excepción explícita no reintentable,
+        # o la excepción era reintentable pero ya se agotaron los reintentos (Celery no levantará la excepción de nuevo).
+        # En ambos casos, devolvemos 'failure'.
         task_log.error("Task finished with error status.", final_db_status=final_status.value, error_msg=final_error_message)
         return {"status": "failure", "document_id": str(document_id), "error": final_error_message or "Error desconocido"}
 ```

@@ -36,7 +36,7 @@ async def get_milvus_chunk_count(document_id: uuid.UUID) -> int:
         store = None # Inicializar fuera del try
         try:
             milvus_log.info("Initializing Milvus store for counting...")
-            # *** CORRECCIÓN DEFINITIVA: Usar embedding_dim aquí también ***
+            # *** RE-VERIFICACIÓN: Usar embedding_dim consistentemente ***
             store = MilvusDocumentStore(
                 connection_args={"uri": str(settings.MILVUS_URI)},
                 collection_name=settings.MILVUS_COLLECTION_NAME,
@@ -49,7 +49,7 @@ async def get_milvus_chunk_count(document_id: uuid.UUID) -> int:
             milvus_log.info("Milvus count result", count=count)
             return count
         except MilvusException as me:
-             milvus_log.error("Milvus connection/query error in get_milvus_chunk_count", error=str(me), code=getattr(me, 'code', None), exc_info=False) # No loguear traceback completo aquí
+             milvus_log.error("Milvus connection/query error in get_milvus_chunk_count", error=str(me), code=getattr(me, 'code', None), exc_info=False)
              return -1 # Indicar error en el conteo
         except TypeError as te:
              # Capturar específicamente el TypeError visto en los logs
@@ -138,7 +138,9 @@ async def ingest_document_haystack(
     minio_client = MinioStorageClient()
     document_id = uuid.uuid4() # Generar ID antes
     request_log = request_log.bind(document_id=str(document_id))
-    object_name = f"{str(company_id)}/{str(document_id)}/{file.filename}"
+    # Sanitize filename for MinIO object name if necessary (optional)
+    safe_filename = "".join(c if c.isalnum() or c in ['.', '-', '_'] else '_' for c in file.filename)
+    object_name = f"{str(company_id)}/{str(document_id)}/{safe_filename}"
 
     try:
         # 1) Persistir registro inicial en DB (Estado UPLOADED)
@@ -147,7 +149,7 @@ async def ingest_document_haystack(
         # 2) Subir archivo a MinIO
         file_bytes = await file.read()
         file_stream = io.BytesIO(file_bytes)
-        await minio_client.upload_file(company_id, document_id, file.filename, file_stream, content_type, len(file_bytes))
+        await minio_client.upload_file(company_id, document_id, safe_filename, file_stream, content_type, len(file_bytes)) # Use safe_filename
 
         # 3) Actualizar file_path en DB (Status sigue UPLOADED)
         await postgres_client.update_document_status(document_id, DocumentStatus.UPLOADED, file_path=object_name)
@@ -529,7 +531,7 @@ async def delete_document_endpoint(
     delete_log.info("Attempting to delete chunks from Milvus...")
     try:
         def _delete_milvus_sync():
-            # *** CORRECCIÓN DEFINITIVA: Usar embedding_dim aquí también ***
+            # *** RE-VERIFICACIÓN: Usar embedding_dim consistentemente ***
             store = MilvusDocumentStore(
                 connection_args={"uri": str(settings.MILVUS_URI)},
                 collection_name=settings.MILVUS_COLLECTION_NAME,
@@ -562,38 +564,28 @@ async def delete_document_endpoint(
     else:
         delete_log.warning("No file_path found in DB, skipping MinIO deletion.")
 
-    # 4. Eliminar registro de PostgreSQL (Solo si no hubo error crítico en Milvus/Minio, opcional)
-    #    Considerar borrar siempre el registro de PG para que no aparezca en la UI,
-    #    incluso si la limpieza en Milvus/Minio falla (dejando datos huérfanos).
-    delete_pg_record = True # Por defecto, intentar borrar de PG
-    if any("Failed to delete" in err for err in errors): # Si hubo error en Milvus o Minio
-        delete_log.warning("Proceeding with PostgreSQL deletion despite errors in other systems.")
-        # Podrías cambiar delete_pg_record a False si prefieres no borrar si algo falló antes
+    # 4. Eliminar registro de PostgreSQL
+    delete_log.info("Attempting to delete record from PostgreSQL...")
+    try:
+        deleted = await postgres_client.delete_document(document_id)
+        if not deleted:
+             error_msg = "Failed to delete document from PostgreSQL (record not found during deletion)."
+             delete_log.error(error_msg)
+             errors.append(error_msg)
+        else:
+             delete_log.info("Document record deleted successfully from PostgreSQL")
+    except Exception as db_err:
+        error_msg = f"Error deleting document record from PostgreSQL: {db_err}"
+        delete_log.exception(error_msg)
+        errors.append(error_msg)
 
-    if delete_pg_record:
-        delete_log.info("Attempting to delete record from PostgreSQL...")
-        try:
-            deleted = await postgres_client.delete_document(document_id)
-            if not deleted:
-                 error_msg = "Failed to delete document from PostgreSQL (record not found during deletion)."
-                 delete_log.error(error_msg)
-                 errors.append(error_msg)
-            else:
-                 delete_log.info("Document record deleted successfully from PostgreSQL")
-        except Exception as db_err:
-            error_msg = f"Error deleting document record from PostgreSQL: {db_err}"
-            delete_log.exception(error_msg)
-            errors.append(error_msg)
-
-    # Si hubo errores *críticos* (opcionalmente, puedes decidir qué errores impiden el 204)
-    if errors and any("Failed to delete document from PostgreSQL" in err for err in errors):
-        # Solo lanzar 500 si falla la eliminación de PG (el registro principal)
+    # Si hubo errores críticos (falla en PG), devolver 500.
+    # Si solo falló Milvus/Minio, loguear pero devolver 204 igual.
+    if any("PostgreSQL" in err for err in errors):
         delete_log.error("Document deletion failed critically (PostgreSQL)", errors=errors)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Document deletion failed for critical components: {'; '.join(errors)}")
     elif errors:
-         # Si falló Milvus o Minio pero PG sí, loguear pero devolver 204
-         delete_log.warning("Document deletion completed with non-critical errors", errors=errors)
-
+         delete_log.warning("Document deletion completed with non-critical errors (Milvus/MinIO)", errors=errors)
 
     delete_log.info("Document deletion process finished.")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
