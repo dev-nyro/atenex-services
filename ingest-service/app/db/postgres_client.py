@@ -59,18 +59,16 @@ async def check_db_connection() -> bool:
 
 # --- Document Operations ---
 
-# LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH create_document DB logic lightly
+# LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH create_document_record DB logic lightly
 async def create_document_record(
-    conn: asyncpg.Connection, # Pasar conexión explícita
+    conn: asyncpg.Connection,
     doc_id: uuid.UUID,
     company_id: uuid.UUID,
     user_id: uuid.UUID,
     filename: str,
     file_type: str,
     minio_object_name: str,
-    # --- FIX: Move default argument into function signature ---
-    status: DocumentStatus = DocumentStatus.PENDING, # Default status set here
-    # --- END FIX ---
+    status: DocumentStatus = DocumentStatus.PENDING, # Default status correctly placed here
     metadata: Optional[Dict[str, Any]] = None
 ) -> None:
     """Crea un registro inicial para un documento en la base de datos."""
@@ -79,7 +77,6 @@ async def create_document_record(
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC');
     """
     metadata_db = json.dumps(metadata) if metadata else None
-    # Use status.value from the parameter (which now has a default)
     params = [doc_id, company_id, user_id, filename, file_type, minio_object_name, metadata_db, status.value, 0]
     insert_log = log.bind(company_id=str(company_id), filename=filename, doc_id=str(doc_id))
     try:
@@ -89,9 +86,9 @@ async def create_document_record(
         insert_log.error("Failed to create document record", error=str(e), exc_info=True)
         raise
 
-# --- REMOVE incorrect module-level line ---
-# status: DocumentStatus = DocumentStatus.PENDING, # <-- DELETE THIS LINE
-# --- END REMOVE ---
+# --- DELETE THIS LINE ---
+# status: DocumentStatus = DocumentStatus.PENDING, # <-- THIS LINE WAS THE ERROR
+# --- END DELETE ---
 
 # LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH find_document_by_name_and_company DB logic lightly
 async def find_document_by_name_and_company(conn: asyncpg.Connection, filename: str, company_id: uuid.UUID) -> Optional[Dict[str, Any]]:
@@ -187,7 +184,6 @@ async def list_documents_paginated(
     offset: int
 ) -> Tuple[List[Dict[str, Any]], int]:
     """Lista documentos paginados para una compañía y devuelve el conteo total."""
-    # LLM_FLAG: NEW_FUNCTION - List documents with pagination and total count
     query = """
     SELECT
         id, company_id, file_name, file_type, minio_object_name, metadata, status,
