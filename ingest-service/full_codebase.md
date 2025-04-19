@@ -62,595 +62,902 @@ app/
 ```py
 # ingest-service/app/api/v1/endpoints/ingest.py
 import uuid
-from typing import Dict, Any, Optional, List
+import mimetypes
 import json
-import structlog
-import io
+from typing import List, Optional, Dict, Any
 import asyncio
-from milvus_haystack import MilvusDocumentStore
-from pymilvus.exceptions import MilvusException
-import traceback
+from contextlib import asynccontextmanager
 
 from fastapi import (
-    APIRouter, UploadFile, File, Depends, HTTPException,
-    status, Form, Header, Query, Request, Response
+    APIRouter, Depends, HTTPException, status,
+    UploadFile, File, Form, Header, Query, Path, BackgroundTasks, Request
 )
-from minio.error import S3Error
-from pydantic import ValidationError
+import structlog
+import asyncpg
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type, before_sleep_log
 
-from app.api.v1 import schemas
+# Haystack imports (only for type hinting or specific checks if needed here)
+# Note: DocumentStore interactions for count/delete are often better abstracted
+from milvus_haystack import MilvusDocumentStore # For type hints or direct use
+
+# Custom imports
 from app.core.config import settings
-from app.db import postgres_client
+from app.db import postgres_client as db_client
 from app.models.domain import DocumentStatus
-from app.tasks.process_document import process_document_haystack_task
-from app.services.minio_client import MinioStorageClient
+from app.api.v1.schemas import IngestResponse, StatusResponse, PaginatedStatusResponse, ErrorDetail
+from app.services.minio_client import MinioClient, MinioError
+from app.tasks.celery_app import celery_app # Import celery_app instance
+from app.tasks.process_document import process_document_haystack_task # Import task signature
 
 log = structlog.get_logger(__name__)
 
 router = APIRouter()
 
-# Helper para obtención dinámica de estado en Milvus
-async def get_milvus_chunk_count(document_id: uuid.UUID) -> int:
-    """Cuenta los chunks indexados en Milvus para un documento específico."""
-    loop = asyncio.get_running_loop()
-    milvus_log = log.bind(document_id=str(document_id))
-    def _count_chunks():
-        store = None # Inicializar fuera del try
-        try:
-            milvus_log.info("Initializing Milvus store for counting...")
-            # *** RE-VERIFICACIÓN: Usar embedding_dim consistentemente ***
-            store = MilvusDocumentStore(
-                connection_args={"uri": str(settings.MILVUS_URI)},
-                collection_name=settings.MILVUS_COLLECTION_NAME,
-                embedding_dim=settings.EMBEDDING_DIMENSION, # CORREGIDO
-                consistency_level="Strong",
-            )
-            milvus_log.info("Milvus store initialized for counting.")
-            milvus_log.info("Counting documents in Milvus...")
-            count = store.count_documents(filters={"document_id": str(document_id)})
-            milvus_log.info("Milvus count result", count=count)
-            return count
-        except MilvusException as me:
-             milvus_log.error("Milvus connection/query error in get_milvus_chunk_count", error=str(me), code=getattr(me, 'code', None), exc_info=False)
-             return -1 # Indicar error en el conteo
-        except TypeError as te:
-             # Capturar específicamente el TypeError visto en los logs
-             milvus_log.error(f"MilvusDocumentStore init TypeError in count check: {te}. Check arguments.", exc_info=False)
-             return -1 # Indicar error
-        except Exception as e:
-            milvus_log.error(f"Error connecting to or querying Milvus in get_milvus_chunk_count: {type(e).__name__}", error=str(e), exc_info=True)
-            return -1 # Indicar error en el conteo
+# --- Helper Functions ---
 
+def get_minio_client():
+    """Dependency to get Minio client instance."""
     try:
-        milvus_log.debug("Executing Milvus count via executor")
-        count = await loop.run_in_executor(None, _count_chunks)
-        milvus_log.debug("Milvus count execution finished", count=count)
-        return count
+        return MinioClient(
+            endpoint=settings.MINIO_ENDPOINT,
+            access_key=settings.MINIO_ACCESS_KEY,
+            secret_key=settings.MINIO_SECRET_KEY,
+            bucket_name=settings.MINIO_BUCKET_NAME,
+            secure=settings.MINIO_USE_SSL
+        )
     except Exception as e:
-        milvus_log.error("Executor error in get_milvus_chunk_count", error=str(e))
-        return -1 # Indicar error en el conteo
+        log.exception("Failed to initialize MinioClient dependency", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Storage service configuration error."
+        )
 
-# --- Dependencias (Sin cambios) ---
-async def get_current_company_id(x_company_id: Optional[str] = Header(None, alias="X-Company-ID")) -> uuid.UUID:
-    if not x_company_id:
-        log.warning("Missing required X-Company-ID header")
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing required header: X-Company-ID")
-    try:
-        return uuid.UUID(x_company_id)
-    except ValueError:
-        log.warning("Invalid UUID format in X-Company-ID header", header_value=x_company_id)
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid X-Company-ID header format")
+# Define retry strategy for database operations within API requests
+api_db_retry_strategy = retry(
+    stop=stop_after_attempt(2), # Fewer retries for API context
+    wait=wait_fixed(1),
+    retry=retry_if_exception_type((asyncpg.exceptions.PostgresConnectionError, TimeoutError, OSError)),
+    before_sleep=before_sleep_log(log, logging.WARNING)
+)
 
-async def get_current_user_id(x_user_id: Optional[str] = Header(None, alias="X-User-ID")) -> uuid.UUID:
-    if not x_user_id:
-        log.warning("Missing required X-User-ID header")
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing required header: X-User-ID")
+@asynccontextmanager
+async def get_db_conn():
+    """Provides a single connection from the pool for API request context."""
+    pool = await db_client.get_db_pool()
+    conn = None
     try:
-        return uuid.UUID(x_user_id)
-    except ValueError:
-        log.warning("Invalid UUID format in X-User-ID header", header_value=x_user_id)
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid X-User-ID header format")
+        conn = await pool.acquire()
+        yield conn
+    except Exception as e:
+        log.error("Failed to acquire DB connection for request", error=str(e))
+        raise HTTPException(status_code=503, detail="Database connection unavailable.")
+    finally:
+        if conn:
+            await pool.release(conn)
+
+
+# Helper for Milvus interactions (Count and Delete)
+# These run synchronously within asyncio's executor
+def _initialize_milvus_store_sync() -> MilvusDocumentStore:
+    """Synchronously initializes MilvusDocumentStore for API helpers."""
+    api_log = log.bind(component="MilvusHelperSync")
+    api_log.debug("Initializing MilvusDocumentStore for API helper...")
+    try:
+        store = MilvusDocumentStore(
+            connection_args={"uri": settings.MILVUS_URI},
+            collection_name=settings.MILVUS_COLLECTION_NAME,
+             # embedding_dim=settings.EMBEDDING_DIMENSION, # <-- REMOVED
+            # Other relevant args? Consistency Level might not be needed for count/delete
+        )
+        api_log.debug("MilvusDocumentStore initialized successfully for API helper.")
+        return store
+    except TypeError as te: # Should be fixed now, but keep check
+        api_log.error("MilvusDocumentStore init TypeError in API helper", error=str(te), exc_info=True)
+        raise RuntimeError(f"Milvus TypeError (check arguments like embedding_dim): {te}") from te
+    except Exception as e:
+        api_log.exception("Failed to initialize MilvusDocumentStore for API helper", error=str(e))
+        raise RuntimeError(f"Milvus Store Initialization Error for API helper: {e}") from e
+
+def _get_milvus_chunk_count_sync(document_id: str, company_id: str) -> int:
+    """Synchronously counts chunks in Milvus for a specific document."""
+    count_log = log.bind(document_id=document_id, company_id=company_id, component="MilvusHelperSync")
+    try:
+        store = _initialize_milvus_store_sync()
+        # Construct filters based on metadata Haystack uses
+        filters = {
+            "field": "meta", # Assuming meta field contains our IDs
+            "operator": "AND",
+            "conditions": [
+                {"field": "document_id", "operator": "==", "value": document_id},
+                {"field": "company_id", "operator": "==", "value": company_id},
+            ]
+        }
+        count = store.count_documents(filters=filters)
+        count_log.info("Milvus chunk count successful", count=count)
+        return count
+    except RuntimeError as re: # Catch init errors
+        count_log.error("Failed to get Milvus count due to store init error", error=str(re))
+        return -1 # Indicate error with -1
+    except Exception as e:
+        count_log.exception("Error counting documents in Milvus", error=str(e))
+        return -1 # Indicate error with -1
+
+def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
+    """Synchronously deletes chunks from Milvus for a specific document."""
+    delete_log = log.bind(document_id=document_id, company_id=company_id, component="MilvusHelperSync")
+    try:
+        store = _initialize_milvus_store_sync()
+        # Construct filters based on metadata
+        filters = {
+            "field": "meta", # Assuming meta field contains our IDs
+            "operator": "AND",
+            "conditions": [
+                {"field": "document_id", "operator": "==", "value": document_id},
+                {"field": "company_id", "operator": "==", "value": company_id},
+            ]
+        }
+        store.delete_documents(filters=filters) # Assuming filter-based delete is efficient
+        # Note: delete_documents might not return success/fail count easily. Assume success if no exception.
+        delete_log.info("Milvus delete operation executed (async nature means eventual consistency).")
+        return True
+    except RuntimeError as re: # Catch init errors
+        delete_log.error("Failed to delete Milvus chunks due to store init error", error=str(re))
+        return False
+    except Exception as e:
+        delete_log.exception("Error deleting documents from Milvus", error=str(e))
+        return False
 
 # --- Endpoints ---
 
 @router.post(
     "/upload",
-    response_model=schemas.IngestResponse,
+    response_model=IngestResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    summary="Ingestar un nuevo documento",
-    description="Sube un documento via API Gateway. Usa X-Company-ID y X-User-ID.",
+    summary="Upload a document for asynchronous ingestion",
+    responses={
+        400: {"model": ErrorDetail, "description": "Bad Request (e.g., invalid metadata, type, duplicate)"},
+        415: {"model": ErrorDetail, "description": "Unsupported Media Type"},
+        409: {"model": ErrorDetail, "description": "Conflict (Duplicate file)"},
+        500: {"model": ErrorDetail, "description": "Internal Server Error"},
+        503: {"model": ErrorDetail, "description": "Service Unavailable (DB or MinIO)"},
+    }
 )
-async def ingest_document_haystack(
-    company_id: uuid.UUID = Depends(get_current_company_id),
-    user_id: uuid.UUID = Depends(get_current_user_id),
-    metadata_json: str = Form(default="{}", description="String JSON de metadatos opcionales"),
-    file: UploadFile = File(..., description="El archivo a ingestar"),
-    request: Request = None
+async def upload_document(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    metadata_json: Optional[str] = Form(None),
+    company_id: str = Header(..., description="Company ID associated with the document"),
+    user_id: str = Header(..., description="User ID initiating the upload"),
+    minio_client: MinioClient = Depends(get_minio_client),
 ):
-    request_id = request.headers.get("x-request-id", str(uuid.uuid4())) if request else str(uuid.uuid4())
-    request_log = log.bind(
-        request_id=request_id,
-        company_id=str(company_id),
-        user_id=str(user_id),
-        filename=file.filename,
-        content_type=file.content_type
-    )
-    request_log.info("Processing document ingestion request from gateway")
+    """
+    Receives a document file and optional metadata, saves it to MinIO,
+    creates a record in PostgreSQL, and queues a Celery task for processing.
+    Prevents upload if a non-error document with the same name exists for the company.
+    """
+    req_id = getattr(request.state, 'request_id', 'N/A')
+    endpoint_log = log.bind(request_id=req_id, company_id=company_id, user_id=user_id,
+                            filename=file.filename, content_type=file.content_type)
+    endpoint_log.info("Processing document ingestion request from gateway")
 
-    content_type = file.content_type or "application/octet-stream"
-    if content_type not in settings.SUPPORTED_CONTENT_TYPES:
-        request_log.warning("Unsupported file type received", received_type=content_type)
-        raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail=f"Unsupported file type: '{content_type}'. Supported: {settings.SUPPORTED_CONTENT_TYPES}")
-    try:
-        metadata = json.loads(metadata_json)
-        if not isinstance(metadata, dict): raise ValueError("Metadata is not a JSON object")
-    except (json.JSONDecodeError, ValueError) as json_err:
-        request_log.warning("Invalid metadata JSON received", error=str(json_err))
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid JSON format for metadata: {json_err}")
-
-    # Verificar duplicados ANTES de crear registro DB
-    existing_docs = await postgres_client.list_documents_by_company(company_id, limit=1000, offset=0)
-    for doc in existing_docs:
-        db_filename = doc.get("file_name")
-        db_status = doc.get("status")
-        if db_filename and file.filename and db_filename == file.filename and db_status != DocumentStatus.ERROR.value:
-            request_log.warning("Intento de subida duplicada detectado", filename=file.filename, status=db_status)
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Ya existe un documento con el mismo nombre en estado '{db_status}'. Elimina o reintenta el anterior antes de subir uno nuevo.")
-
-    minio_client = MinioStorageClient()
-    document_id = uuid.uuid4() # Generar ID antes
-    request_log = request_log.bind(document_id=str(document_id))
-    # Sanitize filename for MinIO object name if necessary (optional)
-    safe_filename = "".join(c if c.isalnum() or c in ['.', '-', '_'] else '_' for c in file.filename)
-    object_name = f"{str(company_id)}/{str(document_id)}/{safe_filename}"
-
-    try:
-        # 1) Persistir registro inicial en DB (Estado UPLOADED)
-        await postgres_client.create_document(document_id, company_id, file.filename, content_type, metadata)
-
-        # 2) Subir archivo a MinIO
-        file_bytes = await file.read()
-        file_stream = io.BytesIO(file_bytes)
-        await minio_client.upload_file(company_id, document_id, safe_filename, file_stream, content_type, len(file_bytes)) # Use safe_filename
-
-        # 3) Actualizar file_path en DB (Status sigue UPLOADED)
-        await postgres_client.update_document_status(document_id, DocumentStatus.UPLOADED, file_path=object_name)
-
-        # 4) Encolar tarea Celery
-        task = process_document_haystack_task.delay(
-            str(document_id), str(company_id), object_name, file.filename, content_type, metadata
+    # 1. Validate Content-Type
+    if file.content_type not in settings.SUPPORTED_CONTENT_TYPES:
+        endpoint_log.warning("Unsupported content type received")
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Unsupported file type: {file.content_type}. Supported types: {', '.join(settings.SUPPORTED_CONTENT_TYPES)}"
         )
-        request_log.info("Document ingestion task queued successfully", task_id=task.id)
 
-        # Devolver respuesta 202 con estado UPLOADED (el worker lo cambiará a PROCESSING)
-        return schemas.IngestResponse(document_id=document_id, task_id=task.id, status=DocumentStatus.UPLOADED.value, message="Document upload received and queued for processing.")
-
-    except HTTPException as http_exc:
-        raise http_exc # Re-raise known HTTP exceptions
-    except Exception as e:
-        request_log.exception("Failed during initial document creation/upload")
-        # Intentar marcar como error si el registro DB se creó
+    # 2. Validate Metadata JSON (if provided)
+    metadata = None
+    if metadata_json:
         try:
-            if await postgres_client.get_document_status(document_id):
-                 await postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=f"Failed during initial upload: {e}")
-        except Exception as db_err:
-             request_log.error("Failed to update status to ERROR after initial upload failure", db_error=str(db_err))
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to initiate document ingestion: {e}")
+            metadata = json.loads(metadata_json)
+            if not isinstance(metadata, dict):
+                raise ValueError("Metadata must be a JSON object.")
+        except json.JSONDecodeError:
+            endpoint_log.warning("Invalid metadata JSON format received")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid metadata format: Must be valid JSON.")
+        except ValueError as e:
+             endpoint_log.warning(f"Invalid metadata content: {e}")
+             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid metadata content: {e}")
 
+    # 3. Check for Duplicates (in PostgreSQL)
+    try:
+        company_uuid = uuid.UUID(company_id)
+        async with get_db_conn() as conn:
+            existing_doc = await api_db_retry_strategy(db_client.find_document_by_name_and_company)(
+                conn=conn, filename=file.filename, company_id=company_uuid
+            )
+            if existing_doc and existing_doc['status'] != DocumentStatus.ERROR.value:
+                 endpoint_log.warning("Duplicate document detected", document_id=existing_doc['id'], status=existing_doc['status'])
+                 raise HTTPException(
+                     status_code=status.HTTP_409_CONFLICT,
+                     detail=f"Document '{file.filename}' already exists with status '{existing_doc['status']}'. Delete it first or wait for processing."
+                 )
+            elif existing_doc and existing_doc['status'] == DocumentStatus.ERROR.value:
+                 endpoint_log.info("Found existing document in error state, proceeding with overwrite logic implicitly (new upload).", document_id=existing_doc['id'])
+                 # We will create a new record, the old 'error' record remains until manually deleted.
+                 # Or, you could implement logic here to delete the old 'error' record first.
+                 pass # Allow upload to proceed, creating a new document ID
+
+    except ValueError:
+        endpoint_log.error("Invalid Company ID format provided", company_id_received=company_id)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Company ID format.")
+    except HTTPException as http_exc:
+        raise http_exc # Re-raise conflict or other HTTP exceptions
+    except Exception as e:
+        endpoint_log.exception("Error checking for duplicate document", error=str(e))
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error checking for duplicates.")
+
+    # 4. Create Initial Document Record (PostgreSQL)
+    document_id = uuid.uuid4()
+    object_name = f"{company_id}/{document_id}/{file.filename}" # Define object name *before* DB write
+
+    try:
+        async with get_db_conn() as conn:
+            await api_db_retry_strategy(db_client.create_document_record)(
+                conn=conn,
+                doc_id=document_id,
+                company_id=company_uuid,
+                user_id=uuid.UUID(user_id), # Assuming user_id is also UUID
+                filename=file.filename,
+                file_type=file.content_type,
+                minio_object_name=object_name, # Store object name early
+                status=DocumentStatus.PENDING, # Start as PENDING before upload
+                metadata=metadata
+            )
+        endpoint_log.info("Document record created in PostgreSQL", document_id=str(document_id))
+    except ValueError:
+        endpoint_log.error("Invalid User ID format provided", user_id_received=user_id)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid User ID format.")
+    except Exception as e:
+        endpoint_log.exception("Failed to create document record in PostgreSQL", error=str(e))
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error creating record.")
+
+    # 5. Upload to MinIO (using background task for large files if preferred, but await is safer)
+    try:
+        file_content = await file.read() # Read file content
+        await file.seek(0) # Reset file pointer if needed elsewhere
+        await minio_client.upload_file_async(
+            object_name=object_name,
+            data=file_content,
+            content_type=file.content_type
+        )
+        endpoint_log.info("File uploaded successfully to MinIO", object_name=object_name)
+
+        # 6. Update DB status to 'uploaded'
+        async with get_db_conn() as conn:
+             await api_db_retry_strategy(db_client.update_document_status)(
+                 pool=conn, # Use acquired connection directly if pool returns connection
+                 document_id=document_id,
+                 new_status=DocumentStatus.UPLOADED
+             )
+        endpoint_log.info("Document status updated to 'uploaded'", document_id=str(document_id))
+
+    except MinioError as me:
+        endpoint_log.error("Failed to upload file to MinIO", object_name=object_name, error=str(me))
+        # Attempt to mark document as error in DB
+        try:
+            async with get_db_conn() as conn:
+                await api_db_retry_strategy(db_client.update_document_status)(
+                    conn, document_id, DocumentStatus.ERROR, error_message=f"MinIO upload failed: {me}"
+                )
+        except Exception as db_err:
+            endpoint_log.exception("Failed to update status to ERROR after MinIO failure", error=str(db_err))
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Storage service error: {me}")
+    except Exception as e:
+         endpoint_log.exception("Unexpected error during file upload or DB update", error=str(e))
+          # Attempt to mark document as error in DB
+         try:
+             async with get_db_conn() as conn:
+                 await api_db_retry_strategy(db_client.update_document_status)(
+                     conn, document_id, DocumentStatus.ERROR, error_message=f"Unexpected upload error: {e}"
+                 )
+         except Exception as db_err:
+             endpoint_log.exception("Failed to update status to ERROR after unexpected upload failure", error=str(db_err))
+         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error during upload: {e}")
+    finally:
+         await file.close() # Ensure file handle is closed
+
+    # 7. Queue Celery Task
+    try:
+        task_payload = {
+            "document_id": str(document_id),
+            "company_id": company_id,
+            "filename": file.filename,
+            "content_type": file.content_type,
+            "user_id": user_id, # Pass user if needed by task
+        }
+        task = process_document_haystack_task.delay(**task_payload)
+        endpoint_log.info("Document ingestion task queued successfully", task_id=task.id)
+    except Exception as e:
+        endpoint_log.exception("Failed to queue Celery task", error=str(e))
+        # Attempt to mark document as error
+        try:
+            async with get_db_conn() as conn:
+                await api_db_retry_strategy(db_client.update_document_status)(
+                    conn, document_id, DocumentStatus.ERROR, error_message=f"Failed to queue processing task: {e}"
+                )
+        except Exception as db_err:
+             endpoint_log.exception("Failed to update status to ERROR after Celery failure", error=str(db_err))
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to queue processing task: {e}")
+
+    return IngestResponse(
+        document_id=str(document_id),
+        task_id=task.id,
+        status=DocumentStatus.UPLOADED.value, # Return the status *after* successful upload
+        message="Document upload accepted, processing started."
+    )
 
 @router.get(
     "/status/{document_id}",
-    response_model=schemas.StatusResponse,
-    status_code=status.HTTP_200_OK,
-    summary="Consultar estado de ingesta de un documento",
-    description="Recupera el estado de procesamiento de un documento específico, incluyendo verificación real en MinIO y Milvus.",
+    response_model=StatusResponse,
+    summary="Get the status of a specific document",
+    responses={
+        404: {"model": ErrorDetail, "description": "Document not found"},
+        500: {"model": ErrorDetail, "description": "Internal Server Error"},
+        503: {"model": ErrorDetail, "description": "Service Unavailable (DB, MinIO, Milvus)"},
+    }
 )
-async def get_ingestion_status(
-    document_id: uuid.UUID,
-    company_id: uuid.UUID = Depends(get_current_company_id),
-    request: Request = None
+async def get_document_status(
+    request: Request,
+    document_id: uuid.UUID = Path(..., description="The UUID of the document"),
+    company_id: str = Header(..., description="Company ID"),
+    minio_client: MinioClient = Depends(get_minio_client),
 ):
-    request_id = request.headers.get("x-request-id", str(uuid.uuid4())) if request else str(uuid.uuid4())
-    status_log = log.bind(request_id=request_id, document_id=str(document_id), company_id=str(company_id))
-    status_log.info("Received request for single document status")
+    """
+    Retrieves the status of a document from PostgreSQL.
+    Performs live checks:
+    - Verifies file existence in MinIO.
+    - Counts chunks in Milvus (via executor).
+    - Updates the DB status if inconsistencies are found (e.g., chunks exist but status is 'uploaded').
+    """
+    req_id = getattr(request.state, 'request_id', 'N/A')
+    status_log = log.bind(request_id=req_id, document_id=str(document_id), company_id=company_id)
+    status_log.info("Request received for document status")
+
     try:
-        record = await postgres_client.get_document_status(document_id)
-        if not record:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Documento no encontrado.")
-        if record.get("company_id") != company_id:
-            status_log.warning("Attempt to access document status from another company", owner_company=str(record.get('company_id')))
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Documento no encontrado.")
+        company_uuid = uuid.UUID(company_id)
+    except ValueError:
+        status_log.warning("Invalid Company ID format")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Company ID format.")
 
-        enriched_data = dict(record)
-        current_status_str = enriched_data["status"]
-        current_status = DocumentStatus(current_status_str)
-        original_chunk_count = enriched_data.get('chunk_count', 0) # Guardar valor original de la DB
+    doc_data: Optional[Dict[str, Any]] = None
+    needs_update = False
+    updated_status = None
+    updated_chunk_count = None
+    final_error_message = None
 
-        # ---- Enriquecimiento ----
-        if isinstance(enriched_data.get('metadata'), str):
-            try: enriched_data['metadata'] = json.loads(enriched_data['metadata'])
-            except json.JSONDecodeError: enriched_data['metadata'] = {"error": "invalid metadata format in DB"}
+    # 1. Get Base Status from DB
+    try:
+        async with get_db_conn() as conn:
+             doc_data = await api_db_retry_strategy(db_client.get_document_by_id)(
+                 conn, doc_id=document_id, company_id=company_uuid
+             )
+        if not doc_data:
+            status_log.warning("Document not found in DB")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+        status_log.info("Retrieved base document data from DB", status=doc_data['status'])
+        updated_status = DocumentStatus(doc_data['status']) # Keep track
+        final_error_message = doc_data.get('error_message')
 
-        file_path = enriched_data.get("file_path")
-        minio_exists = False
-        if file_path:
-            try:
-                minio_exists = await MinioStorageClient().file_exists(file_path)
-                status_log.debug("MinIO existence check result", object_path=file_path, exists=minio_exists)
-            except Exception as minio_err: status_log.error("Error checking MinIO", error=str(minio_err))
-        enriched_data['minio_exists'] = minio_exists
-
-        milvus_count = -1 # -1 indica error o no aplicable
-        milvus_check_error = False
-        # Solo verificar Milvus si el estado sugiere que *debería* haber chunks
-        if current_status in [DocumentStatus.PROCESSING, DocumentStatus.PROCESSED, DocumentStatus.INDEXED]:
-            status_log.debug("Checking chunk count in Milvus...")
-            milvus_count = await get_milvus_chunk_count(document_id)
-            if milvus_count == -1:
-                status_log.error("Milvus check failed during status retrieval.")
-                milvus_check_error = True # Marcar que hubo error en la verificación
-            else:
-                status_log.debug("Milvus chunk count result", count=milvus_count)
-        elif current_status == DocumentStatus.UPLOADED:
-             milvus_count = 0 # Asumir 0 si aún no debería estar procesado
-        # Si está en ERROR, milvus_count permanece -1 (no relevante o incierto)
-        enriched_data['milvus_chunk_count'] = milvus_count if not milvus_check_error else None # Poner None si hubo error
-
-        # --- Lógica de Actualización de Estado Basada en Verificaciones ---
-        needs_db_update = False
-        new_status = current_status
-        # Usar milvus_count si es válido, sino el de la DB
-        new_chunk_count = milvus_count if milvus_count >= 0 else original_chunk_count
-        new_error_message = enriched_data.get('error_message')
-
-        if not minio_exists and current_status != DocumentStatus.ERROR:
-             status_log.warning("MinIO file missing but status is not ERROR. Updating DB.", db_status=current_status_str)
-             new_status = DocumentStatus.ERROR
-             new_error_message = "Error: Archivo original no encontrado en almacenamiento."
-             new_chunk_count = 0 # Resetear chunks si el archivo fuente no está
-             needs_db_update = True
-        elif not milvus_check_error: # Solo actuar si la verificación Milvus fue exitosa
-             if milvus_count > 0 and current_status in [DocumentStatus.UPLOADED, DocumentStatus.PROCESSING]:
-                 status_log.warning("DB status mismatch, chunks found in Milvus. Updating DB.", db_status=current_status_str, milvus_count=milvus_count)
-                 new_status = DocumentStatus.PROCESSED
-                 new_chunk_count = milvus_count
-                 new_error_message = None # Limpiar error si ahora está procesado
-                 needs_db_update = True
-             elif milvus_count == 0 and current_status == DocumentStatus.PROCESSING:
-                 status_log.warning("Milvus has 0 chunks but DB status is PROCESSING. Updating DB to ERROR.", db_status=current_status_str)
-                 new_status = DocumentStatus.ERROR
-                 new_error_message = "Error: Procesamiento no generó contenido indexable o falló inesperadamente."
-                 new_chunk_count = 0
-                 needs_db_update = True
-             elif milvus_count >= 0 and current_status != DocumentStatus.ERROR and original_chunk_count != milvus_count:
-                  # Si el conteo de Milvus es válido y difiere del de la DB (y no estamos ya en Error)
-                  status_log.warning("DB chunk count mismatch. Updating DB count.", db_count=original_chunk_count, milvus_count=milvus_count)
-                  new_chunk_count = milvus_count
-                  needs_db_update = True # Solo actualiza count si status ya es correcto
-
-        # Si se necesita actualizar la DB
-        if needs_db_update:
-             status_log.info("Updating document status/chunks in DB based on real-time checks.", new_status=new_status.value, new_chunk_count=new_chunk_count)
-             try:
-                 await postgres_client.update_document_status(
-                     document_id, new_status, chunk_count=new_chunk_count, error_message=new_error_message
-                 )
-                 # Actualizar los datos locales para la respuesta
-                 enriched_data["status"] = new_status.value
-                 enriched_data["chunk_count"] = new_chunk_count
-                 enriched_data["error_message"] = new_error_message
-             except Exception as db_update_err:
-                  status_log.error("Failed to update DB status during consistency check", error=str(db_update_err))
-                  # Continuar con los datos originales de la DB si la actualización falla
-
-        # Generar mensaje descriptivo basado en el estado *final*
-        final_status = DocumentStatus(enriched_data["status"])
-        status_messages = {
-            DocumentStatus.UPLOADED: "Documento subido, pendiente de procesamiento.",
-            DocumentStatus.PROCESSING: "Documento está siendo procesado.",
-            DocumentStatus.PROCESSED: "Documento procesado correctamente.",
-            DocumentStatus.INDEXED: "Documento procesado e indexado.",
-            DocumentStatus.ERROR: f"Error de procesamiento: {enriched_data.get('error_message') or 'Error desconocido'}",
-        }
-        # Añadir nota si hubo error al verificar Milvus
-        message = status_messages.get(final_status, "Estado desconocido.")
-        if milvus_check_error and final_status != DocumentStatus.ERROR:
-            message += " (No se pudo verificar el estado de indexación en Milvus)"
-        enriched_data['message'] = message
-
-        # ---- Validación Final ----
-        try:
-            response_data = schemas.StatusResponse.model_validate(enriched_data)
-            status_log.info("Returning detailed document status", status=response_data.status, minio_exists=response_data.minio_exists, milvus_chunks=response_data.milvus_chunk_count)
-            return response_data
-        except ValidationError as val_err:
-            status_log.error("Final validation failed after enrichment", errors=val_err.errors(), data_validated=enriched_data)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to format final document status.")
-
-    except HTTPException as http_exc: raise http_exc
+    except HTTPException as http_exc:
+        raise http_exc
     except Exception as e:
-        status_log.exception("Error retrieving detailed document status")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve detailed document status.")
+        status_log.exception("Error fetching document status from DB", error=str(e))
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error fetching status.")
 
+    minio_path = doc_data.get('minio_object_name') # Use the stored path
+    if not minio_path:
+         status_log.warning("MinIO object name missing in DB record", db_id=doc_data['id'])
+         # Consider setting error state? Or just report inconsistency
+         minio_exists = False
+    else:
+        # 2. Check MinIO Existence (Async)
+        status_log.debug("Checking MinIO for file existence", object_name=minio_path)
+        minio_exists = await minio_client.check_file_exists_async(minio_path)
+        status_log.info("MinIO existence check complete", exists=minio_exists)
+        if not minio_exists and updated_status not in [DocumentStatus.ERROR, DocumentStatus.PENDING]:
+             status_log.warning("File missing in MinIO but DB status is not ERROR/PENDING", current_db_status=updated_status.value)
+             # File is gone, mark as error if not already
+             if updated_status != DocumentStatus.ERROR:
+                 needs_update = True
+                 updated_status = DocumentStatus.ERROR
+                 final_error_message = "File missing from storage."
+
+    # 3. Check Milvus Chunk Count (Sync in Executor)
+    status_log.debug("Checking Milvus for chunk count...")
+    loop = asyncio.get_running_loop()
+    try:
+        milvus_chunk_count = await loop.run_in_executor(
+            None, _get_milvus_chunk_count_sync, str(document_id), company_id
+        )
+        status_log.info("Milvus chunk count check complete", count=milvus_chunk_count)
+        if milvus_chunk_count == -1:
+            status_log.error("Milvus count check failed (returned -1). Treating as error.")
+            if updated_status != DocumentStatus.ERROR:
+                needs_update = True
+                updated_status = DocumentStatus.ERROR
+                final_error_message = (final_error_message or "") + " Failed to verify processed data (Milvus count error)."
+        elif milvus_chunk_count > 0 and updated_status == DocumentStatus.UPLOADED:
+            status_log.warning("Inconsistency: Chunks found in Milvus but DB status is 'uploaded'. Correcting to 'processed'.")
+            needs_update = True
+            updated_status = DocumentStatus.PROCESSED
+            updated_chunk_count = milvus_chunk_count # Store the count we found
+            final_error_message = None # Clear error if we are now processed
+        elif milvus_chunk_count == 0 and updated_status == DocumentStatus.PROCESSED:
+             status_log.warning("Inconsistency: DB status is 'processed' but no chunks found in Milvus. Correcting to 'error'.")
+             needs_update = True
+             updated_status = DocumentStatus.ERROR
+             updated_chunk_count = 0
+             final_error_message = (final_error_message or "") + " Processed data missing (Milvus count is 0)."
+        elif updated_status == DocumentStatus.PROCESSED:
+            # If status is already processed and count matches DB or is > 0, update stored count
+            if updated_chunk_count is None or updated_chunk_count != milvus_chunk_count:
+                 updated_chunk_count = milvus_chunk_count
+                 if doc_data.get('chunk_count') != updated_chunk_count:
+                      needs_update = True # Need to update DB chunk count
+    except Exception as e:
+        status_log.exception("Unexpected error during Milvus count check", error=str(e))
+        milvus_chunk_count = -1 # Indicate error
+        if updated_status != DocumentStatus.ERROR:
+            needs_update = True
+            updated_status = DocumentStatus.ERROR
+            final_error_message = (final_error_message or "") + f" Error checking processed data: {e}."
+
+    # 4. Update DB if inconsistencies were found
+    if needs_update:
+        status_log.warning("Inconsistency detected, updating document status in DB",
+                          new_status=updated_status.value, new_count=updated_chunk_count, new_error=final_error_message)
+        try:
+             async with get_db_conn() as conn:
+                 await api_db_retry_strategy(db_client.update_document_status)(
+                     conn, document_id, updated_status,
+                     chunk_count=updated_chunk_count, # Update count if changed
+                     error_message=final_error_message # Update error message
+                 )
+             status_log.info("Document status updated successfully in DB due to inconsistency check.")
+             # Update local data for response
+             doc_data['status'] = updated_status.value
+             if updated_chunk_count is not None: doc_data['chunk_count'] = updated_chunk_count
+             if final_error_message is not None: doc_data['error_message'] = final_error_message
+        except Exception as e:
+             status_log.exception("Failed to update document status in DB after inconsistency check", error=str(e))
+             # Continue to return status, but log the failure to update
+             # The returned status might be stale now.
+
+    # 5. Construct and Return Response
+    status_log.info("Returning final document status")
+    return StatusResponse(
+        document_id=str(doc_data['id']),
+        status=doc_data['status'],
+        file_name=doc_data['file_name'],
+        file_type=doc_data['file_type'],
+        chunk_count=doc_data.get('chunk_count', 0), # Use DB value (potentially updated)
+        minio_exists=minio_exists, # Live check result
+        milvus_chunk_count=milvus_chunk_count, # Live check result (or -1 for error)
+        last_updated=doc_data['updated_at'],
+        error_message=doc_data.get('error_message'), # Use DB value (potentially updated)
+        metadata=doc_data.get('metadata') # Include metadata if available
+    )
 
 @router.get(
     "/status",
-    response_model=List[schemas.StatusResponse],
-    status_code=status.HTTP_200_OK,
-    summary="Listar estados de ingesta para la compañía (con estado real)",
-    description="Recupera lista de documentos con verificación en MinIO y conteo real de Milvus en paralelo.",
+    response_model=PaginatedStatusResponse,
+    summary="List document statuses with pagination and live checks",
+    responses={
+        500: {"model": ErrorDetail, "description": "Internal Server Error"},
+        503: {"model": ErrorDetail, "description": "Service Unavailable (DB, MinIO, Milvus)"},
+    }
 )
-async def list_ingestion_statuses(
-    company_id: uuid.UUID = Depends(get_current_company_id),
-    limit: int = Query(default=30, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
-    request: Request = None
+async def list_document_statuses(
+    request: Request,
+    company_id: str = Header(..., description="Company ID"),
+    limit: int = Query(30, ge=1, le=100, description="Number of documents per page"),
+    offset: int = Query(0, ge=0, description="Offset for pagination"),
+    # Add optional filters? e.g., status=... filename=...
+    minio_client: MinioClient = Depends(get_minio_client),
 ):
-    request_id = request.headers.get("x-request-id", str(uuid.uuid4())) if request else str(uuid.uuid4())
-    list_log = log.bind(request_id=request_id, company_id=str(company_id), limit=limit, offset=offset)
+    """
+    Lists documents for the company with pagination.
+    Performs live checks for MinIO/Milvus in parallel for listed documents.
+    Updates the DB status/chunk_count if inconsistencies are found.
+    Returns the potentially updated status information.
+    """
+    req_id = getattr(request.state, 'request_id', 'N/A')
+    list_log = log.bind(request_id=req_id, company_id=company_id, limit=limit, offset=offset)
     list_log.info("Listing document statuses with real-time checks")
+
     try:
-        records = await postgres_client.list_documents_by_company(company_id, limit=limit, offset=offset)
-        if not records:
-             list_log.info("No documents found for this company.")
-             return []
+        company_uuid = uuid.UUID(company_id)
+    except ValueError:
+        list_log.warning("Invalid Company ID format")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Company ID format.")
 
-        # Función para enriquecer y validar cada status en paralelo
-        async def enrich_and_validate(record: Dict[str, Any]) -> Optional[schemas.StatusResponse]:
-            doc_id = record.get("id")
-            enrich_log = list_log.bind(document_id=str(doc_id))
-            enriched_data = dict(record)
-            current_status_str = enriched_data["status"]
-            current_status = DocumentStatus(current_status_str)
-            original_chunk_count = enriched_data.get('chunk_count', 0)
+    documents_db: List[Dict[str, Any]] = []
+    total_count: int = 0
 
-            # Parsear metadata
-            if isinstance(enriched_data.get('metadata'), str):
-                try: enriched_data['metadata'] = json.loads(enriched_data['metadata'])
-                except json.JSONDecodeError: enriched_data['metadata'] = {"error": "invalid metadata format in DB"}
-
-            # Verificar MinIO
-            file_path = enriched_data.get("file_path")
-            minio_exists = False
-            try: minio_exists = await MinioStorageClient().file_exists(file_path) if file_path else False
-            except Exception as ex: enrich_log.error("MinIO check failed", error=str(ex))
-            enriched_data['minio_exists'] = minio_exists
-
-            # Contar chunks en Milvus
-            milvus_count = -1
-            milvus_check_error = False
-            if current_status in [DocumentStatus.PROCESSING, DocumentStatus.PROCESSED, DocumentStatus.INDEXED]:
-                 try: milvus_count = await get_milvus_chunk_count(doc_id)
-                 except Exception as ex:
-                      enrich_log.error("Milvus check failed", error=str(ex))
-                      milvus_check_error = True
-                 if milvus_count == -1 and not milvus_check_error: milvus_check_error = True
-            elif current_status == DocumentStatus.UPLOADED:
-                 milvus_count = 0
-            enriched_data['milvus_chunk_count'] = milvus_count if not milvus_check_error else None
-
-            # Lógica de Actualización de Estado Basada en Verificaciones
-            needs_db_update = False
-            new_status = current_status
-            new_chunk_count = milvus_count if milvus_count >= 0 else original_chunk_count
-            new_error_message = enriched_data.get('error_message')
-
-            if not minio_exists and current_status != DocumentStatus.ERROR:
-                 new_status = DocumentStatus.ERROR; new_error_message = "Error: Archivo original no encontrado."; needs_db_update = True
-            elif not milvus_check_error:
-                 if milvus_count > 0 and current_status in [DocumentStatus.UPLOADED, DocumentStatus.PROCESSING]:
-                     new_status = DocumentStatus.PROCESSED; new_chunk_count = milvus_count; new_error_message = None; needs_db_update = True
-                 elif milvus_count == 0 and current_status == DocumentStatus.PROCESSING:
-                     new_status = DocumentStatus.ERROR; new_error_message = "Error: Procesamiento sin resultado indexable."; needs_db_update = True
-                 elif milvus_count >= 0 and current_status != DocumentStatus.ERROR and original_chunk_count != milvus_count:
-                      new_chunk_count = milvus_count; needs_db_update = True
-
-            if needs_db_update:
-                 enrich_log.info("Updating document status/chunks in DB based on real-time checks.", new_status=new_status.value, new_chunk_count=new_chunk_count)
-                 try:
-                     await postgres_client.update_document_status(
-                         doc_id, new_status, chunk_count=new_chunk_count, error_message=new_error_message
-                     )
-                     enriched_data["status"] = new_status.value
-                     enriched_data["chunk_count"] = new_chunk_count
-                     enriched_data["error_message"] = new_error_message
-                 except Exception as db_err:
-                     enrich_log.error("Failed to update DB during enrichment", error=str(db_err))
-
-            # Generar mensaje final
-            final_status = DocumentStatus(enriched_data["status"])
-            status_messages = {
-                DocumentStatus.UPLOADED: "Pendiente de procesamiento.",
-                DocumentStatus.PROCESSING: "Procesando...",
-                DocumentStatus.PROCESSED: "Procesado.",
-                DocumentStatus.INDEXED: "Indexado.",
-                DocumentStatus.ERROR: f"Error: {enriched_data.get('error_message') or 'Desconocido'}",
-            }
-            message = status_messages.get(final_status, "Estado desconocido.")
-            if milvus_check_error and final_status != DocumentStatus.ERROR:
-                message += " (Verificación Milvus falló)"
-            enriched_data['message'] = message
-
-            # Validar finalmente
-            try:
-                return schemas.StatusResponse.model_validate(enriched_data)
-            except ValidationError as val_err:
-                enrich_log.error(
-                     "Error validating status after enrichment",
-                     error=str(val_err),
-                     data_validated=enriched_data
-                 )
-                return None # Excluir de la lista final
-
-        # Lanzar enriquecimiento en paralelo
-        tasks = [asyncio.create_task(enrich_and_validate(record)) for record in records]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Filtrar resultados válidos
-        final_list: List[schemas.StatusResponse] = []
-        for i, res in enumerate(results):
-            if isinstance(res, Exception):
-                list_log.error("Unhandled exception during status enrichment task", document_id=str(records[i].get('id')), error=str(res), tb=traceback.format_exc())
-            elif res is not None: # Si no es None (validación exitosa)
-                final_list.append(res)
-
-        list_log.info("Returning enriched statuses", count=len(final_list))
-        return final_list
+    # 1. Get paginated list from DB
+    try:
+        async with get_db_conn() as conn:
+            documents_db, total_count = await api_db_retry_strategy(db_client.list_documents_paginated)(
+                conn, company_id=company_uuid, limit=limit, offset=offset
+            )
+        list_log.info("Retrieved documents from DB", count=len(documents_db), total_db_count=total_count)
     except Exception as e:
-        list_log.exception("Error listing enriched statuses")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error retrieving document statuses.")
+        list_log.exception("Error listing documents from DB", error=str(e))
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error listing documents.")
+
+    if not documents_db:
+        return PaginatedStatusResponse(items=[], total=0, limit=limit, offset=offset)
+
+    # --- Perform Live Checks in Parallel ---
+    async def check_single_document(doc_db_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Async helper to check MinIO/Milvus for one document."""
+        check_log = log.bind(request_id=req_id, document_id=str(doc_db_data['id']), company_id=company_id)
+        check_log.debug("Starting live checks for document")
+
+        minio_exists_live = False
+        milvus_count_live = -1 # Default to error state
+        doc_needs_update = False
+        doc_updated_status_val = doc_db_data['status']
+        doc_updated_chunk_count = doc_db_data.get('chunk_count')
+        doc_final_error_msg = doc_db_data.get('error_message')
+
+        # Check MinIO
+        minio_path_db = doc_db_data.get('minio_object_name')
+        if minio_path_db:
+            try:
+                minio_exists_live = await minio_client.check_file_exists_async(minio_path_db)
+                check_log.debug("MinIO check done", exists=minio_exists_live)
+                if not minio_exists_live and doc_updated_status_val not in [DocumentStatus.ERROR.value, DocumentStatus.PENDING.value]:
+                     check_log.warning("File missing in MinIO but DB status is not ERROR/PENDING", current_db_status=doc_updated_status_val)
+                     if doc_updated_status_val != DocumentStatus.ERROR.value:
+                         doc_needs_update = True
+                         doc_updated_status_val = DocumentStatus.ERROR.value
+                         doc_final_error_msg = "File missing from storage."
+            except Exception as e:
+                 check_log.error("MinIO check failed", error=str(e))
+                 minio_exists_live = False # Assume false on error
+                 if doc_updated_status_val != DocumentStatus.ERROR.value:
+                      doc_needs_update = True
+                      doc_updated_status_val = DocumentStatus.ERROR.value
+                      doc_final_error_msg = (doc_final_error_msg or "") + f" MinIO check error: {e}."
+        else:
+             check_log.warning("MinIO object name missing in DB record.")
+             minio_exists_live = False
+
+        # Check Milvus (Sync in Executor)
+        loop = asyncio.get_running_loop()
+        try:
+            milvus_count_live = await loop.run_in_executor(
+                None, _get_milvus_chunk_count_sync, str(doc_db_data['id']), company_id
+            )
+            check_log.debug("Milvus count check done", count=milvus_count_live)
+            if milvus_count_live == -1:
+                check_log.error("Milvus count check failed (returned -1)")
+                if doc_updated_status_val != DocumentStatus.ERROR.value:
+                    doc_needs_update = True
+                    doc_updated_status_val = DocumentStatus.ERROR.value
+                    doc_final_error_msg = (doc_final_error_msg or "") + " Failed to verify processed data (Milvus count error)."
+            elif milvus_count_live > 0 and doc_updated_status_val == DocumentStatus.UPLOADED.value:
+                 check_log.warning("Inconsistency: Chunks found in Milvus but DB status is 'uploaded'. Correcting to 'processed'.")
+                 doc_needs_update = True
+                 doc_updated_status_val = DocumentStatus.PROCESSED.value
+                 doc_updated_chunk_count = milvus_count_live
+                 doc_final_error_msg = None # Clear error
+            elif milvus_count_live == 0 and doc_updated_status_val == DocumentStatus.PROCESSED.value:
+                 check_log.warning("Inconsistency: DB status is 'processed' but no chunks found in Milvus. Correcting to 'error'.")
+                 doc_needs_update = True
+                 doc_updated_status_val = DocumentStatus.ERROR.value
+                 doc_updated_chunk_count = 0
+                 doc_final_error_msg = (doc_final_error_msg or "") + " Processed data missing (Milvus count is 0)."
+            elif doc_updated_status_val == DocumentStatus.PROCESSED.value:
+                 # If status is already processed and count matches DB or is > 0, update stored count
+                 if doc_updated_chunk_count is None or doc_updated_chunk_count != milvus_count_live:
+                      doc_updated_chunk_count = milvus_count_live
+                      if doc_db_data.get('chunk_count') != doc_updated_chunk_count:
+                           doc_needs_update = True # Need to update DB chunk count
+
+        except Exception as e:
+            check_log.exception("Unexpected error during Milvus count check", error=str(e))
+            milvus_count_live = -1 # Indicate error
+            if doc_updated_status_val != DocumentStatus.ERROR.value:
+                doc_needs_update = True
+                doc_updated_status_val = DocumentStatus.ERROR.value
+                doc_final_error_msg = (doc_final_error_msg or "") + f" Error checking processed data: {e}."
+
+        # Store results for potential DB update and final response construction
+        return {
+            "db_data": doc_db_data,
+            "needs_update": doc_needs_update,
+            "updated_status": doc_updated_status_val,
+            "updated_chunk_count": doc_updated_chunk_count,
+            "final_error_message": doc_final_error_msg,
+            "live_minio_exists": minio_exists_live,
+            "live_milvus_chunk_count": milvus_count_live,
+        }
+
+    # Run checks concurrently
+    check_tasks = [check_single_document(doc) for doc in documents_db]
+    check_results = await asyncio.gather(*check_tasks)
+
+    # Update DB for inconsistent documents (sequentially or batched)
+    updated_doc_data_map = {} # Store updated data by doc_id
+    docs_to_update_in_db = []
+    for result in check_results:
+        if result["needs_update"]:
+            docs_to_update_in_db.append({
+                "id": result["db_data"]["id"],
+                "status": DocumentStatus(result["updated_status"]), # Enum for update func
+                "chunk_count": result["updated_chunk_count"],
+                "error_message": result["final_error_message"],
+            })
+        # Store the potentially updated data for the final response
+        updated_doc_data_map[str(result["db_data"]["id"])] = {
+             **result["db_data"], # Original data
+             "status": result["updated_status"], # Potentially updated status
+             "chunk_count": result["updated_chunk_count"], # Potentially updated count
+             "error_message": result["final_error_message"], # Potentially updated error
+        }
+
+
+    if docs_to_update_in_db:
+        list_log.warning("Updating statuses in DB for inconsistent documents", count=len(docs_to_update_in_db))
+        # Consider batch update if db_client supports it, otherwise sequential
+        try:
+             async with get_db_conn() as conn:
+                 for update_info in docs_to_update_in_db:
+                     try:
+                         await api_db_retry_strategy(db_client.update_document_status)(
+                             conn, update_info["id"], update_info["status"],
+                             chunk_count=update_info["chunk_count"],
+                             error_message=update_info["error_message"]
+                         )
+                         list_log.info("Successfully updated DB status", document_id=str(update_info["id"]), new_status=update_info["status"].value)
+                     except Exception as single_update_err:
+                         # Log error for this specific update but continue with others
+                         list_log.error("Failed DB update for single document during list check",
+                                        document_id=str(update_info["id"]), error=str(single_update_err))
+        except Exception as bulk_update_err:
+            list_log.exception("Error during bulk DB status update process", error=str(bulk_update_err))
+            # Proceed with potentially stale data, error logged
+
+    # Construct final response using potentially updated data
+    final_items = []
+    for result in check_results:
+         doc_id_str = str(result["db_data"]["id"])
+         # Use data from map which includes potential updates, fallback to original if error somehow
+         current_data = updated_doc_data_map.get(doc_id_str, result["db_data"])
+         final_items.append(StatusResponse(
+            document_id=doc_id_str,
+            status=current_data['status'],
+            file_name=current_data['file_name'],
+            file_type=current_data['file_type'],
+            chunk_count=current_data.get('chunk_count', 0),
+            minio_exists=result["live_minio_exists"], # Use live check result
+            milvus_chunk_count=result["live_milvus_chunk_count"], # Use live check result
+            last_updated=current_data['updated_at'],
+            error_message=current_data.get('error_message'),
+            metadata=current_data.get('metadata')
+         ))
+
+    list_log.info("Returning enriched statuses", count=len(final_items))
+    return PaginatedStatusResponse(items=final_items, total=total_count, limit=limit, offset=offset)
 
 
 @router.post(
     "/retry/{document_id}",
-    response_model=schemas.IngestResponse,
+    response_model=IngestResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    summary="Reintentar la ingesta de un documento con error",
-    description="Permite reintentar la ingesta de un documento que falló. Solo disponible si el estado es 'error'."
+    summary="Retry ingestion for a document currently in 'error' state",
+    responses={
+        404: {"model": ErrorDetail, "description": "Document not found"},
+        409: {"model": ErrorDetail, "description": "Document is not in 'error' state"},
+        500: {"model": ErrorDetail, "description": "Internal Server Error"},
+        503: {"model": ErrorDetail, "description": "Service Unavailable (DB or Celery)"},
+    }
 )
-async def retry_document_ingest(
-    document_id: uuid.UUID,
-    company_id: uuid.UUID = Depends(get_current_company_id),
-    user_id: uuid.UUID = Depends(get_current_user_id),
-    request: Request = None
+async def retry_ingestion(
+    request: Request,
+    document_id: uuid.UUID = Path(..., description="The UUID of the document to retry"),
+    company_id: str = Header(..., description="Company ID"),
+    user_id: str = Header(..., description="User ID initiating the retry"),
 ):
-    request_id = request.headers.get("x-request-id", str(uuid.uuid4())) if request else str(uuid.uuid4())
-    retry_log = log.bind(request_id=request_id, company_id=str(company_id), user_id=str(user_id), document_id=str(document_id))
+    """
+    Allows retrying the ingestion process for a document that previously failed.
+    - Checks if the document exists and belongs to the company.
+    - Verifies the document status is 'error'.
+    - Updates the status to 'processing' (clearing error message).
+    - Re-queues the Celery processing task.
+    """
+    req_id = getattr(request.state, 'request_id', 'N/A')
+    retry_log = log.bind(request_id=req_id, document_id=str(document_id), company_id=company_id, user_id=user_id)
     retry_log.info("Received request to retry document ingestion")
 
-    doc = await postgres_client.get_document_status(document_id)
-    if not doc:
-        retry_log.warning("Document not found for retry attempt")
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Documento no encontrado.")
-    try: doc_company_id = uuid.UUID(str(doc.get("company_id")))
-    except (ValueError, TypeError): raise HTTPException(status_code=500, detail="Error interno al verificar documento.")
-    if doc_company_id != company_id: raise HTTPException(status_code=404, detail="Documento no encontrado.")
-
-    if doc.get("status") != DocumentStatus.ERROR.value:
-        retry_log.warning("Retry attempt on document not in 'error' state", current_status=doc.get("status"))
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Solo se puede reintentar la ingesta si el estado es 'error'.")
-    if not doc.get("file_path"):
-        retry_log.error("Cannot retry document without a valid file_path in DB")
-        await postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message="Cannot retry: Original file path missing.")
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No se puede reintentar: falta la ruta del archivo original.")
-
-    metadata_to_pass = doc.get("metadata", {})
-    if isinstance(metadata_to_pass, str):
-         try: metadata_to_pass = json.loads(metadata_to_pass)
-         except: metadata_to_pass = {}
-    elif not isinstance(metadata_to_pass, dict): metadata_to_pass = {}
-
     try:
-        # 1. Actualizar estado a 'PROCESSING' y limpiar error ANTES de encolar
-        await postgres_client.update_document_status(
-            document_id=document_id, status=DocumentStatus.PROCESSING, error_message=None
-        )
-        retry_log.info("Document status updated to PROCESSING for retry.")
+        company_uuid = uuid.UUID(company_id)
+    except ValueError:
+        retry_log.warning("Invalid Company ID format")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Company ID format.")
 
-        # 2. Reencolar la tarea Celery
-        task = process_document_haystack_task.delay(
-            document_id_str=str(document_id), company_id_str=str(company_id),
-            minio_object_name=doc["file_path"], file_name=doc["file_name"],
-            content_type=doc["file_type"], original_metadata=metadata_to_pass
-        )
-        retry_log.info("Retry ingestion task queued", task_id=task.id)
-        return schemas.IngestResponse(document_id=document_id, task_id=task.id, status=DocumentStatus.PROCESSING.value, message="Reintento de ingesta encolado correctamente.")
+    # 1. Get document and verify state
+    doc_data: Optional[Dict[str, Any]] = None
+    try:
+         async with get_db_conn() as conn:
+            doc_data = await api_db_retry_strategy(db_client.get_document_by_id)(
+                conn, doc_id=document_id, company_id=company_uuid
+            )
+         if not doc_data:
+            retry_log.warning("Document not found for retry")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
 
+         if doc_data['status'] != DocumentStatus.ERROR.value:
+             retry_log.warning("Document is not in error state, cannot retry", current_status=doc_data['status'])
+             raise HTTPException(
+                 status_code=status.HTTP_409_CONFLICT,
+                 detail=f"Document is not in 'error' state (current state: {doc_data['status']}). Cannot retry."
+             )
+         retry_log.info("Document found and confirmed to be in 'error' state.")
+
+    except HTTPException as http_exc:
+        raise http_exc
     except Exception as e:
-        retry_log.exception("Failed during retry initiation (DB update or Celery queue)")
-        # Intentar volver a poner en error si falló el encolado
-        try: await postgres_client.update_document_status(document_id, DocumentStatus.ERROR, error_message=f"Fallo al iniciar reintento: {e}")
-        except: pass # Ignorar error secundario
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al iniciar reintento: {e}")
+        retry_log.exception("Error fetching document for retry", error=str(e))
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error checking document for retry.")
+
+    # 2. Update status to 'processing' (clear error message)
+    try:
+        async with get_db_conn() as conn:
+            await api_db_retry_strategy(db_client.update_document_status)(
+                conn, document_id, DocumentStatus.PROCESSING, chunk_count=None, error_message=None # Clear error
+            )
+        retry_log.info("Document status updated to 'processing' for retry.")
+    except Exception as e:
+        retry_log.exception("Failed to update document status to 'processing' for retry", error=str(e))
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error updating status for retry.")
+
+    # 3. Re-queue Celery task
+    try:
+        task_payload = {
+            "document_id": str(document_id),
+            "company_id": company_id,
+            "filename": doc_data['file_name'],
+            "content_type": doc_data['file_type'],
+             "user_id": user_id,
+        }
+        task = process_document_haystack_task.delay(**task_payload)
+        retry_log.info("Document reprocessing task queued successfully", task_id=task.id)
+    except Exception as e:
+        retry_log.exception("Failed to re-queue Celery task for retry", error=str(e))
+        # Attempt to revert status back to 'error' ? This is tricky.
+        # For now, raise 500, status might be stuck in 'processing'.
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to queue reprocessing task: {e}")
+
+    return IngestResponse(
+        document_id=str(document_id),
+        task_id=task.id,
+        status=DocumentStatus.PROCESSING.value,
+        message="Document retry accepted, processing started."
+    )
 
 
 @router.delete(
     "/{document_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    summary="Eliminar un documento",
-    description="Elimina completamente un documento (registro DB, archivo MinIO, chunks Milvus)."
+    summary="Delete a document and its associated data",
+    responses={
+        404: {"model": ErrorDetail, "description": "Document not found"},
+        500: {"model": ErrorDetail, "description": "Internal Server Error"},
+        503: {"model": ErrorDetail, "description": "Service Unavailable (DB, MinIO, Milvus)"},
+    }
 )
 async def delete_document_endpoint(
-    document_id: uuid.UUID,
-    company_id: uuid.UUID = Depends(get_current_company_id),
-    request: Request = None
+    request: Request,
+    document_id: uuid.UUID = Path(..., description="The UUID of the document to delete"),
+    company_id: str = Header(..., description="Company ID"),
+    minio_client: MinioClient = Depends(get_minio_client),
 ):
-    request_id = request.headers.get("x-request-id", str(uuid.uuid4())) if request else str(uuid.uuid4())
-    delete_log = log.bind(request_id=request_id, document_id=str(document_id), company_id=str(company_id))
+    """
+    Deletes a document completely:
+    - Removes chunks from Milvus (via executor).
+    - Removes the file from MinIO (async).
+    - Removes the record from PostgreSQL.
+    Verifies ownership before deletion.
+    """
+    req_id = getattr(request.state, 'request_id', 'N/A')
+    delete_log = log.bind(request_id=req_id, document_id=str(document_id), company_id=company_id)
     delete_log.info("Received request to delete document")
 
-    # 1. Validar existencia y pertenencia
-    doc = await postgres_client.get_document_status(document_id)
-    if not doc: raise HTTPException(status_code=404, detail="Documento no encontrado.")
-    try: doc_company_id = uuid.UUID(str(doc.get("company_id")))
-    except: raise HTTPException(status_code=500, detail="Error interno al verificar documento.")
-    if doc_company_id != company_id: raise HTTPException(status_code=404, detail="Documento no encontrado.")
-
-    errors = []
-    loop = asyncio.get_running_loop()
-
-    # 2. Eliminar chunks de Milvus
-    delete_log.info("Attempting to delete chunks from Milvus...")
     try:
-        def _delete_milvus_sync():
-            # *** RE-VERIFICACIÓN: Usar embedding_dim consistentemente ***
-            store = MilvusDocumentStore(
-                connection_args={"uri": str(settings.MILVUS_URI)},
-                collection_name=settings.MILVUS_COLLECTION_NAME,
-                embedding_dim=settings.EMBEDDING_DIMENSION, # CORREGIDO
-                consistency_level="Strong"
-            )
-            store.delete_documents(filters={"document_id": str(document_id)})
-        await loop.run_in_executor(None, _delete_milvus_sync)
-        delete_log.info("Successfully deleted chunks from Milvus.")
-    except Exception as milvus_err:
-        error_msg = f"Failed to delete chunks from Milvus: {milvus_err}"
-        # Capturar el TypeError específico aquí también
-        if isinstance(milvus_err, TypeError) and 'embedding_dim' in str(milvus_err):
-             error_msg = f"Milvus TypeError on delete (check arguments like embedding_dim): {milvus_err}"
-        delete_log.error(error_msg, exc_info=True)
-        errors.append(error_msg)
+        company_uuid = uuid.UUID(company_id)
+    except ValueError:
+        delete_log.warning("Invalid Company ID format")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Company ID format.")
 
-    # 3. Eliminar archivo de MinIO
-    file_path = doc.get("file_path")
-    if file_path:
-        delete_log.info("Attempting to delete file from MinIO...")
+    # 1. Verify document exists and belongs to company
+    doc_data: Optional[Dict[str, Any]] = None
+    try:
+        async with get_db_conn() as conn:
+             doc_data = await api_db_retry_strategy(db_client.get_document_by_id)(
+                 conn, doc_id=document_id, company_id=company_uuid
+             )
+        if not doc_data:
+            delete_log.warning("Document not found for deletion")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+        delete_log.info("Document verified for deletion", filename=doc_data.get('file_name'))
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        delete_log.exception("Error verifying document before deletion", error=str(e))
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error during delete verification.")
+
+    errors = [] # Collect non-critical errors (Milvus/MinIO)
+
+    # 2. Delete from Milvus (Sync in Executor)
+    delete_log.info("Attempting to delete chunks from Milvus...")
+    loop = asyncio.get_running_loop()
+    try:
+        milvus_deleted = await loop.run_in_executor(
+            None, _delete_milvus_sync, str(document_id), company_id
+        )
+        if milvus_deleted:
+            delete_log.info("Milvus delete command executed successfully.")
+        else:
+            # Error already logged in _delete_milvus_sync
+            errors.append("Failed to execute delete operation in Milvus (check worker logs for details).")
+            delete_log.warning("Milvus delete operation failed.")
+    except Exception as e:
+        delete_log.exception("Unexpected error during Milvus delete", error=str(e))
+        errors.append(f"Unexpected error during Milvus delete: {e}")
+
+
+    # 3. Delete from MinIO (Async)
+    minio_path = doc_data.get('minio_object_name')
+    if minio_path:
+        delete_log.info("Attempting to delete file from MinIO...", object_name=minio_path)
         try:
-            minio_client = MinioStorageClient()
-            await minio_client.delete_file(file_path)
+            await minio_client.delete_file_async(minio_path)
             delete_log.info("Successfully deleted file from MinIO.")
-        except Exception as minio_err:
-            error_msg = f"Failed to delete file from MinIO: {minio_err}"
-            delete_log.error(error_msg, exc_info=True)
-            errors.append(error_msg)
+        except MinioError as me:
+            delete_log.error("Failed to delete file from MinIO", object_name=minio_path, error=str(me))
+            errors.append(f"Failed to delete file from storage: {me}")
+        except Exception as e:
+            delete_log.exception("Unexpected error during MinIO delete", error=str(e))
+            errors.append(f"Unexpected error during storage delete: {e}")
     else:
-        delete_log.warning("No file_path found in DB, skipping MinIO deletion.")
+        delete_log.warning("Skipping MinIO delete: object name not found in DB record.")
+        errors.append("Could not delete from storage: path unknown.")
 
-    # 4. Eliminar registro de PostgreSQL
+    # 4. Delete from PostgreSQL (Critical step)
     delete_log.info("Attempting to delete record from PostgreSQL...")
     try:
-        deleted = await postgres_client.delete_document(document_id)
-        if not deleted:
-             error_msg = "Failed to delete document from PostgreSQL (record not found during deletion)."
-             delete_log.error(error_msg)
-             errors.append(error_msg)
-        else:
-             delete_log.info("Document record deleted successfully from PostgreSQL")
-    except Exception as db_err:
-        error_msg = f"Error deleting document record from PostgreSQL: {db_err}"
-        delete_log.exception(error_msg)
-        errors.append(error_msg)
+         async with get_db_conn() as conn:
+            deleted_id = await api_db_retry_strategy(db_client.delete_document)(
+                conn, doc_id=document_id, company_id=company_uuid
+            )
+            if deleted_id:
+                 delete_log.info("Document record deleted successfully from PostgreSQL")
+            else:
+                 # Should not happen if verification passed, but log just in case
+                 delete_log.warning("PostgreSQL delete command executed but no record was deleted (already gone?).")
+                 # Don't add to errors, maybe already deleted by another request
+    except Exception as e:
+        delete_log.exception("CRITICAL: Failed to delete document record from PostgreSQL", error=str(e))
+        # This is a critical failure, the record persists but data might be gone.
+        # Raise 500 Internal Server Error.
+        error_detail = f"Successfully deleted from storage/vectors (with errors: {', '.join(errors)}) but FAILED to delete database record: {e}"
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=error_detail)
 
-    # Si hubo errores críticos (falla en PG), devolver 500.
-    # Si solo falló Milvus/Minio, loguear pero devolver 204 igual.
-    if any("PostgreSQL" in err for err in errors):
-        delete_log.error("Document deletion failed critically (PostgreSQL)", errors=errors)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Document deletion failed for critical components: {'; '.join(errors)}")
-    elif errors:
-         delete_log.warning("Document deletion completed with non-critical errors (Milvus/MinIO)", errors=errors)
+    # 5. Log warnings if non-critical errors occurred
+    if errors:
+        delete_log.warning("Document deletion completed with non-critical errors (Milvus/MinIO)", errors=errors)
+        # Still return 204 as the DB record (primary source of truth) is gone.
 
     delete_log.info("Document deletion process finished.")
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    # Return 204 No Content implicitly by FastAPI for delete operations without a return value
 ```
 
 ## File: `app\api\v1\schemas.py`
@@ -1693,376 +2000,594 @@ log.info("Celery app configured", broker=settings.CELERY_BROKER_URL)
 ## File: `app\tasks\process_document.py`
 ```py
 # ingest-service/app/tasks/process_document.py
-import uuid
 import asyncio
-from typing import Dict, Any, Optional, List, Type
-import tempfile
 import os
-from pathlib import Path
+import tempfile
+import uuid
+from typing import Optional, Dict, Any, List, Tuple, Type
+from contextlib import asynccontextmanager
 import structlog
-import io
-import time
-import traceback # Para formatear excepciones
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type, before_sleep_log
+from celery import Celery, Task
+from celery.exceptions import Ignore, Reject, MaxRetriesExceededError
+import httpx
+import asyncpg
 
-import asyncpg # Importar para tipos de excepción
-
-# --- Haystack Imports ---
-from haystack import Pipeline, Document
-from haystack.utils import Secret
+# Haystack Imports
+from haystack.dataclasses import Document
+from haystack.document_stores.types import DuplicatePolicy
 from haystack.components.converters import (
-    PyPDFToDocument, TextFileToDocument, MarkdownToDocument,
-    HTMLToDocument, DOCXToDocument,
+    PyPDFToDocument,  # Assuming tika is not strictly needed based on current logs
+    MarkdownToDocument,
+    HTMLToDocument,
+    TextFileToDocument,
+    # Add others if needed and installed, e.g., from haystack.components.converters.tika import TikaDocumentConverter
 )
+# Requires 'pip install haystack-ai[ocr]' for image-to-text or OCR PDFs
+# from haystack.components.converters.ocr import OCRDocumentConverter
+# Requires 'pip install haystack-ai[docx]'
+from haystack.components.converters.docx import DOCXToDocument
 from haystack.components.preprocessors import DocumentSplitter
 from haystack.components.embedders import OpenAIDocumentEmbedder
-from milvus_haystack import MilvusDocumentStore # Importación correcta
-from pymilvus.exceptions import MilvusException # Importar excepciones de Milvus
-from minio.error import S3Error # Importar excepciones de Minio
 from haystack.components.writers import DocumentWriter
-from haystack.dataclasses import ByteStream
 
-# --- Local Imports ---
-from app.tasks.celery_app import celery_app
+# Milvus specific integration
+from milvus_haystack import MilvusDocumentStore # Correct import for Haystack 2.x
+
+# Custom imports
 from app.core.config import settings
-from app.db import postgres_client # Cliente DB async
+from app.db import postgres_client as db_client
 from app.models.domain import DocumentStatus
-from app.services.minio_client import MinioStorageClient # Cliente MinIO async
+from app.services.minio_client import MinioClient, MinioError
 
+# Initialize logger
 log = structlog.get_logger(__name__)
 
-# --- Funciones Helper Síncronas para Haystack ---
+# Timeout for the entire processing flow within the task
+TIMEOUT_SECONDS = 600 # 10 minutes, adjust as needed
+
+# --- Milvus Initialization ---
+# Wrap synchronous Haystack init in a function for run_in_executor
 def _initialize_milvus_store() -> MilvusDocumentStore:
-    """Función interna SÍNCRONA para inicializar MilvusDocumentStore."""
-    init_log = log.bind(component="MilvusDocumentStore")
-    init_log.info("Attempting to initialize MilvusDocumentStore...")
+    """
+    Synchronously initializes and returns a MilvusDocumentStore instance.
+    Handles potential configuration errors during initialization.
+    """
+    log.debug("Initializing MilvusDocumentStore...")
     try:
-        # *** RE-VERIFICACIÓN: Usar embedding_dim consistentemente ***
         store = MilvusDocumentStore(
-            connection_args={"uri": str(settings.MILVUS_URI)},
+            connection_args={"uri": settings.MILVUS_URI},
             collection_name=settings.MILVUS_COLLECTION_NAME,
-            embedding_dim=settings.EMBEDDING_DIMENSION, # CORREGIDO
-            embedding_field=settings.MILVUS_EMBEDDING_FIELD,
-            content_field=settings.MILVUS_CONTENT_FIELD,
-            metadata_fields=settings.MILVUS_METADATA_FIELDS,
-            index_params=settings.MILVUS_INDEX_PARAMS,
-            search_params=settings.MILVUS_SEARCH_PARAMS,
-            consistency_level="Strong",
+            # embedding_dim=settings.EMBEDDING_DIMENSION, # <--- REMOVED: Incorrect argument for milvus-haystack 2.x
+            consistency_level="Strong", # Example setting, adjust if needed
+            # Add other relevant Milvus connection args if required
+            # drop_old=False, # Usually False for workers, maybe True for testing
         )
-        init_log.info("MilvusDocumentStore initialization successful.")
+        # Optional: Add a quick check to ensure the connection works if the store provides one
+        # e.g., if store.count_documents() doesn't fail immediately (though might be slow)
+        log.info("MilvusDocumentStore initialized successfully.",
+                 uri=settings.MILVUS_URI, collection=settings.MILVUS_COLLECTION_NAME)
         return store
-    except MilvusException as me:
-        init_log.error("Milvus connection/initialization failed", code=getattr(me, 'code', None), message=str(me), exc_info=True)
-        raise ConnectionError(f"Milvus connection failed: {me}") from me
     except TypeError as te:
-        # Este es el error específico visto en los logs
-        init_log.error(f"MilvusDocumentStore init TypeError: {te}. Check arguments (e.g., 'embedding_dim').", exc_info=True)
+        # Catching the specific error seen in logs, though it should be fixed now.
+        log.exception("MilvusDocumentStore init TypeError", error=str(te), exc_info=True)
+        # Raise a specific runtime error to be caught in the main task flow
         raise RuntimeError(f"Milvus TypeError (check arguments like embedding_dim): {te}") from te
     except Exception as e:
-        init_log.exception("Unexpected error during MilvusDocumentStore initialization")
+        log.exception("Failed to initialize MilvusDocumentStore", error=str(e), exc_info=True)
+        # Raise a generic runtime error for other potential init issues
+        raise RuntimeError(f"Milvus Store Initialization Error: {e}") from e
+
+# --- Haystack Component Initialization ---
+def _initialize_haystack_components(
+    document_store: MilvusDocumentStore
+) -> Tuple[DocumentSplitter, OpenAIDocumentEmbedder, DocumentWriter]:
+    """Synchronously initializes necessary Haystack processing components."""
+    log.debug("Initializing Haystack components (Splitter, Embedder, Writer)...")
+    try:
+        # Document Splitter
+        splitter = DocumentSplitter(
+            split_by="word", # or "sentence", "passage"
+            split_length=settings.SPLITTER_CHUNK_SIZE,
+            split_overlap=settings.SPLITTER_CHUNK_OVERLAP
+        )
+
+        # Document Embedder (OpenAI)
+        embedder = OpenAIDocumentEmbedder(
+            api_key=settings.OPENAI_API_KEY,
+            model=settings.OPENAI_EMBEDDING_MODEL,
+            # Consider adding dimensions_to_truncate if needed by model/Milvus
+            # dimensions=settings.EMBEDDING_DIMENSION, # May not be needed if model provides it
+            # meta_fields_to_embed=["company_id", "document_id"] # Example if needed
+            # batch_size=... # Configure batch size
+        )
+
+        # Document Writer (using the initialized Milvus store)
+        writer = DocumentWriter(
+            document_store=document_store,
+            policy=DuplicatePolicy.OVERWRITE # Or FAIL, SKIP
+        )
+        log.info("Haystack components initialized successfully.")
+        return splitter, embedder, writer
+    except Exception as e:
+        log.exception("Failed to initialize Haystack components", error=str(e), exc_info=True)
+        raise RuntimeError(f"Haystack Component Initialization Error: {e}") from e
+
+# --- File Type to Converter Mapping ---
+def get_converter(content_type: str) -> Type:
+    """Returns the appropriate Haystack Converter based on content type."""
+    log.debug("Selecting converter", content_type=content_type)
+    if content_type == "application/pdf":
+        # PyPDFToDocument is generally preferred unless OCR is needed
+        # return OCRDocumentConverter() # Use if OCR is needed for image-based PDFs
+        return PyPDFToDocument
+    elif content_type in ["application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/msword"]:
+        # Requires 'pip install python-docx'
+        return DOCXToDocument
+    elif content_type == "text/plain":
+        return TextFileToDocument
+    elif content_type == "text/markdown":
+        return MarkdownToDocument
+    elif content_type == "text/html":
+        return HTMLToDocument
+    # Add more converters as needed
+    # elif content_type == "application/vnd.oasis.opendocument.text": # ODT
+    #    from haystack.components.converters.odt import ODTToDocument
+    #    return ODTToDocument
+    else:
+        log.warning("Unsupported content type for conversion", content_type=content_type)
+        raise ValueError(f"Unsupported content type: {content_type}")
+
+# --- Celery Task Setup ---
+celery_app = Celery(
+    'ingest_tasks',
+    broker=settings.CELERY_BROKER_URL,
+    backend=settings.CELERY_RESULT_BACKEND
+)
+
+celery_app.conf.update(
+    task_serializer='json',
+    result_serializer='json',
+    accept_content=['json'],
+    task_track_started=True,
+    # task_acks_late=True, # Consider enabling for more robust error handling
+    # worker_prefetch_multiplier=1, # Process one task at a time if memory/CPU intensive
+    task_time_limit=TIMEOUT_SECONDS + 60, # Task hard timeout slightly > flow timeout
+    task_soft_time_limit=TIMEOUT_SECONDS, # Task soft timeout = flow timeout
+)
+
+# Setup logging for Celery task context
+structlog.configure(
+    processors=[
+        structlog.stdlib.filter_by_level,
+        structlog.contextvars.merge_contextvars,
+        structlog.stdlib.add_logger_name,
+        structlog.stdlib.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+        # Add process/thread info if needed
+        structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+    ],
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    wrapper_class=structlog.stdlib.BoundLogger,
+    cache_logger_on_first_use=True,
+)
+
+formatter = structlog.stdlib.ProcessorFormatter(
+    processor=structlog.processors.JSONRenderer(),
+)
+
+handler = logging.StreamHandler()
+handler.setFormatter(formatter)
+root_logger = logging.getLogger()
+if not root_logger.handlers: # Avoid adding handlers multiple times if reloaded
+    root_logger.addHandler(handler)
+    root_logger.setLevel(settings.LOG_LEVEL.upper())
+
+
+# Define retry strategy for database operations
+db_retry_strategy = retry(
+    stop=stop_after_attempt(3),
+    wait=wait_fixed(2),
+    retry=retry_if_exception_type((asyncpg.exceptions.PostgresConnectionError, TimeoutError, OSError)),
+    before_sleep=before_sleep_log(log, logging.WARNING)
+)
+
+@asynccontextmanager
+async def db_session_manager():
+    """Provides a managed database connection pool session."""
+    pool = None
+    try:
+        pool = await db_client.get_db_pool() # Reuse existing pool logic
+        yield pool # The pool itself can be used to acquire connections
+    except Exception as e:
+        log.error("Failed to get DB pool for session", error=str(e), exc_info=True)
+        raise
+    finally:
+        # The pool itself is managed globally, don't close it here.
+        # Connections acquired from the pool should be released.
+        log.debug("DB session context exited.")
+        pass
+
+# --- Main Asynchronous Processing Flow ---
+async def async_process_flow(
+    *, # Enforce keyword arguments
+    document_id: str,
+    company_id: str,
+    filename: str,
+    content_type: str,
+    task_id: str,
+    attempt: int
+):
+    """The core asynchronous processing logic for a single document."""
+    flow_log = log.bind(
+        document_id=document_id, company_id=company_id, task_id=task_id,
+        attempt=attempt, filename=filename, content_type=content_type
+    )
+    flow_log.info("Starting asynchronous processing flow")
+
+    # 1. Initialize Minio Client
+    minio_client = MinioClient(
+        endpoint=settings.MINIO_ENDPOINT,
+        access_key=settings.MINIO_ACCESS_KEY,
+        secret_key=settings.MINIO_SECRET_KEY,
+        bucket_name=settings.MINIO_BUCKET_NAME,
+        secure=settings.MINIO_USE_SSL
+    )
+
+    # 2. Download file from Minio
+    object_name = f"{company_id}/{document_id}/{filename}"
+    temp_file_path = None
+    try:
+        flow_log.info("Downloading file from MinIO", object_name=object_name)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as temp_file:
+            temp_file_path = temp_file.name
+            await minio_client.download_file(object_name, temp_file_path)
+        flow_log.info("File downloaded successfully", temp_path=temp_file_path)
+    except MinioError as me:
+        flow_log.error("Failed to download file from MinIO", object_name=object_name, error=str(me))
+        raise RuntimeError(f"MinIO download failed: {me}") from me # Non-retryable for now
+    except Exception as e:
+        flow_log.exception("Unexpected error during file download", error=str(e))
+        raise RuntimeError(f"Unexpected download error: {e}") from e
+
+    # 3. Initialize Milvus Store (potentially blocking)
+    loop = asyncio.get_running_loop()
+    try:
+        flow_log.info("Initializing Milvus document store...")
+        # Run synchronous initialization in a separate thread
+        store = await loop.run_in_executor(None, _initialize_milvus_store) # Can raise RuntimeError
+        flow_log.info("Milvus document store initialized.")
+    except RuntimeError as e:
+        flow_log.error("Failed to initialize Milvus store during flow", error=str(e))
+        # This is a configuration/infrastructure error, likely not retryable from worker perspective
+        raise e # Re-raise the specific RuntimeError
+    except Exception as e:
+        flow_log.exception("Unexpected error initializing Milvus store", error=str(e))
         raise RuntimeError(f"Unexpected Milvus init error: {e}") from e
 
-# --- (El resto de helpers _initialize_* no cambian) ---
-def _initialize_openai_embedder() -> OpenAIDocumentEmbedder:
-    init_log = log.bind(component="OpenAIDocumentEmbedder")
-    init_log.info("Initializing...")
-    api_key_value = settings.OPENAI_API_KEY.get_secret_value()
-    if not api_key_value:
-        init_log.error("OpenAI API Key is missing!")
-        raise ValueError("OpenAI API Key is required.")
-    embedder = OpenAIDocumentEmbedder(
-        api_key=Secret.from_token(api_key_value),
-        model=settings.OPENAI_EMBEDDING_MODEL,
-        meta_fields_to_embed=[]
-    )
-    init_log.info("Initialization successful.", model=settings.OPENAI_EMBEDDING_MODEL)
-    return embedder
+    # 4. Initialize other Haystack Components (potentially blocking)
+    try:
+        flow_log.info("Initializing Haystack processing components...")
+        splitter, embedder, writer = await loop.run_in_executor(None, _initialize_haystack_components, store)
+        flow_log.info("Haystack processing components initialized.")
+    except RuntimeError as e:
+        flow_log.error("Failed to initialize Haystack components during flow", error=str(e))
+        raise e # Configuration/setup error
+    except Exception as e:
+        flow_log.exception("Unexpected error initializing Haystack components", error=str(e))
+        raise RuntimeError(f"Unexpected Haystack init error: {e}") from e
 
-def _initialize_splitter() -> DocumentSplitter:
-    init_log = log.bind(component="DocumentSplitter")
-    init_log.info("Initializing...")
-    splitter = DocumentSplitter(
-        split_by=settings.SPLITTER_SPLIT_BY,
-        split_length=settings.SPLITTER_CHUNK_SIZE,
-        split_overlap=settings.SPLITTER_CHUNK_OVERLAP
-    )
-    init_log.info("Initialization successful.", split_by=settings.SPLITTER_SPLIT_BY, length=settings.SPLITTER_CHUNK_SIZE)
-    return splitter
+    # 5. Initialize Converter (potentially blocking, select based on type)
+    try:
+        flow_log.info("Initializing document converter...")
+        ConverterClass = get_converter(content_type) # Can raise ValueError
+        # Initialize the converter (assuming simple init or handled by Haystack)
+        converter = ConverterClass()
+        flow_log.info("Document converter initialized", converter=ConverterClass.__name__)
+    except ValueError as ve: # Specific error for unsupported type
+        flow_log.error("Unsupported content type", error=str(ve))
+        raise ve # Propagate as non-retryable user error
+    except Exception as e:
+        flow_log.exception("Failed to initialize converter", error=str(e))
+        raise RuntimeError(f"Converter Initialization Error: {e}") from e
 
-def _initialize_document_writer(store: MilvusDocumentStore) -> DocumentWriter:
-    init_log = log.bind(component="DocumentWriter")
-    init_log.info("Initializing...")
-    writer = DocumentWriter(document_store=store, policy="OVERWRITE")
-    init_log.info("Initialization successful.")
-    return writer
+    # --- Haystack Pipeline Execution (Run in Executor) ---
+    total_chunks_written = 0
+    try:
+        flow_log.info("Starting Haystack pipeline execution (converter, splitter, embedder, writer)...")
 
-def get_converter_for_content_type(content_type: str) -> Optional[Type]:
-    converters = {
-        "application/pdf": PyPDFToDocument,
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": DOCXToDocument,
-        "application/msword": DOCXToDocument,
-        "text/plain": TextFileToDocument,
-        "text/markdown": MarkdownToDocument,
-        "text/html": HTMLToDocument,
-        "application/vnd.ms-excel": None,
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": None,
-        "image/png": None,
-        "image/jpeg": None,
-        "image/jpg": None,
-    }
-    normalized_content_type = content_type.lower().split(';')[0].strip()
-    converter = converters.get(normalized_content_type)
-    if converter is None:
-        log.warning("Unsupported content type received for conversion", provided_type=content_type, normalized_type=normalized_content_type)
-        raise ValueError(f"Tipo de archivo '{normalized_content_type}' no soportado actualmente.")
-    return converter
+        def run_haystack_pipeline_sync():
+            nonlocal total_chunks_written
+            # This function runs synchronously in the executor thread
+            pipeline_log = log.bind(
+                document_id=document_id, company_id=company_id, task_id=task_id,
+                filename=filename, in_sync_executor=True
+            )
+            pipeline_log.debug("Executing conversion...")
+            conversion_result = converter.run(sources=[temp_file_path])
+            docs = conversion_result["documents"]
+            pipeline_log.debug("Conversion complete", num_docs_converted=len(docs))
+            if not docs:
+                pipeline_log.warning("Converter produced no documents.")
+                return 0 # No chunks to process
+
+            # Add essential metadata for filtering/identification
+            for doc in docs:
+                doc.meta["company_id"] = company_id
+                doc.meta["document_id"] = document_id
+                doc.meta["file_name"] = filename
+                doc.meta["file_type"] = content_type
+                # Add other meta from upload if available and needed
+
+            pipeline_log.debug("Executing splitting...")
+            split_docs = splitter.run(documents=docs)["documents"]
+            pipeline_log.debug("Splitting complete", num_chunks=len(split_docs))
+            if not split_docs:
+                 pipeline_log.warning("Splitter produced no documents (chunks).")
+                 return 0
+
+            pipeline_log.debug("Executing embedding...")
+            embedded_docs = embedder.run(documents=split_docs)["documents"]
+            pipeline_log.debug("Embedding complete.")
+            if not embedded_docs:
+                 pipeline_log.warning("Embedder produced no documents.")
+                 return 0
+
+            pipeline_log.debug("Executing writing to Milvus...")
+            # Writer handles potential batching internally
+            write_result = writer.run(documents=embedded_docs)
+            written_count = write_result["documents_written"]
+            pipeline_log.info("Writing complete.", documents_written=written_count)
+            total_chunks_written = written_count
+            return written_count # Return the count
+
+        # Run the synchronous pipeline function in the executor
+        chunks_written = await loop.run_in_executor(None, run_haystack_pipeline_sync)
+        flow_log.info("Haystack pipeline execution finished.", chunks_written=chunks_written)
+
+    except Exception as e:
+        flow_log.exception("Error during Haystack pipeline execution", error=str(e))
+        # Determine if error is potentially retryable (e.g., temporary OpenAI issue)
+        # For now, treat most pipeline errors as potentially document-specific failures
+        raise RuntimeError(f"Haystack Pipeline Error: {e}") from e
+    finally:
+        # 6. Clean up temporary file
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+                flow_log.debug("Temporary file deleted", path=temp_file_path)
+            except OSError as e:
+                flow_log.warning("Failed to delete temporary file", path=temp_file_path, error=str(e))
+
+    return total_chunks_written # Return the final count
+
 
 # --- Celery Task Definition ---
-# Añadir RuntimeError a los no reintentables (por si falla init de Milvus por TypeError)
-NON_RETRYABLE_ERRORS = (FileNotFoundError, ValueError, TypeError, NotImplementedError, KeyError, AttributeError, asyncpg.exceptions.DataError, asyncpg.exceptions.IntegrityConstraintViolationError, RuntimeError)
-# Añadir ConnectionError y ConnectionDoesNotExistError
-RETRYABLE_ERRORS = (IOError, ConnectionError, TimeoutError, S3Error, MilvusException, asyncpg.exceptions.PostgresConnectionError, asyncpg.exceptions.InterfaceError, asyncpg.exceptions.ConnectionDoesNotExistError, asyncio.TimeoutError)
+class ProcessDocumentTask(Task):
+    """Custom Celery Task class for document processing."""
+    name = "tasks.process_document_haystack"
+    # Set maximum retries for the task itself (e.g., for transient broker issues)
+    # Max retries for application logic errors are handled internally if needed.
+    max_retries = 3 # Example: Retry task publish/infrastructure issues up to 3 times
+    default_retry_delay = 60 # Example: Wait 60 seconds between task infrastructure retries
 
-# --- Helper para actualizar estado de forma robusta ---
-async def _robust_update_status(doc_id: uuid.UUID, status: DocumentStatus, message: Optional[str] = None, chunk_count: Optional[int] = None):
-    """Intenta actualizar el estado, reintentando una vez en caso de error de conexión."""
-    update_log = log.bind(document_id=str(doc_id), target_status=status.value)
-    for attempt in range(2): # Intentar 2 veces
+    # Global clients (initialized once per worker process)
+    # Note: These might not be ideal if worker concurrency > 1 and clients are not thread-safe
+    # Consider initializing them within the task or using context managers if needed.
+    # For now, assume they are safe or worker concurrency is 1.
+    # _minio_client: Optional[MinioClient] = None
+    # _db_pool: Optional[asyncpg.Pool] = None
+
+    def __init__(self):
+        super().__init__()
+        # Initialize clients if needed here, or better, within the task run/async flow
+        # self._minio_client = MinioClient(...)
+        self.task_log = log.bind(task_name=self.name)
+        self.task_log.info("ProcessDocumentTask initialized.")
+
+    # async def _get_db(self):
+    #     # Example of lazy-loading DB pool per task instance (if needed)
+    #     if self._db_pool is None or self._db_pool._closed:
+    #         self._db_pool = await db_client.get_db_pool()
+    #     return self._db_pool
+
+    async def _update_status_with_retry(
+        self, pool: asyncpg.Pool, doc_id: str, status: DocumentStatus,
+        chunk_count: Optional[int] = None, error_msg: Optional[str] = None
+    ):
+        """Helper to update document status with retry."""
+        update_log = self.task_log.bind(document_id=doc_id, target_status=status.value)
         try:
-            await postgres_client.get_db_pool() # Re-asegura que el pool esté vivo
-            success = await postgres_client.update_document_status(doc_id, status, error_message=message, chunk_count=chunk_count)
-            if success:
-                 update_log.info("Successfully updated final document status.", attempt=attempt+1)
-                 return True
-            else:
-                 update_log.error("Document not found during final status update attempt.", attempt=attempt+1)
-                 return False
-        except (asyncpg.exceptions.PostgresConnectionError, asyncpg.exceptions.InterfaceError, asyncpg.exceptions.ConnectionDoesNotExistError) as db_conn_err:
-            update_log.warning("Connection error during final status update", attempt=attempt+1, error=str(db_conn_err))
-            if attempt == 0:
-                update_log.info("Waiting before retrying final status update...")
-                await asyncio.sleep(3) # Esperar 3 segundos antes de reintentar
-            else:
-                update_log.critical("Failed to update final document status after retry due to connection error.", error=str(db_conn_err))
-                return False # Falló después de reintentar
+            await db_retry_strategy(db_client.update_document_status)(
+                pool=pool,
+                document_id=uuid.UUID(doc_id),
+                new_status=status,
+                chunk_count=chunk_count,
+                error_message=error_msg
+            )
+            update_log.info("Document status updated successfully in DB.")
         except Exception as e:
-            update_log.critical("Unexpected error during final status update", attempt=attempt+1, error=str(e), exc_info=True)
-            return False # Falló por otra razón
-    return False # Si por alguna razón sale del bucle
+            # Log critical failure after retries
+            update_log.critical("CRITICAL: Failed final document status update in DB!",
+                                error=str(e), chunk_count=chunk_count, error_msg=error_msg,
+                                exc_info=True)
+            # What to do now? The processing might be done, but status is wrong.
+            # Option 1: Raise Reject to potentially dead-letter the task
+            # Option 2: Log and move on, hoping a reconciliation job fixes it
+            # Option 3: Try one last desperate log?
+            # For now, let's raise Reject to signal a persistent DB issue requires attention
+            raise Reject(f"Persistent DB error updating status for {doc_id} to {status.value}", requeue=False) from e
 
+    async def run_async_processing(self, *args, **kwargs):
+        """Runs the main async processing flow and handles final status updates."""
+        doc_id = kwargs['document_id']
+        task_id = self.request.id # Get task ID from request context
+        attempt = self.request.retries + 1
+        task_log = self.task_log.bind(document_id=doc_id, task_id=task_id, attempt=attempt)
+        final_status = DocumentStatus.ERROR # Default to error
+        final_chunk_count = None
+        error_to_report = "Unknown processing error"
+        is_retryable_error = False # Assume errors aren't retryable unless specified
+        e_non_retry: Optional[Exception] = None # Store the final exception
 
-@celery_app.task(
-    bind=True,
-    autoretry_for=RETRYABLE_ERRORS,
-    retry_backoff=True,
-    retry_backoff_max=300,
-    retry_jitter=True,
-    retry_kwargs={'max_retries': 3},
-    reject_on_worker_lost=True,
-    acks_late=True,
-    name="tasks.process_document_haystack"
-)
-def process_document_haystack_task(
-    self, # Instancia de la tarea Celery
-    document_id_str: str,
-    company_id_str: str,
-    minio_object_name: str,
-    file_name: str,
-    content_type: str,
-    original_metadata: Dict[str, Any],
-):
-    """Tarea Celery para procesar un documento usando Haystack."""
-    document_id = uuid.UUID(document_id_str)
-    company_id = uuid.UUID(company_id_str)
-    task_log = log.bind(
-        document_id=str(document_id),
-        company_id=str(company_id),
-        task_id=self.request.id or "unknown",
-        attempt=self.request.retries + 1,
-        filename=file_name,
-        content_type=content_type
-    )
-    task_log.info("Starting Haystack document processing task execution")
-    processed_chunk_count = 0
-    # Establecer valores por defecto para el bloque finally
-    final_status = DocumentStatus.ERROR
-    final_error_message = "Error inesperado al inicio de la tarea."
-    task_exception = None # Para guardar la excepción original si ocurre
+        async with db_session_manager() as pool: # Ensure DB pool is ready
+            try:
+                # 1. Set status to 'processing' initially
+                task_log.info("Setting document status to 'processing'")
+                await self._update_status_with_retry(pool, doc_id, DocumentStatus.PROCESSING, error_msg=None) # Clear previous errors
 
-    async def async_process_flow():
-        # Usar nonlocal para modificar las variables del scope exterior
-        nonlocal processed_chunk_count, final_status, final_error_message
-        minio_client = None
-        downloaded_file_stream: Optional[io.BytesIO] = None
-        pipeline: Optional[Pipeline] = None
+                # 2. Execute the main processing flow with timeout
+                task_log.info("Executing main async_process_flow with timeout", timeout=TIMEOUT_SECONDS)
+                final_chunk_count = await asyncio.wait_for(
+                    async_process_flow(task_id=task_id, attempt=attempt, **kwargs),
+                    timeout=TIMEOUT_SECONDS
+                )
+                final_status = DocumentStatus.PROCESSED
+                error_to_report = None # Success!
+                task_log.info("Async process flow completed successfully.", chunks_processed=final_chunk_count)
 
-        try:
-            # 0. Marcar como PROCESSING en DB
-            task_log.info("Updating document status to PROCESSING")
-            update_success = await postgres_client.update_document_status(document_id, DocumentStatus.PROCESSING, error_message=None)
-            if not update_success:
-                task_log.warning("Document record not found in DB before processing started. Aborting task.")
+            except asyncio.TimeoutError:
+                task_log.error("Processing timed out", timeout=TIMEOUT_SECONDS)
+                error_to_report = f"Processing timed out after {TIMEOUT_SECONDS} seconds."
                 final_status = DocumentStatus.ERROR
-                final_error_message = "Registro del documento no encontrado al iniciar procesamiento."
-                # Levantar error no reintentable para detener aquí
-                raise FileNotFoundError(final_error_message)
+                # Timeout might be due to temporary load, consider if retryable
+                # is_retryable_error = True # Example if you want to retry timeouts
+                e_non_retry = TimeoutError(error_to_report)
 
-            # 1. Descargar archivo de MinIO
-            task_log.info("Downloading file from MinIO")
-            minio_client = MinioStorageClient()
-            downloaded_file_stream = await minio_client.download_file_stream(minio_object_name)
-            file_bytes = downloaded_file_stream.getvalue()
-            if not file_bytes: raise ValueError("Downloaded file is empty.")
-            task_log.info(f"File downloaded successfully ({len(file_bytes)} bytes)")
+            except ValueError as ve: # Specific user errors (e.g., unsupported type)
+                 task_log.error("Processing failed due to value error (e.g., unsupported file type)", error=str(ve))
+                 error_to_report = f"Unsupported file type or invalid input: {ve}"
+                 final_status = DocumentStatus.ERROR
+                 is_retryable_error = False # User error, don't retry
+                 e_non_retry = ve
 
-            # 2. Inicializar componentes Haystack y construir pipeline
-            task_log.info("Initializing Haystack components and building pipeline via executor...")
-            loop = asyncio.get_running_loop()
-            # --- Ejecutar inicializaciones síncronas en executor ---
-            store = await loop.run_in_executor(None, _initialize_milvus_store) # Puede lanzar error
-            embedder = await loop.run_in_executor(None, _initialize_openai_embedder)
-            splitter = await loop.run_in_executor(None, _initialize_splitter)
-            writer = await loop.run_in_executor(None, _initialize_document_writer, store)
-            ConverterClass = get_converter_for_content_type(content_type)
-            converter_instance = ConverterClass()
+            except RuntimeError as rte: # Errors raised explicitly from init/pipeline steps
+                 task_log.error(f"Processing failed permanently: {rte}", exc_info=False) # Log traceback where raised
+                 error_to_report = f"Error config./código Milvus o Haystack ({type(rte).__name__}). Contacte soporte." # User-friendly-ish
+                 # Check if it's the Milvus init error specifically
+                 if "Milvus TypeError" in str(rte) or "Milvus Store Initialization Error" in str(rte):
+                    error_to_report = "Error config./código Milvus (RuntimeError). Contacte soporte."
+                 elif "Haystack Component Initialization Error" in str(rte) or "Haystack Pipeline Error" in str(rte):
+                    error_to_report = "Error interno Haystack (RuntimeError). Contacte soporte."
+                 elif "Converter Initialization Error" in str(rte):
+                     error_to_report = "Error interno Conversor (RuntimeError). Contacte soporte."
+                 elif "MinIO download failed" in str(rte):
+                     error_to_report = "Error descargando archivo (MinIO). Verifique conexión/permisos."
+                 final_status = DocumentStatus.ERROR
+                 is_retryable_error = False # Config/infra/code errors usually aren't task-retryable
+                 e_non_retry = rte
 
-            pipeline = Pipeline()
-            pipeline.add_component("converter", converter_instance)
-            pipeline.add_component("splitter", splitter)
-            pipeline.add_component("embedder", embedder)
-            pipeline.add_component("writer", writer)
-            pipeline.connect("converter.documents", "splitter.documents")
-            pipeline.connect("splitter.documents", "embedder.documents")
-            pipeline.connect("embedder.documents", "writer.documents")
-            task_log.info("Haystack pipeline built successfully.")
+            except Exception as e: # Catch-all for unexpected errors
+                task_log.exception("Unexpected exception during processing flow.", error=str(e))
+                error_to_report = f"Error inesperado ({type(e).__name__}). Contacte soporte."
+                final_status = DocumentStatus.ERROR
+                # Decide if truly unexpected errors warrant a retry
+                # is_retryable_error = True # Maybe retry once for unexpected?
+                e_non_retry = e
 
-            # 3. Preparar Metadatos y ByteStream
-            allowed_meta_keys = set(settings.MILVUS_METADATA_FIELDS)
-            doc_meta = {
-                "company_id": str(company_id),
-                "document_id": str(document_id),
-                "file_name": file_name or "unknown",
-                "file_type": content_type or "unknown",
-            }
-            added_original_meta = 0
-            for key, value in original_metadata.items():
-                if key in allowed_meta_keys and key not in doc_meta:
-                    doc_meta[key] = str(value) if value is not None else None
-                    added_original_meta += 1
-            task_log.debug("Prepared metadata for Haystack Document", final_meta=doc_meta, added_original_count=added_original_meta)
+            # 3. Update final status in DB
+            task_log.info("Attempting to update final document status in DB", status=final_status.value, chunks=final_chunk_count, error=error_to_report)
+            try:
+                await self._update_status_with_retry(
+                    pool, doc_id, final_status,
+                    chunk_count=final_chunk_count if final_status == DocumentStatus.PROCESSED else None, # Only set count on success
+                    error_msg=error_to_report
+                )
+            except Reject as r: # Catch Reject from _update_status_with_retry
+                # DB update failed persistently. The task state is now inconsistent.
+                # Log critically and re-raise Reject to potentially DLQ.
+                task_log.critical("CRITICAL: Failed to update final document status in DB after processing attempt!", target_status=final_status.value, error_msg=error_to_report)
+                raise r # Propagate Reject
+            except Exception as db_update_exc:
+                 # Should ideally be caught by Reject, but handle just in case
+                 task_log.critical("CRITICAL: Unhandled exception during final DB status update!", error=str(db_update_exc), target_status=final_status.value, exc_info=True)
+                 # Raise Reject here too, as the state is inconsistent
+                 raise Reject(f"Unhandled DB error updating status for {doc_id}", requeue=False) from db_update_exc
 
-            source_stream = ByteStream(data=file_bytes, meta=doc_meta)
-            pipeline_input = {"converter": {"sources": [source_stream]}}
+            # 4. Handle retries or final failure for the task itself
+            if final_status == DocumentStatus.ERROR:
+                if is_retryable_error:
+                    task_log.warning("Processing failed with a retryable error, attempting task retry.", error=error_to_report)
+                    try:
+                        # Celery's retry mechanism
+                        self.retry(exc=e_non_retry if e_non_retry else RuntimeError(error_to_report), countdown=60 * attempt) # Exponential backoff basic
+                    except MaxRetriesExceededError:
+                        task_log.error("Max retries exceeded for task.", error=error_to_report)
+                        # Give up, the status is already 'error' in DB.
+                        raise Ignore() # Prevent Celery from logging it as failure again
+                    except Reject as r: # If retry itself causes Reject (e.g. broker issue)
+                         task_log.error("Task rejected during retry attempt.", reason=str(r))
+                         raise r # Propagate the rejection
+                else:
+                    # Non-retryable error, status is 'error', log and raise Ignore or the original exception
+                    task_log.error("Processing failed with non-retryable error.", error=error_to_report, exception_type=type(e_non_retry).__name__)
+                    # Raise the original exception to mark the task as failed in Celery,
+                    # allowing result backend to store the error type.
+                    if e_non_retry:
+                        raise e_non_retry
+                    else:
+                        # Should not happen if error_to_report is set, but safety fallback
+                        raise RuntimeError(error_to_report or "Unknown non-retryable processing error")
 
-            # 4. Ejecutar Pipeline Haystack
-            task_log.info("Running Haystack pipeline via executor...")
-            start_time = time.monotonic()
-            pipeline_result = await loop.run_in_executor(None, pipeline.run, pipeline_input)
-            duration = time.monotonic() - start_time
-            task_log.info(f"Haystack pipeline execution finished", duration_sec=round(duration, 2))
+            elif final_status == DocumentStatus.PROCESSED:
+                 task_log.info("Processing completed successfully for document.")
+                 # Task succeeded
+                 return {"status": "processed", "document_id": doc_id, "chunks_processed": final_chunk_count}
 
-            # 5. Procesar Resultado y Contar Chunks
-            writer_output = pipeline_result.get("writer", {})
-            if isinstance(writer_output, dict) and "documents_written" in writer_output:
-                processed_chunk_count = writer_output["documents_written"]
-                task_log.info(f"Chunks written to Milvus determined by writer: {processed_chunk_count}")
-            else:
-                 task_log.warning("Writer output missing 'documents_written', attempting fallback count from splitter", writer_output=writer_output)
-                 splitter_output = pipeline_result.get("splitter", {})
-                 if isinstance(splitter_output, dict) and "documents" in splitter_output and isinstance(splitter_output["documents"], list):
-                      processed_chunk_count = len(splitter_output["documents"])
-                      task_log.warning(f"Inferred chunk count from splitter output: {processed_chunk_count}")
-                 else:
-                      task_log.error("Pipeline finished but failed to determine processed chunk count.", pipeline_output=pipeline_result)
-                      raise RuntimeError("Pipeline execution yielded unclear results regarding written documents.")
+    def run(self, *args, **kwargs):
+        """Synchronous wrapper to run the async processing logic."""
+        self.task_log.info("Task received", args=args, kwargs=list(kwargs.keys()))
+        try:
+            # Run the async function using asyncio.run()
+            # This handles the event loop management for the task.
+            return asyncio.run(self.run_async_processing(*args, **kwargs))
+        except Reject as r:
+             # Log and re-raise Reject to ensure Celery handles it (e.g., DLQ)
+             self.task_log.error(f"Task rejected due to persistent DB error: {r.reason}", exc_info=False)
+             raise r
+        except Ignore:
+             # Log that we are ignoring after max retries or non-retryable error
+             self.task_log.warning("Task is being ignored (e.g., max retries exceeded or non-retryable error).")
+             raise Ignore() # Ensure Celery ignores it
+        except Exception as e:
+             # Catch exceptions raised by run_async_processing if they weren't Ignore/Reject
+             self.task_log.exception("Task failed with unhandled exception in run wrapper", error=str(e))
+             # Re-raise the exception so Celery marks the task as FAILED
+             raise e
 
-            if processed_chunk_count == 0:
-                 task_log.warning("Pipeline ran successfully but resulted in 0 chunks being written to Milvus.")
+    def on_failure(self, exc, task_id, args, kwargs, einfo):
+        """Log task failure."""
+        # This catches exceptions raised from run() that are not Ignore or Reject
+        log.error(
+            "Celery task failed",
+            task_id=task_id,
+            task_name=self.name,
+            args=args,
+            kwargs=kwargs,
+            error_type=type(exc).__name__,
+            error=str(exc),
+            traceback=str(einfo.traceback),
+            exc_info=False # Avoid duplicate traceback logging if already logged
+        )
+        # Optionally, trigger alerts or cleanup here.
+        # The final DB status *should* have been set to 'error' already by run_async_processing,
+        # unless the failure was in the final DB update itself (handled by Reject).
 
-            # 6. Éxito: Marcar estado final como PROCESSED
-            final_status = DocumentStatus.PROCESSED
-            final_error_message = None # Limpiar mensaje de error en éxito
-            task_log.info("Haystack pipeline completed successfully.")
+    def on_success(self, retval, task_id, args, kwargs):
+        """Log task success."""
+        log.info(
+            "Celery task completed successfully",
+            task_id=task_id,
+            task_name=self.name,
+            args=args,
+            kwargs=kwargs,
+            retval=retval
+        )
 
-        # *** Manejo de errores dentro del flujo async ***
-        except NON_RETRYABLE_ERRORS as e_non_retry:
-            err_type = type(e_non_retry).__name__
-            err_msg_detail = str(e_non_retry)[:500]
-            user_error_msg = f"Error irrecuperable ({err_type}). Verifique el archivo o contacte a soporte."
-            if isinstance(e_non_retry, ValueError) and ("Unsupported content type" in err_msg_detail or "API Key" in err_msg_detail):
-                 user_error_msg = err_msg_detail
-            elif isinstance(e_non_retry, RuntimeError) and "Milvus TypeError" in err_msg_detail:
-                 user_error_msg = f"Error config./código Milvus ({err_type}). Contacte soporte."
-            elif isinstance(e_non_retry, FileNotFoundError):
-                 user_error_msg = final_error_message # Usar el mensaje ya definido
-
-            formatted_traceback = traceback.format_exc()
-            task_log.error(f"Processing failed permanently: {err_type}: {err_msg_detail}", traceback=formatted_traceback)
-            final_status = DocumentStatus.ERROR
-            final_error_message = user_error_msg
-            # Re-levantar para que el bloque exterior lo capture
-            raise e_non_retry
-
-        except RETRYABLE_ERRORS as e_retry:
-            err_type = type(e_retry).__name__
-            err_msg_detail = str(e_retry)[:500]
-            max_retries = self.max_retries if hasattr(self, 'max_retries') else 3
-            current_attempt = self.request.retries + 1
-            user_error_msg = f"Error temporal ({err_type} - Intento {current_attempt}/{max_retries+1}). Reintentando..."
-            if isinstance(e_retry, ConnectionError) and "Milvus connection failed" in err_msg_detail:
-                 user_error_msg = f"Error temporal conexión base vectorial (Intento {current_attempt}/{max_retries+1}). Reintentando..."
-
-            task_log.warning(f"Processing failed, will retry: {err_type}: {err_msg_detail}", traceback=traceback.format_exc())
-            final_status = DocumentStatus.ERROR
-            final_error_message = user_error_msg
-            # Re-levantar la excepción ORIGINAL para que Celery la capture y reintente
-            raise e_retry
-
-        finally:
-            if downloaded_file_stream:
-                downloaded_file_stream.close()
-            task_log.debug("Cleaned up async flow resources.")
-
-    # --- Ejecutar el flujo async y manejar resultado final / actualización DB ---
-    try:
-        TIMEOUT_SECONDS = 600 # 10 minutos
-        asyncio.run(asyncio.wait_for(async_process_flow(), timeout=TIMEOUT_SECONDS))
-    except asyncio.TimeoutError as toe:
-        task_log.error(f"Processing timed out after {TIMEOUT_SECONDS} seconds.")
-        final_status = DocumentStatus.ERROR
-        final_error_message = "El procesamiento del documento tardó demasiado."
-        task_exception = toe # Guardar para posible re-raise
-    except Exception as outer_exc:
-        task_log.exception("Exception caught after running async_process_flow.", exc_info=outer_exc)
-        # El estado y mensaje ya deberían estar seteados dentro del flujo
-        if final_status != DocumentStatus.ERROR:
-             final_error_message = final_error_message or f"Error inesperado: {outer_exc}"
-             final_status = DocumentStatus.ERROR
-        task_exception = outer_exc # Guardar excepción original
-
-    # --- Actualización Final de Estado (Robusta) ---
-    task_log.info("Attempting final status update in DB.", status=final_status.value, chunks=processed_chunk_count, error=final_error_message)
-    # Usar la función robusta para la actualización final
-    update_success = asyncio.run(_robust_update_status(document_id, final_status, final_error_message, processed_chunk_count))
-
-    if not update_success:
-         task_log.critical("CRITICAL: Failed to update final document status in DB after processing attempt!",
-                           target_status=final_status.value, error_msg=final_error_message)
-
-    # --- Devolver resultado a Celery ---
-    if final_status == DocumentStatus.PROCESSED:
-        task_log.info("Haystack document processing task completed successfully.")
-        return {"status": "success", "document_id": str(document_id), "chunk_count": processed_chunk_count}
-    else:
-        # *** CORRECCIÓN: Usar RETRYABLE_ERRORS para la comparación ***
-        # Si la excepción original guardada NO es una de las que Celery reintenta automáticamente
-        # (definidas en RETRYABLE_ERRORS), la levantamos para marcar como FAILED.
-        if task_exception and not isinstance(task_exception, RETRYABLE_ERRORS):
-            task_log.error("Raising final non-retryable exception to Celery.", exception_type=type(task_exception).__name__)
-            raise task_exception
-        # Si no hubo excepción O era reintentable (y Celery ya no reintentará más),
-        # simplemente devolvemos 'failure'.
-        task_log.error("Task finished with error status.", final_db_status=final_status.value, error_msg=final_error_message)
-        return {"status": "failure", "document_id": str(document_id), "error": final_error_message or "Error desconocido"}
+# Register the custom task class with Celery
+process_document_haystack_task = celery_app.register_task(ProcessDocumentTask())
 ```
 
 ## File: `app\utils\__init__.py`
