@@ -87,10 +87,7 @@ async def create_document_record(
         insert_log.error("Failed to create document record", error=str(e), exc_info=True)
         raise
 
-# --- ERROR LINE REMOVED ---
-# status: DocumentStatus = DocumentStatus.PENDING, # <-- THIS LINE WAS THE ERROR and has been DELETED
-# --- END ERROR LINE REMOVED ---
-
+# --- ERROR LINE HAS BEEN REMOVED FROM HERE ---
 
 # LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH find_document_by_name_and_company DB logic lightly
 async def find_document_by_name_and_company(conn: asyncpg.Connection, filename: str, company_id: uuid.UUID) -> Optional[Dict[str, Any]]:
