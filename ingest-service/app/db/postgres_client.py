@@ -16,7 +16,7 @@ _pool: Optional[asyncpg.Pool] = None
 # --- Pool Management (Sin cambios) ---
 async def get_db_pool() -> asyncpg.Pool:
     global _pool
-    if _pool is None or _pool._closed:
+    if (_pool is None or _pool._closed):
         log.info("Creating PostgreSQL connection pool...", host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT, user=settings.POSTGRES_USER, db=settings.POSTGRES_DB)
         try:
             def _json_encoder(value): return json.dumps(value)
@@ -62,7 +62,8 @@ async def create_document(company_id: uuid.UUID, file_name: str, file_type: str,
     INSERT INTO documents (id, company_id, file_name, file_type, file_path, metadata, status, chunk_count, error_message, uploaded_at, updated_at)
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC');
     """
-    params = [doc_id, company_id, file_name, file_type, None, json.dumps(metadata), DocumentStatus.UPLOADED.value, 0]
+    # Use empty string for file_path to satisfy NOT NULL constraint
+    params = [doc_id, company_id, file_name, file_type, "", json.dumps(metadata), DocumentStatus.UPLOADED.value, 0]
     insert_log = log.bind(company_id=str(company_id), filename=file_name, doc_id=str(doc_id))
     try:
         async with pool.acquire() as conn:

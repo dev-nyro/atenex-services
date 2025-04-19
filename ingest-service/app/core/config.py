@@ -14,7 +14,8 @@ import json
 # --- Service Names en K8s ---
 POSTGRES_K8S_SVC = "postgresql.nyro-develop.svc.cluster.local"
 MINIO_K8S_SVC = "minio-service.nyro-develop.svc.cluster.local"
-MILVUS_K8S_SVC = "milvus-milvus.default.svc.cluster.local" # Milvus en default ns
+# Correct service and port; use standard host:port format (no http scheme)
+MILVUS_K8S_SVC = "milvus-service.nyro-develop.svc.cluster.local"
 REDIS_K8S_SVC = "redis-service-master.nyro-develop.svc.cluster.local"
 
 # --- Defaults ---
@@ -59,7 +60,8 @@ class Settings(BaseSettings):
     POSTGRES_DB: str = POSTGRES_K8S_DB_DEFAULT
 
     # --- Milvus ---
-    MILVUS_URI: str = Field(default=f"http://{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}")
+    # Connect via host:port string; no HTTP prefix
+    MILVUS_URI: str = Field(default=f"{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}")
     MILVUS_COLLECTION_NAME: str = MILVUS_DEFAULT_COLLECTION
     # LLM_COMMENT: Ensure metadata fields include filtering keys and display keys
     MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name", "file_type"])

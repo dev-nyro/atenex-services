@@ -10,30 +10,56 @@ from datetime import datetime
 #     pass
 
 class IngestResponse(BaseModel):
-    """Respuesta devuelta al iniciar la ingesta."""
     document_id: uuid.UUID
-    task_id: Optional[str] = None # ID de la tarea Celery
-    status: DocumentStatus = DocumentStatus.UPLOADED # Estado inicial UPLOADED
+    task_id: str
+    status: str
     message: str = "Document upload received and queued for processing."
 
-class StatusResponse(BaseModel):
-    """Schema para representar el estado de un documento."""
-    # Usar alias para mapear nombres de columnas de DB a nombres de campo API
-    document_id: uuid.UUID = Field(..., alias="id")
-    status: DocumentStatus # El enum se valida automáticamente
-    file_name: Optional[str] = None
-    file_type: Optional[str] = None
-    chunk_count: Optional[int] = None
-    # Estado actual en MinIO
-    minio_exists: Optional[bool] = None
-    # Número de chunks indexados en Milvus
-    milvus_chunk_count: Optional[int] = None
-    last_updated: Optional[datetime] = Field(None, alias="updated_at")
-    # Mensaje descriptivo añadido en el endpoint, no viene de la DB directamente
-    message: Optional[str] = Field(None, exclude=False) # Incluir en respuesta si se añade
+    class Config:
+        schema_extra = {
+            "example": {
+                "document_id": "123e4567-e89b-12d3-a456-426614174000",
+                "task_id": "abcd1234efgh",
+                "status": "processing",
+                "message": "Document upload received and queued for processing."
+            }
+        }
 
-    # Configuración Pydantic v2 para mapeo y creación desde atributos
-    model_config = {
-        "populate_by_name": True, # Permite usar 'alias' para mapear desde nombres de DB/dict
-        "from_attributes": True   # Permite crear instancia desde un objeto con atributos (como asyncpg.Record)
-    }
+class StatusResponse(BaseModel):
+    document_id: uuid.UUID = Field(..., alias="id")
+    company_id: uuid.UUID
+    file_name: str
+    file_type: str
+    file_path: Optional[str]
+    metadata: Optional[Dict[str, Any]]
+    status: str
+    chunk_count: int
+    error_message: Optional[str]
+    uploaded_at: datetime
+    updated_at: datetime
+
+    # Fields added by status endpoints
+    minio_exists: bool
+    milvus_chunk_count: int
+    message: str
+
+    class Config:
+        allow_population_by_field_name = True
+        schema_extra = {
+            "example": {
+                "id": "123e4567-e89b-12d3-a456-426614174000",
+                "company_id": "51a66c8f-f6b1-43bd-8038-8768471a8b09",
+                "file_name": "document.pdf",
+                "file_type": "application/pdf",
+                "file_path": "51a66c8f-f6b1-43bd-8038-8768471a8b09/123e4567-e89b-12d3-a456-426614174000/document.pdf",
+                "metadata": {},
+                "status": "processed",
+                "chunk_count": 10,
+                "error_message": null,
+                "uploaded_at": "2025-04-18T20:00:00Z",
+                "updated_at": "2025-04-18T20:30:00Z",
+                "minio_exists": true,
+                "milvus_chunk_count": 10,
+                "message": "Document processed successfully."
+            }
+        }
