@@ -55,28 +55,24 @@ async def check_db_connection() -> bool:
     except Exception as e: log.error("Database connection check failed", error=str(e)); return False
 
 # --- Document Operations ---
-# ***** CORRECCIÓN: Añadido document_id como primer argumento *****
 async def create_document(document_id: uuid.UUID, company_id: uuid.UUID, file_name: str, file_type: str, metadata: Dict[str, Any]) -> None:
     """Crea un registro inicial para un documento en la base de datos."""
     pool = await get_db_pool()
-    # doc_id ya viene como argumento
     query = """
     INSERT INTO documents (id, company_id, file_name, file_type, file_path, metadata, status, chunk_count, error_message, uploaded_at, updated_at)
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC');
     """
-    # Usar "" como placeholder inicial para file_path
+    # Usar "" como placeholder inicial para file_path y DocumentStatus.UPLOADED
     params = [document_id, company_id, file_name, file_type, "", json.dumps(metadata), DocumentStatus.UPLOADED.value, 0]
     insert_log = log.bind(company_id=str(company_id), filename=file_name, doc_id=str(document_id))
     try:
         async with pool.acquire() as conn:
             await conn.execute(query, *params)
         insert_log.info("Document record created in PostgreSQL")
-        # Ya no devuelve el ID, ya que se pasa como argumento
     except Exception as e:
         insert_log.error("Failed to create document record", error=str(e), exc_info=True)
-        raise # Relanzar para que el endpoint lo maneje
+        raise
 
-# Resto de funciones sin cambios (update_document_status, get_document_status, etc.)
 async def update_document_status(
     document_id: uuid.UUID,
     status: DocumentStatus,
@@ -84,6 +80,7 @@ async def update_document_status(
     chunk_count: Optional[int] = None,
     error_message: Optional[str] = None
 ) -> bool:
+    """Actualiza el estado, file_path, chunk_count y/o error_message de un documento."""
     pool = await get_db_pool()
     params: List[Any] = [document_id]
     fields: List[str] = ["status = $2", "updated_at = NOW() AT TIME ZONE 'UTC'"]
@@ -93,15 +90,15 @@ async def update_document_status(
         fields.append(f"file_path = ${param_index}"); params.append(file_path); param_index += 1
     if chunk_count is not None:
         fields.append(f"chunk_count = ${param_index}"); params.append(chunk_count); param_index += 1
-    # Asegurarse de que el mensaje de error solo se establezca si el estado es ERROR
-    # y se limpie si el estado es diferente de ERROR.
+
+    # Manejo de error_message: Limpiar si no es estado ERROR, setear si es ERROR y se provee
     if status == DocumentStatus.ERROR:
         # Solo añadir/actualizar error_message si se proporciona uno
         if error_message is not None:
-             fields.append(f"error_message = ${param_index}"); params.append(error_message); param_index += 1
-        # Si el estado es ERROR pero no se proporciona mensaje, no tocar el existente
+            fields.append(f"error_message = ${param_index}"); params.append(error_message); param_index += 1
+        # Si status es ERROR pero no viene mensaje, se mantiene el existente (no añadir "error_message = NULL")
     else:
-        # Si el estado NO es ERROR, SIEMPRE limpiar el mensaje de error
+        # Si el status NO es ERROR, limpiar el mensaje de error explícitamente
         fields.append("error_message = NULL")
 
     set_clause = ", ".join(fields)
@@ -109,7 +106,11 @@ async def update_document_status(
     update_log = log.bind(document_id=str(document_id), new_status=status.value)
     try:
         async with pool.acquire() as conn:
-            await conn.execute(query, *params)
+            result = await conn.execute(query, *params)
+            # Check if update affected any row
+            if result == 'UPDATE 0':
+                 update_log.warning("Attempted to update status for non-existent document_id")
+                 return False
         update_log.info("Document status updated in PostgreSQL")
         return True
     except Exception as e:
@@ -129,7 +130,6 @@ async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]
         if not record:
             get_log.warning("Queried non-existent document_id")
             return None
-        # Convertir a dict para poder modificarlo si es necesario (como parsear metadata)
         return dict(record)
     except Exception as e:
         get_log.error("Failed to get document status", error=str(e), exc_info=True)
@@ -145,7 +145,6 @@ async def list_documents_by_company(company_id: uuid.UUID, limit: int = 100, off
     try:
         async with pool.acquire() as conn:
             rows = await conn.fetch(query, company_id, limit, offset)
-        # Convertir cada registro a dict
         return [dict(r) for r in rows]
     except Exception as e:
         list_log.error("Failed to list documents by company", error=str(e), exc_info=True)
@@ -164,9 +163,7 @@ async def delete_document(document_id: uuid.UUID) -> bool:
         delete_log.error("Error deleting document record", error=str(e), exc_info=True)
         raise
 
-# --- Funciones de Chat (Se mantienen por si son usadas internamente, pero no son parte del core de ingest) ---
-# ... (resto de funciones de chat sin cambios) ...
-
+# --- Funciones de Chat (Se mantienen, sin cambios) ---
 async def create_chat(user_id: uuid.UUID, company_id: uuid.UUID, title: Optional[str] = None) -> uuid.UUID:
     pool = await get_db_pool()
     chat_id = uuid.uuid4()

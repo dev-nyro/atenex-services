@@ -11,9 +11,8 @@ import sys
 import json
 
 # --- Service Names en K8s ---
-POSTGRES_K8S_SVC = "postgresql.nyro-develop.svc.cluster.local"
+POSTGRES_K8S_SVC = "postgresql-service.nyro-develop.svc.cluster.local" # Corregido nombre servicio
 MINIO_K8S_SVC = "minio-service.nyro-develop.svc.cluster.local"
-# ***** CORRECCIÓN: Nombre del servicio Milvus y namespace correctos *****
 MILVUS_K8S_SVC = "milvus-milvus.default.svc.cluster.local" # Servicio en namespace 'default'
 REDIS_K8S_SVC = "redis-service-master.nyro-develop.svc.cluster.local"
 
@@ -22,10 +21,9 @@ POSTGRES_K8S_PORT_DEFAULT = 5432
 POSTGRES_K8S_DB_DEFAULT = "atenex"
 POSTGRES_K8S_USER_DEFAULT = "postgres"
 MINIO_K8S_PORT_DEFAULT = 9000
-MINIO_BUCKET_DEFAULT = "ingested-documents" # Usar el nombre del bucket correcto
-MILVUS_K8S_PORT_DEFAULT = 19530 # Puerto de Milvus
-REDIS_K8S_PORT_DEFAULT = 6379
-MILVUS_DEFAULT_COLLECTION = "document_chunks_haystack" # Mantener nombre colección
+MINIO_BUCKET_DEFAULT = "ingested-documents"
+MILVUS_K8S_PORT_DEFAULT = 19530
+MILVUS_DEFAULT_COLLECTION = "document_chunks_haystack"
 MILVUS_DEFAULT_INDEX_PARAMS = '{"metric_type": "COSINE", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}}'
 MILVUS_DEFAULT_SEARCH_PARAMS = '{"metric_type": "COSINE", "params": {"ef": 128}}'
 OPENAI_DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
@@ -43,8 +41,9 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
 
     # --- Celery ---
-    CELERY_BROKER_URL: RedisDsn = Field(default=RedisDsn(f"redis://{REDIS_K8S_SVC}:{REDIS_K8S_PORT_DEFAULT}/0"))
-    CELERY_RESULT_BACKEND: RedisDsn = Field(default=RedisDsn(f"redis://{REDIS_K8S_SVC}:{REDIS_K8S_PORT_DEFAULT}/1"))
+    CELERY_BROKER_URL: RedisDsn = Field(default_factory=lambda: RedisDsn(f"redis://{REDIS_K8S_SVC}:{REDIS_K8S_PORT_DEFAULT}/0"))
+    CELERY_RESULT_BACKEND: RedisDsn = Field(default_factory=lambda: RedisDsn(f"redis://{REDIS_K8S_SVC}:{REDIS_K8S_PORT_DEFAULT}/1"))
+
 
     # --- Database ---
     POSTGRES_USER: str = POSTGRES_K8S_USER_DEFAULT
@@ -54,8 +53,6 @@ class Settings(BaseSettings):
     POSTGRES_DB: str = POSTGRES_K8S_DB_DEFAULT
 
     # --- Milvus ---
-    # ***** CORRECCIÓN: Usar http:// y el servicio K8s correcto para la URI *****
-    # MilvusDocumentStore espera una URI completa
     MILVUS_URI: str = Field(default=f"http://{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}")
     MILVUS_COLLECTION_NAME: str = MILVUS_DEFAULT_COLLECTION
     MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name", "file_type"])
@@ -131,6 +128,13 @@ class Settings(BaseSettings):
              raise ValueError(f"Required secret field '{field_name}' cannot be empty.")
         return v
 
+    @field_validator('MILVUS_URI', mode='before')
+    @classmethod
+    def validate_milvus_uri(cls, v: str) -> str:
+        if not v.startswith("http://") and not v.startswith("https://"):
+             raise ValueError(f"Invalid MILVUS_URI format: '{v}'. Must start with 'http://' or 'https://'")
+        return v
+
 # --- Instancia Global ---
 temp_log = logging.getLogger("ingest_service.config.loader")
 if not temp_log.handlers:
@@ -153,7 +157,6 @@ try:
     temp_log.info(f"  POSTGRES_DB:              {settings.POSTGRES_DB}")
     temp_log.info(f"  POSTGRES_USER:            {settings.POSTGRES_USER}")
     temp_log.info(f"  POSTGRES_PASSWORD:        *** SET ***")
-    # ***** CORRECCIÓN: Loguear la URI corregida de Milvus *****
     temp_log.info(f"  MILVUS_URI:               {settings.MILVUS_URI}")
     temp_log.info(f"  MILVUS_COLLECTION_NAME:   {settings.MILVUS_COLLECTION_NAME}")
     temp_log.info(f"  MINIO_ENDPOINT:           {settings.MINIO_ENDPOINT}")
