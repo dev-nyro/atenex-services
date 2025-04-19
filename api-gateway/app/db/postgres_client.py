@@ -1,220 +1,182 @@
-# ingest-service/app/db/postgres_client.py
+# File: app/db/postgres_client.py
+# api-gateway/app/db/postgres_client.py
 import uuid
 from typing import Any, Optional, Dict, List
 import asyncpg
 import structlog
 import json
-from datetime import datetime, timezone
 
 from app.core.config import settings
-from app.models.domain import DocumentStatus
 
 log = structlog.get_logger(__name__)
 
 _pool: Optional[asyncpg.Pool] = None
 
-# --- Pool Management (Sin cambios) ---
 async def get_db_pool() -> asyncpg.Pool:
+    """
+    Obtiene o crea el pool de conexiones a la base de datos PostgreSQL.
+    """
     global _pool
-    if (_pool is None or _pool._closed):
-        log.info("Creating PostgreSQL connection pool...", host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT, user=settings.POSTGRES_USER, db=settings.POSTGRES_DB)
+    if _pool is None or _pool._closed: # Recrea el pool si está cerrado
         try:
-            def _json_encoder(value): return json.dumps(value)
-            def _json_decoder(value): return json.loads(value)
+            log.info("Creating PostgreSQL connection pool...",
+                     host=settings.POSTGRES_SERVER,
+                     port=settings.POSTGRES_PORT,
+                     user=settings.POSTGRES_USER,
+                     database=settings.POSTGRES_DB)
+
+            # Asegúrate de que el codec jsonb esté registrado si usas JSONB
+            def _json_encoder(value):
+                return json.dumps(value)
+            def _json_decoder(value):
+                return json.loads(value)
+
             async def init_connection(conn):
-                await conn.set_type_codec('jsonb', encoder=_json_encoder, decoder=_json_decoder, schema='pg_catalog', format='text')
-                await conn.set_type_codec('json', encoder=_json_encoder, decoder=_json_decoder, schema='pg_catalog', format='text')
+                 await conn.set_type_codec(
+                     'jsonb',
+                     encoder=_json_encoder,
+                     decoder=_json_decoder,
+                     schema='pg_catalog'
+                 )
+                 await conn.set_type_codec(
+                      'json',
+                      encoder=_json_encoder,
+                      decoder=_json_decoder,
+                      schema='pg_catalog'
+                  )
 
             _pool = await asyncpg.create_pool(
-                user=settings.POSTGRES_USER, password=settings.POSTGRES_PASSWORD.get_secret_value(),
-                database=settings.POSTGRES_DB, host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT,
-                min_size=2, max_size=10, timeout=30.0, command_timeout=60.0,
-                init=init_connection, statement_cache_size=0
+                user=settings.POSTGRES_USER,
+                password=settings.POSTGRES_PASSWORD.get_secret_value(), # Obtener valor del SecretStr
+                database=settings.POSTGRES_DB,
+                host=settings.POSTGRES_SERVER,
+                port=settings.POSTGRES_PORT,
+                min_size=5,   # Ajusta según necesidad
+                max_size=20,  # Ajusta según necesidad
+                statement_cache_size=0, # Deshabilitar caché para evitar problemas con tipos dinámicos
+                init=init_connection # Añadir inicializador para codecs JSON/JSONB
             )
             log.info("PostgreSQL connection pool created successfully.")
-        except (asyncpg.exceptions.InvalidPasswordError, OSError, ConnectionRefusedError) as conn_err:
-            log.critical("CRITICAL: Failed to connect to PostgreSQL", error=str(conn_err), exc_info=True)
-            _pool = None; raise ConnectionError(f"Failed to connect to PostgreSQL: {conn_err}") from conn_err
         except Exception as e:
-            log.critical("CRITICAL: Failed to create PostgreSQL connection pool", error=str(e), exc_info=True)
-            _pool = None; raise RuntimeError(f"Failed to create PostgreSQL pool: {e}") from e
+            log.error("Failed to create PostgreSQL connection pool",
+                      error=str(e), error_type=type(e).__name__,
+                      host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT,
+                      db=settings.POSTGRES_DB, user=settings.POSTGRES_USER,
+                      exc_info=True)
+            _pool = None # Asegurar que el pool es None si falla la creación
+            raise # Relanzar para que el inicio de la app falle si no hay DB
     return _pool
 
 async def close_db_pool():
+    """Cierra el pool de conexiones a la base de datos."""
     global _pool
-    if (_pool and not _pool._closed): log.info("Closing PostgreSQL connection pool..."); await _pool.close(); _pool = None; log.info("PostgreSQL connection pool closed.")
-    elif _pool and _pool._closed: log.warning("Attempted to close an already closed PostgreSQL pool."); _pool = None
-    else: log.info("No active PostgreSQL connection pool to close.")
+    if _pool and not _pool._closed:
+        log.info("Closing PostgreSQL connection pool...")
+        await _pool.close()
+        _pool = None # Resetear la variable global
+        log.info("PostgreSQL connection pool closed successfully.")
+    elif _pool and _pool._closed:
+        log.warning("Attempted to close an already closed PostgreSQL pool.")
+        _pool = None
+    else:
+        log.info("No active PostgreSQL connection pool to close.")
+
 
 async def check_db_connection() -> bool:
+    """Verifica que la conexión a la base de datos esté funcionando."""
+    pool = None # Asegurar inicialización
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
-            async with conn.transaction(): result = await conn.fetchval("SELECT 1")
+            result = await conn.fetchval("SELECT 1")
         return result == 1
-    except Exception as e: log.error("Database connection check failed", error=str(e)); return False
+    except Exception as e:
+        log.error("Database connection check failed", error=str(e))
+        return False
+    # No cerrar el pool aquí, solo verificar
 
-# --- Document Operations ---
-# ***** CORRECCIÓN: Añadido document_id como primer argumento *****
-async def create_document(document_id: uuid.UUID, company_id: uuid.UUID, file_name: str, file_type: str, metadata: Dict[str, Any]) -> None:
-    """Crea un registro inicial para un documento en la base de datos."""
-    pool = await get_db_pool()
-    # doc_id ya viene como argumento
-    query = """
-    INSERT INTO documents (id, company_id, file_name, file_type, file_path, metadata, status, chunk_count, error_message, uploaded_at, updated_at)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC');
+# --- Métodos específicos para la tabla USERS ---
+
+async def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
     """
-    # Usar "" como placeholder inicial para file_path
-    params = [document_id, company_id, file_name, file_type, "", json.dumps(metadata), DocumentStatus.UPLOADED.value, 0]
-    insert_log = log.bind(company_id=str(company_id), filename=file_name, doc_id=str(document_id))
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute(query, *params)
-        insert_log.info("Document record created in PostgreSQL")
-        # Ya no devuelve el ID, ya que se pasa como argumento
-    except Exception as e:
-        insert_log.error("Failed to create document record", error=str(e), exc_info=True)
-        raise # Relanzar para que el endpoint lo maneje
-
-# Resto de funciones sin cambios (update_document_status, get_document_status, etc.)
-async def update_document_status(
-    document_id: uuid.UUID,
-    status: DocumentStatus,
-    file_path: Optional[str] = None,
-    chunk_count: Optional[int] = None,
-    error_message: Optional[str] = None
-) -> bool:
-    pool = await get_db_pool()
-    params: List[Any] = [document_id]
-    fields: List[str] = ["status = $2", "updated_at = NOW() AT TIME ZONE 'UTC'"]
-    params.append(status.value)
-    param_index = 3
-    if file_path is not None:
-        fields.append(f"file_path = ${param_index}"); params.append(file_path); param_index += 1
-    if chunk_count is not None:
-        fields.append(f"chunk_count = ${param_index}"); params.append(chunk_count); param_index += 1
-    # Asegurarse de que el mensaje de error solo se establezca si el estado es ERROR
-    # y se limpie si el estado es diferente de ERROR.
-    if status == DocumentStatus.ERROR:
-        # Solo añadir/actualizar error_message si se proporciona uno
-        if error_message is not None:
-             fields.append(f"error_message = ${param_index}"); params.append(error_message); param_index += 1
-        # Si el estado es ERROR pero no se proporciona mensaje, no tocar el existente
-    else:
-        # Si el estado NO es ERROR, SIEMPRE limpiar el mensaje de error
-        fields.append("error_message = NULL")
-
-    set_clause = ", ".join(fields)
-    query = f"UPDATE documents SET {set_clause} WHERE id = $1;"
-    update_log = log.bind(document_id=str(document_id), new_status=status.value)
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute(query, *params)
-        update_log.info("Document status updated in PostgreSQL")
-        return True
-    except Exception as e:
-        update_log.error("Failed to update document status", error=str(e), exc_info=True)
-        raise
-
-async def get_document_status(document_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+    Recupera un usuario por su email.
+    Devuelve un diccionario con los datos del usuario o None si no se encuentra.
+    Alineado con el esquema USERS.
+    """
     pool = await get_db_pool()
     query = """
-    SELECT id, company_id, file_name, file_type, file_path, metadata, status, chunk_count, error_message, uploaded_at, updated_at
-    FROM documents WHERE id = $1;
+        SELECT id, company_id, email, hashed_password, full_name, role,
+               created_at, last_login, is_active
+        FROM users
+        WHERE lower(email) = lower($1)
     """
-    get_log = log.bind(document_id=str(document_id))
+    # No filtramos por is_active aquí, la lógica de autenticación puede decidir
+    log.debug("Executing get_user_by_email query", email=email)
     try:
         async with pool.acquire() as conn:
-            record = await conn.fetchrow(query, document_id)
-        if not record:
-            get_log.warning("Queried non-existent document_id")
+            row = await conn.fetchrow(query, email)
+        if row:
+            log.debug("User found by email", user_id=str(row['id']))
+            return dict(row) # Convertir asyncpg.Record a dict
+        else:
+            log.debug("User not found by email", email=email)
             return None
-        # Convertir a dict para poder modificarlo si es necesario (como parsear metadata)
-        return dict(record)
     except Exception as e:
-        get_log.error("Failed to get document status", error=str(e), exc_info=True)
-        raise
+        log.error("Error getting user by email", error=str(e), email=email, exc_info=True)
+        raise # Relanzar para manejo de errores superior
 
-async def list_documents_by_company(company_id: uuid.UUID, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+async def get_user_by_id(user_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+    """
+    Recupera un usuario por su ID (UUID).
+    Devuelve un diccionario con los datos del usuario o None si no se encuentra.
+    Alineado con el esquema USERS. Excluye la contraseña hash por seguridad.
+    """
     pool = await get_db_pool()
     query = """
-    SELECT id, company_id, file_name, file_type, file_path, metadata, status, chunk_count, error_message, uploaded_at, updated_at
-    FROM documents WHERE company_id = $1 ORDER BY updated_at DESC LIMIT $2 OFFSET $3;
+        SELECT id, company_id, email, full_name, role,
+               created_at, last_login, is_active
+        FROM users
+        WHERE id = $1
     """
-    list_log = log.bind(company_id=str(company_id), limit=limit, offset=offset)
+    log.debug("Executing get_user_by_id query", user_id=str(user_id))
     try:
         async with pool.acquire() as conn:
-            rows = await conn.fetch(query, company_id, limit, offset)
-        # Convertir cada registro a dict
-        return [dict(r) for r in rows]
+            row = await conn.fetchrow(query, user_id)
+        if row:
+            log.debug("User found by ID", user_id=str(user_id))
+            return dict(row)
+        else:
+            log.debug("User not found by ID", user_id=str(user_id))
+            return None
     except Exception as e:
-        list_log.error("Failed to list documents by company", error=str(e), exc_info=True)
+        log.error("Error getting user by ID", error=str(e), user_id=str(user_id), exc_info=True)
         raise
 
-async def delete_document(document_id: uuid.UUID) -> bool:
+async def update_user_company(user_id: uuid.UUID, company_id: uuid.UUID) -> bool:
+    """
+    Actualiza el company_id para un usuario específico y actualiza last_login.
+    Devuelve True si la actualización fue exitosa (al menos una fila afectada), False en caso contrario.
+    Alineado con el esquema USERS.
+    """
     pool = await get_db_pool()
-    query = "DELETE FROM documents WHERE id = $1 RETURNING id;"
-    delete_log = log.bind(document_id=str(document_id))
+    query = """
+        UPDATE users
+        SET company_id = $2, updated_at = NOW()
+        WHERE id = $1
+        RETURNING id -- Devolvemos el ID para confirmar la actualización
+    """
+    log.debug("Executing update_user_company query", user_id=str(user_id), company_id=str(company_id))
     try:
         async with pool.acquire() as conn:
-            deleted_id = await conn.fetchval(query, document_id)
-        delete_log.info("Document deleted from PostgreSQL", deleted_id=str(deleted_id))
-        return deleted_id is not None
+            # Usar fetchval para obtener el ID devuelto o None
+            result = await conn.fetchval(query, user_id, company_id)
+        if result is not None:
+            log.info("User company updated successfully", user_id=str(user_id), new_company_id=str(company_id))
+            return True
+        else:
+            # Esto podría suceder si el user_id no existe
+            log.warning("Update user company command executed but no rows were affected.", user_id=str(user_id))
+            return False
     except Exception as e:
-        delete_log.error("Error deleting document record", error=str(e), exc_info=True)
+        log.error("Error updating user company", error=str(e), user_id=str(user_id), company_id=str(company_id), exc_info=True)
         raise
-
-# --- Funciones de Chat (Se mantienen por si son usadas internamente, pero no son parte del core de ingest) ---
-# ... (resto de funciones de chat sin cambios) ...
-
-async def create_chat(user_id: uuid.UUID, company_id: uuid.UUID, title: Optional[str] = None) -> uuid.UUID:
-    pool = await get_db_pool()
-    chat_id = uuid.uuid4()
-    query = """INSERT INTO chats (id, user_id, company_id, title, created_at, updated_at) VALUES ($1, $2, $3, $4, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC') RETURNING id;"""
-    try:
-        async with pool.acquire() as conn:
-            result = await conn.fetchval(query, chat_id, user_id, company_id, title or f"Chat {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}")
-            return result
-    except Exception as e:
-        log.error("Failed create_chat (ingest context)", error=str(e))
-        raise
-
-async def get_user_chats(user_id: uuid.UUID, company_id: uuid.UUID, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
-    pool = await get_db_pool()
-    query = """SELECT id, title, updated_at FROM chats WHERE user_id = $1 AND company_id = $2 ORDER BY updated_at DESC LIMIT $3 OFFSET $4;"""
-    try:
-        async with pool.acquire() as conn: rows = await conn.fetch(query, user_id, company_id, limit, offset); return [dict(row) for row in rows]
-    except Exception as e: log.error("Failed get_user_chats (ingest context)", error=str(e)); raise
-
-async def check_chat_ownership(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID) -> bool:
-    pool = await get_db_pool()
-    query = "SELECT EXISTS (SELECT 1 FROM chats WHERE id = $1 AND user_id = $2 AND company_id = $3);"
-    try:
-        async with pool.acquire() as conn: exists = await conn.fetchval(query, chat_id, user_id, company_id); return exists is True
-    except Exception as e: log.error("Failed check_chat_ownership (ingest context)", error=str(e)); return False
-
-async def get_chat_messages(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-    pool = await get_db_pool(); owner = await check_chat_ownership(chat_id, user_id, company_id)
-    if not owner: return []
-    messages_query = """SELECT id, role, content, sources, created_at FROM messages WHERE chat_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3;"""
-    try:
-        async with pool.acquire() as conn: message_rows = await conn.fetch(messages_query, chat_id, limit, offset); return [dict(row) for row in message_rows]
-    except Exception as e: log.error("Failed get_chat_messages (ingest context)", error=str(e)); raise
-
-async def save_message(chat_id: uuid.UUID, role: str, content: str, sources: Optional[List[Dict[str, Any]]] = None) -> uuid.UUID:
-    pool = await get_db_pool(); message_id = uuid.uuid4()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            try:
-                update_chat_query = "UPDATE chats SET updated_at = NOW() AT TIME ZONE 'UTC' WHERE id = $1 RETURNING id;"; chat_updated = await conn.fetchval(update_chat_query, chat_id)
-                if not chat_updated: raise ValueError(f"Chat {chat_id} not found (ingest context).")
-                insert_message_query = """INSERT INTO messages (id, chat_id, role, content, sources, created_at) VALUES ($1, $2, $3, $4, $5, NOW() AT TIME ZONE 'UTC') RETURNING id;"""
-                result = await conn.fetchval(insert_message_query, message_id, chat_id, role, content, json.dumps(sources or [])); return result
-            except Exception as e: log.error("Failed save_message (ingest context)", error=str(e)); raise
-
-async def delete_chat(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID) -> bool:
-    pool = await get_db_pool()
-    query = "DELETE FROM chats WHERE id = $1 AND user_id = $2 AND company_id = $3 RETURNING id;"; delete_log = log.bind(chat_id=str(chat_id), user_id=str(user_id))
-    try:
-        async with pool.acquire() as conn: deleted_id = await conn.fetchval(query, chat_id, user_id, company_id); return deleted_id is not None
-    except Exception as e: delete_log.error("Failed to delete chat (ingest context)", error=str(e)); raise

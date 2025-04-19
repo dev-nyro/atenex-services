@@ -1,184 +1,147 @@
-# ingest-service/app/core/config.py
-import logging
+# File: app/core/config.py
+# api-gateway/app/core/config.py
 import os
-from typing import Optional, List, Any, Dict, Union
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import (
-    RedisDsn, AnyHttpUrl, SecretStr, Field, field_validator, ValidationError,
-    ValidationInfo
-)
+from pydantic import Field, validator, ValidationError, HttpUrl, SecretStr
+from functools import lru_cache
 import sys
-import json
+import logging
+from typing import Optional, List
+import uuid # Para validar UUID
 
-# --- Service Names en K8s ---
-POSTGRES_K8S_SVC = "postgresql.nyro-develop.svc.cluster.local"
-MINIO_K8S_SVC = "minio-service.nyro-develop.svc.cluster.local"
-# ***** CORRECCIÓN: Nombre del servicio Milvus y namespace correctos *****
-MILVUS_K8S_SVC = "milvus-milvus.default.svc.cluster.local" # Servicio en namespace 'default'
-REDIS_K8S_SVC = "redis-service-master.nyro-develop.svc.cluster.local"
+# URLs por defecto si no se especifican en el entorno (usando el namespace 'nyro-develop')
+K8S_INGEST_SVC_URL_DEFAULT = "http://ingest-api-service.nyro-develop.svc.cluster.local:80"
+K8S_QUERY_SVC_URL_DEFAULT = "http://query-service.atenex-develop.svc.cluster.local:80"
+K8S_AUTH_SVC_URL_DEFAULT = None # No hay auth service por defecto
 
-# --- Defaults ---
+# PostgreSQL Kubernetes Default (usando el namespace 'atenex-develop')
+POSTGRES_K8S_HOST_DEFAULT = "postgresql.atenex-develop.svc.cluster.local" # <-- K8s Service Name
 POSTGRES_K8S_PORT_DEFAULT = 5432
-POSTGRES_K8S_DB_DEFAULT = "atenex"
-POSTGRES_K8S_USER_DEFAULT = "postgres"
-MINIO_K8S_PORT_DEFAULT = 9000
-MINIO_BUCKET_DEFAULT = "ingested-documents" # Usar el nombre del bucket correcto
-MILVUS_K8S_PORT_DEFAULT = 19530 # Puerto de Milvus
-REDIS_K8S_PORT_DEFAULT = 6379
-MILVUS_DEFAULT_COLLECTION = "document_chunks_haystack" # Mantener nombre colección
-MILVUS_DEFAULT_INDEX_PARAMS = '{"metric_type": "COSINE", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}}'
-MILVUS_DEFAULT_SEARCH_PARAMS = '{"metric_type": "COSINE", "params": {"ef": 128}}'
-OPENAI_DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
-DEFAULT_EMBEDDING_DIM = 1536 # Dimension for text-embedding-3-small & ada-002
+POSTGRES_K8S_DB_DEFAULT = "atenex" # <-- Nombre de DB (asegúrate que coincida)
+POSTGRES_K8S_USER_DEFAULT = "postgres" # <-- Usuario DB (asegúrate que coincida)
 
 class Settings(BaseSettings):
+    # Configuración de Pydantic-Settings
     model_config = SettingsConfigDict(
-        env_file='.env', env_prefix='INGEST_', env_file_encoding='utf-8',
-        case_sensitive=False, extra='ignore'
+        env_file='.env',
+        env_prefix='GATEWAY_',
+        case_sensitive=False,
+        env_file_encoding='utf-8',
+        extra='ignore'
     )
 
-    # --- General ---
-    PROJECT_NAME: str = "Atenex Ingest Service"
-    API_V1_STR: str = "/api/v1/ingest"
-    LOG_LEVEL: str = "INFO"
+    # Información del Proyecto
+    PROJECT_NAME: str = "Atenex API Gateway" # <-- Nombre actualizado
+    API_V1_STR: str = "/api/v1"
 
-    # --- Celery ---
-    CELERY_BROKER_URL: RedisDsn = Field(default=RedisDsn(f"redis://{REDIS_K8S_SVC}:{REDIS_K8S_PORT_DEFAULT}/0"))
-    CELERY_RESULT_BACKEND: RedisDsn = Field(default=RedisDsn(f"redis://{REDIS_K8S_SVC}:{REDIS_K8S_PORT_DEFAULT}/1"))
+    # URLs de Servicios Backend
+    INGEST_SERVICE_URL: HttpUrl = K8S_INGEST_SVC_URL_DEFAULT
+    QUERY_SERVICE_URL: HttpUrl = K8S_QUERY_SVC_URL_DEFAULT
+    AUTH_SERVICE_URL: Optional[HttpUrl] = K8S_AUTH_SVC_URL_DEFAULT
 
-    # --- Database ---
+    # Configuración JWT (Obligatoria)
+    JWT_SECRET: SecretStr # Obligatorio, usar SecretStr para seguridad
+    JWT_ALGORITHM: str = "HS256"
+
+    # Configuración PostgreSQL (Obligatoria)
     POSTGRES_USER: str = POSTGRES_K8S_USER_DEFAULT
-    POSTGRES_PASSWORD: SecretStr
-    POSTGRES_SERVER: str = POSTGRES_K8S_SVC
+    POSTGRES_PASSWORD: SecretStr # Obligatorio desde Secrets
+    POSTGRES_SERVER: str = POSTGRES_K8S_HOST_DEFAULT
     POSTGRES_PORT: int = POSTGRES_K8S_PORT_DEFAULT
     POSTGRES_DB: str = POSTGRES_K8S_DB_DEFAULT
 
-    # --- Milvus ---
-    # ***** CORRECCIÓN: Usar http:// y el servicio K8s correcto para la URI *****
-    # MilvusDocumentStore espera una URI completa
-    MILVUS_URI: str = Field(default=f"http://{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}")
-    MILVUS_COLLECTION_NAME: str = MILVUS_DEFAULT_COLLECTION
-    MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name", "file_type"])
-    MILVUS_CONTENT_FIELD: str = "content"
-    MILVUS_EMBEDDING_FIELD: str = "embedding"
-    MILVUS_INDEX_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_INDEX_PARAMS))
-    MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_SEARCH_PARAMS))
+    # Configuración de Asociación de Compañía
+    DEFAULT_COMPANY_ID: Optional[str] = None # UUID de compañía por defecto
 
-    # --- MinIO ---
-    MINIO_ENDPOINT: str = Field(default=f"{MINIO_K8S_SVC}:{MINIO_K8S_PORT_DEFAULT}")
-    MINIO_ACCESS_KEY: SecretStr
-    MINIO_SECRET_KEY: SecretStr
-    MINIO_BUCKET_NAME: str = MINIO_BUCKET_DEFAULT
-    MINIO_USE_SECURE: bool = False
-
-    # --- Embeddings (OpenAI for Ingestion) ---
-    OPENAI_API_KEY: SecretStr
-    OPENAI_EMBEDDING_MODEL: str = OPENAI_DEFAULT_EMBEDDING_MODEL
-    EMBEDDING_DIMENSION: int = DEFAULT_EMBEDDING_DIM
-
-    # --- Clients ---
+    # Configuración General
+    LOG_LEVEL: str = "INFO"
     HTTP_CLIENT_TIMEOUT: int = 60
-    HTTP_CLIENT_MAX_RETRIES: int = 2
-    HTTP_CLIENT_BACKOFF_FACTOR: float = 1.0
+    # Corregido: KEEPALIVE en lugar de KEEPALIAS
+    HTTP_CLIENT_MAX_KEEPALIVE_CONNECTIONS: int = 100
+    HTTP_CLIENT_MAX_CONNECTIONS: int = 200
 
-    # --- Processing ---
-    SUPPORTED_CONTENT_TYPES: List[str] = Field(default=[
-        "application/pdf",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document", # DOCX
-        "application/msword", # DOC
-        "text/plain",
-        "text/markdown",
-        "text/html"
-    ])
-    SPLITTER_CHUNK_SIZE: int = 500
-    SPLITTER_CHUNK_OVERLAP: int = 50
-    SPLITTER_SPLIT_BY: str = "word"
+    # CORS (Opcional - URLs de ejemplo, ajusta según necesites)
+    VERCEL_FRONTEND_URL: Optional[str] = "https://atenex-frontend.vercel.app"
+    # NGROK_URL: Optional[str] = None
 
-    # --- Validators ---
-    @field_validator("LOG_LEVEL")
-    @classmethod
-    def check_log_level(cls, v: str) -> str:
-        valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
-        normalized_v = v.upper()
-        if normalized_v not in valid_levels: raise ValueError(f"Invalid LOG_LEVEL '{v}'. Must be one of {valid_levels}")
-        return normalized_v
-
-    @field_validator('EMBEDDING_DIMENSION', mode='before', check_fields=False)
-    @classmethod
-    def set_embedding_dimension(cls, v: Optional[int], info: ValidationInfo) -> int:
-        config_values = info.data
-        model = config_values.get('OPENAI_EMBEDDING_MODEL', OPENAI_DEFAULT_EMBEDDING_MODEL)
-        calculated_dim = DEFAULT_EMBEDDING_DIM
-        if model == "text-embedding-3-large": calculated_dim = 3072
-        elif model in ["text-embedding-3-small", "text-embedding-ada-002"]: calculated_dim = 1536
-
-        if v is not None and v != calculated_dim:
-             logging.warning(f"Provided INGEST_EMBEDDING_DIMENSION {v} conflicts with INGEST_OPENAI_EMBEDDING_MODEL {model} ({calculated_dim} expected). Using calculated value: {calculated_dim}")
-             return calculated_dim
-        elif v is None:
-             logging.debug(f"EMBEDDING_DIMENSION not set, defaulting to {calculated_dim} based on model {model}")
-             return calculated_dim
-        else:
-             if v == calculated_dim:
-                 logging.debug(f"Provided EMBEDDING_DIMENSION {v} matches model {model}")
-             return v
-
-    @field_validator('POSTGRES_PASSWORD', 'MINIO_ACCESS_KEY', 'MINIO_SECRET_KEY', 'OPENAI_API_KEY', mode='before')
-    @classmethod
-    def check_secret_value_present(cls, v: Any, info: ValidationInfo) -> Any:
-        if v is None or v == "":
-             field_name = info.field_name if info.field_name else "Unknown Secret Field"
-             raise ValueError(f"Required secret field '{field_name}' cannot be empty.")
+    # Validadores Pydantic
+    @validator('JWT_SECRET')
+    def check_jwt_secret(cls, v):
+        # get_secret_value() se usa al *usar* el secreto, aquí solo verificamos que no esté vacío
+        if not v or v.get_secret_value() == "YOUR_DEFAULT_JWT_SECRET_KEY_CHANGE_ME_IN_ENV_OR_SECRET":
+            raise ValueError("GATEWAY_JWT_SECRET is not set or uses an insecure default value.")
         return v
 
-# --- Instancia Global ---
-temp_log = logging.getLogger("ingest_service.config.loader")
-if not temp_log.handlers:
-    handler = logging.StreamHandler(sys.stdout)
-    formatter = logging.Formatter('%(levelname)-8s [%(asctime)s] [%(name)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-    handler.setFormatter(formatter)
-    temp_log.addHandler(handler)
-    temp_log.setLevel(logging.INFO)
+    @validator('DEFAULT_COMPANY_ID', always=True)
+    def check_default_company_id_format(cls, v):
+        if v is not None:
+            try:
+                uuid.UUID(str(v))
+            except ValueError:
+                raise ValueError(f"GATEWAY_DEFAULT_COMPANY_ID ('{v}') is not a valid UUID.")
+        return v
 
-try:
-    temp_log.info("Loading Ingest Service settings...")
-    settings = Settings()
-    temp_log.info("--- Ingest Service Settings Loaded ---")
-    temp_log.info(f"  PROJECT_NAME:             {settings.PROJECT_NAME}")
-    temp_log.info(f"  LOG_LEVEL:                {settings.LOG_LEVEL}")
-    temp_log.info(f"  API_V1_STR:               {settings.API_V1_STR}")
-    temp_log.info(f"  CELERY_BROKER_URL:        {settings.CELERY_BROKER_URL}")
-    temp_log.info(f"  CELERY_RESULT_BACKEND:    {settings.CELERY_RESULT_BACKEND}")
-    temp_log.info(f"  POSTGRES_SERVER:          {settings.POSTGRES_SERVER}:{settings.POSTGRES_PORT}")
-    temp_log.info(f"  POSTGRES_DB:              {settings.POSTGRES_DB}")
-    temp_log.info(f"  POSTGRES_USER:            {settings.POSTGRES_USER}")
-    temp_log.info(f"  POSTGRES_PASSWORD:        *** SET ***")
-    # ***** CORRECCIÓN: Loguear la URI corregida de Milvus *****
-    temp_log.info(f"  MILVUS_URI:               {settings.MILVUS_URI}")
-    temp_log.info(f"  MILVUS_COLLECTION_NAME:   {settings.MILVUS_COLLECTION_NAME}")
-    temp_log.info(f"  MINIO_ENDPOINT:           {settings.MINIO_ENDPOINT}")
-    temp_log.info(f"  MINIO_BUCKET_NAME:        {settings.MINIO_BUCKET_NAME}")
-    temp_log.info(f"  MINIO_ACCESS_KEY:         *** SET ***")
-    temp_log.info(f"  MINIO_SECRET_KEY:         *** SET ***")
-    temp_log.info(f"  OPENAI_API_KEY:           *** SET ***")
-    temp_log.info(f"  OPENAI_EMBEDDING_MODEL:   {settings.OPENAI_EMBEDDING_MODEL}")
-    temp_log.info(f"  EMBEDDING_DIMENSION:      {settings.EMBEDDING_DIMENSION}")
-    temp_log.info(f"  SUPPORTED_CONTENT_TYPES:  {settings.SUPPORTED_CONTENT_TYPES}")
-    temp_log.info(f"  SPLITTER_CHUNK_SIZE:      {settings.SPLITTER_CHUNK_SIZE}")
-    temp_log.info(f"  SPLITTER_CHUNK_OVERLAP:   {settings.SPLITTER_CHUNK_OVERLAP}")
-    temp_log.info(f"------------------------------------")
+    @validator('LOG_LEVEL')
+    def check_log_level(cls, v):
+        valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+        normalized_v = v.upper()
+        if normalized_v not in valid_levels:
+            raise ValueError(f"Invalid LOG_LEVEL '{v}'. Must be one of {valid_levels}")
+        return normalized_v
 
-except (ValidationError, ValueError) as e:
-    error_details = ""
-    if isinstance(e, ValidationError):
-        try: error_details = f"\nValidation Errors:\n{e.json(indent=2)}"
-        except Exception: error_details = f"\nRaw Errors: {e.errors()}"
-    temp_log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-    temp_log.critical(f"! FATAL: Ingest Service configuration validation failed:{error_details}")
-    temp_log.critical(f"! Check environment variables (prefixed with INGEST_) or .env file.")
-    temp_log.critical(f"! Original Error: {e}")
-    temp_log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-    sys.exit(1)
-except Exception as e:
-    temp_log.exception(f"FATAL: Unexpected error loading Ingest Service settings: {e}")
-    sys.exit(1)
+# Usar lru_cache para asegurar que las settings se cargan una sola vez
+@lru_cache()
+def get_settings() -> Settings:
+    temp_log = logging.getLogger("atenex_api_gateway.config.loader")
+    if not temp_log.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        formatter = logging.Formatter('%(levelname)s: %(message)s')
+        handler.setFormatter(formatter)
+        temp_log.addHandler(handler)
+        temp_log.setLevel(logging.INFO)
+
+    temp_log.info("Loading Atenex Gateway settings...")
+    try:
+        settings_instance = Settings()
+
+        # Loguear valores cargados (excepto secretos)
+        temp_log.info("Atenex Gateway Settings Loaded Successfully:")
+        temp_log.info(f"  PROJECT_NAME: {settings_instance.PROJECT_NAME}")
+        temp_log.info(f"  INGEST_SERVICE_URL: {str(settings_instance.INGEST_SERVICE_URL)}")
+        temp_log.info(f"  QUERY_SERVICE_URL: {str(settings_instance.QUERY_SERVICE_URL)}")
+        temp_log.info(f"  AUTH_SERVICE_URL: {str(settings_instance.AUTH_SERVICE_URL) if settings_instance.AUTH_SERVICE_URL else 'Not Set'}")
+        temp_log.info(f"  JWT_SECRET: *** SET (Validated) ***")
+        temp_log.info(f"  JWT_ALGORITHM: {settings_instance.JWT_ALGORITHM}")
+        temp_log.info(f"  POSTGRES_SERVER: {settings_instance.POSTGRES_SERVER}")
+        temp_log.info(f"  POSTGRES_PORT: {settings_instance.POSTGRES_PORT}")
+        temp_log.info(f"  POSTGRES_DB: {settings_instance.POSTGRES_DB}")
+        temp_log.info(f"  POSTGRES_USER: {settings_instance.POSTGRES_USER}")
+        temp_log.info(f"  POSTGRES_PASSWORD: *** SET ***")
+        if settings_instance.DEFAULT_COMPANY_ID:
+            temp_log.info(f"  DEFAULT_COMPANY_ID: {settings_instance.DEFAULT_COMPANY_ID} (Validated as UUID if set)")
+        else:
+            temp_log.warning("  DEFAULT_COMPANY_ID: Not Set (Ensure-company endpoint requires this)")
+        temp_log.info(f"  LOG_LEVEL: {settings_instance.LOG_LEVEL}")
+        temp_log.info(f"  HTTP_CLIENT_TIMEOUT: {settings_instance.HTTP_CLIENT_TIMEOUT}")
+        temp_log.info(f"  HTTP_CLIENT_MAX_CONNECTIONS: {settings_instance.HTTP_CLIENT_MAX_CONNECTIONS}")
+        temp_log.info(f"  HTTP_CLIENT_MAX_KEEPALIVE_CONNECTIONS: {settings_instance.HTTP_CLIENT_MAX_KEEPALIVE_CONNECTIONS}")
+        temp_log.info(f"  VERCEL_FRONTEND_URL: {settings_instance.VERCEL_FRONTEND_URL or 'Not Set'}")
+        # temp_log.info(f"  NGROK_URL: {settings_instance.NGROK_URL or 'Not Set'}")
+
+        return settings_instance
+
+    except ValidationError as e:
+        temp_log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        temp_log.critical("! FATAL: Error validating Atenex Gateway settings:")
+        for error in e.errors():
+            loc = " -> ".join(map(str, error['loc'])) if error.get('loc') else 'N/A'
+            temp_log.critical(f"!  - {loc}: {error['msg']}")
+        temp_log.critical("! Check your Kubernetes ConfigMap/Secrets or .env file.")
+        temp_log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        sys.exit("FATAL: Invalid Atenex Gateway configuration. Check logs.")
+    except Exception as e:
+        temp_log.exception(f"FATAL: Unexpected error loading Atenex Gateway settings: {e}")
+        sys.exit(f"FATAL: Unexpected error loading Atenex Gateway settings: {e}")
+
+# Crear instancia global de settings
+settings = get_settings()
