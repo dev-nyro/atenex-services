@@ -68,7 +68,7 @@ async def create_document_record(
     filename: str,
     file_type: str,
     minio_object_name: str,
-    status: DocumentStatus = DocumentStatus.PENDING, # Default status correctly placed here IN THE FUNCTION SIGNATURE
+    status: DocumentStatus, # Default status correctly placed here IN THE FUNCTION SIGNATURE
     metadata: Optional[Dict[str, Any]] = None
 ) -> None:
     """Crea un registro inicial para un documento en la base de datos."""
