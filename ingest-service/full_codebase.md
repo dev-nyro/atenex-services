@@ -78,6 +78,8 @@ from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_t
 # Haystack imports (only for type hinting or specific checks if needed here)
 # Note: DocumentStore interactions for count/delete are often better abstracted
 from milvus_haystack import MilvusDocumentStore # For type hints or direct use
+# LLM_FLAG: ADD_HAYSTACK_IMPORT - Needed for Document dataclass typing
+from haystack.dataclasses import Document
 
 # Custom imports
 from app.core.config import settings
@@ -164,7 +166,7 @@ def _initialize_milvus_store_sync() -> MilvusDocumentStore:
 
 def _get_milvus_chunk_count_sync(document_id: str, company_id: str) -> int:
     """Synchronously counts chunks in Milvus for a specific document."""
-    # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Milvus Sync Count Helper
+    # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Milvus Sync Count Helper (Corrected)
     count_log = log.bind(document_id=document_id, company_id=company_id, component="MilvusHelperSync")
     try:
         store = _initialize_milvus_store_sync()
@@ -176,17 +178,20 @@ def _get_milvus_chunk_count_sync(document_id: str, company_id: str) -> int:
                 {"field": "meta.company_id", "operator": "==", "value": company_id},
             ]
         }
-        count = store.count_documents(filters=filters)
+        # --- CORRECTION: Use get_documents with filters and count the result ---
+        retrieved_docs: List[Document] = store.get_documents(filters=filters)
+        count = len(retrieved_docs)
+        # ----------------------------------------------------------------------
         count_log.info("Milvus chunk count successful", count=count)
         return count
     except RuntimeError as re:
         count_log.error("Failed to get Milvus count due to store init error", error=str(re))
-        return -1
+        return -1 # Return -1 to indicate error during count
     except Exception as e:
         count_log.exception("Error counting documents in Milvus", error=str(e))
         count_log.debug("Filter used for Milvus count", filter_details=json.dumps(filters))
-        return -1
-    # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Milvus Sync Count Helper
+        return -1 # Return -1 to indicate error during count
+    # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Milvus Sync Count Helper (Corrected)
 
 def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
     """Synchronously deletes chunks from Milvus for a specific document."""
@@ -591,7 +596,8 @@ async def list_document_statuses(
                     doc_needs_update = True
                     doc_updated_status_val = DocumentStatus.ERROR.value
                     # --- CORRECTED ERROR MESSAGE ASSIGNMENT ---
-                    doc_final_error_msg = (doc_final_error_msg or "") + f" MinIO check error: {type(minio_check_error).__name__}."
+                    # Use a generic message or the exception type, not the exception instance directly here
+                    doc_final_error_msg = (doc_final_error_msg or "") + f" MinIO check error ({type(minio_check_error).__name__})."
                     # ------------------------------------------
         else: check_log.warning("MinIO file path missing in DB record."); minio_exists_live = False
 
@@ -617,7 +623,7 @@ async def list_document_statuses(
                 doc_needs_update = True
                 doc_updated_status_val = DocumentStatus.ERROR.value
                 # --- CORRECTED ERROR MESSAGE ASSIGNMENT ---
-                doc_final_error_msg = (doc_final_error_msg or "") + f" Error checking Milvus: {type(milvus_check_error).__name__}."
+                doc_final_error_msg = (doc_final_error_msg or "") + f" Error checking Milvus ({type(milvus_check_error).__name__})."
                 # ------------------------------------------
 
         return {"db_data": doc_db_data, "needs_update": doc_needs_update, "updated_status": doc_updated_status_val, "updated_chunk_count": doc_updated_chunk_count, "final_error_message": doc_final_error_msg, "live_minio_exists": minio_exists_live, "live_milvus_chunk_count": milvus_count_live}

@@ -248,15 +248,15 @@ async def upload_document(
     file_path_in_storage = f"{company_id}/{document_id}/{file.filename}"
     # ---------------------------------------------------------
     try:
-        user_uuid = uuid.UUID(user_id)
+        user_uuid = uuid.UUID(user_id) # Validate user_id format here
         async with get_db_conn() as conn:
-            # --- UPDATED FUNCTION CALL: pass file_path argument ---
+            # --- UPDATED FUNCTION CALL: pass file_path argument, NO user_id ---
             await api_db_retry_strategy(db_client.create_document_record)(
-                conn=conn, doc_id=document_id, company_id=company_uuid, user_id=user_uuid,
+                conn=conn, doc_id=document_id, company_id=company_uuid, # removed user_id=user_uuid
                 filename=file.filename, file_type=file.content_type, file_path=file_path_in_storage,
                 status=DocumentStatus.PENDING, metadata=metadata
             )
-            # -----------------------------------------------------
+            # ------------------------------------------------------------------
         endpoint_log.info("Document record created in PostgreSQL", document_id=str(document_id))
     except ValueError:
         endpoint_log.error("Invalid User ID format provided", user_id_received=user_id)
@@ -299,7 +299,9 @@ async def upload_document(
     finally: await file.close()
 
     try:
-        task_payload = {"document_id": str(document_id), "company_id": company_id, "filename": file.filename, "content_type": file.content_type, "user_id": user_id}
+        # --- REMOVED user_id from task payload as it's not used in the task/DB ---
+        task_payload = {"document_id": str(document_id), "company_id": company_id, "filename": file.filename, "content_type": file.content_type} # removed user_id
+        # -------------------------------------------------------------------------
         task = process_document_haystack_task.delay(**task_payload)
         endpoint_log.info("Document ingestion task queued successfully", task_id=task.id)
     except Exception as e:
@@ -673,7 +675,9 @@ async def retry_ingestion(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error updating status for retry.")
 
     try:
-        task_payload = {"document_id": str(document_id), "company_id": company_id, "filename": doc_data['file_name'], "content_type": doc_data['file_type'], "user_id": user_id}
+        # --- REMOVED user_id from task payload ---
+        task_payload = {"document_id": str(document_id), "company_id": company_id, "filename": doc_data['file_name'], "content_type": doc_data['file_type']}
+        # ------------------------------------------
         task = process_document_haystack_task.delay(**task_payload)
         retry_log.info("Document reprocessing task queued successfully", task_id=task.id)
     except Exception as e:

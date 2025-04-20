@@ -64,26 +64,26 @@ async def create_document_record(
     conn: asyncpg.Connection,
     doc_id: uuid.UUID,
     company_id: uuid.UUID,
-    user_id: uuid.UUID,
+    # --- REMOVED user_id parameter ---
+    # user_id: uuid.UUID,
+    # --------------------------------
     filename: str,
     file_type: str,
-    # --- RENAMED PARAMETER ---
     file_path: str,
-    # -------------------------
     status: DocumentStatus = DocumentStatus.PENDING,
     metadata: Optional[Dict[str, Any]] = None
 ) -> None:
     """Crea un registro inicial para un documento en la base de datos."""
-    # --- UPDATED QUERY: Use file_path instead of minio_object_name ---
+    # --- UPDATED QUERY: Removed user_id column ---
     query = """
-    INSERT INTO documents (id, company_id, user_id, file_name, file_type, file_path, metadata, status, chunk_count, error_message, uploaded_at, updated_at)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC');
+    INSERT INTO documents (id, company_id, file_name, file_type, file_path, metadata, status, chunk_count, error_message, uploaded_at, updated_at)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC');
     """
-    # ---------------------------------------------------------------
+    # -------------------------------------------------
     metadata_db = json.dumps(metadata) if metadata else None
-    # --- UPDATED PARAMS: Use file_path for $6 ---
-    params = [doc_id, company_id, user_id, filename, file_type, file_path, metadata_db, status.value, 0]
-    # -------------------------------------------
+    # --- UPDATED PARAMS: Removed user_id, adjusted indices ---
+    params = [doc_id, company_id, filename, file_type, file_path, metadata_db, status.value, 0]
+    # -------------------------------------------------------
     insert_log = log.bind(company_id=str(company_id), filename=filename, doc_id=str(doc_id))
     try:
         await conn.execute(query, *params)
@@ -91,6 +91,7 @@ async def create_document_record(
     except Exception as e:
         insert_log.error("Failed to create document record", error=str(e), exc_info=True)
         raise
+
 
 # LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH find_document_by_name_and_company DB logic lightly
 async def find_document_by_name_and_company(conn: asyncpg.Connection, filename: str, company_id: uuid.UUID) -> Optional[Dict[str, Any]]:
@@ -163,13 +164,13 @@ async def update_document_status(
 # LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH get_document_by_id DB logic lightly
 async def get_document_by_id(conn: asyncpg.Connection, doc_id: uuid.UUID, company_id: uuid.UUID) -> Optional[Dict[str, Any]]:
     """Obtiene un documento por ID y verifica la compañía."""
-    # --- UPDATED QUERY: Select file_path instead of minio_object_name ---
+    # --- UPDATED QUERY: Removed user_id ---
     query = """
     SELECT id, company_id, file_name, file_type, file_path, metadata, status, chunk_count, error_message, uploaded_at, updated_at
     FROM documents
     WHERE id = $1 AND company_id = $2;
     """
-    # ---------------------------------------------------------------
+    # --------------------------------------
     get_log = log.bind(document_id=str(doc_id), company_id=str(company_id))
     try:
         record = await conn.fetchrow(query, doc_id, company_id)
@@ -190,7 +191,7 @@ async def list_documents_paginated(
     offset: int
 ) -> Tuple[List[Dict[str, Any]], int]:
     """Lista documentos paginados para una compañía y devuelve el conteo total."""
-    # --- UPDATED QUERY: Select file_path instead of minio_object_name ---
+    # --- UPDATED QUERY: Removed user_id ---
     query = """
     SELECT
         id, company_id, file_name, file_type, file_path, metadata, status,
@@ -201,7 +202,7 @@ async def list_documents_paginated(
     ORDER BY updated_at DESC
     LIMIT $2 OFFSET $3;
     """
-    # ---------------------------------------------------------------
+    # --------------------------------------
     list_log = log.bind(company_id=str(company_id), limit=limit, offset=offset)
     try:
         rows = await conn.fetch(query, company_id, limit, offset)
