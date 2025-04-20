@@ -64,9 +64,7 @@ async def create_document_record(
     conn: asyncpg.Connection,
     doc_id: uuid.UUID,
     company_id: uuid.UUID,
-    # --- REMOVED user_id parameter ---
-    # user_id: uuid.UUID,
-    # --------------------------------
+    user_id: uuid.UUID, # Parámetro aún presente, pero no usado en query
     filename: str,
     file_type: str,
     file_path: str,
@@ -74,24 +72,27 @@ async def create_document_record(
     metadata: Optional[Dict[str, Any]] = None
 ) -> None:
     """Crea un registro inicial para un documento en la base de datos."""
-    # --- UPDATED QUERY: Removed user_id column ---
+    # --- QUERY CORREGIDA: Sin user_id ---
     query = """
     INSERT INTO documents (id, company_id, file_name, file_type, file_path, metadata, status, chunk_count, error_message, uploaded_at, updated_at)
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC');
     """
-    # -------------------------------------------------
+    # -----------------------------------
     metadata_db = json.dumps(metadata) if metadata else None
-    # --- UPDATED PARAMS: Removed user_id, adjusted indices ---
+    # --- PARÁMETROS CORREGIDOS: Sin user_id ---
     params = [doc_id, company_id, filename, file_type, file_path, metadata_db, status.value, 0]
-    # -------------------------------------------------------
+    # ------------------------------------------
     insert_log = log.bind(company_id=str(company_id), filename=filename, doc_id=str(doc_id))
     try:
         await conn.execute(query, *params)
         insert_log.info("Document record created in PostgreSQL")
+    except asyncpg.exceptions.UndefinedColumnError as col_err:
+         # Log específico si el error es por columna inexistente
+         insert_log.critical(f"FATAL DB SCHEMA ERROR: Column missing in 'documents' table.", error=str(col_err), table_schema_expected="id, company_id, file_name, file_type, file_path, metadata, status, chunk_count, error_message, uploaded_at, updated_at")
+         raise RuntimeError(f"Database schema error: {col_err}") from col_err
     except Exception as e:
         insert_log.error("Failed to create document record", error=str(e), exc_info=True)
         raise
-
 
 # LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH find_document_by_name_and_company DB logic lightly
 async def find_document_by_name_and_company(conn: asyncpg.Connection, filename: str, company_id: uuid.UUID) -> Optional[Dict[str, Any]]:

@@ -351,9 +351,13 @@ async def async_process_flow(
 
 
 # --- Celery Task Definition ---
+# --- CORRECTION: Added explicit name to the task decorator ---
+@celery_app.task(name="app.tasks.process_document.process_document_haystack_task", bind=True)
+# --------------------------------------------------------------
 class ProcessDocumentTask(Task):
     """Custom Celery Task class for document processing."""
-    name = "tasks.process_document_haystack"
+    # Removed explicit name here as it's now in the decorator
+    # name = "tasks.process_document_haystack"
     max_retries = 3
     default_retry_delay = 60
 

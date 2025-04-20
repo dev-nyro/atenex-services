@@ -128,6 +128,19 @@ def _get_milvus_chunk_count_sync(document_id: str, company_id: str) -> int:
     except RuntimeError as re:
         count_log.error("Failed to get Milvus count due to store init error", error=str(re))
         return -1 # Return -1 to indicate error during count
+    # LLM_FLAG: FIX_APPLIED - Handle AttributeError for get_documents if library version mismatch
+    except AttributeError as ae:
+        count_log.error("AttributeError accessing MilvusDocumentStore (likely get_documents/count_documents mismatch)", error=str(ae), exc_info=True)
+        # Attempt fallback to count_documents without filters, though this is less accurate
+        try:
+            count = store.count_documents() # No filters possible here
+            count_log.warning("Fallback count used due to get_documents error", total_collection_count=count)
+            # Cannot accurately filter here, returning -1 indicates filtered count failed
+            return -1
+        except Exception as fallback_e:
+            count_log.exception("Fallback count_documents also failed", error=str(fallback_e))
+            return -1
+    # -------------------------------------------------------------------------
     except Exception as e:
         count_log.exception("Error counting documents in Milvus", error=str(e))
         count_log.debug("Filter used for Milvus count", filter_details=json.dumps(filters))
@@ -250,13 +263,13 @@ async def upload_document(
     try:
         user_uuid = uuid.UUID(user_id) # Validate user_id format here
         async with get_db_conn() as conn:
-            # --- UPDATED FUNCTION CALL: pass file_path argument, NO user_id ---
+            # --- UPDATED FUNCTION CALL: Pass validated user_uuid ---
             await api_db_retry_strategy(db_client.create_document_record)(
-                conn=conn, doc_id=document_id, company_id=company_uuid, # removed user_id=user_uuid
+                conn=conn, doc_id=document_id, company_id=company_uuid, user_id=user_uuid, # Now passing user_uuid
                 filename=file.filename, file_type=file.content_type, file_path=file_path_in_storage,
                 status=DocumentStatus.PENDING, metadata=metadata
             )
-            # ------------------------------------------------------------------
+            # -----------------------------------------------------
         endpoint_log.info("Document record created in PostgreSQL", document_id=str(document_id))
     except ValueError:
         endpoint_log.error("Invalid User ID format provided", user_id_received=user_id)
@@ -299,9 +312,9 @@ async def upload_document(
     finally: await file.close()
 
     try:
-        # --- REMOVED user_id from task payload as it's not used in the task/DB ---
-        task_payload = {"document_id": str(document_id), "company_id": company_id, "filename": file.filename, "content_type": file.content_type} # removed user_id
-        # -------------------------------------------------------------------------
+        # --- REMOVED user_id from task payload as it's not in DB schema ---
+        task_payload = {"document_id": str(document_id), "company_id": company_id, "filename": file.filename, "content_type": file.content_type}
+        # -----------------------------------------------------------------
         task = process_document_haystack_task.delay(**task_payload)
         endpoint_log.info("Document ingestion task queued successfully", task_id=task.id)
     except Exception as e:
