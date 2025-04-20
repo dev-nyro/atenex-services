@@ -6,3 +6,4 @@ class DocumentStatus(str, Enum):
     PROCESSED = "processed"
     INDEXED = "indexed" # Podríamos unir processed e indexed
     ERROR = "error"
+    PENDING = "pending"
