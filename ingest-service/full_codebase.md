@@ -573,16 +573,30 @@ async def list_document_statuses(
         # --- USE CORRECT COLUMN NAME: file_path ---
         minio_path_db = doc_db_data.get('file_path')
         # ------------------------------------------
+        minio_check_error = None # Variable to store MinIO check exception
         if minio_path_db:
             try:
                 minio_exists_live = await minio_client.check_file_exists_async(minio_path_db)
                 check_log.debug("MinIO check done", exists=minio_exists_live)
                 if not minio_exists_live and doc_updated_status_val not in [DocumentStatus.ERROR.value, DocumentStatus.PENDING.value]:
-                     if doc_updated_status_val != DocumentStatus.ERROR.value: doc_needs_update = True; doc_updated_status_val = DocumentStatus.ERROR.value; doc_final_error_msg = "File missing from storage."
-            except Exception as e: check_log.error("MinIO check failed", error=str(e)); minio_exists_live = False;
-            if doc_updated_status_val != DocumentStatus.ERROR.value: doc_needs_update = True; doc_updated_status_val = DocumentStatus.ERROR.value; doc_final_error_msg = (doc_final_error_msg or "") + f" MinIO check error: {e}."
+                     if doc_updated_status_val != DocumentStatus.ERROR.value:
+                         doc_needs_update = True
+                         doc_updated_status_val = DocumentStatus.ERROR.value
+                         doc_final_error_msg = "File missing from storage."
+            except Exception as e: # Catch specific exception during MinIO check
+                minio_check_error = e # Store the exception
+                check_log.error("MinIO check failed", error=str(e))
+                minio_exists_live = False
+                if doc_updated_status_val != DocumentStatus.ERROR.value:
+                    doc_needs_update = True
+                    doc_updated_status_val = DocumentStatus.ERROR.value
+                    # --- CORRECTED ERROR MESSAGE ASSIGNMENT ---
+                    doc_final_error_msg = (doc_final_error_msg or "") + f" MinIO check error: {type(minio_check_error).__name__}."
+                    # ------------------------------------------
         else: check_log.warning("MinIO file path missing in DB record."); minio_exists_live = False
+
         loop = asyncio.get_running_loop()
+        milvus_check_error = None # Variable to store Milvus check exception
         try:
             milvus_count_live = await loop.run_in_executor( None, _get_milvus_chunk_count_sync, str(doc_db_data['id']), company_id )
             check_log.debug("Milvus count check done", count=milvus_count_live)
@@ -596,9 +610,16 @@ async def list_document_statuses(
                  if doc_updated_chunk_count is None or doc_updated_chunk_count != milvus_count_live:
                       doc_updated_chunk_count = milvus_count_live
                       if doc_db_data.get('chunk_count') != doc_updated_chunk_count: doc_needs_update = True
-        except Exception as e:
+        except Exception as e: # Catch specific exception during Milvus check
+            milvus_check_error = e # Store the exception
             check_log.exception("Unexpected error during Milvus count check", error=str(e)); milvus_count_live = -1
-            if doc_updated_status_val != DocumentStatus.ERROR.value: doc_needs_update = True; doc_updated_status_val = DocumentStatus.ERROR.value; doc_final_error_msg = (doc_final_error_msg or "") + f" Error checking Milvus: {e}."
+            if doc_updated_status_val != DocumentStatus.ERROR.value:
+                doc_needs_update = True
+                doc_updated_status_val = DocumentStatus.ERROR.value
+                # --- CORRECTED ERROR MESSAGE ASSIGNMENT ---
+                doc_final_error_msg = (doc_final_error_msg or "") + f" Error checking Milvus: {type(milvus_check_error).__name__}."
+                # ------------------------------------------
+
         return {"db_data": doc_db_data, "needs_update": doc_needs_update, "updated_status": doc_updated_status_val, "updated_chunk_count": doc_updated_chunk_count, "final_error_message": doc_final_error_msg, "live_minio_exists": minio_exists_live, "live_milvus_chunk_count": milvus_count_live}
         # LLM_FLAG: SENSITIVE_SUB_LOGIC_END - Parallel check
 
