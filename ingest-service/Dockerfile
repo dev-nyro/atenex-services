@@ -22,14 +22,19 @@ RUN curl -sSL https://install.python-poetry.org | python3 -
 WORKDIR /app
 
 # Copy dependency definition files
+# poetry.lock* will be ignored if it doesn't exist in the repo/context
 COPY pyproject.toml poetry.lock* ./
 
-# >>>>>>>>>>> CORRECTION: Verify ONNX Runtime providers after install <<<<<<<<<<<<<<
+# --- CORRECTION: Separate Install and Check ---
+
 # Install project dependencies using Poetry
-# Add check for ONNX Runtime providers after installation
-RUN poetry install --no-root --no-dev --no-interaction --no-ansi \
-    && python -c "import onnxruntime; print('ONNX Runtime available providers:', onnxruntime.get_available_providers())"
-# >>>>>>>>>>> END CORRECTION <<<<<<<<<<<<<<
+# This will generate a poetry.lock inside the container if one wasn't copied
+RUN poetry install --no-root --no-dev --no-interaction --no-ansi
+
+# Verify ONNX Runtime providers in a separate layer AFTER installation is complete
+RUN python -c "import onnxruntime; print('ONNX Runtime available providers:', onnxruntime.get_available_providers())"
+
+# --- END CORRECTION ---
 
 # Copy the application code into the container
 COPY ./app /app/app
