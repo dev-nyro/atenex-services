@@ -348,13 +348,11 @@ async def async_process_flow(
 
 
 # --- Celery Task Definition ---
-# >>>>>>>>>>> CORRECTION APPLIED (Celery Task Registration - bind = True removed) <<<<<<<<<<<<<<
 class ProcessDocumentTask(Task):
     """Custom Celery Task class for document processing."""
     # Define name within the class
     name = "app.tasks.process_document.ProcessDocumentTask" # Standard name
     # DO NOT define bind=True here, let the base class handle it
-    # bind = True # <--- REMOVED THIS LINE
     max_retries = 3
     default_retry_delay = 60 # 1 minute
 
@@ -365,6 +363,7 @@ class ProcessDocumentTask(Task):
         self.task_log.info("ProcessDocumentTask initialized.")
         # Celery's register_task will call self.bind(app) correctly now
 
+    # >>>>>>>>>>> CORRECTION APPLIED (Pass conn and use status.value) <<<<<<<<<<<<<<
     async def _update_status_with_retry(
         self, pool: asyncpg.Pool, doc_id: str, status: DocumentStatus,
         chunk_count: Optional[int] = None, error_msg: Optional[str] = None
@@ -373,22 +372,26 @@ class ProcessDocumentTask(Task):
         # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - DB Update Helper
         update_log = self.task_log.bind(document_id=doc_id, target_status=status.value)
         try:
-            # Use the correct DB client function signature
-            await db_retry_strategy(db_client.update_document_status)(
-                document_id=uuid.UUID(doc_id), # Pass UUID directly
-                status=status, # Pass enum member
-                # Pass optional args explicitly
-                chunk_count=chunk_count,
-                error_message=error_msg
-            )
+            # 1) Adquiere una conexión del pool
+            async with pool.acquire() as conn:
+                # 2) Llama a la función pasándole conn=conn y el .value del enum
+                await db_retry_strategy(db_client.update_document_status)(
+                    conn=conn,                         # Pass acquired connection
+                    document_id=uuid.UUID(doc_id),
+                    status=status.value,               # Pass enum's string value
+                    chunk_count=chunk_count,
+                    error_message=error_msg
+                )
             update_log.info("Document status updated successfully in DB.")
         except Exception as e:
             update_log.critical("CRITICAL: Failed final document status update in DB!",
                                 error=str(e), chunk_count=chunk_count, error_msg=error_msg,
                                 exc_info=True)
             # Re-raise the exception to be caught by the main runner, which handles Reject
+            # Use a more specific exception if possible, but ConnectionError is reasonable
             raise ConnectionError(f"Persistent DB error updating status for {doc_id} to {status.value}") from e
         # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - DB Update Helper
+    # >>>>>>>>>>> END CORRECTION <<<<<<<<<<<<<<
 
     async def run_async_processing(self, *args, **kwargs):
         """Runs the main async processing flow and handles final status updates."""
@@ -566,4 +569,3 @@ class ProcessDocumentTask(Task):
 # The class defines its internal name as 'app.tasks.process_document.ProcessDocumentTask'
 # Celery's register_task links the external instance name to the internal class/name.
 process_document_haystack_task = celery_app.register_task(ProcessDocumentTask())
-# >>>>>>>>>>> END CORRECTION (Celery Task Registration - bind = True removed) <<<<<<<<<<<<<<
