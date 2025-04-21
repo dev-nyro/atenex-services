@@ -363,22 +363,23 @@ class ProcessDocumentTask(Task):
         self.task_log.info("ProcessDocumentTask initialized.")
         # Celery's register_task will call self.bind(app) correctly now
 
-    # >>>>>>>>>>> CORRECTION APPLIED (Pass conn and use status.value) <<<<<<<<<<<<<<
+    # >>>>>>>>>>> CORRECTION APPLIED (Pass Enum Member, not .value) <<<<<<<<<<<<<<
     async def _update_status_with_retry(
         self, pool: asyncpg.Pool, doc_id: str, status: DocumentStatus,
         chunk_count: Optional[int] = None, error_msg: Optional[str] = None
     ):
         """Helper to update document status with retry."""
         # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - DB Update Helper
+        # Log the target status value for clarity
         update_log = self.task_log.bind(document_id=doc_id, target_status=status.value)
         try:
             # 1) Adquiere una conexión del pool
             async with pool.acquire() as conn:
-                # 2) Llama a la función pasándole conn=conn y el .value del enum
+                # 2) Llama a la función pasándole conn=conn y el enum entero
                 await db_retry_strategy(db_client.update_document_status)(
-                    conn=conn,                         # Pass acquired connection
+                    conn=conn,
                     document_id=uuid.UUID(doc_id),
-                    status=status.value,               # Pass enum's string value
+                    status=status,            # <-- Pass the enum member directly
                     chunk_count=chunk_count,
                     error_message=error_msg
                 )
@@ -388,7 +389,6 @@ class ProcessDocumentTask(Task):
                                 error=str(e), chunk_count=chunk_count, error_msg=error_msg,
                                 exc_info=True)
             # Re-raise the exception to be caught by the main runner, which handles Reject
-            # Use a more specific exception if possible, but ConnectionError is reasonable
             raise ConnectionError(f"Persistent DB error updating status for {doc_id} to {status.value}") from e
         # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - DB Update Helper
     # >>>>>>>>>>> END CORRECTION <<<<<<<<<<<<<<
@@ -457,11 +457,13 @@ class ProcessDocumentTask(Task):
                  task_log.info("Attempting to update final document status in DB", status=final_status.value, chunks=final_chunk_count, error=error_to_report)
                  try:
                      # Pass pool argument
+                     # >>>>>>>>>>> CORRECTION APPLIED (Pass Enum Member) <<<<<<<<<<<<<<
                      await self._update_status_with_retry(
-                         pool, doc_id, final_status,
+                         pool, doc_id, final_status, # Pass Enum here too
                          chunk_count=final_chunk_count if final_status == DocumentStatus.PROCESSED else None,
                          error_msg=error_to_report
                      )
+                     # >>>>>>>>>>> END CORRECTION <<<<<<<<<<<<<<
                  except ConnectionError as db_update_exc: # Catch error from _update_status_with_retry
                       task_log.critical("CRITICAL: Failed to update final document status in DB!", target_status=final_status.value, error=str(db_update_exc))
                       # Reject the task as we cannot reliably update the state
