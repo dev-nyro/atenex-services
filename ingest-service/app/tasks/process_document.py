@@ -348,24 +348,22 @@ async def async_process_flow(
 
 
 # --- Celery Task Definition ---
-# >>>>>>>>>>> CORRECTION APPLIED (Celery Task Registration) <<<<<<<<<<<<<<
-# Remove the decorator
-# @celery_app.task(name="app.tasks.process_document.process_document_haystack_task", bind=True)
-
+# >>>>>>>>>>> CORRECTION APPLIED (Celery Task Registration - bind = True removed) <<<<<<<<<<<<<<
 class ProcessDocumentTask(Task):
     """Custom Celery Task class for document processing."""
-    # Define name and bind within the class
+    # Define name within the class
     name = "app.tasks.process_document.ProcessDocumentTask" # Standard name
-    bind = True
+    # DO NOT define bind=True here, let the base class handle it
+    # bind = True # <--- REMOVED THIS LINE
     max_retries = 3
     default_retry_delay = 60 # 1 minute
 
     def __init__(self):
         super().__init__()
         # Ensure logging is configured when the task instance is created
-        # (structlog setup might need adjustment depending on worker init)
         self.task_log = log.bind(task_name=self.name)
         self.task_log.info("ProcessDocumentTask initialized.")
+        # Celery's register_task will call self.bind(app) correctly now
 
     async def _update_status_with_retry(
         self, pool: asyncpg.Pool, doc_id: str, status: DocumentStatus,
@@ -376,7 +374,6 @@ class ProcessDocumentTask(Task):
         update_log = self.task_log.bind(document_id=doc_id, target_status=status.value)
         try:
             # Use the correct DB client function signature
-            # Connection/Pool is now managed by the session manager, so don't pass it here
             await db_retry_strategy(db_client.update_document_status)(
                 document_id=uuid.UUID(doc_id), # Pass UUID directly
                 status=status, # Pass enum member
@@ -397,8 +394,8 @@ class ProcessDocumentTask(Task):
         """Runs the main async processing flow and handles final status updates."""
         # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Task Async Runner
         doc_id = kwargs['document_id']
-        task_id = self.request.id
-        attempt = self.request.retries + 1
+        task_id = self.request.id # Access task_id via self.request
+        attempt = self.request.retries + 1 # Access retries via self.request
         task_log = self.task_log.bind(document_id=doc_id, task_id=task_id, attempt=attempt)
         final_status = DocumentStatus.ERROR # Default to ERROR
         final_chunk_count = None
@@ -415,6 +412,7 @@ class ProcessDocumentTask(Task):
                  try:
                     # 1. Set status to 'processing'
                     task_log.info("Setting document status to 'processing'")
+                    # Pass pool argument since _update_status_with_retry expects it
                     await self._update_status_with_retry(pool, doc_id, DocumentStatus.PROCESSING, error_msg=None)
 
                     # 2. Execute main flow
@@ -455,6 +453,7 @@ class ProcessDocumentTask(Task):
                  # 3. Update final status in DB (always attempt this)
                  task_log.info("Attempting to update final document status in DB", status=final_status.value, chunks=final_chunk_count, error=error_to_report)
                  try:
+                     # Pass pool argument
                      await self._update_status_with_retry(
                          pool, doc_id, final_status,
                          chunk_count=final_chunk_count if final_status == DocumentStatus.PROCESSED else None,
@@ -476,10 +475,7 @@ class ProcessDocumentTask(Task):
              raise r # Re-raise Reject to Celery
         except Exception as outer_exc:
              # Catch any exception that occurred *before* or *after* the main try block inside the async runner
-             # This could include DB pool acquisition errors or unhandled errors after processing
              task_log.exception("Outer exception caught in run_async_processing", error=str(outer_exc))
-             # We might not have updated the DB status to ERROR here, attempt it if possible? Risky.
-             # For simplicity, let Celery handle this based on the raised exception type.
              processing_exception = outer_exc # Store the exception
              final_status = DocumentStatus.ERROR # Ensure status reflects failure
 
@@ -487,20 +483,26 @@ class ProcessDocumentTask(Task):
         # 4. Handle retries or final failure based on processing_exception
         if final_status == DocumentStatus.ERROR and processing_exception:
              # Determine if the error is retryable (customize this logic)
-             is_retryable = not isinstance(processing_exception, (ValueError, RuntimeError, asyncio.TimeoutError, Reject))
+             is_retryable = not isinstance(processing_exception, (ValueError, RuntimeError, asyncio.TimeoutError, Reject, ConnectionError))
              if is_retryable:
                  task_log.warning("Processing failed with a potentially retryable error, attempting task retry.", error=str(processing_exception))
                  try:
                      # Use the captured exception for retry context
-                     raise self.retry(exc=processing_exception, countdown=self.default_retry_delay * attempt)
+                     # Check if self.request is available before calling retry
+                     if self.request:
+                         raise self.retry(exc=processing_exception, countdown=self.default_retry_delay * attempt)
+                     else:
+                         task_log.error("Cannot retry task: self.request is not available.")
+                         raise Reject(f"Cannot retry {doc_id}, request context unavailable", requeue=False) from processing_exception
                  except MaxRetriesExceededError:
                      task_log.error("Max retries exceeded for task.", error=str(processing_exception))
-                     # Do not raise Ignore() here, let the original exception propagate if needed
-                     # Or explicitly raise Reject if we are sure it shouldn't run again.
                      raise Reject(f"Max retries exceeded for {doc_id}", requeue=False) from processing_exception
                  except Reject as r: # Catch if retry itself is rejected
                       task_log.error("Task rejected during retry attempt.", reason=str(r))
                       raise r
+                 except Exception as retry_exc: # Catch potential errors during the retry call itself
+                     task_log.exception("Exception occurred during task retry mechanism", error=str(retry_exc))
+                     raise Reject(f"Retry mechanism failed for {doc_id}", requeue=False) from retry_exc
              else:
                  task_log.error("Processing failed with non-retryable error.", error=str(processing_exception), type=type(processing_exception).__name__)
                  # Raise Reject to prevent Celery from retrying non-retryable errors
@@ -523,24 +525,15 @@ class ProcessDocumentTask(Task):
         task_log = log.bind(task_id=self.request.id, task_name=self.name) # Bind early
         task_log.info("Task received", args=args, kwargs=list(kwargs.keys()))
         try:
-            # Setup contextvars if needed for structlog within asyncio run
-            # import contextvars
-            # contextvars.copy_context().run(asyncio.run, self.run_async_processing(*args, **kwargs))
             return asyncio.run(self.run_async_processing(*args, **kwargs))
         except Reject as r:
              task_log.error(f"Task rejected: {r.reason}", exc_info=False)
-             # Propagate Reject to Celery - this marks the task as failed but not for retry by default
              raise r
         except Ignore:
-             # This should ideally not be raised directly from run_async_processing anymore
-             # Kept for safety, but might indicate a logic flaw if reached.
              task_log.warning("Task is being ignored.")
              raise Ignore()
         except Exception as e:
-             # Catch any synchronous exception or exceptions propagated from run_async_processing
              task_log.exception("Task failed with unhandled exception in run wrapper", error=str(e))
-             # Update DB status to ERROR one last time if possible? Very difficult to do reliably here.
-             # Let Celery mark the task as FAILED based on the exception.
              raise e # Re-raise the exception
         # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Celery Sync Runner
 
@@ -548,13 +541,14 @@ class ProcessDocumentTask(Task):
         """Log task failure."""
         # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Celery Failure Handler
         failure_log = log.bind(task_id=task_id, task_name=self.name, status="FAILED")
+        # Check if exc is Reject and log the reason if available
+        reason = getattr(exc, 'reason', str(exc))
         failure_log.error(
             "Celery task final failure",
-            args=args, kwargs=kwargs, error_type=type(exc).__name__, error=str(exc),
-            traceback=str(einfo.traceback), exc_info=False # Avoid duplicate traceback logging
+            args=args, kwargs=kwargs, error_type=type(exc).__name__, error=reason,
+            traceback=str(einfo.traceback) if einfo else "No traceback info",
+            exc_info=False # Avoid duplicate traceback logging
         )
-        # Optional: Add logic here to ensure DB status is ERROR if it wasn't updated before failure
-        # This is complex due to needing async context and potential DB issues.
         # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Celery Failure Handler
 
     def on_success(self, retval, task_id, args, kwargs):
@@ -572,4 +566,4 @@ class ProcessDocumentTask(Task):
 # The class defines its internal name as 'app.tasks.process_document.ProcessDocumentTask'
 # Celery's register_task links the external instance name to the internal class/name.
 process_document_haystack_task = celery_app.register_task(ProcessDocumentTask())
-# >>>>>>>>>>> END CORRECTION (Celery Task Registration) <<<<<<<<<<<<<<
+# >>>>>>>>>>> END CORRECTION (Celery Task Registration - bind = True removed) <<<<<<<<<<<<<<
