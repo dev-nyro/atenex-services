@@ -60,11 +60,12 @@ async def check_db_connection() -> bool:
 # --- Document Operations ---
 
 # LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH create_document_record DB logic lightly
+# >>>>>>>>>>> CORRECTION APPLIED (Diff 1) <<<<<<<<<<<<<<
 async def create_document_record(
     conn: asyncpg.Connection,
     doc_id: uuid.UUID,
     company_id: uuid.UUID,
-    user_id: uuid.UUID, # Parámetro aún presente, pero no usado en query
+    # user_id: uuid.UUID,  # REMOVED Parameter
     filename: str,
     file_type: str,
     file_path: str,
@@ -72,15 +73,31 @@ async def create_document_record(
     metadata: Optional[Dict[str, Any]] = None
 ) -> None:
     """Crea un registro inicial para un documento en la base de datos."""
-    # --- QUERY CORREGIDA: Sin user_id ---
+    # --- QUERY CORREGIDA: Formatted, no functional change from diff ---
     query = """
-    INSERT INTO documents (id, company_id, file_name, file_type, file_path, metadata, status, chunk_count, error_message, uploaded_at, updated_at)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC');
+    INSERT INTO documents (
+        id, company_id, file_name, file_type, file_path,
+        metadata, status, chunk_count, error_message,
+        uploaded_at, updated_at
+    ) VALUES (
+        $1, $2, $3, $4, $5,
+        $6, $7, $8, NULL,
+        NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC'
+    );
     """
     # -----------------------------------
     metadata_db = json.dumps(metadata) if metadata else None
     # --- PARÁMETROS CORREGIDOS: Sin user_id ---
-    params = [doc_id, company_id, filename, file_type, file_path, metadata_db, status.value, 0]
+    params = [
+        doc_id,
+        company_id,
+        filename,
+        file_type,
+        file_path,
+        metadata_db,
+        status.value,
+        0  # chunk_count inicializado a 0
+    ]
     # ------------------------------------------
     insert_log = log.bind(company_id=str(company_id), filename=filename, doc_id=str(doc_id))
     try:
@@ -93,6 +110,7 @@ async def create_document_record(
     except Exception as e:
         insert_log.error("Failed to create document record", error=str(e), exc_info=True)
         raise
+# >>>>>>>>>>> END CORRECTION (Diff 1) <<<<<<<<<<<<<<
 
 # LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH find_document_by_name_and_company DB logic lightly
 async def find_document_by_name_and_company(conn: asyncpg.Connection, filename: str, company_id: uuid.UUID) -> Optional[Dict[str, Any]]:
@@ -165,13 +183,26 @@ async def update_document_status(
 # LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH get_document_by_id DB logic lightly
 async def get_document_by_id(conn: asyncpg.Connection, doc_id: uuid.UUID, company_id: uuid.UUID) -> Optional[Dict[str, Any]]:
     """Obtiene un documento por ID y verifica la compañía."""
-    # --- UPDATED QUERY: Removed user_id ---
+    # >>>>>>>>>>> CORRECTION APPLIED (Diff 4a) <<<<<<<<<<<<<<
+    # --- UPDATED QUERY: Uses file_path, includes error_message ---
     query = """
-    SELECT id, company_id, file_name, file_type, file_path, metadata, status, chunk_count, error_message, uploaded_at, updated_at
+    SELECT
+        id,
+        company_id,
+        file_name,
+        file_type,
+        file_path,
+        metadata,
+        status,
+        chunk_count,
+        error_message,
+        uploaded_at,
+        updated_at
     FROM documents
     WHERE id = $1 AND company_id = $2;
     """
     # --------------------------------------
+    # >>>>>>>>>>> END CORRECTION (Diff 4a) <<<<<<<<<<<<<<
     get_log = log.bind(document_id=str(doc_id), company_id=str(company_id))
     try:
         record = await conn.fetchrow(query, doc_id, company_id)
@@ -192,11 +223,21 @@ async def list_documents_paginated(
     offset: int
 ) -> Tuple[List[Dict[str, Any]], int]:
     """Lista documentos paginados para una compañía y devuelve el conteo total."""
-    # --- UPDATED QUERY: Removed user_id ---
+    # >>>>>>>>>>> CORRECTION APPLIED (Diff 4b) <<<<<<<<<<<<<<
+    # --- UPDATED QUERY: Uses file_path ---
     query = """
     SELECT
-        id, company_id, file_name, file_type, file_path, metadata, status,
-        chunk_count, error_message, uploaded_at, updated_at,
+        id,
+        company_id,
+        file_name,
+        file_type,
+        file_path,
+        metadata,
+        status,
+        chunk_count,
+        error_message,
+        uploaded_at,
+        updated_at,
         COUNT(*) OVER() AS total_count
     FROM documents
     WHERE company_id = $1
@@ -204,6 +245,7 @@ async def list_documents_paginated(
     LIMIT $2 OFFSET $3;
     """
     # --------------------------------------
+    # >>>>>>>>>>> END CORRECTION (Diff 4b) <<<<<<<<<<<<<<
     list_log = log.bind(company_id=str(company_id), limit=limit, offset=offset)
     try:
         rows = await conn.fetch(query, company_id, limit, offset)
@@ -242,6 +284,7 @@ async def delete_document(conn: asyncpg.Connection, doc_id: uuid.UUID, company_i
 
 # --- Chat Functions (Placeholder - Copied from Query Service for context, likely unused here) ---
 # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Chat Functions (Likely Unused)
+# NOTE: These functions seem out of place for an ingest service, but kept as per original file structure
 async def create_chat(user_id: uuid.UUID, company_id: uuid.UUID, title: Optional[str] = None) -> uuid.UUID:
     pool = await get_db_pool()
     chat_id = uuid.uuid4()
