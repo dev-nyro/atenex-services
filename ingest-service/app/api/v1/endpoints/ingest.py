@@ -239,7 +239,6 @@ async def upload_document(
                  raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Document '{file.filename}' already exists with status '{existing_doc['status']}'. Delete it first or wait for processing.")
             elif existing_doc and existing_doc['status'] == DocumentStatus.ERROR.value:
                  endpoint_log.info("Found existing document in error state, proceeding with overwrite logic implicitly (new upload).", document_id=existing_doc['id'])
-                 # Potentially delete the old errored record? Or just proceed? Current logic proceeds.
                  pass # Keep existing logic
     except ValueError:
         endpoint_log.error("Invalid Company ID format provided", company_id_received=company_id)
@@ -266,7 +265,7 @@ async def upload_document(
                 filename=file.filename, # Parameter name is filename
                 file_type=file.content_type,
                 file_path=file_path_in_storage,
-                status=DocumentStatus.PENDING, # .value applied inside create_document_record
+                status=DocumentStatus.PENDING, # Pass Enum
                 metadata=metadata
             )
         endpoint_log.info("Document record created in PostgreSQL", document_id=str(document_id))
@@ -288,28 +287,27 @@ async def upload_document(
         )
         endpoint_log.info("File uploaded successfully to MinIO", object_name=file_path_in_storage)
 
-        # >>>>>>>>>>> CORRECTION APPLIED (Block 1: Update to UPLOADED) <<<<<<<<<<<<<<
+        # >>>>>>>>>>> CORRECTION APPLIED (Pass Enum Member) <<<<<<<<<<<<<<
         # Update status to UPLOADED after successful MinIO upload
         async with get_db_conn() as conn:
             await api_db_retry_strategy(db_client.update_document_status)(
-                conn=conn,                         # Pass conn
+                conn=conn,
                 document_id=document_id,
-                status=DocumentStatus.UPLOADED.value # Use .value
-                # No error message or chunk count needed here
+                status=DocumentStatus.UPLOADED # Pass Enum
             )
         endpoint_log.info("Document status updated to 'uploaded'", document_id=str(document_id))
-        # >>>>>>>>>>> END CORRECTION (Block 1) <<<<<<<<<<<<<<
+        # >>>>>>>>>>> END CORRECTION <<<<<<<<<<<<<<
 
-    # >>>>>>>>>>> CORRECTION APPLIED (Block 2: MinioError Handling) <<<<<<<<<<<<<<
+    # >>>>>>>>>>> CORRECTION APPLIED (Pass Enum Member) <<<<<<<<<<<<<<
     except MinioError as me:
         endpoint_log.error("Failed to upload file to MinIO", object_name=file_path_in_storage, error=str(me))
         try:
             # Update DB status to ERROR if MinIO fails, passing conn and using retry
             async with get_db_conn() as conn:
                 await api_db_retry_strategy(db_client.update_document_status)(
-                    conn=conn,                           # Pass conn
+                    conn=conn,
                     document_id=document_id,
-                    status=DocumentStatus.ERROR.value,   # Use .value
+                    status=DocumentStatus.ERROR,   # Pass Enum
                     error_message=f"MinIO upload failed: {me}"
                 )
         except Exception as db_err:
@@ -319,17 +317,18 @@ async def upload_document(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Storage service error: {me}"
         )
-    # >>>>>>>>>>> END CORRECTION (Block 2) <<<<<<<<<<<<<<
+    # >>>>>>>>>>> END CORRECTION <<<<<<<<<<<<<<
 
+    # >>>>>>>>>>> CORRECTION APPLIED (Pass Enum Member) <<<<<<<<<<<<<<
     except Exception as e: # Handle other unexpected errors during upload/DB update
          endpoint_log.exception("Unexpected error during file upload or DB update", error=str(e))
          try:
              # Update DB status to ERROR, passing conn and using retry
              async with get_db_conn() as conn:
                  await api_db_retry_strategy(db_client.update_document_status)(
-                     conn=conn,                         # Pass conn
+                     conn=conn,
                      document_id=document_id,
-                     status=DocumentStatus.ERROR.value, # Use .value
+                     status=DocumentStatus.ERROR, # Pass Enum
                      error_message=f"Unexpected upload error: {e}"
                  )
          except Exception as db_err:
@@ -338,6 +337,7 @@ async def upload_document(
              status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
              detail=f"Internal server error during upload: {e}"
          )
+    # >>>>>>>>>>> END CORRECTION <<<<<<<<<<<<<<
 
     finally: await file.close()
 
@@ -354,16 +354,16 @@ async def upload_document(
         task = process_document_haystack_task.delay(**task_payload)
         endpoint_log.info("Document ingestion task queued successfully", task_id=task.id, task_name=process_document_haystack_task.name)
 
-    # >>>>>>>>>>> CORRECTION APPLIED (Block 3: Celery Error Handling) <<<<<<<<<<<<<<
+    # >>>>>>>>>>> CORRECTION APPLIED (Pass Enum Member) <<<<<<<<<<<<<<
     except Exception as e:
         endpoint_log.exception("Failed to queue Celery task", error=str(e))
         try:
             # Update DB status to ERROR if Celery queueing fails, passing conn and using retry
             async with get_db_conn() as conn:
                 await api_db_retry_strategy(db_client.update_document_status)(
-                    conn=conn,                           # Pass conn
+                    conn=conn,
                     document_id=document_id,
-                    status=DocumentStatus.ERROR.value,   # Use .value
+                    status=DocumentStatus.ERROR,   # Pass Enum
                     error_message=f"Failed to queue processing task: {e}"
                 )
         except Exception as db_err:
@@ -373,7 +373,7 @@ async def upload_document(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to queue processing task: {e}"
         )
-    # >>>>>>>>>>> END CORRECTION (Block 3) <<<<<<<<<<<<<<
+    # >>>>>>>>>>> END CORRECTION <<<<<<<<<<<<<<
 
     return IngestResponse(document_id=str(document_id), task_id=task.id, status=DocumentStatus.UPLOADED.value, message="Document upload accepted, processing started.")
     # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Upload Endpoint Logic
@@ -492,13 +492,15 @@ async def get_document_status(
         status_log.warning("Inconsistency detected, updating document status in DB", new_status=updated_status_enum.value, new_count=updated_chunk_count, new_error=final_error_message)
         try:
              async with get_db_conn() as conn:
+                 # >>>>>>>>>>> CORRECTION APPLIED (Pass Enum Member) <<<<<<<<<<<<<<
                  await api_db_retry_strategy(db_client.update_document_status)(
                      conn=conn, # Pass conn
                      document_id=document_id,
-                     status=updated_status_enum.value, # Pass .value
+                     status=updated_status_enum, # Pass Enum
                      chunk_count=updated_chunk_count,
                      error_message=final_error_message
                  )
+                 # >>>>>>>>>>> END CORRECTION <<<<<<<<<<<<<<
              status_log.info("Document status updated successfully in DB due to inconsistency check.")
              # Update local doc_data to reflect the change for the response
              doc_data['status'] = updated_status_enum.value
@@ -686,7 +688,7 @@ async def list_document_statuses(
                 "error_message": result["final_error_message"]
             })
 
-    # >>>>>>>>>>> CORRECTION APPLIED (Block 4: Sequential Updates) <<<<<<<<<<<<<<
+    # >>>>>>>>>>> CORRECTION APPLIED (Pass Enum Member) <<<<<<<<<<<<<<
     # Perform DB updates if needed, sequentially within one connection
     if docs_to_update_in_db:
         list_log.warning("Updating statuses sequentially in DB for inconsistent documents", count=len(docs_to_update_in_db))
@@ -698,7 +700,7 @@ async def list_document_statuses(
                          update_result = await api_db_retry_strategy(db_client.update_document_status)(
                              conn=conn, # Use the single connection
                              document_id=doc_id_to_update,
-                             status=update_info["status_enum"].value, # Pass .value
+                             status=update_info["status_enum"], # Pass Enum
                              chunk_count=update_info["chunk_count"],
                              error_message=update_info["error_message"]
                          )
@@ -713,7 +715,7 @@ async def list_document_statuses(
         except Exception as bulk_db_conn_err: # Error getting the connection itself
             list_log.exception("Error acquiring DB connection for sequential updates", error=str(bulk_db_conn_err))
             # If connection fails, updates won't happen. The map still holds intended state.
-    # >>>>>>>>>>> END CORRECTION (Block 4) <<<<<<<<<<<<<<
+    # >>>>>>>>>>> END CORRECTION <<<<<<<<<<<<<<
 
     # Construct final response items using the potentially updated data map
     final_items = []
@@ -800,17 +802,17 @@ async def retry_ingestion(
 
     # Update status to PROCESSING before queueing the task
     try:
-        # >>>>>>>>>>> CORRECTION APPLIED (Block 4: Retry Update) <<<<<<<<<<<<<<
+        # >>>>>>>>>>> CORRECTION APPLIED (Pass Enum Member) <<<<<<<<<<<<<<
         async with get_db_conn() as conn:
             await api_db_retry_strategy(db_client.update_document_status)(
-                conn=conn,                             # Pass conn
+                conn=conn,
                 document_id=document_id,
-                status=DocumentStatus.PROCESSING.value,# Use .value
-                chunk_count=None,                      # Reset chunk count
-                error_message=None                     # Clear previous error
+                status=DocumentStatus.PROCESSING, # Pass Enum
+                chunk_count=None,
+                error_message=None
             )
         retry_log.info("Document status updated to 'processing' for retry.")
-        # >>>>>>>>>>> END CORRECTION (Block 4) <<<<<<<<<<<<<<
+        # >>>>>>>>>>> END CORRECTION <<<<<<<<<<<<<<
     except Exception as e:
         retry_log.exception("Failed to update document status to 'processing' for retry", error=str(e))
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error updating status for retry.")
