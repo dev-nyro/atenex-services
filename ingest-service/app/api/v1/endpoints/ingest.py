@@ -532,9 +532,11 @@ async def get_document_status(
     # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Get Status Endpoint Logic
 
 
+# >>>>>>>>>>> CORRECTION APPLIED (Change response model and return type) <<<<<<<<<<<<<<
 @router.get(
     "/status",
-    response_model=PaginatedStatusResponse,
+    # response_model=PaginatedStatusResponse, <-- Remove Paginated Response
+    response_model=List[StatusResponse],      # <-- Use List of StatusResponse
     summary="List document statuses with pagination and live checks",
     responses={
         422: {"model": ErrorDetail, "description": "Validation Error (Missing Headers)"},
@@ -548,11 +550,12 @@ async def list_document_statuses(
     offset: int = Query(0, ge=0, description="Offset for pagination"),
     minio_client: MinioClient = Depends(get_minio_client),
 ):
+# >>>>>>>>>>> END CORRECTION <<<<<<<<<<<<<<
     """
     Lists documents for the company with pagination.
     Performs live checks for MinIO/Milvus in parallel for listed documents using 'file_path'.
     Updates the DB status/chunk_count if inconsistencies are found **sequentially**.
-    Returns the potentially updated status information.
+    Returns the potentially updated status information **as a direct list**.
     Header X-Company-ID is read directly from the request.
     """
     company_id = request.headers.get("X-Company-ID")
@@ -572,7 +575,7 @@ async def list_document_statuses(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Company ID format.")
 
     documents_db: List[Dict[str, Any]] = []
-    total_count: int = 0
+    total_count: int = 0 # total_count is fetched but no longer returned in the response
 
     try:
         async with get_db_conn() as conn:
@@ -589,7 +592,9 @@ async def list_document_statuses(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error listing documents.")
 
     if not documents_db:
-        return PaginatedStatusResponse(items=[], total=0, limit=limit, offset=offset)
+        # >>>>>>>>>>> CORRECTION APPLIED (Return empty list) <<<<<<<<<<<<<<
+        return [] # Return empty list directly
+        # >>>>>>>>>>> END CORRECTION <<<<<<<<<<<<<<
 
     async def check_single_document(doc_db_data: Dict[str, Any]) -> Dict[str, Any]:
         """Async helper to check MinIO/Milvus for one document."""
@@ -743,7 +748,10 @@ async def list_document_statuses(
          ))
 
     list_log.info("Returning enriched statuses", count=len(final_items))
-    return PaginatedStatusResponse(items=final_items, total=total_count, limit=limit, offset=offset)
+    # >>>>>>>>>>> CORRECTION APPLIED (Return list directly) <<<<<<<<<<<<<<
+    return final_items # Return the list directly
+    # return PaginatedStatusResponse(items=final_items, total=total_count, limit=limit, offset=offset) # Old return
+    # >>>>>>>>>>> END CORRECTION <<<<<<<<<<<<<<
     # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - List Statuses Endpoint Logic
 
 
