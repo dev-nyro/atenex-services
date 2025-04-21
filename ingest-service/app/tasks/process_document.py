@@ -41,6 +41,8 @@ from app.db import postgres_client as db_client
 from app.models.domain import DocumentStatus
 # LLM_FLAG: IMPORT_FIX - Ensure correct class name is imported
 from app.services.minio_client import MinioClient, MinioError # Corrected class name
+# Import the Celery app instance defined here or elsewhere
+from app.tasks.celery_app import celery_app # Import celery_app
 
 # Initialize logger
 log = structlog.get_logger(__name__)
@@ -91,7 +93,7 @@ def _initialize_haystack_components(
 
         # Document Embedder (OpenAI)
         embedder = OpenAIDocumentEmbedder(
-            api_key=settings.OPENAI_API_KEY,
+            api_key=settings.OPENAI_API_KEY.get_secret_value(), # Use get_secret_value() for Pydantic SecretStr
             model=settings.OPENAI_EMBEDDING_MODEL,
         )
 
@@ -108,7 +110,7 @@ def _initialize_haystack_components(
     # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Haystack Component Init
 
 # --- File Type to Converter Mapping ---
-def get_converter(content_type: str) -> Type:
+def get_converter(content_type: str) -> Type[Any]: # Use Type[Any] for broader compatibility
     """Returns the appropriate Haystack Converter based on content type."""
     log.debug("Selecting converter", content_type=content_type)
     # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Converter Mapping
@@ -128,25 +130,11 @@ def get_converter(content_type: str) -> Type:
     # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Converter Mapping
 
 # --- Celery Task Setup ---
-# LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Celery App Config
-celery_app = Celery(
-    'ingest_tasks',
-    broker=str(settings.CELERY_BROKER_URL),
-    backend=str(settings.CELERY_RESULT_BACKEND)
-)
-
-celery_app.conf.update(
-    task_serializer='json',
-    result_serializer='json',
-    accept_content=['json'],
-    task_track_started=True,
-    task_time_limit=TIMEOUT_SECONDS + 60,
-    task_soft_time_limit=TIMEOUT_SECONDS,
-    # Consider task_acks_late=True for more robustness if needed
-)
-# LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Celery App Config
+# Celery app instance should be defined elsewhere (e.g., celery_app.py) and imported
+# from app.tasks.celery_app import celery_app
 
 # --- Logging Configuration within Worker Context ---
+# (Assuming structlog/logging setup is done correctly, kept as before)
 # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Logging Setup
 structlog.configure(
     processors=[
@@ -168,8 +156,7 @@ formatter = structlog.stdlib.ProcessorFormatter(
     processor=structlog.processors.JSONRenderer(),
 )
 
-# Corrected NameError location: Ensure logging is imported before use
-handler = logging.StreamHandler() # Now 'logging' is defined due to import at top
+handler = logging.StreamHandler()
 handler.setFormatter(formatter)
 root_logger = logging.getLogger()
 if not root_logger.handlers:
@@ -179,7 +166,6 @@ if not root_logger.handlers:
     except ValueError:
         root_logger.setLevel("INFO")
         log.warning("Invalid LOG_LEVEL in settings, defaulting to INFO.")
-
 # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Logging Setup
 
 
@@ -196,12 +182,13 @@ async def db_session_manager():
     """Provides a managed database connection pool session."""
     pool = None
     try:
-        pool = await db_client.get_db_pool()
+        pool = await db_client.get_db_pool() # Ensure pool is fetched before yielding
         yield pool
     except Exception as e:
         log.error("Failed to get DB pool for session", error=str(e), exc_info=True)
         raise
     finally:
+        # No explicit close needed here, pool management is handled elsewhere
         log.debug("DB session context exited.")
         pass
 
@@ -224,145 +211,159 @@ async def async_process_flow(
     flow_log.info("Starting asynchronous processing flow")
 
     # 1. Initialize Minio Client
-    # LLM_FLAG: SENSITIVE_DEPENDENCY - MinioClient instance
-    minio_client = MinioClient(
-        # Credentials and config are taken from settings inside MinioClient
-    )
+    minio_client = MinioClient()
 
     # 2. Download file from Minio
     object_name = f"{company_id}/{document_id}/{filename}"
     temp_file_path = None
     try:
         flow_log.info("Downloading file from MinIO", object_name=object_name)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as temp_file:
-            temp_file_path = temp_file.name
+        # Create a temporary directory to handle potential complex filenames securely
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Construct path within the temporary directory
+            temp_file_path = os.path.join(temp_dir, filename) # Use original filename inside temp dir
             # Use the correct method name from MinioClient
             await minio_client.download_file(object_name, temp_file_path)
-        flow_log.info("File downloaded successfully", temp_path=temp_file_path)
+            flow_log.info("File downloaded successfully", temp_path=temp_file_path)
+
+            # --- Processing happens within the 'with temp_dir' block ---
+
+            # 3. Initialize Milvus Store (potentially blocking)
+            loop = asyncio.get_running_loop()
+            try:
+                flow_log.info("Initializing Milvus document store...")
+                store = await loop.run_in_executor(None, _initialize_milvus_store)
+                flow_log.info("Milvus document store initialized.")
+            except RuntimeError as e:
+                flow_log.error("Failed to initialize Milvus store during flow", error=str(e))
+                raise e
+            except Exception as e:
+                flow_log.exception("Unexpected error initializing Milvus store", error=str(e))
+                raise RuntimeError(f"Unexpected Milvus init error: {e}") from e
+
+            # 4. Initialize other Haystack Components (potentially blocking)
+            try:
+                flow_log.info("Initializing Haystack processing components...")
+                splitter, embedder, writer = await loop.run_in_executor(None, _initialize_haystack_components, store)
+                flow_log.info("Haystack processing components initialized.")
+            except RuntimeError as e:
+                flow_log.error("Failed to initialize Haystack components during flow", error=str(e))
+                raise e
+            except Exception as e:
+                flow_log.exception("Unexpected error initializing Haystack components", error=str(e))
+                raise RuntimeError(f"Unexpected Haystack init error: {e}") from e
+
+            # 5. Initialize Converter (potentially blocking, select based on type)
+            try:
+                flow_log.info("Initializing document converter...")
+                ConverterClass = get_converter(content_type)
+                converter = ConverterClass()
+                flow_log.info("Document converter initialized", converter=ConverterClass.__name__)
+            except ValueError as ve:
+                flow_log.error("Unsupported content type", error=str(ve))
+                raise ve
+            except Exception as e:
+                flow_log.exception("Failed to initialize converter", error=str(e))
+                raise RuntimeError(f"Converter Initialization Error: {e}") from e
+
+            # --- Haystack Pipeline Execution (Run in Executor) ---
+            total_chunks_written = 0
+            try:
+                flow_log.info("Starting Haystack pipeline execution (converter, splitter, embedder, writer)...")
+
+                def run_haystack_pipeline_sync(local_temp_file_path): # Pass the path
+                    nonlocal total_chunks_written
+                    pipeline_log = log.bind(
+                        document_id=document_id, company_id=company_id, task_id=task_id,
+                        filename=filename, in_sync_executor=True
+                    )
+                    pipeline_log.debug("Executing conversion...")
+                    # Use the passed path
+                    conversion_result = converter.run(sources=[local_temp_file_path])
+                    docs = conversion_result["documents"]
+                    pipeline_log.debug("Conversion complete", num_docs_converted=len(docs))
+                    if not docs:
+                        pipeline_log.warning("Converter produced no documents.")
+                        return 0
+
+                    # Add essential metadata
+                    for doc in docs:
+                        # Ensure meta exists
+                        if doc.meta is None:
+                             doc.meta = {}
+                        doc.meta["company_id"] = company_id
+                        doc.meta["document_id"] = document_id
+                        doc.meta["file_name"] = filename
+                        doc.meta["file_type"] = content_type
+                        # Add any other relevant metadata from DB if needed
+
+                    pipeline_log.debug("Executing splitting...")
+                    split_docs = splitter.run(documents=docs)["documents"]
+                    pipeline_log.debug("Splitting complete", num_chunks=len(split_docs))
+                    if not split_docs:
+                         pipeline_log.warning("Splitter produced no documents (chunks).")
+                         return 0
+
+                    pipeline_log.debug("Executing embedding...")
+                    embedded_docs = embedder.run(documents=split_docs)["documents"]
+                    pipeline_log.debug("Embedding complete.")
+                    if not embedded_docs:
+                         pipeline_log.warning("Embedder produced no documents.")
+                         return 0
+
+                    pipeline_log.debug("Executing writing to Milvus...")
+                    write_result = writer.run(documents=embedded_docs)
+                    written_count = write_result["documents_written"]
+                    pipeline_log.info("Writing complete.", documents_written=written_count)
+                    total_chunks_written = written_count
+                    return written_count
+
+                # Pass temp_file_path to the synchronous function
+                chunks_written = await loop.run_in_executor(None, run_haystack_pipeline_sync, temp_file_path)
+                flow_log.info("Haystack pipeline execution finished.", chunks_written=chunks_written)
+                return total_chunks_written
+
+            except Exception as e:
+                flow_log.exception("Error during Haystack pipeline execution", error=str(e))
+                raise RuntimeError(f"Haystack Pipeline Error: {e}") from e
+            # Temporary directory is automatically cleaned up here
+
     except MinioError as me:
         flow_log.error("Failed to download file from MinIO", object_name=object_name, error=str(me))
         raise RuntimeError(f"MinIO download failed: {me}") from me
     except Exception as e:
-        flow_log.exception("Unexpected error during file download", error=str(e))
-        raise RuntimeError(f"Unexpected download error: {e}") from e
+        flow_log.exception("Unexpected error during file download or processing initiation", error=str(e))
+        # Clean up temp file if it exists and download failed midway
+        if temp_file_path and os.path.exists(temp_file_path) and isinstance(e, MinioError): # Only clean up if download partially succeeded then failed
+             try: os.remove(temp_file_path)
+             except OSError: pass
+        raise RuntimeError(f"Unexpected download/init error: {e}") from e
 
-    # 3. Initialize Milvus Store (potentially blocking)
-    loop = asyncio.get_running_loop()
-    try:
-        flow_log.info("Initializing Milvus document store...")
-        store = await loop.run_in_executor(None, _initialize_milvus_store)
-        flow_log.info("Milvus document store initialized.")
-    except RuntimeError as e:
-        flow_log.error("Failed to initialize Milvus store during flow", error=str(e))
-        raise e
-    except Exception as e:
-        flow_log.exception("Unexpected error initializing Milvus store", error=str(e))
-        raise RuntimeError(f"Unexpected Milvus init error: {e}") from e
-
-    # 4. Initialize other Haystack Components (potentially blocking)
-    try:
-        flow_log.info("Initializing Haystack processing components...")
-        splitter, embedder, writer = await loop.run_in_executor(None, _initialize_haystack_components, store)
-        flow_log.info("Haystack processing components initialized.")
-    except RuntimeError as e:
-        flow_log.error("Failed to initialize Haystack components during flow", error=str(e))
-        raise e
-    except Exception as e:
-        flow_log.exception("Unexpected error initializing Haystack components", error=str(e))
-        raise RuntimeError(f"Unexpected Haystack init error: {e}") from e
-
-    # 5. Initialize Converter (potentially blocking, select based on type)
-    try:
-        flow_log.info("Initializing document converter...")
-        ConverterClass = get_converter(content_type)
-        converter = ConverterClass()
-        flow_log.info("Document converter initialized", converter=ConverterClass.__name__)
-    except ValueError as ve:
-        flow_log.error("Unsupported content type", error=str(ve))
-        raise ve
-    except Exception as e:
-        flow_log.exception("Failed to initialize converter", error=str(e))
-        raise RuntimeError(f"Converter Initialization Error: {e}") from e
-
-    # --- Haystack Pipeline Execution (Run in Executor) ---
-    total_chunks_written = 0
-    try:
-        flow_log.info("Starting Haystack pipeline execution (converter, splitter, embedder, writer)...")
-
-        def run_haystack_pipeline_sync():
-            nonlocal total_chunks_written
-            pipeline_log = log.bind(
-                document_id=document_id, company_id=company_id, task_id=task_id,
-                filename=filename, in_sync_executor=True
-            )
-            pipeline_log.debug("Executing conversion...")
-            conversion_result = converter.run(sources=[temp_file_path])
-            docs = conversion_result["documents"]
-            pipeline_log.debug("Conversion complete", num_docs_converted=len(docs))
-            if not docs:
-                pipeline_log.warning("Converter produced no documents.")
-                return 0
-
-            # Add essential metadata
-            for doc in docs:
-                doc.meta["company_id"] = company_id
-                doc.meta["document_id"] = document_id
-                doc.meta["file_name"] = filename
-                doc.meta["file_type"] = content_type
-
-            pipeline_log.debug("Executing splitting...")
-            split_docs = splitter.run(documents=docs)["documents"]
-            pipeline_log.debug("Splitting complete", num_chunks=len(split_docs))
-            if not split_docs:
-                 pipeline_log.warning("Splitter produced no documents (chunks).")
-                 return 0
-
-            pipeline_log.debug("Executing embedding...")
-            embedded_docs = embedder.run(documents=split_docs)["documents"]
-            pipeline_log.debug("Embedding complete.")
-            if not embedded_docs:
-                 pipeline_log.warning("Embedder produced no documents.")
-                 return 0
-
-            pipeline_log.debug("Executing writing to Milvus...")
-            write_result = writer.run(documents=embedded_docs)
-            written_count = write_result["documents_written"]
-            pipeline_log.info("Writing complete.", documents_written=written_count)
-            total_chunks_written = written_count
-            return written_count
-
-        chunks_written = await loop.run_in_executor(None, run_haystack_pipeline_sync)
-        flow_log.info("Haystack pipeline execution finished.", chunks_written=chunks_written)
-
-    except Exception as e:
-        flow_log.exception("Error during Haystack pipeline execution", error=str(e))
-        raise RuntimeError(f"Haystack Pipeline Error: {e}") from e
-    finally:
-        # 6. Clean up temporary file
-        if temp_file_path and os.path.exists(temp_file_path):
-            try:
-                os.remove(temp_file_path)
-                flow_log.debug("Temporary file deleted", path=temp_file_path)
-            except OSError as e:
-                flow_log.warning("Failed to delete temporary file", path=temp_file_path, error=str(e))
-
-    return total_chunks_written
+    # This point should not be reached if processing happened inside the 'with temp_dir'
+    # If download failed, exception was raised. If processing finished, value was returned.
+    # If processing raised exception, it was re-raised.
+    # Adding a safeguard return just in case.
+    return 0
     # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Main Async Flow
 
 
 # --- Celery Task Definition ---
-# --- CORRECTION: Added explicit name to the task decorator ---
-@celery_app.task(name="app.tasks.process_document.process_document_haystack_task", bind=True)
-# --------------------------------------------------------------
+# >>>>>>>>>>> CORRECTION APPLIED (Celery Task Registration) <<<<<<<<<<<<<<
+# Remove the decorator
+# @celery_app.task(name="app.tasks.process_document.process_document_haystack_task", bind=True)
+
 class ProcessDocumentTask(Task):
     """Custom Celery Task class for document processing."""
-    # Removed explicit name here as it's now in the decorator
-    # name = "tasks.process_document_haystack"
+    # Define name and bind within the class
+    name = "app.tasks.process_document.ProcessDocumentTask" # Standard name
+    bind = True
     max_retries = 3
-    default_retry_delay = 60
+    default_retry_delay = 60 # 1 minute
 
     def __init__(self):
         super().__init__()
+        # Ensure logging is configured when the task instance is created
+        # (structlog setup might need adjustment depending on worker init)
         self.task_log = log.bind(task_name=self.name)
         self.task_log.info("ProcessDocumentTask initialized.")
 
@@ -375,20 +376,21 @@ class ProcessDocumentTask(Task):
         update_log = self.task_log.bind(document_id=doc_id, target_status=status.value)
         try:
             # Use the correct DB client function signature
+            # Connection/Pool is now managed by the session manager, so don't pass it here
             await db_retry_strategy(db_client.update_document_status)(
                 document_id=uuid.UUID(doc_id), # Pass UUID directly
                 status=status, # Pass enum member
-                # Pass optional args explicitly, pool is handled by context manager now
+                # Pass optional args explicitly
                 chunk_count=chunk_count,
                 error_message=error_msg
-                # file_path is not updated here usually
             )
             update_log.info("Document status updated successfully in DB.")
         except Exception as e:
             update_log.critical("CRITICAL: Failed final document status update in DB!",
                                 error=str(e), chunk_count=chunk_count, error_msg=error_msg,
                                 exc_info=True)
-            raise Reject(f"Persistent DB error updating status for {doc_id} to {status.value}", requeue=False) from e
+            # Re-raise the exception to be caught by the main runner, which handles Reject
+            raise ConnectionError(f"Persistent DB error updating status for {doc_id} to {status.value}") from e
         # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - DB Update Helper
 
     async def run_async_processing(self, *args, **kwargs):
@@ -398,133 +400,176 @@ class ProcessDocumentTask(Task):
         task_id = self.request.id
         attempt = self.request.retries + 1
         task_log = self.task_log.bind(document_id=doc_id, task_id=task_id, attempt=attempt)
-        final_status = DocumentStatus.ERROR
+        final_status = DocumentStatus.ERROR # Default to ERROR
         final_chunk_count = None
         error_to_report = "Unknown processing error"
-        is_retryable_error = False
-        e_non_retry: Optional[Exception] = None
+        processing_exception: Optional[Exception] = None
 
-        async with db_session_manager() as pool: # Manage DB pool connection
-             # Ensure pool is valid before proceeding (get_db_pool handles this)
-             if not pool:
-                 task_log.critical("Failed to get DB pool for task execution.")
-                 raise Reject("DB pool unavailable for task", requeue=False)
+        try:
+            async with db_session_manager() as pool: # Manage DB pool connection context
+                 if not pool:
+                     task_log.critical("Failed to get DB pool for task execution.")
+                     # Use Reject to prevent retries if DB pool itself is unavailable
+                     raise Reject("DB pool unavailable for task", requeue=False)
 
-             try:
-                # 1. Set status to 'processing'
-                task_log.info("Setting document status to 'processing'")
-                # Pass pool correctly if needed by the update function structure
-                await self._update_status_with_retry(pool, doc_id, DocumentStatus.PROCESSING, error_msg=None)
+                 try:
+                    # 1. Set status to 'processing'
+                    task_log.info("Setting document status to 'processing'")
+                    await self._update_status_with_retry(pool, doc_id, DocumentStatus.PROCESSING, error_msg=None)
 
-                # 2. Execute main flow
-                task_log.info("Executing main async_process_flow with timeout", timeout=TIMEOUT_SECONDS)
-                final_chunk_count = await asyncio.wait_for(
-                    async_process_flow(task_id=task_id, attempt=attempt, **kwargs),
-                    timeout=TIMEOUT_SECONDS
-                )
-                final_status = DocumentStatus.PROCESSED
-                error_to_report = None
-                task_log.info("Async process flow completed successfully.", chunks_processed=final_chunk_count)
+                    # 2. Execute main flow
+                    task_log.info("Executing main async_process_flow with timeout", timeout=TIMEOUT_SECONDS)
+                    final_chunk_count = await asyncio.wait_for(
+                        async_process_flow(task_id=task_id, attempt=attempt, **kwargs),
+                        timeout=TIMEOUT_SECONDS
+                    )
+                    final_status = DocumentStatus.PROCESSED
+                    error_to_report = None # Success! Clear default error message
+                    task_log.info("Async process flow completed successfully.", chunks_processed=final_chunk_count)
 
-             except asyncio.TimeoutError:
-                 task_log.error("Processing timed out", timeout=TIMEOUT_SECONDS)
-                 error_to_report = f"Processing timed out after {TIMEOUT_SECONDS} seconds."
-                 final_status = DocumentStatus.ERROR
-                 e_non_retry = TimeoutError(error_to_report)
-             except ValueError as ve:
-                  task_log.error("Processing failed due to value error", error=str(ve))
-                  error_to_report = f"Unsupported file type or invalid input: {ve}"
-                  final_status = DocumentStatus.ERROR
-                  is_retryable_error = False
-                  e_non_retry = ve
-             except RuntimeError as rte:
-                  task_log.error(f"Processing failed permanently: {rte}", exc_info=False)
-                  # Provide user-friendly errors based on runtime error type
-                  if "Milvus" in str(rte): error_to_report = "Error config./código Milvus. Contacte soporte."
-                  elif "Haystack" in str(rte): error_to_report = "Error interno Haystack. Contacte soporte."
-                  elif "Converter" in str(rte): error_to_report = "Error interno Conversor. Contacte soporte."
-                  elif "MinIO download failed" in str(rte): error_to_report = "Error descargando archivo (MinIO)."
-                  else: error_to_report = f"Error interno ({type(rte).__name__}). Contacte soporte."
-                  final_status = DocumentStatus.ERROR
-                  is_retryable_error = False
-                  e_non_retry = rte
-             except Exception as e:
-                 task_log.exception("Unexpected exception during processing flow.", error=str(e))
-                 error_to_report = f"Error inesperado ({type(e).__name__}). Contacte soporte."
-                 final_status = DocumentStatus.ERROR
-                 e_non_retry = e
+                 except asyncio.TimeoutError as e:
+                     task_log.error("Processing timed out", timeout=TIMEOUT_SECONDS)
+                     error_to_report = f"Processing timed out after {TIMEOUT_SECONDS} seconds."
+                     final_status = DocumentStatus.ERROR
+                     processing_exception = e
+                 except ValueError as e: # e.g., Unsupported content type
+                      task_log.error("Processing failed due to value error", error=str(e))
+                      error_to_report = f"Configuration or Input Error: {e}"
+                      final_status = DocumentStatus.ERROR
+                      processing_exception = e # Non-retryable typically
+                 except RuntimeError as e: # e.g., Milvus/Haystack init or pipeline errors
+                      task_log.error(f"Processing failed with runtime error: {e}", exc_info=False)
+                      error_to_report = f"Processing Runtime Error: {e}"
+                      final_status = DocumentStatus.ERROR
+                      processing_exception = e # Treat as non-retryable unless specific subtypes are known
+                 except ConnectionError as e: # Specific catch for DB connection errors during status update
+                      task_log.critical("Persistent DB connection error during status update", error=str(e))
+                      # This indicates a system problem, reject the task
+                      raise Reject(f"Persistent DB error for {doc_id}: {e}", requeue=False) from e
+                 except Exception as e:
+                     task_log.exception("Unexpected exception during processing flow.", error=str(e))
+                     error_to_report = f"Unexpected error during processing: {type(e).__name__}"
+                     final_status = DocumentStatus.ERROR
+                     processing_exception = e # Assume retryable unless known otherwise
 
-             # 3. Update final status in DB
-             task_log.info("Attempting to update final document status in DB", status=final_status.value, chunks=final_chunk_count, error=error_to_report)
-             try:
-                 await self._update_status_with_retry(
-                     pool, doc_id, final_status,
-                     chunk_count=final_chunk_count if final_status == DocumentStatus.PROCESSED else None,
-                     error_msg=error_to_report
-                 )
-             except Reject as r:
-                 task_log.critical("CRITICAL: Failed to update final document status in DB!", target_status=final_status.value, error_msg=error_to_report)
-                 raise r # Propagate Reject
-             except Exception as db_update_exc:
-                  task_log.critical("CRITICAL: Unhandled exception during final DB status update!", error=str(db_update_exc), target_status=final_status.value, exc_info=True)
-                  raise Reject(f"Unhandled DB error updating status for {doc_id}", requeue=False) from db_update_exc
+                 # 3. Update final status in DB (always attempt this)
+                 task_log.info("Attempting to update final document status in DB", status=final_status.value, chunks=final_chunk_count, error=error_to_report)
+                 try:
+                     await self._update_status_with_retry(
+                         pool, doc_id, final_status,
+                         chunk_count=final_chunk_count if final_status == DocumentStatus.PROCESSED else None,
+                         error_msg=error_to_report
+                     )
+                 except ConnectionError as db_update_exc: # Catch error from _update_status_with_retry
+                      task_log.critical("CRITICAL: Failed to update final document status in DB!", target_status=final_status.value, error=str(db_update_exc))
+                      # Reject the task as we cannot reliably update the state
+                      raise Reject(f"Final DB update failed for {doc_id}: {db_update_exc}", requeue=False) from db_update_exc
+                 except Exception as db_unhandled_exc:
+                      task_log.critical("CRITICAL: Unhandled exception during final DB update", error=str(db_unhandled_exc), exc_info=True)
+                      raise Reject(f"Unhandled final DB update error for {doc_id}", requeue=False) from db_unhandled_exc
 
-             # 4. Handle retries or final failure
-             if final_status == DocumentStatus.ERROR:
-                 if is_retryable_error:
-                     task_log.warning("Processing failed with a retryable error, attempting task retry.", error=error_to_report)
-                     try:
-                         self.retry(exc=e_non_retry or RuntimeError(error_to_report), countdown=60 * attempt)
-                     except MaxRetriesExceededError:
-                         task_log.error("Max retries exceeded for task.", error=error_to_report)
-                         raise Ignore()
-                     except Reject as r:
-                          task_log.error("Task rejected during retry attempt.", reason=str(r))
-                          raise r
-                 else:
-                     task_log.error("Processing failed with non-retryable error.", error=error_to_report, exception_type=type(e_non_retry).__name__)
-                     if e_non_retry: raise e_non_retry
-                     else: raise RuntimeError(error_to_report or "Unknown non-retryable processing error")
-             elif final_status == DocumentStatus.PROCESSED:
-                  task_log.info("Processing completed successfully for document.")
-                  return {"status": "processed", "document_id": doc_id, "chunks_processed": final_chunk_count}
+
+        # --- Exception Handling & Retry Logic (outside DB session manager) ---
+        except Reject as r:
+             # Task explicitly rejected (e.g., persistent DB error), do not retry
+             task_log.error(f"Task rejected: {r.reason}")
+             raise r # Re-raise Reject to Celery
+        except Exception as outer_exc:
+             # Catch any exception that occurred *before* or *after* the main try block inside the async runner
+             # This could include DB pool acquisition errors or unhandled errors after processing
+             task_log.exception("Outer exception caught in run_async_processing", error=str(outer_exc))
+             # We might not have updated the DB status to ERROR here, attempt it if possible? Risky.
+             # For simplicity, let Celery handle this based on the raised exception type.
+             processing_exception = outer_exc # Store the exception
+             final_status = DocumentStatus.ERROR # Ensure status reflects failure
+
+
+        # 4. Handle retries or final failure based on processing_exception
+        if final_status == DocumentStatus.ERROR and processing_exception:
+             # Determine if the error is retryable (customize this logic)
+             is_retryable = not isinstance(processing_exception, (ValueError, RuntimeError, asyncio.TimeoutError, Reject))
+             if is_retryable:
+                 task_log.warning("Processing failed with a potentially retryable error, attempting task retry.", error=str(processing_exception))
+                 try:
+                     # Use the captured exception for retry context
+                     raise self.retry(exc=processing_exception, countdown=self.default_retry_delay * attempt)
+                 except MaxRetriesExceededError:
+                     task_log.error("Max retries exceeded for task.", error=str(processing_exception))
+                     # Do not raise Ignore() here, let the original exception propagate if needed
+                     # Or explicitly raise Reject if we are sure it shouldn't run again.
+                     raise Reject(f"Max retries exceeded for {doc_id}", requeue=False) from processing_exception
+                 except Reject as r: # Catch if retry itself is rejected
+                      task_log.error("Task rejected during retry attempt.", reason=str(r))
+                      raise r
+             else:
+                 task_log.error("Processing failed with non-retryable error.", error=str(processing_exception), type=type(processing_exception).__name__)
+                 # Raise Reject to prevent Celery from retrying non-retryable errors
+                 raise Reject(f"Non-retryable error for {doc_id}: {processing_exception}", requeue=False) from processing_exception
+
+        elif final_status == DocumentStatus.PROCESSED:
+              task_log.info("Processing completed successfully for document.")
+              return {"status": "processed", "document_id": doc_id, "chunks_processed": final_chunk_count}
+        else:
+             # Should not happen if logic above is correct, but handle defensively
+             task_log.error("Task ended in unexpected state", final_status=final_status, error=error_to_report)
+             raise Reject(f"Task for {doc_id} ended in unexpected state {final_status}", requeue=False)
+
+
          # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Task Async Runner
 
     def run(self, *args, **kwargs):
         """Synchronous wrapper to run the async processing logic."""
         # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Celery Sync Runner
-        self.task_log.info("Task received", args=args, kwargs=list(kwargs.keys()))
+        task_log = log.bind(task_id=self.request.id, task_name=self.name) # Bind early
+        task_log.info("Task received", args=args, kwargs=list(kwargs.keys()))
         try:
+            # Setup contextvars if needed for structlog within asyncio run
+            # import contextvars
+            # contextvars.copy_context().run(asyncio.run, self.run_async_processing(*args, **kwargs))
             return asyncio.run(self.run_async_processing(*args, **kwargs))
         except Reject as r:
-             self.task_log.error(f"Task rejected due to persistent DB error: {r.reason}", exc_info=False)
+             task_log.error(f"Task rejected: {r.reason}", exc_info=False)
+             # Propagate Reject to Celery - this marks the task as failed but not for retry by default
              raise r
         except Ignore:
-             self.task_log.warning("Task is being ignored (e.g., max retries exceeded or non-retryable error).")
+             # This should ideally not be raised directly from run_async_processing anymore
+             # Kept for safety, but might indicate a logic flaw if reached.
+             task_log.warning("Task is being ignored.")
              raise Ignore()
         except Exception as e:
-             self.task_log.exception("Task failed with unhandled exception in run wrapper", error=str(e))
-             raise e # Propagate exception to mark task as FAILED
+             # Catch any synchronous exception or exceptions propagated from run_async_processing
+             task_log.exception("Task failed with unhandled exception in run wrapper", error=str(e))
+             # Update DB status to ERROR one last time if possible? Very difficult to do reliably here.
+             # Let Celery mark the task as FAILED based on the exception.
+             raise e # Re-raise the exception
         # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Celery Sync Runner
 
     def on_failure(self, exc, task_id, args, kwargs, einfo):
         """Log task failure."""
         # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Celery Failure Handler
-        log.error(
-            "Celery task failed", task_id=task_id, task_name=self.name,
+        failure_log = log.bind(task_id=task_id, task_name=self.name, status="FAILED")
+        failure_log.error(
+            "Celery task final failure",
             args=args, kwargs=kwargs, error_type=type(exc).__name__, error=str(exc),
-            traceback=str(einfo.traceback), exc_info=False
+            traceback=str(einfo.traceback), exc_info=False # Avoid duplicate traceback logging
         )
+        # Optional: Add logic here to ensure DB status is ERROR if it wasn't updated before failure
+        # This is complex due to needing async context and potential DB issues.
         # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Celery Failure Handler
 
     def on_success(self, retval, task_id, args, kwargs):
         """Log task success."""
         # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Celery Success Handler
-        log.info(
-            "Celery task completed successfully", task_id=task_id, task_name=self.name,
+        success_log = log.bind(task_id=task_id, task_name=self.name, status="SUCCESS")
+        success_log.info(
+            "Celery task completed successfully",
             args=args, kwargs=kwargs, retval=retval
         )
         # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Celery Success Handler
 
-# Register the custom task class with Celery
+# Register the custom task class with Celery *ONCE*
+# The instance name 'process_document_haystack_task' is used in ingest.py to call .delay()
+# The class defines its internal name as 'app.tasks.process_document.ProcessDocumentTask'
+# Celery's register_task links the external instance name to the internal class/name.
 process_document_haystack_task = celery_app.register_task(ProcessDocumentTask())
+# >>>>>>>>>>> END CORRECTION (Celery Task Registration) <<<<<<<<<<<<<<

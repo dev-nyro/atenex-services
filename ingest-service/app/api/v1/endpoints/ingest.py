@@ -34,6 +34,7 @@ from app.services.minio_client import MinioClient, MinioError
 # LLM_FLAG: SENSITIVE_DEPENDENCY - Celery app instance
 from app.tasks.celery_app import celery_app
 # LLM_FLAG: SENSITIVE_DEPENDENCY - Celery task signature
+# Import the task instance exported from process_document.py
 from app.tasks.process_document import process_document_haystack_task
 
 log = structlog.get_logger(__name__)
@@ -105,9 +106,10 @@ def _initialize_milvus_store_sync() -> MilvusDocumentStore:
         raise RuntimeError(f"Milvus Store Initialization Error for API helper: {e}") from e
     # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Milvus Sync Init Helper
 
+# >>>>>>>>>>> CORRECTION APPLIED (Milvus count_documents) <<<<<<<<<<<<<<
 def _get_milvus_chunk_count_sync(document_id: str, company_id: str) -> int:
-    """Synchronously counts chunks in Milvus for a specific document."""
-    # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Milvus Sync Count Helper (Corrected)
+    """Synchronously counts chunks in Milvus for a specific document using count_documents."""
+    # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Milvus Sync Count Helper (Corrected with count_documents)
     count_log = log.bind(document_id=document_id, company_id=company_id, component="MilvusHelperSync")
     try:
         store = _initialize_milvus_store_sync()
@@ -119,33 +121,25 @@ def _get_milvus_chunk_count_sync(document_id: str, company_id: str) -> int:
                 {"field": "meta.company_id", "operator": "==", "value": company_id},
             ]
         }
-        # --- CORRECTION: Use get_documents with filters and count the result ---
-        retrieved_docs: List[Document] = store.get_documents(filters=filters)
-        count = len(retrieved_docs)
-        # ----------------------------------------------------------------------
+        # --- CORRECCIÓN: Usamos count_documents con filtros ---
+        # (MilvusDocumentStore.count_documents acepta un parámetro `filters`)
+        count = store.count_documents(filters=filters)
         count_log.info("Milvus chunk count successful", count=count)
         return count
     except RuntimeError as re:
         count_log.error("Failed to get Milvus count due to store init error", error=str(re))
         return -1 # Return -1 to indicate error during count
-    # LLM_FLAG: FIX_APPLIED - Handle AttributeError for get_documents if library version mismatch
     except AttributeError as ae:
-        count_log.error("AttributeError accessing MilvusDocumentStore (likely get_documents/count_documents mismatch)", error=str(ae), exc_info=True)
-        # Attempt fallback to count_documents without filters, though this is less accurate
-        try:
-            count = store.count_documents() # No filters possible here
-            count_log.warning("Fallback count used due to get_documents error", total_collection_count=count)
-            # Cannot accurately filter here, returning -1 indicates filtered count failed
-            return -1
-        except Exception as fallback_e:
-            count_log.exception("Fallback count_documents also failed", error=str(fallback_e))
-            return -1
-    # -------------------------------------------------------------------------
+        # This might happen if the specific version of milvus_haystack DOES NOT support filters in count_documents
+        count_log.error("AttributeError calling count_documents (likely filters not supported or method signature changed)", error=str(ae), exc_info=True)
+        # Fallback or indicate error - returning -1 seems appropriate
+        return -1
     except Exception as e:
         count_log.exception("Error counting documents in Milvus", error=str(e))
         count_log.debug("Filter used for Milvus count", filter_details=json.dumps(filters))
         return -1 # Return -1 to indicate error during count
-    # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Milvus Sync Count Helper (Corrected)
+    # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Milvus Sync Count Helper (Corrected with count_documents)
+# >>>>>>>>>>> END CORRECTION (Milvus count_documents) <<<<<<<<<<<<<<
 
 def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
     """Synchronously deletes chunks from Milvus for a specific document."""
@@ -161,6 +155,7 @@ def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
                 {"field": "meta.company_id", "operator": "==", "value": company_id},
             ]
         }
+        # Assuming delete_documents exists and works as expected
         store.delete_documents(filters=filters)
         delete_log.info("Milvus delete operation executed.")
         return True
@@ -331,7 +326,6 @@ async def upload_document(
     finally: await file.close()
 
     try:
-        # >>>>>>>>>>> CORRECTION APPLIED (Diff 2a) <<<<<<<<<<<<<<
         # --- REMOVED user_id from task payload ---
         task_payload = {
             "document_id": str(document_id),
@@ -340,10 +334,9 @@ async def upload_document(
             "filename": file.filename,
             "content_type": file.content_type
         }
-        # -----------------------------------------------------------------
-        # >>>>>>>>>>> END CORRECTION (Diff 2a) <<<<<<<<<<<<<<
+        # Use the imported task instance (ensure its name matches registration in process_document.py)
         task = process_document_haystack_task.delay(**task_payload)
-        endpoint_log.info("Document ingestion task queued successfully", task_id=task.id)
+        endpoint_log.info("Document ingestion task queued successfully", task_id=task.id, task_name=process_document_haystack_task.name)
     except Exception as e:
         endpoint_log.exception("Failed to queue Celery task", error=str(e))
         try:
@@ -421,11 +414,9 @@ async def get_document_status(
         status_log.exception("Error fetching document status from DB", error=str(e))
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error fetching status.")
 
-    # >>>>>>>>>>> CORRECTION APPLIED (Diff 3 - Consistency Check) <<<<<<<<<<<<<<
     # --- USE CORRECT COLUMN NAME: file_path ---
     minio_path = doc_data.get('file_path') # Ensuring 'file_path' is used as per Diff 3
     # ------------------------------------------
-    # >>>>>>>>>>> END CORRECTION (Diff 3 - Consistency Check) <<<<<<<<<<<<<<
     if not minio_path:
          status_log.warning("MinIO file path missing in DB record", db_id=doc_data['id'])
          minio_exists = False
@@ -444,6 +435,7 @@ async def get_document_status(
     loop = asyncio.get_running_loop()
     milvus_chunk_count = -1
     try:
+        # Use the corrected helper function _get_milvus_chunk_count_sync
         milvus_chunk_count = await loop.run_in_executor(
             None, _get_milvus_chunk_count_sync, str(document_id), company_id
         )
@@ -574,11 +566,9 @@ async def list_document_statuses(
         # Initialize updated values with current DB values
         doc_updated_status_val = doc_db_data['status']; doc_updated_chunk_count = doc_db_data.get('chunk_count'); doc_final_error_msg = doc_db_data.get('error_message')
 
-        # >>>>>>>>>>> CORRECTION APPLIED (Diff 3 - Consistency Check) <<<<<<<<<<<<<<
         # --- USE CORRECT COLUMN NAME: file_path ---
         minio_path_db = doc_db_data.get('file_path') # Ensuring 'file_path' is used
         # ------------------------------------------
-        # >>>>>>>>>>> END CORRECTION (Diff 3 - Consistency Check) <<<<<<<<<<<<<<
         minio_check_error = None # Variable to store MinIO check exception
         if minio_path_db:
             try:
@@ -606,6 +596,7 @@ async def list_document_statuses(
         loop = asyncio.get_running_loop()
         milvus_check_error = None # Variable to store Milvus check exception
         try:
+            # Use the corrected helper function _get_milvus_chunk_count_sync
             milvus_count_live = await loop.run_in_executor( None, _get_milvus_chunk_count_sync, str(doc_db_data['id']), company_id )
             check_log.debug("Milvus count check done", count=milvus_count_live)
             if milvus_count_live == -1: # Indicates an error during the count
@@ -793,7 +784,6 @@ async def retry_ingestion(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error updating status for retry.")
 
     try:
-        # >>>>>>>>>>> CORRECTION APPLIED (Diff 2b) <<<<<<<<<<<<<<
         # --- REMOVED user_id from task payload ---
         task_payload = {
             "document_id": str(document_id),
@@ -802,10 +792,9 @@ async def retry_ingestion(
             "filename": doc_data['file_name'],
             "content_type": doc_data['file_type']
         }
-        # ------------------------------------------
-        # >>>>>>>>>>> END CORRECTION (Diff 2b) <<<<<<<<<<<<<<
+        # Use the imported task instance
         task = process_document_haystack_task.delay(**task_payload)
-        retry_log.info("Document reprocessing task queued successfully", task_id=task.id)
+        retry_log.info("Document reprocessing task queued successfully", task_id=task.id, task_name=process_document_haystack_task.name)
     except Exception as e:
         retry_log.exception("Failed to re-queue Celery task for retry", error=str(e))
         # Attempt to revert status back to ERROR? Or leave as PROCESSING? Leaving as PROCESSING for now.
@@ -884,11 +873,9 @@ async def delete_document_endpoint(
         delete_log.exception("Unexpected error during Milvus delete", error=str(e)); errors.append(f"Milvus error: {e}")
 
     # 2. Delete from MinIO (Object Storage)
-    # >>>>>>>>>>> CORRECTION APPLIED (Diff 3 - Consistency Check) <<<<<<<<<<<<<<
     # --- USE CORRECT COLUMN NAME: file_path ---
     minio_path = doc_data.get('file_path') # Ensuring 'file_path' is used
     # ------------------------------------------
-    # >>>>>>>>>>> END CORRECTION (Diff 3 - Consistency Check) <<<<<<<<<<<<<<
     if minio_path:
         delete_log.info("Attempting to delete file from MinIO...", object_name=minio_path)
         try:
