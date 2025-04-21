@@ -30,7 +30,6 @@ ENV/
 .env.example
 
 # Poetry
-poetry.lock
 
 # Environment variables
 .env

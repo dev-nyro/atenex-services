@@ -22,20 +22,7 @@ RUN curl -sSL https://install.python-poetry.org | python3 -
 WORKDIR /app
 
 # Copy ONLY the pyproject.toml file first
-COPY pyproject.toml ./
-
-# --- CORRECTION: Generate lock file BEFORE installing ---
-# Generate the lock file based *only* on pyproject.toml.
-# If poetry.lock existed in the context, --no-update would prevent changes.
-# Since it likely doesn't exist, this generates a fresh, correct lock file inside the image.
-RUN poetry lock --no-update
-# --- END CORRECTION ---
-
-# Now copy the potentially existing (but likely absent) lock file from context.
-# If the 'poetry lock' command above ran, the lock file now exists in the WORKDIR.
-# This COPY step might be redundant now but is harmless. If poetry.lock *was*
-# committed later, this ensures it's used over the generated one.
-COPY poetry.lock* ./
+COPY pyproject.toml poetry.lock* ./
 
 # Install project dependencies using the generated or copied lock file
 RUN poetry install --no-root --no-dev --no-interaction --no-ansi
