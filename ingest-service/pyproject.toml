@@ -35,7 +35,7 @@ beautifulsoup4 = "^4.12.3"
 
 # >>>>>>>>>>> CORRECTION: Add FastEmbed and ONNX GPU Dependencies <<<<<<<<<<<<<<
 # --- FastEmbed & GPU Dependencies ---
-fastembed-haystack = "^0.1.3"    # Haystack integration for FastEmbed
+fastembed-haystack = "^1.3.0"    # Haystack integration for FastEmbed
 onnxruntime-gpu = "^1.17.0"      # ONNX Runtime with GPU support (ensure version compatibility)
 # >>>>>>>>>>> END CORRECTION <<<<<<<<<<<<<<
 
