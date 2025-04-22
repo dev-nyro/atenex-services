@@ -7,6 +7,9 @@ from typing import Optional, Dict, Any, List, Tuple, Type
 from contextlib import asynccontextmanager
 import structlog
 import logging
+# <<< CORRECTION: Add import for urllib.parse >>>
+import urllib.parse
+# <<< END CORRECTION >>>
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type, before_sleep_log
 from celery import Celery, Task
 from celery.exceptions import Ignore, Reject, MaxRetriesExceededError, Retry # Import Retry
@@ -49,24 +52,50 @@ log = structlog.get_logger(__name__)
 TIMEOUT_SECONDS = 600 # 10 minutes, adjust as needed
 
 # --- Milvus Initialization ---
+# <<< CORRECTION: Updated MilvusDocumentStore initialization >>>
 def _initialize_milvus_store() -> MilvusDocumentStore:
     log.debug("Initializing MilvusDocumentStore...")
     try:
+        # Parse URI to get host and port
+        parsed_uri = urllib.parse.urlparse(settings.MILVUS_URI)
+        host = parsed_uri.hostname
+        port = parsed_uri.port if parsed_uri.port else 19530 # Default Milvus port
+
+        if not host:
+             log.warning("Could not parse hostname from MILVUS_URI, using full URI as host.", milvus_uri=settings.MILVUS_URI)
+             host = settings.MILVUS_URI # Fallback if parsing fails
+
+        log.info("Attempting to connect to Milvus", host=host, port=port, index=settings.MILVUS_COLLECTION_NAME)
+
         store = MilvusDocumentStore(
-            connection_args={"uri": settings.MILVUS_URI},
-            collection_name=settings.MILVUS_COLLECTION_NAME,
-            # embedding_dim=settings.EMBEDDING_DIMENSION, # REMOVED - Not a valid argument in newer versions
-            consistency_level="Strong",
+            host=host,
+            port=port,
+            index=settings.MILVUS_COLLECTION_NAME, # Use 'index' parameter
+            vector_dim=settings.EMBEDDING_DIMENSION, # Use 'vector_dim' parameter
+            similarity="cosine", # Or "dot_product" depending on your embedding model
+            # Define index parameters for efficient search (example: IVF_FLAT)
+            # Adjust nlist based on expected data size (rule of thumb: 4 * sqrt(N), N=num vectors)
+            index_params={
+                 "index_type": "IVF_FLAT",
+                 "metric_type": "COSINE", # Match similarity metric (COSINE for cosine similarity)
+                 "params": {"nlist": 1024} # Adjust as needed
+            },
+            consistency_level="Strong", # Ensures reads reflect recent writes
+            drop_old_index=True,      # Recommended for dev/staging to handle schema changes
+            # shards_num=4            # Optional: Adjust based on Milvus cluster size for scalability
         )
         log.info("MilvusDocumentStore initialized successfully.",
-                 uri=settings.MILVUS_URI, collection=settings.MILVUS_COLLECTION_NAME)
+                 host=host, port=port, index=settings.MILVUS_COLLECTION_NAME,
+                 vector_dim=settings.EMBEDDING_DIMENSION, similarity="cosine")
         return store
     except TypeError as te:
-        log.exception("MilvusDocumentStore init TypeError (check constructor arguments for your version)", error=str(te), exc_info=True)
+        # This might indicate incompatible arguments with the installed library version
+        log.exception("MilvusDocumentStore init TypeError (check constructor arguments)", error=str(te), exc_info=True)
         raise RuntimeError(f"Milvus Constructor TypeError: {te}") from te
     except Exception as e:
         log.exception("Failed to initialize MilvusDocumentStore", error=str(e), exc_info=True)
         raise RuntimeError(f"Milvus Store Initialization Error: {e}") from e
+# <<< END CORRECTION >>>
 
 # --- Haystack Component Initialization ---
 def _initialize_haystack_components(
@@ -74,6 +103,7 @@ def _initialize_haystack_components(
 ) -> Tuple[DocumentSplitter, FastembedDocumentEmbedder, DocumentWriter]:
     log.debug("Initializing Haystack components (Splitter, Embedder, Writer)...")
     try:
+        # Using chunk size/overlap from settings (adjust in config if needed)
         splitter = DocumentSplitter(
             split_by=settings.SPLITTER_SPLIT_BY,
             split_length=settings.SPLITTER_CHUNK_SIZE,
@@ -186,7 +216,6 @@ async def db_session_manager():
                 await pool.release(conn)
                 log.debug("DB connection released back to pool.")
             except Exception as release_err:
-                # Log error during release but don't prevent context exit
                 log.error("Error releasing DB connection back to pool", error=str(release_err))
         log.debug("DB session context exited.")
 
@@ -221,7 +250,8 @@ async def async_process_flow(
             await minio_client.download_file(object_name, temp_file_path)
             flow_log.info("File downloaded successfully", temp_path=temp_file_path)
 
-            loop = asyncio.get_running_loop() # Get loop within async context
+            loop = asyncio.get_running_loop()
+            # Initialize components using corrected Milvus init
             store = await loop.run_in_executor(None, _initialize_milvus_store)
             splitter, embedder, writer = await loop.run_in_executor(None, _initialize_haystack_components, store)
 
@@ -273,10 +303,10 @@ async def async_process_flow(
         raise RuntimeError(f"MinIO download failed for {object_name}: {me}") from me
     except ValueError as ve:
          flow_log.error("Value Error (likely unsupported type)", error=str(ve))
-         raise ve # Propagate as non-retryable
+         raise ve
     except RuntimeError as rt_err:
          flow_log.error("Runtime Error during processing", error=str(rt_err))
-         raise rt_err # Propagate for potential retry
+         raise rt_err
     except Exception as e:
         flow_log.exception("Unexpected error during processing flow", error=str(e))
         raise RuntimeError(f"Unexpected flow error: {e}") from e
@@ -341,7 +371,6 @@ class ProcessDocumentTask(Task):
                     )
 
                     wrapper_log.info("Executing main async_process_flow...")
-                    # Removed timeout here, let Celery handle task timeout if needed
                     final_chunk_count = await async_process_flow(
                             document_id=document_id, company_id=company_id, filename=filename,
                             content_type=content_type, task_id=task_id, attempt=attempt
@@ -362,7 +391,7 @@ class ProcessDocumentTask(Task):
                       processing_exception = e
                 except ConnectionError as e: # Critical DB error during update
                       wrapper_log.critical("Persistent DB connection error during status update", error=str(e))
-                      raise e # Re-raise to be caught by outer try
+                      raise e
                 except Exception as e: # Unexpected processing errors
                      wrapper_log.exception("Unexpected exception during processing flow.", error=str(e))
                      error_to_report = f"Unexpected error: {type(e).__name__}"
@@ -377,20 +406,20 @@ class ProcessDocumentTask(Task):
                 )
 
                 if processing_exception:
-                    raise processing_exception # Re-raise after final DB update
+                    raise processing_exception
 
         except (ConnectionError, asyncpg.exceptions.PostgresConnectionError) as db_conn_exc:
              wrapper_log.critical("Failed to execute task due to DB connection error", error=str(db_conn_exc))
-             raise db_conn_exc # Propagate DB connection error
+             raise db_conn_exc
         except Exception as e:
              wrapper_log.exception("Exception caught in async wrapper", error=str(e))
-             raise e # Propagate other errors
+             raise e
 
         # Return result dict only on success
         return {"status": "processed", "document_id": document_id, "chunks_processed": final_chunk_count}
 
 
-    # <<< CORRECTION: run is now synchronous, using loop.run_until_complete >>>
+    # <<< Using synchronous run method again to address potential Celery/Gevent EncodeError >>>
     # LLM_FLAG: CELERY_TASK_RUNNER - Main synchronous task entry point
     def run(self, *args, **kwargs):
         """
@@ -412,19 +441,22 @@ class ProcessDocumentTask(Task):
         loop = None
 
         try:
-            # Get or create an event loop
+            # Get or create an event loop - crucial for sync task calling async code
             try:
-                loop = asyncio.get_running_loop()
-                task_log.debug("Reusing existing event loop.")
-            except RuntimeError:
-                task_log.debug("No running event loop, creating a new one.")
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    task_log.warning("Event loop was already running. This might indicate issues with gevent/asyncio integration.")
+                    # Avoid running if loop is already busy from another context (less likely with run_until_complete)
+                    # Fallback or raise specific error might be needed depending on observed behavior
+            except RuntimeError: # No loop in current thread
+                task_log.debug("No running event loop, creating a new one for this task run.")
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
 
             # Prepare arguments for the async wrapper
             wrapper_kwargs = {**kwargs, "task_id": task_id, "attempt": attempt}
 
-            # Run the async wrapper until it completes
+            # Run the async wrapper until it completes using the obtained loop
             result = loop.run_until_complete(self._async_run_wrapper(*args, **wrapper_kwargs))
             task_log.info("Async wrapper executed successfully via run_until_complete.")
 
@@ -435,8 +467,9 @@ class ProcessDocumentTask(Task):
             task_log.exception("Exception caught from run_until_complete(_async_run_wrapper)", error=str(e))
             run_exception = e # Store exception for retry logic
         # finally:
-            # Avoid closing the loop if we didn't create it or if gevent manages it
-            # if loop and not loop.is_running() and hasattr(loop, 'close'):
+            # Avoid closing the loop, especially if obtained via get_event_loop()
+            # Let Celery/Gevent manage loop lifecycle
+            # if loop and not loop.is_running() and created_loop: # Only close if we explicitly created it AND it's not running
             #     task_log.debug("Closing event loop created by task.")
             #     loop.close()
 
@@ -453,25 +486,25 @@ class ProcessDocumentTask(Task):
                      raise self.retry(exc=run_exception, countdown=int(self.default_retry_delay * (attempt**1.5)))
                  except MaxRetriesExceededError:
                      task_log.error("Max retries exceeded after failure.", error=str(run_exception))
-                     raise run_exception from None # Reraise original exception
+                     raise run_exception from None
                  except Retry:
-                     raise # Re-raise Retry for Celery
+                     raise
                  except Exception as retry_exc:
                      task_log.exception("Exception during Celery retry mechanism", error=str(retry_exc))
                      raise Reject(f"Retry mechanism failed for {document_id}", requeue=False) from retry_exc
              else:
                  error_reason = "Non-retryable error" if not is_retryable else "Max retries exceeded"
                  task_log.error(f"Processing failed permanently ({error_reason}).", error=str(run_exception), type=type(run_exception).__name__)
-                 raise run_exception from None # Reraise original exception
+                 raise run_exception from None
 
         elif result:
               task_log.info("Processing completed successfully (sync run).")
-              return result # Return the serializable dict
+              return result
         else:
              task_log.error("Sync run finished without result or exception.")
              raise Reject(f"Unexpected end state for {document_id}", requeue=False)
 
-    # LLM_FLAG: STANDARD_CELERY_CALLBACK - Keep standard failure handler
+    # Standard Celery callbacks
     def on_failure(self, exc, task_id, args, kwargs, einfo):
         failure_log = log.bind(task_id=task_id, task_name=self.name, status="FAILED")
         reason = getattr(exc, 'reason', str(exc))
@@ -482,7 +515,6 @@ class ProcessDocumentTask(Task):
             traceback=str(einfo.traceback) if einfo else "No traceback available"
         )
 
-    # LLM_FLAG: STANDARD_CELERY_CALLBACK - Keep standard success handler
     def on_success(self, retval, task_id, args, kwargs):
         success_log = log.bind(task_id=task_id, task_name=self.name, status="SUCCESS")
         success_log.info(
@@ -490,7 +522,6 @@ class ProcessDocumentTask(Task):
             args_repr=repr(args), kwargs_keys=list(kwargs.keys()),
             retval=retval
         )
-# <<< END CORRECTION >>>
 
 # Register the custom task class with Celery
 process_document_haystack_task = celery_app.register_task(ProcessDocumentTask())
