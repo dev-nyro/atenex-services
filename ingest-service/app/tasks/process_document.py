@@ -7,8 +7,8 @@ from typing import Optional, Dict, Any, List, Tuple, Type
 from contextlib import asynccontextmanager
 import structlog
 import logging
-# <<< CORRECTION: Re-added import for urllib.parse >>>
-import urllib.parse
+# <<< CORRECTION: Removed urllib.parse import, no longer needed >>>
+# import urllib.parse
 # <<< END CORRECTION >>>
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type, before_sleep_log
 from celery import Celery, Task
@@ -52,49 +52,31 @@ log = structlog.get_logger(__name__)
 TIMEOUT_SECONDS = 600 # 10 minutes, adjust as needed
 
 # --- Milvus Initialization ---
-# <<< CORRECTION: Apply signature from latest explanation (host/port in conn_args, index param) >>>
+# <<< CORRECTION: Final attempt using only connection_args with URI and flags >>>
 def _initialize_milvus_store() -> MilvusDocumentStore:
-    log.debug("Initializing MilvusDocumentStore (attempting signature from latest explanation)...")
-    store = None # Initialize store to None
+    log.debug("Initializing MilvusDocumentStore (milvus-haystack >= 0.0.16 - URI based)...")
+    store = None
     try:
-        # Parse URI to get components
-        parsed = urllib.parse.urlparse(settings.MILVUS_URI)
-        host = parsed.hostname
-        port = parsed.port or 19530 # Default Milvus port
-        secure = (parsed.scheme == "https")
+        # Only connection_args (with URI) and optional flags are expected
+        conn_args = {"uri": settings.MILVUS_URI}
+        # Optionally add 'secure': True if URI scheme is https
+        # This might need to be parsed if not handled by the underlying pymilvus connection string
+        if settings.MILVUS_URI.lower().startswith("https"):
+             conn_args["secure"] = True # Check if pymilvus URI handles this or if secure key is needed
+             log.info("Milvus connection_args potentially includes secure=True")
 
-        if not host:
-            log.error("Could not parse hostname from MILVUS_URI.", milvus_uri=settings.MILVUS_URI)
-            raise ValueError(f"Invalid MILVUS_URI format: {settings.MILVUS_URI}")
-
-        # Build connection_args dictionary with host/port etc.
-        # Ensure correct types if needed (e.g., port as string)
-        conn_args = {
-            "host": host,
-            "port": str(port),
-            "user": "",       # Add credentials if Milvus requires them
-            "password": "",
-            "secure": secure
-        }
-        log.info("Milvus connection_args prepared", **conn_args)
-
-        # Initialize with connection_args and index parameter as per latest explanation
-        # NOTE: This contradicts previous errors (unexpected keyword 'index').
-        # Keeping consistency_level and drop_old as they are common flags.
         store = MilvusDocumentStore(
             connection_args=conn_args,
-            index=settings.MILVUS_COLLECTION_NAME,  # Use 'index' for collection name
-            drop_old=False,                         # Keep index across restarts
-            consistency_level="Strong"              # Use strong consistency
-            # Removed vector_dim, similarity, index_params from constructor
+            # Removed index, host, port, vector_dim etc. from constructor
+            drop_old=False, # Avoid deleting index on restarts
+            consistency_level="Strong" # Use strong consistency
         )
-        log.info("MilvusDocumentStore initialized successfully.",
-                 host=host, port=port, index=settings.MILVUS_COLLECTION_NAME)
+        log.info("MilvusDocumentStore initialized successfully using connection_args.", connection_args=conn_args)
         return store
     except TypeError as te:
-        # Log the specific error if the constructor fails again
-        log.exception("MilvusDocumentStore init TypeError (Verify constructor arguments for installed version)",
-                      error=str(te), used_args={'connection_args': conn_args, 'index': settings.MILVUS_COLLECTION_NAME, 'drop_old': False, 'consistency_level': 'Strong'},
+        # If this fails, the installed milvus-haystack is likely older or has a different signature
+        log.exception("MilvusDocumentStore init TypeError (Verify installed milvus-haystack version and constructor args)",
+                      error=str(te), used_args={'connection_args': conn_args, 'drop_old': False, 'consistency_level': 'Strong'},
                       exc_info=True)
         raise RuntimeError(f"Milvus Constructor TypeError: {te}") from te
     except Exception as e:
@@ -103,7 +85,7 @@ def _initialize_milvus_store() -> MilvusDocumentStore:
 # <<< END CORRECTION >>>
 
 # --- Haystack Component Initialization ---
-# <<< CORRECTION: Removed 'index' parameter from DocumentWriter >>>
+# <<< CORRECTION: Ensure DocumentWriter receives the index name >>>
 def _initialize_haystack_components(
     document_store: MilvusDocumentStore
 ) -> Tuple[DocumentSplitter, FastembedDocumentEmbedder, DocumentWriter]:
@@ -142,18 +124,18 @@ def _initialize_haystack_components(
         log.info("FastembedDocumentEmbedder initialized.")
 
         log.info("Warming up FastEmbed model...")
-        embedder.warm_up() # This might take time or hang
+        embedder.warm_up()
         log.info("FastEmbed model warmed up successfully.")
 
         log.debug("Initializing DocumentWriter...")
-        # Removed index parameter as per latest explanation (store constructor handles it)
+        # Specify the target index (collection name) for the writer
         writer = DocumentWriter(
             document_store=document_store,
-            # index=settings.MILVUS_COLLECTION_NAME, # REMOVED
+            index=settings.MILVUS_COLLECTION_NAME, # Pass collection name here
             policy=DuplicatePolicy.OVERWRITE,
             batch_size=512
         )
-        log.info("DocumentWriter initialized", policy="OVERWRITE", batch_size=512)
+        log.info("DocumentWriter initialized", policy="OVERWRITE", batch_size=512, target_index=settings.MILVUS_COLLECTION_NAME)
 
         log.info("Haystack components initialized successfully.")
         return splitter, embedder, writer
@@ -311,14 +293,14 @@ async def async_process_flow(
                     if not embedded_docs: return 0
 
                     pipeline_log.info("Step 5: Executing writing to Milvus...")
+                    # The writer now knows the target index/collection from initialization
                     write_result = writer.run(documents=embedded_docs)
                     written_count = write_result["documents_written"]
                     pipeline_log.info("Step 5: Writing complete.", documents_written=written_count)
                     return written_count
                 except Exception as pipe_exc:
-                     # Log error within the sync function before raising
                      pipeline_log.exception("Error occurred inside run_haystack_pipeline_sync", error=str(pipe_exc))
-                     raise pipe_exc # Re-raise to be caught by the main try-except
+                     raise pipe_exc
 
             chunks_written = await loop.run_in_executor(None, run_haystack_pipeline_sync, temp_file_path)
             flow_log.info("Haystack pipeline execution finished.", chunks_written=chunks_written)
@@ -334,7 +316,6 @@ async def async_process_flow(
          flow_log.error("Runtime Error during processing", error=str(rt_err))
          raise rt_err
     except Exception as e:
-        # Catch errors from run_haystack_pipeline_sync if they weren't caught inside
         flow_log.exception("Unexpected error during processing flow or pipeline execution", error=str(e))
         raise RuntimeError(f"Unexpected flow error: {e}") from e
 
