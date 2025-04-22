@@ -7,7 +7,7 @@ from typing import Optional, Dict, Any, List, Tuple, Type
 from contextlib import asynccontextmanager
 import structlog
 import logging
-# <<< CORRECTION: Add import for urllib.parse >>>
+# <<< CORRECTION: Add import for urllib.parse (needed again for secure check) >>>
 import urllib.parse
 # <<< END CORRECTION >>>
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type, before_sleep_log
@@ -52,45 +52,33 @@ log = structlog.get_logger(__name__)
 TIMEOUT_SECONDS = 600 # 10 minutes, adjust as needed
 
 # --- Milvus Initialization ---
-# <<< CORRECTION: Updated MilvusDocumentStore initialization >>>
+# <<< CORRECTION: Updated MilvusDocumentStore initialization for >= 0.0.16 >>>
 def _initialize_milvus_store() -> MilvusDocumentStore:
-    log.debug("Initializing MilvusDocumentStore...")
+    log.debug("Initializing MilvusDocumentStore for milvus-haystack >= 0.0.16...")
     try:
-        # Parse URI to get host and port
-        parsed_uri = urllib.parse.urlparse(settings.MILVUS_URI)
-        host = parsed_uri.hostname
-        port = parsed_uri.port if parsed_uri.port else 19530 # Default Milvus port
+        # Prepare connection arguments based on URI
+        conn_args = {"uri": settings.MILVUS_URI}
+        if settings.MILVUS_URI.lower().startswith("https"):
+            conn_args["secure"] = True
+            log.info("Milvus connection configured with secure=True")
 
-        if not host:
-             log.warning("Could not parse hostname from MILVUS_URI, using full URI as host.", milvus_uri=settings.MILVUS_URI)
-             host = settings.MILVUS_URI # Fallback if parsing fails
-
-        log.info("Attempting to connect to Milvus", host=host, port=port, index=settings.MILVUS_COLLECTION_NAME)
-
+        # Initialize using the correct signature
         store = MilvusDocumentStore(
-            host=host,
-            port=port,
-            index=settings.MILVUS_COLLECTION_NAME, # Use 'index' parameter
-            vector_dim=settings.EMBEDDING_DIMENSION, # Use 'vector_dim' parameter
-            similarity="cosine", # Or "dot_product" depending on your embedding model
-            # Define index parameters for efficient search (example: IVF_FLAT)
-            # Adjust nlist based on expected data size (rule of thumb: 4 * sqrt(N), N=num vectors)
-            index_params={
-                 "index_type": "IVF_FLAT",
-                 "metric_type": "COSINE", # Match similarity metric (COSINE for cosine similarity)
-                 "params": {"nlist": 1024} # Adjust as needed
-            },
-            consistency_level="Strong", # Ensures reads reflect recent writes
-            drop_old_index=True,      # Recommended for dev/staging to handle schema changes
-            # shards_num=4            # Optional: Adjust based on Milvus cluster size for scalability
+            connection_args=conn_args,
+            # Note: collection_name is often managed implicitly or via specific methods
+            # in newer versions, but let's assume it's needed if errors persist.
+            # collection_name=settings.MILVUS_COLLECTION_NAME, # Keep commented unless needed
+            drop_old=False,  # Avoid deleting index on restarts in prod/staging
+            consistency_level="Strong", # Keep if supported and needed
+            # Removed: host, port, index, vector_dim, similarity, index_params
+            # These are either inferred or not part of the constructor anymore.
         )
-        log.info("MilvusDocumentStore initialized successfully.",
-                 host=host, port=port, index=settings.MILVUS_COLLECTION_NAME,
-                 vector_dim=settings.EMBEDDING_DIMENSION, similarity="cosine")
+        log.info("MilvusDocumentStore initialized successfully.", connection_args=conn_args)
         return store
     except TypeError as te:
-        # This might indicate incompatible arguments with the installed library version
-        log.exception("MilvusDocumentStore init TypeError (check constructor arguments)", error=str(te), exc_info=True)
+        # This error could mean the installed version is *older* than 0.0.16
+        # or requires different args (like embedding_dim if older).
+        log.exception("MilvusDocumentStore init TypeError (Check constructor arguments for installed milvus-haystack version)", error=str(te), exc_info=True)
         raise RuntimeError(f"Milvus Constructor TypeError: {te}") from te
     except Exception as e:
         log.exception("Failed to initialize MilvusDocumentStore", error=str(e), exc_info=True)
@@ -103,7 +91,7 @@ def _initialize_haystack_components(
 ) -> Tuple[DocumentSplitter, FastembedDocumentEmbedder, DocumentWriter]:
     log.debug("Initializing Haystack components (Splitter, Embedder, Writer)...")
     try:
-        # Using chunk size/overlap from settings (adjust in config if needed)
+        # Using chunk size/overlap from settings (adjust in config/ConfigMap if needed)
         splitter = DocumentSplitter(
             split_by=settings.SPLITTER_SPLIT_BY,
             split_length=settings.SPLITTER_CHUNK_SIZE,
@@ -111,7 +99,6 @@ def _initialize_haystack_components(
         )
         log.info("DocumentSplitter initialized", split_by=settings.SPLITTER_SPLIT_BY, length=settings.SPLITTER_CHUNK_SIZE, overlap=settings.SPLITTER_CHUNK_OVERLAP)
 
-        # Determine device for FastEmbed
         if settings.USE_GPU:
             try:
                 device = ComponentDevice.from_str("cuda:0")
@@ -199,7 +186,6 @@ db_retry_strategy = retry(
 # --- Database Session Manager ---
 @asynccontextmanager
 async def db_session_manager():
-    """Provides a pooled connection for the duration of the 'with' block."""
     pool = None
     conn = None
     try:
@@ -232,7 +218,6 @@ async def async_process_flow(
 ) -> int:
     """
     Downloads file, runs Haystack pipeline, returns chunk count.
-    (DB updates moved to the wrapper)
     """
     flow_log = log.bind(
         document_id=document_id, company_id=company_id, task_id=task_id, attempt=attempt,
@@ -251,7 +236,6 @@ async def async_process_flow(
             flow_log.info("File downloaded successfully", temp_path=temp_file_path)
 
             loop = asyncio.get_running_loop()
-            # Initialize components using corrected Milvus init
             store = await loop.run_in_executor(None, _initialize_milvus_store)
             splitter, embedder, writer = await loop.run_in_executor(None, _initialize_haystack_components, store)
 
@@ -379,20 +363,20 @@ class ProcessDocumentTask(Task):
                     error_to_report = None
                     wrapper_log.info("Async process flow completed successfully.", chunks_processed=final_chunk_count)
 
-                except ValueError as e: # Non-retryable
+                except ValueError as e:
                       wrapper_log.error("Processing failed: Value error", error=str(e))
                       error_to_report = f"Input/Config Error: {e}"
                       final_status = DocumentStatus.ERROR
                       processing_exception = e
-                except RuntimeError as e: # Potentially retryable
+                except RuntimeError as e:
                       wrapper_log.error("Processing failed: Runtime error", error=str(e), exc_info=False)
                       error_to_report = f"Runtime Error: {e}"
                       final_status = DocumentStatus.ERROR
                       processing_exception = e
-                except ConnectionError as e: # Critical DB error during update
+                except ConnectionError as e:
                       wrapper_log.critical("Persistent DB connection error during status update", error=str(e))
                       raise e
-                except Exception as e: # Unexpected processing errors
+                except Exception as e:
                      wrapper_log.exception("Unexpected exception during processing flow.", error=str(e))
                      error_to_report = f"Unexpected error: {type(e).__name__}"
                      final_status = DocumentStatus.ERROR
@@ -415,11 +399,10 @@ class ProcessDocumentTask(Task):
              wrapper_log.exception("Exception caught in async wrapper", error=str(e))
              raise e
 
-        # Return result dict only on success
         return {"status": "processed", "document_id": document_id, "chunks_processed": final_chunk_count}
 
 
-    # <<< Using synchronous run method again to address potential Celery/Gevent EncodeError >>>
+    # <<< Keeping synchronous run method based on previous findings with gevent/EncodeError >>>
     # LLM_FLAG: CELERY_TASK_RUNNER - Main synchronous task entry point
     def run(self, *args, **kwargs):
         """
@@ -439,39 +422,38 @@ class ProcessDocumentTask(Task):
         result = None
         run_exception = None
         loop = None
+        created_loop = False # Flag to track if we created the loop
 
         try:
-            # Get or create an event loop - crucial for sync task calling async code
             try:
                 loop = asyncio.get_event_loop()
                 if loop.is_running():
-                    task_log.warning("Event loop was already running. This might indicate issues with gevent/asyncio integration.")
-                    # Avoid running if loop is already busy from another context (less likely with run_until_complete)
-                    # Fallback or raise specific error might be needed depending on observed behavior
-            except RuntimeError: # No loop in current thread
+                     task_log.warning("Event loop was already running. Attempting to use it.")
+                     # If gevent provides a running loop, use it cautiously.
+            except RuntimeError:
                 task_log.debug("No running event loop, creating a new one for this task run.")
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
+                created_loop = True # Mark that we created this loop
 
-            # Prepare arguments for the async wrapper
             wrapper_kwargs = {**kwargs, "task_id": task_id, "attempt": attempt}
-
-            # Run the async wrapper until it completes using the obtained loop
             result = loop.run_until_complete(self._async_run_wrapper(*args, **wrapper_kwargs))
             task_log.info("Async wrapper executed successfully via run_until_complete.")
 
         except (Retry, Reject) as celery_exc:
              task_log.warning(f"Celery control flow exception caught: {type(celery_exc).__name__}")
-             raise celery_exc # Let Celery handle these
+             raise celery_exc
         except Exception as e:
             task_log.exception("Exception caught from run_until_complete(_async_run_wrapper)", error=str(e))
-            run_exception = e # Store exception for retry logic
-        # finally:
-            # Avoid closing the loop, especially if obtained via get_event_loop()
-            # Let Celery/Gevent manage loop lifecycle
-            # if loop and not loop.is_running() and created_loop: # Only close if we explicitly created it AND it's not running
-            #     task_log.debug("Closing event loop created by task.")
-            #     loop.close()
+            run_exception = e
+        finally:
+            # Only close the loop if we created it and it's not running
+            if loop and created_loop and not loop.is_running():
+                task_log.debug("Closing event loop created by task.")
+                loop.close()
+            elif created_loop: # If we created it but it's somehow still running (unlikely)
+                task_log.warning("Loop created by task is still running after run_until_complete. Not closing.")
+
 
         # --- Retry / Final Outcome Logic (sync context) ---
         if run_exception:
@@ -487,8 +469,7 @@ class ProcessDocumentTask(Task):
                  except MaxRetriesExceededError:
                      task_log.error("Max retries exceeded after failure.", error=str(run_exception))
                      raise run_exception from None
-                 except Retry:
-                     raise
+                 except Retry: raise
                  except Exception as retry_exc:
                      task_log.exception("Exception during Celery retry mechanism", error=str(retry_exc))
                      raise Reject(f"Retry mechanism failed for {document_id}", requeue=False) from retry_exc
