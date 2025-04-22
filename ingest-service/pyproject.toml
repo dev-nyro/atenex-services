@@ -1,8 +1,8 @@
 # ingest-service/pyproject.toml
 [tool.poetry]
 name = "ingest-service"
-version = "0.1.3" # Increment version for GPU changes
-description = "Ingest service for Atenex B2B SaaS (Haystack/Postgres/Minio/Milvus/FastEmbed)" # Update description
+version = "0.1.4" # Increment version for CPU-only changes
+description = "Ingest service for Atenex B2B SaaS (Haystack/Postgres/Minio/Milvus/FastEmbed - CPU)" # Update description
 authors = ["Atenex Team <dev@atenex.com>"]
 readme = "README.md"
 
@@ -33,12 +33,10 @@ python-docx = "^1.1.0"
 markdown = "^3.5.1"
 beautifulsoup4 = "^4.12.3"
 
-# >>>>>>>>>>> CORRECTION: Add FastEmbed and ONNX GPU Dependencies <<<<<<<<<<<<<<
-# --- FastEmbed & GPU Dependencies ---
+# --- FastEmbed & ONNX CPU Dependencies ---
 fastembed-haystack = "^1.3.0"    # Haystack integration for FastEmbed
-onnxruntime = "^1.21.1" # <-- LÍNEA ELIMINADA/COMENTADA
-onnxruntime-gpu = "^1.17.0"      # ONNX Runtime with GPU support (ensure version compatibility)
-# >>>>>>>>>>> END CORRECTION <<<<<<<<<<<<<<
+# onnxruntime-gpu = "^1.17.0"      # REMOVED GPU version
+onnxruntime = "^1.17.0"          # USE standard CPU version of ONNX Runtime
 
 # --- HTTP Client ---
 httpx = {extras = ["http2"], version = "^0.27.0"}

@@ -10,13 +10,13 @@ from pydantic import (
 import sys
 import json
 
-# --- Service Names en K8s ---
-POSTGRES_K8S_SVC = "postgresql-service.nyro-develop.svc.cluster.local" # Corregido nombre servicio
+# --- Service Names en K8s (sin cambios) ---
+POSTGRES_K8S_SVC = "postgresql-service.nyro-develop.svc.cluster.local"
 MINIO_K8S_SVC = "minio-service.nyro-develop.svc.cluster.local"
-MILVUS_K8S_SVC = "milvus-milvus.default.svc.cluster.local" # Servicio en namespace 'default'
+MILVUS_K8S_SVC = "milvus-milvus.default.svc.cluster.local"
 REDIS_K8S_SVC = "redis-service-master.nyro-develop.svc.cluster.local"
 
-# --- Defaults ---
+# --- Defaults (sin cambios) ---
 POSTGRES_K8S_PORT_DEFAULT = 5432
 POSTGRES_K8S_DB_DEFAULT = "atenex"
 POSTGRES_K8S_USER_DEFAULT = "postgres"
@@ -26,8 +26,9 @@ MILVUS_K8S_PORT_DEFAULT = 19530
 MILVUS_DEFAULT_COLLECTION = "document_chunks_haystack"
 MILVUS_DEFAULT_INDEX_PARAMS = '{"metric_type": "COSINE", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}}'
 MILVUS_DEFAULT_SEARCH_PARAMS = '{"metric_type": "COSINE", "params": {"ef": 128}}'
-OPENAI_DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
-DEFAULT_EMBEDDING_DIM = 1536 # Dimension for text-embedding-3-small & ada-002
+# OPENAI_DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small" # No relevante para ingesta ahora
+DEFAULT_FASTEMBED_MODEL = "BAAI/bge-base-en-v1.5" # Un default por si no se especifica
+DEFAULT_FASTEMBED_DIM = 768 # Dimensión para bge-base
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -35,24 +36,24 @@ class Settings(BaseSettings):
         case_sensitive=False, extra='ignore'
     )
 
-    # --- General ---
+    # --- General (sin cambios) ---
     PROJECT_NAME: str = "Atenex Ingest Service"
     API_V1_STR: str = "/api/v1/ingest"
     LOG_LEVEL: str = "INFO"
 
-    # --- Celery ---
+    # --- Celery (sin cambios) ---
     CELERY_BROKER_URL: RedisDsn = Field(default_factory=lambda: RedisDsn(f"redis://{REDIS_K8S_SVC}:{REDIS_K8S_PORT_DEFAULT}/0"))
     CELERY_RESULT_BACKEND: RedisDsn = Field(default_factory=lambda: RedisDsn(f"redis://{REDIS_K8S_SVC}:{REDIS_K8S_PORT_DEFAULT}/1"))
 
 
-    # --- Database ---
+    # --- Database (sin cambios) ---
     POSTGRES_USER: str = POSTGRES_K8S_USER_DEFAULT
     POSTGRES_PASSWORD: SecretStr
     POSTGRES_SERVER: str = POSTGRES_K8S_SVC
     POSTGRES_PORT: int = POSTGRES_K8S_PORT_DEFAULT
     POSTGRES_DB: str = POSTGRES_K8S_DB_DEFAULT
 
-    # --- Milvus ---
+    # --- Milvus (sin cambios) ---
     MILVUS_URI: str = Field(default=f"http://{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}")
     MILVUS_COLLECTION_NAME: str = MILVUS_DEFAULT_COLLECTION
     MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name", "file_type"])
@@ -61,24 +62,25 @@ class Settings(BaseSettings):
     MILVUS_INDEX_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_INDEX_PARAMS))
     MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_SEARCH_PARAMS))
 
-    # --- MinIO ---
+    # --- MinIO (sin cambios) ---
     MINIO_ENDPOINT: str = Field(default=f"{MINIO_K8S_SVC}:{MINIO_K8S_PORT_DEFAULT}")
     MINIO_ACCESS_KEY: SecretStr
     MINIO_SECRET_KEY: SecretStr
     MINIO_BUCKET_NAME: str = MINIO_BUCKET_DEFAULT
     MINIO_USE_SECURE: bool = False
 
-    # --- Embeddings (OpenAI for Ingestion) ---
-    OPENAI_API_KEY: SecretStr
-    OPENAI_EMBEDDING_MODEL: str = OPENAI_DEFAULT_EMBEDDING_MODEL
-    EMBEDDING_DIMENSION: int = DEFAULT_EMBEDDING_DIM
+    # --- Embeddings (Configuración para FastEmbed) ---
+    FASTEMBED_MODEL: str = DEFAULT_FASTEMBED_MODEL # Modelo FastEmbed a usar
+    USE_GPU: bool = False # Usar GPU (ahora es un booleano)
+    EMBEDDING_DIMENSION: int = DEFAULT_FASTEMBED_DIM # Dimensión del modelo (tomado de ConfigMap)
+    OPENAI_API_KEY: Optional[SecretStr] = None # Mantener opcional si se usa en otro lado
 
-    # --- Clients ---
+    # --- Clients (sin cambios) ---
     HTTP_CLIENT_TIMEOUT: int = 60
     HTTP_CLIENT_MAX_RETRIES: int = 2
     HTTP_CLIENT_BACKOFF_FACTOR: float = 1.0
 
-    # --- Processing ---
+    # --- Processing (sin cambios) ---
     SUPPORTED_CONTENT_TYPES: List[str] = Field(default=[
         "application/pdf",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document", # DOCX
@@ -95,34 +97,31 @@ class Settings(BaseSettings):
     @field_validator("LOG_LEVEL")
     @classmethod
     def check_log_level(cls, v: str) -> str:
+        # (sin cambios)
         valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
         normalized_v = v.upper()
         if normalized_v not in valid_levels: raise ValueError(f"Invalid LOG_LEVEL '{v}'. Must be one of {valid_levels}")
         return normalized_v
 
-    @field_validator('EMBEDDING_DIMENSION', mode='before', check_fields=False)
+    # <<< REMOVED/SIMPLIFIED EMBEDDING VALIDATOR >>>
+    # Ya no validamos la dimensión contra OpenAI, asumimos que el valor
+    # de INGEST_EMBEDDING_DIMENSION en el ConfigMap es correcto para el
+    # INGEST_FASTEMBED_MODEL seleccionado.
+    @field_validator('EMBEDDING_DIMENSION')
     @classmethod
-    def set_embedding_dimension(cls, v: Optional[int], info: ValidationInfo) -> int:
-        config_values = info.data
-        model = config_values.get('OPENAI_EMBEDDING_MODEL', OPENAI_DEFAULT_EMBEDDING_MODEL)
-        calculated_dim = DEFAULT_EMBEDDING_DIM
-        if model == "text-embedding-3-large": calculated_dim = 3072
-        elif model in ["text-embedding-3-small", "text-embedding-ada-002"]: calculated_dim = 1536
+    def check_embedding_dimension(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("EMBEDDING_DIMENSION must be a positive integer.")
+        # Podríamos añadir una validación más específica si conocemos las dimensiones de los modelos FastEmbed soportados
+        # Ejemplo: if settings.FASTEMBED_MODEL == "BAAI/bge-large-en-v1.5" and v != 1024: log warning...
+        logging.debug(f"Using EMBEDDING_DIMENSION: {v}")
+        return v
 
-        if v is not None and v != calculated_dim:
-             logging.warning(f"Provided INGEST_EMBEDDING_DIMENSION {v} conflicts with INGEST_OPENAI_EMBEDDING_MODEL {model} ({calculated_dim} expected). Using calculated value: {calculated_dim}")
-             return calculated_dim
-        elif v is None:
-             logging.debug(f"EMBEDDING_DIMENSION not set, defaulting to {calculated_dim} based on model {model}")
-             return calculated_dim
-        else:
-             if v == calculated_dim:
-                 logging.debug(f"Provided EMBEDDING_DIMENSION {v} matches model {model}")
-             return v
-
-    @field_validator('POSTGRES_PASSWORD', 'MINIO_ACCESS_KEY', 'MINIO_SECRET_KEY', 'OPENAI_API_KEY', mode='before')
+    # Validador de secretos (modificado para hacer opcional OPENAI_API_KEY)
+    @field_validator('POSTGRES_PASSWORD', 'MINIO_ACCESS_KEY', 'MINIO_SECRET_KEY', mode='before')
     @classmethod
-    def check_secret_value_present(cls, v: Any, info: ValidationInfo) -> Any:
+    def check_required_secret_value_present(cls, v: Any, info: ValidationInfo) -> Any:
+        # (sin cambios, aplica a los secretos requeridos)
         if v is None or v == "":
              field_name = info.field_name if info.field_name else "Unknown Secret Field"
              raise ValueError(f"Required secret field '{field_name}' cannot be empty.")
@@ -131,6 +130,7 @@ class Settings(BaseSettings):
     @field_validator('MILVUS_URI', mode='before')
     @classmethod
     def validate_milvus_uri(cls, v: str) -> str:
+        # (sin cambios)
         if not v.startswith("http://") and not v.startswith("https://"):
              raise ValueError(f"Invalid MILVUS_URI format: '{v}'. Must start with 'http://' or 'https://'")
         return v
@@ -156,15 +156,16 @@ try:
     temp_log.info(f"  POSTGRES_SERVER:          {settings.POSTGRES_SERVER}:{settings.POSTGRES_PORT}")
     temp_log.info(f"  POSTGRES_DB:              {settings.POSTGRES_DB}")
     temp_log.info(f"  POSTGRES_USER:            {settings.POSTGRES_USER}")
-    temp_log.info(f"  POSTGRES_PASSWORD:        *** SET ***")
+    temp_log.info(f"  POSTGRES_PASSWORD:        {'*** SET ***' if settings.POSTGRES_PASSWORD else '!!! NOT SET !!!'}")
     temp_log.info(f"  MILVUS_URI:               {settings.MILVUS_URI}")
     temp_log.info(f"  MILVUS_COLLECTION_NAME:   {settings.MILVUS_COLLECTION_NAME}")
     temp_log.info(f"  MINIO_ENDPOINT:           {settings.MINIO_ENDPOINT}")
     temp_log.info(f"  MINIO_BUCKET_NAME:        {settings.MINIO_BUCKET_NAME}")
-    temp_log.info(f"  MINIO_ACCESS_KEY:         *** SET ***")
-    temp_log.info(f"  MINIO_SECRET_KEY:         *** SET ***")
-    temp_log.info(f"  OPENAI_API_KEY:           *** SET ***")
-    temp_log.info(f"  OPENAI_EMBEDDING_MODEL:   {settings.OPENAI_EMBEDDING_MODEL}")
+    temp_log.info(f"  MINIO_ACCESS_KEY:         {'*** SET ***' if settings.MINIO_ACCESS_KEY else '!!! NOT SET !!!'}")
+    temp_log.info(f"  MINIO_SECRET_KEY:         {'*** SET ***' if settings.MINIO_SECRET_KEY else '!!! NOT SET !!!'}")
+    # temp_log.info(f"  OPENAI_API_KEY:           {'*** SET ***' if settings.OPENAI_API_KEY else '--- NOT SET ---'}") # Comentado, menos relevante
+    temp_log.info(f"  FASTEMBED_MODEL:          {settings.FASTEMBED_MODEL}")
+    temp_log.info(f"  USE_GPU:                  {settings.USE_GPU}")
     temp_log.info(f"  EMBEDDING_DIMENSION:      {settings.EMBEDDING_DIMENSION}")
     temp_log.info(f"  SUPPORTED_CONTENT_TYPES:  {settings.SUPPORTED_CONTENT_TYPES}")
     temp_log.info(f"  SPLITTER_CHUNK_SIZE:      {settings.SPLITTER_CHUNK_SIZE}")
