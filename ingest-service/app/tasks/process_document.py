@@ -7,7 +7,7 @@ from typing import Optional, Dict, Any, List, Tuple, Type
 from contextlib import asynccontextmanager
 import structlog
 import logging
-# <<< CORRECTION: Add import for urllib.parse (needed again for secure check) >>>
+# <<< CORRECTION: Ensure urllib.parse is imported >>>
 import urllib.parse
 # <<< END CORRECTION >>>
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type, before_sleep_log
@@ -52,32 +52,43 @@ log = structlog.get_logger(__name__)
 TIMEOUT_SECONDS = 600 # 10 minutes, adjust as needed
 
 # --- Milvus Initialization ---
-# <<< CORRECTION: Updated MilvusDocumentStore initialization for >= 0.0.16 >>>
+# <<< CORRECTION: Use connection_args with host/port dict + index parameter >>>
 def _initialize_milvus_store() -> MilvusDocumentStore:
-    log.debug("Initializing MilvusDocumentStore for milvus-haystack >= 0.0.16...")
+    log.debug("Initializing MilvusDocumentStore (milvus-haystack >= 0.0.16)...")
     try:
-        # Prepare connection arguments based on URI
-        conn_args = {"uri": settings.MILVUS_URI}
-        if settings.MILVUS_URI.lower().startswith("https"):
-            conn_args["secure"] = True
-            log.info("Milvus connection configured with secure=True")
+        # Parse URI to get components
+        parsed = urllib.parse.urlparse(settings.MILVUS_URI)
+        host = parsed.hostname
+        port = parsed.port or 19530 # Default Milvus port
+        secure = (parsed.scheme == "https")
 
-        # Initialize using the correct signature
+        if not host:
+            log.error("Could not parse hostname from MILVUS_URI.", milvus_uri=settings.MILVUS_URI)
+            raise ValueError(f"Invalid MILVUS_URI format: {settings.MILVUS_URI}")
+
+        # Build connection_args dictionary as required
+        conn_args = {
+            "host": host,
+            "port": str(port), # Port as string is often expected
+            "user": "",       # Add credentials if Milvus requires them
+            "password": "",
+            "secure": secure
+        }
+        log.info("Milvus connection_args prepared", host=host, port=port, secure=secure)
+
+        # Initialize with connection_args and index parameter
         store = MilvusDocumentStore(
             connection_args=conn_args,
-            # Note: collection_name is often managed implicitly or via specific methods
-            # in newer versions, but let's assume it's needed if errors persist.
-            # collection_name=settings.MILVUS_COLLECTION_NAME, # Keep commented unless needed
-            drop_old=False,  # Avoid deleting index on restarts in prod/staging
-            consistency_level="Strong", # Keep if supported and needed
-            # Removed: host, port, index, vector_dim, similarity, index_params
-            # These are either inferred or not part of the constructor anymore.
+            index=settings.MILVUS_COLLECTION_NAME,  # Use 'index' for collection name
+            # vector_dim=settings.EMBEDDING_DIMENSION # Dimension is inferred or managed differently
+            drop_old=False,  # Avoid deleting index automatically
+            consistency_level="Strong" # Use strong consistency
+            # Removed other parameters like similarity, index_params from constructor
         )
-        log.info("MilvusDocumentStore initialized successfully.", connection_args=conn_args)
+        log.info("MilvusDocumentStore initialized successfully.",
+                 host=host, port=port, index=settings.MILVUS_COLLECTION_NAME)
         return store
     except TypeError as te:
-        # This error could mean the installed version is *older* than 0.0.16
-        # or requires different args (like embedding_dim if older).
         log.exception("MilvusDocumentStore init TypeError (Check constructor arguments for installed milvus-haystack version)", error=str(te), exc_info=True)
         raise RuntimeError(f"Milvus Constructor TypeError: {te}") from te
     except Exception as e:
@@ -402,12 +413,13 @@ class ProcessDocumentTask(Task):
         return {"status": "processed", "document_id": document_id, "chunks_processed": final_chunk_count}
 
 
-    # <<< Keeping synchronous run method based on previous findings with gevent/EncodeError >>>
+    # <<< CORRECTION: Using synchronous run with *new* isolated event loop >>>
     # LLM_FLAG: CELERY_TASK_RUNNER - Main synchronous task entry point
     def run(self, *args, **kwargs):
         """
         Synchronous Celery task entry point. Executes the async logic using
-        loop.run_until_complete(). Handles retries and returns a JSON-serializable result.
+        a *new* event loop and run_until_complete(). Handles retries and returns
+        a JSON-serializable result. Aims to prevent event loop conflicts.
         """
         document_id = kwargs.get('document_id')
         task_id = self.request.id if self.request else 'N/A'
@@ -417,28 +429,20 @@ class ProcessDocumentTask(Task):
             document_id=document_id, task_id=task_id, attempt=attempt,
             company_id=kwargs.get('company_id'), filename=kwargs.get('filename')
         )
-        task_log.info("Sync task run invoked", args_repr=repr(args), kwargs_keys=list(kwargs.keys()))
+        task_log.info("Sync task run invoked (using new event loop strategy)", args_repr=repr(args), kwargs_keys=list(kwargs.keys()))
 
         result = None
         run_exception = None
-        loop = None
-        created_loop = False # Flag to track if we created the loop
+        # <<< CORRECTION: Always create a new loop for this task run >>>
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        task_log.debug("Created new event loop for task run.")
+        # <<< END CORRECTION >>>
 
         try:
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                     task_log.warning("Event loop was already running. Attempting to use it.")
-                     # If gevent provides a running loop, use it cautiously.
-            except RuntimeError:
-                task_log.debug("No running event loop, creating a new one for this task run.")
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                created_loop = True # Mark that we created this loop
-
             wrapper_kwargs = {**kwargs, "task_id": task_id, "attempt": attempt}
             result = loop.run_until_complete(self._async_run_wrapper(*args, **wrapper_kwargs))
-            task_log.info("Async wrapper executed successfully via run_until_complete.")
+            task_log.info("Async wrapper executed successfully via run_until_complete on new loop.")
 
         except (Retry, Reject) as celery_exc:
              task_log.warning(f"Celery control flow exception caught: {type(celery_exc).__name__}")
@@ -447,12 +451,13 @@ class ProcessDocumentTask(Task):
             task_log.exception("Exception caught from run_until_complete(_async_run_wrapper)", error=str(e))
             run_exception = e
         finally:
-            # Only close the loop if we created it and it's not running
-            if loop and created_loop and not loop.is_running():
-                task_log.debug("Closing event loop created by task.")
-                loop.close()
-            elif created_loop: # If we created it but it's somehow still running (unlikely)
-                task_log.warning("Loop created by task is still running after run_until_complete. Not closing.")
+            # <<< CORRECTION: Always close the loop created for the task >>>
+            task_log.debug("Closing event loop created for task.")
+            loop.close()
+            # Reset the event loop for the current thread context if needed,
+            # though gevent might handle this differently. Setting to None is safer.
+            # asyncio.set_event_loop(None) # Optional: Clear the loop from the current context
+            # <<< END CORRECTION >>>
 
 
         # --- Retry / Final Outcome Logic (sync context) ---
@@ -463,7 +468,7 @@ class ProcessDocumentTask(Task):
              )) and not isinstance(run_exception, ValueError)
 
              if is_retryable and self.request and self.request.retries < self.max_retries:
-                 task_log.warning("Processing failed within run_until_complete, attempting retry.", error=str(run_exception))
+                 task_log.warning("Processing failed, attempting retry.", error=str(run_exception))
                  try:
                      raise self.retry(exc=run_exception, countdown=int(self.default_retry_delay * (attempt**1.5)))
                  except MaxRetriesExceededError:

@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "ingest-service"
-version = "0.1.5" # Increment version
+version = "0.1.6" # Increment version
 description = "Ingest service for Atenex B2B SaaS (Haystack/Postgres/Minio/Milvus/FastEmbed - CPU)"
 authors = ["Atenex Team <dev@atenex.com>"]
 readme = "README.md"
@@ -23,8 +23,8 @@ minio = "^7.1.17"
 # --- Haystack Dependencies ---
 haystack-ai = "^2.0.1" # Or the stable version you use for Haystack 2.x
 pymilvus = "^2.4.1"
-# <<< CORRECTION: Updated milvus-haystack version >>>
-milvus-haystack = "^0.0.16" # Ensure at least this version
+# <<< CORRECTION: Ensure milvus-haystack is >= 0.0.16 >>>
+milvus-haystack = ">=0.0.16" # Use explicit range as per suggestion
 # <<< END CORRECTION >>>
 
 
