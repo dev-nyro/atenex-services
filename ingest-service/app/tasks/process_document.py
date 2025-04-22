@@ -7,8 +7,8 @@ from typing import Optional, Dict, Any, List, Tuple, Type
 from contextlib import asynccontextmanager
 import structlog
 import logging
-# <<< CORRECTION: Ensure urllib.parse is imported >>>
-import urllib.parse
+# <<< CORRECTION: Removed urllib.parse as it's no longer needed >>>
+# import urllib.parse
 # <<< END CORRECTION >>>
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type, before_sleep_log
 from celery import Celery, Task
@@ -52,44 +52,28 @@ log = structlog.get_logger(__name__)
 TIMEOUT_SECONDS = 600 # 10 minutes, adjust as needed
 
 # --- Milvus Initialization ---
-# <<< CORRECTION: Use connection_args with host/port dict + index parameter >>>
+# <<< CORRECTION: Simplified MilvusDocumentStore init for >= 0.0.16 >>>
 def _initialize_milvus_store() -> MilvusDocumentStore:
     log.debug("Initializing MilvusDocumentStore (milvus-haystack >= 0.0.16)...")
     try:
-        # Parse URI to get components
-        parsed = urllib.parse.urlparse(settings.MILVUS_URI)
-        host = parsed.hostname
-        port = parsed.port or 19530 # Default Milvus port
-        secure = (parsed.scheme == "https")
+        # Only connection_args (with URI) and optional flags are expected
+        conn_args = {"uri": settings.MILVUS_URI}
+        # Optionally add 'secure': True if URI scheme is https
+        if settings.MILVUS_URI.lower().startswith("https"):
+             conn_args["secure"] = True
+             log.info("Milvus connection_args includes secure=True")
 
-        if not host:
-            log.error("Could not parse hostname from MILVUS_URI.", milvus_uri=settings.MILVUS_URI)
-            raise ValueError(f"Invalid MILVUS_URI format: {settings.MILVUS_URI}")
-
-        # Build connection_args dictionary as required
-        conn_args = {
-            "host": host,
-            "port": str(port), # Port as string is often expected
-            "user": "",       # Add credentials if Milvus requires them
-            "password": "",
-            "secure": secure
-        }
-        log.info("Milvus connection_args prepared", host=host, port=port, secure=secure)
-
-        # Initialize with connection_args and index parameter
         store = MilvusDocumentStore(
             connection_args=conn_args,
-            index=settings.MILVUS_COLLECTION_NAME,  # Use 'index' for collection name
-            # vector_dim=settings.EMBEDDING_DIMENSION # Dimension is inferred or managed differently
-            drop_old=False,  # Avoid deleting index automatically
-            consistency_level="Strong" # Use strong consistency
-            # Removed other parameters like similarity, index_params from constructor
+            # Removed index, host, port, vector_dim etc. from constructor
+            drop_old=False, # Avoid deleting index on restarts
+            consistency_level="Strong"
         )
-        log.info("MilvusDocumentStore initialized successfully.",
-                 host=host, port=port, index=settings.MILVUS_COLLECTION_NAME)
+        log.info("MilvusDocumentStore initialized successfully.", connection_args=conn_args)
         return store
     except TypeError as te:
-        log.exception("MilvusDocumentStore init TypeError (Check constructor arguments for installed milvus-haystack version)", error=str(te), exc_info=True)
+        # If this still fails, double-check the exact installed milvus-haystack version
+        log.exception("MilvusDocumentStore init TypeError (Verify installed milvus-haystack version and constructor args)", error=str(te), exc_info=True)
         raise RuntimeError(f"Milvus Constructor TypeError: {te}") from te
     except Exception as e:
         log.exception("Failed to initialize MilvusDocumentStore", error=str(e), exc_info=True)
@@ -97,12 +81,12 @@ def _initialize_milvus_store() -> MilvusDocumentStore:
 # <<< END CORRECTION >>>
 
 # --- Haystack Component Initialization ---
+# <<< CORRECTION: Added 'index' parameter to DocumentWriter >>>
 def _initialize_haystack_components(
     document_store: MilvusDocumentStore
 ) -> Tuple[DocumentSplitter, FastembedDocumentEmbedder, DocumentWriter]:
     log.debug("Initializing Haystack components (Splitter, Embedder, Writer)...")
     try:
-        # Using chunk size/overlap from settings (adjust in config/ConfigMap if needed)
         splitter = DocumentSplitter(
             split_by=settings.SPLITTER_SPLIT_BY,
             split_length=settings.SPLITTER_CHUNK_SIZE,
@@ -133,18 +117,21 @@ def _initialize_haystack_components(
         embedder.warm_up()
         log.info("FastEmbed model warmed up successfully.")
 
+        # Specify the target index (collection name) for the writer
         writer = DocumentWriter(
             document_store=document_store,
+            index=settings.MILVUS_COLLECTION_NAME, # Pass collection name here
             policy=DuplicatePolicy.OVERWRITE,
             batch_size=512
         )
-        log.info("DocumentWriter initialized", policy="OVERWRITE", batch_size=512)
+        log.info("DocumentWriter initialized", policy="OVERWRITE", batch_size=512, target_index=settings.MILVUS_COLLECTION_NAME)
 
         log.info("Haystack components initialized successfully.")
         return splitter, embedder, writer
     except Exception as e:
         log.exception("Failed to initialize Haystack components", error=str(e), exc_info=True)
         raise RuntimeError(f"Haystack Component Initialization Error: {e}") from e
+# <<< END CORRECTION >>>
 
 # --- File Type to Converter Mapping ---
 def get_converter(content_type: str) -> Type[Any]:
@@ -284,6 +271,7 @@ async def async_process_flow(
                 if not embedded_docs: return 0
 
                 pipeline_log.debug("Executing writing to Milvus...")
+                # The writer now knows the target index/collection
                 write_result = writer.run(documents=embedded_docs)
                 written_count = write_result["documents_written"]
                 pipeline_log.info("Writing complete.", documents_written=written_count)
@@ -413,7 +401,7 @@ class ProcessDocumentTask(Task):
         return {"status": "processed", "document_id": document_id, "chunks_processed": final_chunk_count}
 
 
-    # <<< CORRECTION: Using synchronous run with *new* isolated event loop >>>
+    # <<< Keeping synchronous run method with new isolated event loop >>>
     # LLM_FLAG: CELERY_TASK_RUNNER - Main synchronous task entry point
     def run(self, *args, **kwargs):
         """
@@ -433,11 +421,9 @@ class ProcessDocumentTask(Task):
 
         result = None
         run_exception = None
-        # <<< CORRECTION: Always create a new loop for this task run >>>
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        task_log.debug("Created new event loop for task run.")
-        # <<< END CORRECTION >>>
+        loop = asyncio.new_event_loop() # Always create a new loop
+        asyncio.set_event_loop(loop)    # Set it for the current context
+        task_log.debug("Created and set new event loop for task run.")
 
         try:
             wrapper_kwargs = {**kwargs, "task_id": task_id, "attempt": attempt}
@@ -451,13 +437,9 @@ class ProcessDocumentTask(Task):
             task_log.exception("Exception caught from run_until_complete(_async_run_wrapper)", error=str(e))
             run_exception = e
         finally:
-            # <<< CORRECTION: Always close the loop created for the task >>>
+            # Always close the loop we created
             task_log.debug("Closing event loop created for task.")
             loop.close()
-            # Reset the event loop for the current thread context if needed,
-            # though gevent might handle this differently. Setting to None is safer.
-            # asyncio.set_event_loop(None) # Optional: Clear the loop from the current context
-            # <<< END CORRECTION >>>
 
 
         # --- Retry / Final Outcome Logic (sync context) ---
@@ -468,7 +450,7 @@ class ProcessDocumentTask(Task):
              )) and not isinstance(run_exception, ValueError)
 
              if is_retryable and self.request and self.request.retries < self.max_retries:
-                 task_log.warning("Processing failed, attempting retry.", error=str(run_exception))
+                 task_log.warning("Processing failed within run_until_complete, attempting retry.", error=str(run_exception))
                  try:
                      raise self.retry(exc=run_exception, countdown=int(self.default_retry_delay * (attempt**1.5)))
                  except MaxRetriesExceededError:
