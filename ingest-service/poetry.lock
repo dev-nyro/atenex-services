@@ -1760,19 +1760,19 @@ files = [
 
 [[package]]
 name = "milvus-haystack"
-version = "0.0.6"
+version = "0.0.16"
 description = ""
 optional = false
 python-versions = ">=3.7"
 groups = ["main"]
 files = [
-    {file = "milvus_haystack-0.0.6-py3-none-any.whl", hash = "sha256:43202ca5dd4a94a643c9b3cccbf1689500f0259bab735fbf89c98c455f243a9e"},
-    {file = "milvus_haystack-0.0.6.tar.gz", hash = "sha256:77fdd9611320aacd590fa8aa9ad980cccdbb04b50b0b1c0614b4ed794f330448"},
+    {file = "milvus_haystack-0.0.16-py3-none-any.whl", hash = "sha256:8b671bd73817a3ab1de2fc2ccfa45a29ad9a9e052a1dd6b34bec2445fb7c779c"},
+    {file = "milvus_haystack-0.0.16.tar.gz", hash = "sha256:76aa49eef6d05ca6c137711a3a339ee51c43fad9d271fffc35cd2cd930181272"},
 ]
 
 [package.dependencies]
 haystack-ai = "*"
-pymilvus = "*"
+pymilvus = ">=2.5.6"
 typing-extensions = "*"
 
 [[package]]
@@ -2073,37 +2073,6 @@ numpy = ">=1.21.6"
 packaging = "*"
 protobuf = "*"
 sympy = "*"
-
-[[package]]
-name = "onnxruntime-gpu"
-version = "1.21.1"
-description = "ONNX Runtime is a runtime accelerator for Machine Learning models"
-optional = false
-python-versions = ">=3.10"
-groups = ["main"]
-files = [
-    {file = "onnxruntime_gpu-1.21.1-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:838337c704a95250dba92c2d6062e976bb9546d79d7665322964ed8891726bc9"},
-    {file = "onnxruntime_gpu-1.21.1-cp310-cp310-win_amd64.whl", hash = "sha256:d01bbadb943860d41cb49b3d85a5fc587a5f25e0aa07f421018927468015facf"},
-    {file = "onnxruntime_gpu-1.21.1-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f210e613293bf939cf62b4ffa149cc4ccc5622430044e72201a058b261799eed"},
-    {file = "onnxruntime_gpu-1.21.1-cp311-cp311-win_amd64.whl", hash = "sha256:ef940d9912d37962368406071eec38dc142dc350aacd70e7ddd27bf4629c40c5"},
-    {file = "onnxruntime_gpu-1.21.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:968123d2668add079548980999edfd35fb6317cad9c35c0798fc0665591003f0"},
-    {file = "onnxruntime_gpu-1.21.1-cp312-cp312-win_amd64.whl", hash = "sha256:5c1885a46061c5f5e0ca26256d8e338db9ea0428867754bd93e517bcb0a3899c"},
-    {file = "onnxruntime_gpu-1.21.1-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1405e953da84e5a9463c467d86c3fd46a50f4dc767c87c3682d9fabf0a0e2251"},
-    {file = "onnxruntime_gpu-1.21.1-cp313-cp313-win_amd64.whl", hash = "sha256:69f407ec2e5f8b409d2729191708cbad5b95539b6d5f7a28dac1aa9f9f644bf9"},
-    {file = "onnxruntime_gpu-1.21.1-cp313-cp313t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:dd2056e7cadcec184b1014dc4f8484e1458a633d6db8262f88c0148ef1e572a6"},
-]
-
-[package.dependencies]
-coloredlogs = "*"
-flatbuffers = "*"
-numpy = ">=1.21.6"
-packaging = "*"
-protobuf = "*"
-sympy = "*"
-
-[package.extras]
-cuda = ["nvidia-cuda-nvrtc-cu12 (>=12.0,<13.0)", "nvidia-cuda-runtime-cu12 (>=12.0,<13.0)", "nvidia-cufft-cu12 (>=11.0,<12.0)", "nvidia-curand-cu12 (>=10.0,<11.0)"]
-cudnn = ["nvidia-cudnn-cu12 (>=9.0,<10.0)"]
 
 [[package]]
 name = "openai"
@@ -3846,4 +3815,4 @@ testing = ["coverage[toml]", "zope.event", "zope.testing"]
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.10"
-content-hash = "3ebe0e95a04eb56fcacb740723745adc4b1b1f4accb9dee4812ec66aa8519583"
+content-hash = "d9b2162c295c05a3cb1b495938dae31390cd0e83f6f8427569c039a682aad09b"
