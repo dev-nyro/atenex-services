@@ -7,8 +7,8 @@ from typing import Optional, Dict, Any, List, Tuple, Type
 from contextlib import asynccontextmanager
 import structlog
 import logging
-# <<< CORRECTION: Removed urllib.parse as it's no longer needed >>>
-# import urllib.parse
+# <<< CORRECTION: Re-added import for urllib.parse >>>
+import urllib.parse
 # <<< END CORRECTION >>>
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type, before_sleep_log
 from celery import Celery, Task
@@ -52,28 +52,50 @@ log = structlog.get_logger(__name__)
 TIMEOUT_SECONDS = 600 # 10 minutes, adjust as needed
 
 # --- Milvus Initialization ---
-# <<< CORRECTION: Simplified MilvusDocumentStore init for >= 0.0.16 >>>
+# <<< CORRECTION: Apply signature from latest explanation (host/port in conn_args, index param) >>>
 def _initialize_milvus_store() -> MilvusDocumentStore:
-    log.debug("Initializing MilvusDocumentStore (milvus-haystack >= 0.0.16)...")
+    log.debug("Initializing MilvusDocumentStore (attempting signature from latest explanation)...")
+    store = None # Initialize store to None
     try:
-        # Only connection_args (with URI) and optional flags are expected
-        conn_args = {"uri": settings.MILVUS_URI}
-        # Optionally add 'secure': True if URI scheme is https
-        if settings.MILVUS_URI.lower().startswith("https"):
-             conn_args["secure"] = True
-             log.info("Milvus connection_args includes secure=True")
+        # Parse URI to get components
+        parsed = urllib.parse.urlparse(settings.MILVUS_URI)
+        host = parsed.hostname
+        port = parsed.port or 19530 # Default Milvus port
+        secure = (parsed.scheme == "https")
 
+        if not host:
+            log.error("Could not parse hostname from MILVUS_URI.", milvus_uri=settings.MILVUS_URI)
+            raise ValueError(f"Invalid MILVUS_URI format: {settings.MILVUS_URI}")
+
+        # Build connection_args dictionary with host/port etc.
+        # Ensure correct types if needed (e.g., port as string)
+        conn_args = {
+            "host": host,
+            "port": str(port),
+            "user": "",       # Add credentials if Milvus requires them
+            "password": "",
+            "secure": secure
+        }
+        log.info("Milvus connection_args prepared", **conn_args)
+
+        # Initialize with connection_args and index parameter as per latest explanation
+        # NOTE: This contradicts previous errors (unexpected keyword 'index').
+        # Keeping consistency_level and drop_old as they are common flags.
         store = MilvusDocumentStore(
             connection_args=conn_args,
-            # Removed index, host, port, vector_dim etc. from constructor
-            drop_old=False, # Avoid deleting index on restarts
-            consistency_level="Strong"
+            index=settings.MILVUS_COLLECTION_NAME,  # Use 'index' for collection name
+            drop_old=False,                         # Keep index across restarts
+            consistency_level="Strong"              # Use strong consistency
+            # Removed vector_dim, similarity, index_params from constructor
         )
-        log.info("MilvusDocumentStore initialized successfully.", connection_args=conn_args)
+        log.info("MilvusDocumentStore initialized successfully.",
+                 host=host, port=port, index=settings.MILVUS_COLLECTION_NAME)
         return store
     except TypeError as te:
-        # If this still fails, double-check the exact installed milvus-haystack version
-        log.exception("MilvusDocumentStore init TypeError (Verify installed milvus-haystack version and constructor args)", error=str(te), exc_info=True)
+        # Log the specific error if the constructor fails again
+        log.exception("MilvusDocumentStore init TypeError (Verify constructor arguments for installed version)",
+                      error=str(te), used_args={'connection_args': conn_args, 'index': settings.MILVUS_COLLECTION_NAME, 'drop_old': False, 'consistency_level': 'Strong'},
+                      exc_info=True)
         raise RuntimeError(f"Milvus Constructor TypeError: {te}") from te
     except Exception as e:
         log.exception("Failed to initialize MilvusDocumentStore", error=str(e), exc_info=True)
@@ -81,12 +103,16 @@ def _initialize_milvus_store() -> MilvusDocumentStore:
 # <<< END CORRECTION >>>
 
 # --- Haystack Component Initialization ---
-# <<< CORRECTION: Added 'index' parameter to DocumentWriter >>>
+# <<< CORRECTION: Removed 'index' parameter from DocumentWriter >>>
 def _initialize_haystack_components(
     document_store: MilvusDocumentStore
 ) -> Tuple[DocumentSplitter, FastembedDocumentEmbedder, DocumentWriter]:
     log.debug("Initializing Haystack components (Splitter, Embedder, Writer)...")
+    splitter = None
+    embedder = None
+    writer = None
     try:
+        log.debug("Initializing DocumentSplitter...")
         splitter = DocumentSplitter(
             split_by=settings.SPLITTER_SPLIT_BY,
             split_length=settings.SPLITTER_CHUNK_SIZE,
@@ -94,6 +120,7 @@ def _initialize_haystack_components(
         )
         log.info("DocumentSplitter initialized", split_by=settings.SPLITTER_SPLIT_BY, length=settings.SPLITTER_CHUNK_SIZE, overlap=settings.SPLITTER_CHUNK_OVERLAP)
 
+        log.debug("Determining device for FastEmbed...")
         if settings.USE_GPU:
             try:
                 device = ComponentDevice.from_str("cuda:0")
@@ -112,24 +139,30 @@ def _initialize_haystack_components(
             batch_size=256,
             parallel=0 if device.type == "cpu" else None
         )
+        log.info("FastembedDocumentEmbedder initialized.")
 
         log.info("Warming up FastEmbed model...")
-        embedder.warm_up()
+        embedder.warm_up() # This might take time or hang
         log.info("FastEmbed model warmed up successfully.")
 
-        # Specify the target index (collection name) for the writer
+        log.debug("Initializing DocumentWriter...")
+        # Removed index parameter as per latest explanation (store constructor handles it)
         writer = DocumentWriter(
             document_store=document_store,
-            index=settings.MILVUS_COLLECTION_NAME, # Pass collection name here
+            # index=settings.MILVUS_COLLECTION_NAME, # REMOVED
             policy=DuplicatePolicy.OVERWRITE,
             batch_size=512
         )
-        log.info("DocumentWriter initialized", policy="OVERWRITE", batch_size=512, target_index=settings.MILVUS_COLLECTION_NAME)
+        log.info("DocumentWriter initialized", policy="OVERWRITE", batch_size=512)
 
         log.info("Haystack components initialized successfully.")
         return splitter, embedder, writer
     except Exception as e:
-        log.exception("Failed to initialize Haystack components", error=str(e), exc_info=True)
+        log.exception("Failed to initialize Haystack components", error=str(e),
+                      splitter_init=splitter is not None,
+                      embedder_init=embedder is not None,
+                      writer_init=writer is not None,
+                      exc_info=True)
         raise RuntimeError(f"Haystack Component Initialization Error: {e}") from e
 # <<< END CORRECTION >>>
 
@@ -234,48 +267,58 @@ async def async_process_flow(
             flow_log.info("File downloaded successfully", temp_path=temp_file_path)
 
             loop = asyncio.get_running_loop()
+            flow_log.info("Initializing Milvus store via executor...")
             store = await loop.run_in_executor(None, _initialize_milvus_store)
+            flow_log.info("Milvus store initialized.")
+            flow_log.info("Initializing Haystack components via executor...")
             splitter, embedder, writer = await loop.run_in_executor(None, _initialize_haystack_components, store)
+            flow_log.info("Haystack components initialized.")
 
             ConverterClass = get_converter(content_type)
             converter = ConverterClass()
 
-            flow_log.info("Starting Haystack pipeline execution...")
+            flow_log.info("Starting Haystack pipeline execution via executor...")
 
+            # Define the synchronous pipeline logic to run in executor
             def run_haystack_pipeline_sync(local_temp_file_path):
-                pipeline_log = flow_log
-                pipeline_log.debug("Executing conversion...")
-                conversion_result = converter.run(sources=[local_temp_file_path])
-                docs: List[Document] = conversion_result["documents"]
-                pipeline_log.debug("Conversion complete", num_docs_converted=len(docs))
-                if not docs: return 0
+                pipeline_log = flow_log # Reuse bound logger
+                try:
+                    pipeline_log.info("Step 1: Executing conversion...")
+                    conversion_result = converter.run(sources=[local_temp_file_path])
+                    docs: List[Document] = conversion_result["documents"]
+                    pipeline_log.info("Step 1: Conversion complete", num_docs_converted=len(docs))
+                    if not docs: return 0
 
-                pipeline_log.debug("Adding standard metadata...")
-                for doc in docs:
-                    if doc.meta is None: doc.meta = {}
-                    doc.meta["company_id"] = company_id
-                    doc.meta["document_id"] = document_id
-                    doc.meta["file_name"] = filename
-                    doc.meta["file_type"] = content_type
+                    pipeline_log.info("Step 2: Adding standard metadata...")
+                    for doc in docs:
+                        if doc.meta is None: doc.meta = {}
+                        doc.meta["company_id"] = company_id
+                        doc.meta["document_id"] = document_id
+                        doc.meta["file_name"] = filename
+                        doc.meta["file_type"] = content_type
+                    pipeline_log.info("Step 2: Metadata added.")
 
-                pipeline_log.debug("Executing splitting...")
-                split_result = splitter.run(documents=docs)
-                split_docs: List[Document] = split_result["documents"]
-                pipeline_log.debug("Splitting complete", num_chunks=len(split_docs))
-                if not split_docs: return 0
+                    pipeline_log.info("Step 3: Executing splitting...")
+                    split_result = splitter.run(documents=docs)
+                    split_docs: List[Document] = split_result["documents"]
+                    pipeline_log.info("Step 3: Splitting complete", num_chunks=len(split_docs))
+                    if not split_docs: return 0
 
-                pipeline_log.debug("Executing embedding...")
-                embed_result = embedder.run(documents=split_docs)
-                embedded_docs: List[Document] = embed_result["documents"]
-                pipeline_log.debug("Embedding complete.")
-                if not embedded_docs: return 0
+                    pipeline_log.info("Step 4: Executing embedding...")
+                    embed_result = embedder.run(documents=split_docs)
+                    embedded_docs: List[Document] = embed_result["documents"]
+                    pipeline_log.info("Step 4: Embedding complete.")
+                    if not embedded_docs: return 0
 
-                pipeline_log.debug("Executing writing to Milvus...")
-                # The writer now knows the target index/collection
-                write_result = writer.run(documents=embedded_docs)
-                written_count = write_result["documents_written"]
-                pipeline_log.info("Writing complete.", documents_written=written_count)
-                return written_count
+                    pipeline_log.info("Step 5: Executing writing to Milvus...")
+                    write_result = writer.run(documents=embedded_docs)
+                    written_count = write_result["documents_written"]
+                    pipeline_log.info("Step 5: Writing complete.", documents_written=written_count)
+                    return written_count
+                except Exception as pipe_exc:
+                     # Log error within the sync function before raising
+                     pipeline_log.exception("Error occurred inside run_haystack_pipeline_sync", error=str(pipe_exc))
+                     raise pipe_exc # Re-raise to be caught by the main try-except
 
             chunks_written = await loop.run_in_executor(None, run_haystack_pipeline_sync, temp_file_path)
             flow_log.info("Haystack pipeline execution finished.", chunks_written=chunks_written)
@@ -291,7 +334,8 @@ async def async_process_flow(
          flow_log.error("Runtime Error during processing", error=str(rt_err))
          raise rt_err
     except Exception as e:
-        flow_log.exception("Unexpected error during processing flow", error=str(e))
+        # Catch errors from run_haystack_pipeline_sync if they weren't caught inside
+        flow_log.exception("Unexpected error during processing flow or pipeline execution", error=str(e))
         raise RuntimeError(f"Unexpected flow error: {e}") from e
 
 
