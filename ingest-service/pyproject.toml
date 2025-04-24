@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "ingest-service"
-version = "0.1.6" # Increment version
-description = "Ingest service for Atenex B2B SaaS (Haystack/Postgres/Minio/Milvus/FastEmbed - CPU)"
+version = "0.1.7" # Increment version
+description = "Ingest service for Atenex B2B SaaS (Haystack/Postgres/Minio/Milvus/FastEmbed - CPU - Prefork)"
 authors = ["Atenex Team <dev@atenex.com>"]
 readme = "README.md"
 
@@ -13,8 +13,8 @@ gunicorn = "^21.2.0"
 pydantic = {extras = ["email"], version = "^2.6.4"}
 pydantic-settings = "^2.2.1"
 celery = {extras = ["redis"], version = "^5.3.6"}
-gevent = "^23.9.1"
-asyncpg = "^0.29.0"
+# gevent = "^23.9.1" # REMOVED as per plan
+asyncpg = "^0.29.0" # Keep for API
 tenacity = "^8.2.3"
 python-multipart = "^0.0.9"
 structlog = "^24.1.0"
@@ -23,10 +23,7 @@ minio = "^7.1.17"
 # --- Haystack Dependencies ---
 haystack-ai = "^2.0.1" # Or the stable version you use for Haystack 2.x
 pymilvus = "^2.4.1"
-# <<< CORRECTION: Ensure milvus-haystack is >= 0.0.16 >>>
-milvus-haystack = ">=0.0.16" # Use explicit range as per suggestion
-# <<< END CORRECTION >>>
-
+milvus-haystack = ">=0.0.16"
 
 # --- Haystack Converter Dependencies ---
 pypdf = "^4.0.1"
@@ -41,6 +38,11 @@ onnxruntime = "^1.17.0"
 # --- HTTP Client ---
 httpx = {extras = ["http2"], version = "^0.27.0"}
 h2 = "^4.1.0"
+
+# --- Synchronous DB Dependencies (Added for Step 4.3) ---
+sqlalchemy = "^2.0.28"
+psycopg2-binary = "^2.9.9"
+
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"
