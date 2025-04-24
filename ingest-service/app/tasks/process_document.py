@@ -84,7 +84,6 @@ try:
     log.info("Global MilvusDocumentStore initialized.",
              uri_scheme=settings.MILVUS_URI.split(':')[0], # Log scheme only
              collection=settings.MILVUS_COLLECTION_NAME,
-             embedding_dim=settings.EMBEDDING_DIMENSION,
              consistency="Strong")
     # --- END CORRECTION ---
 
