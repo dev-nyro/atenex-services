@@ -79,7 +79,6 @@ try:
     milvus_store = MilvusDocumentStore(
         connection_args=milvus_connection_args,
         collection_name=settings.MILVUS_COLLECTION_NAME,
-        embedding_dim=settings.EMBEDDING_DIMENSION, # <-- Reverted to embedding_dim
         consistency_level="Strong",
     )
     log.info("Global MilvusDocumentStore initialized.",
