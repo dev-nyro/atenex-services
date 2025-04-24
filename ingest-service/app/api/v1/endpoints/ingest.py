@@ -1060,4 +1060,4 @@ async def delete_document_endpoint(
 
     delete_log.info("Document deletion process finished.")
     # Return 204 No Content on success (DB record deleted), even if minor errors occurred elsewhere.
-    return None # FastAPI handles 204 automatically for None return
+    return None # FastAPI handles 204 automatically for None retur
