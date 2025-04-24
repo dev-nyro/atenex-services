@@ -75,17 +75,17 @@ try:
 
     # NOTE: Assuming grpc_timeout is handled via pymilvus config or env vars if needed,
     # as it's not a direct constructor arg in recent milvus-haystack versions.
-    # --- CORRECTION: Changed 'embedding_dim' to 'dim' ---
+    # --- CORRECTION: Reverted 'dim' back to 'embedding_dim' based on the latest error log ---
     milvus_store = MilvusDocumentStore(
         connection_args=milvus_connection_args,
         collection_name=settings.MILVUS_COLLECTION_NAME,
-        dim=settings.EMBEDDING_DIMENSION, # <-- Corrected parameter name
+        embedding_dim=settings.EMBEDDING_DIMENSION, # <-- Reverted to embedding_dim
         consistency_level="Strong",
     )
     log.info("Global MilvusDocumentStore initialized.",
              uri_scheme=settings.MILVUS_URI.split(':')[0], # Log scheme only
              collection=settings.MILVUS_COLLECTION_NAME,
-             embedding_dim=settings.EMBEDDING_DIMENSION, # Keep log info consistent for now
+             embedding_dim=settings.EMBEDDING_DIMENSION,
              consistency="Strong")
     # --- END CORRECTION ---
 
