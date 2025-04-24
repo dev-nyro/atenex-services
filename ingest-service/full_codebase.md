@@ -2883,7 +2883,7 @@ gunicorn = "^21.2.0"
 pydantic = {extras = ["email"], version = "^2.6.4"}
 pydantic-settings = "^2.2.1"
 celery = {extras = ["redis"], version = "^5.3.6"}
-# gevent = "^23.9.1" # REMOVED as per plan
+gevent = "^23.9.1" # REMOVED as per plan
 asyncpg = "^0.29.0" # Keep for API
 tenacity = "^8.2.3"
 python-multipart = "^0.0.9"
