@@ -1,4 +1,4 @@
-# Estructura de la Codebase
+# Estructura de la Codebase INGEST SERVICE
 
 ```
 app/
@@ -1118,7 +1118,7 @@ async def delete_document_endpoint(
 
     delete_log.info("Document deletion process finished.")
     # Return 204 No Content on success (DB record deleted), even if minor errors occurred elsewhere.
-    return None # FastAPI handles 204 automatically for None return
+    return None # FastAPI handles 204 automatically for None retur
 ```
 
 ## File: `app\api\v1\schemas.py`
@@ -2557,7 +2557,7 @@ from haystack.components.converters import (
 )
 from haystack.components.preprocessors import DocumentSplitter
 from haystack.components.writers import DocumentWriter
-from haystack.utils import ComponentDevice
+from haystack.utils import ComponentDevice # Keep import even if not directly used for type checks now
 
 # --- Milvus Dependencies ---
 from milvus_haystack import MilvusDocumentStore
@@ -2612,21 +2612,16 @@ try:
     if settings.MILVUS_URI.lower().startswith("https"):
         milvus_connection_args["secure"] = True
 
-    # NOTE: Assuming grpc_timeout is handled via pymilvus config or env vars if needed,
-    # as it's not a direct constructor arg in recent milvus-haystack versions.
-    # --- CORRECTION: Changed 'embedding_dim' to 'dim' ---
+    # NOTE: No 'dim' or 'embedding_dim' needed here for Haystack 1.25 compatibility
     milvus_store = MilvusDocumentStore(
         connection_args=milvus_connection_args,
         collection_name=settings.MILVUS_COLLECTION_NAME,
-        dim=settings.EMBEDDING_DIMENSION, # <-- Corrected parameter name
         consistency_level="Strong",
     )
     log.info("Global MilvusDocumentStore initialized.",
              uri_scheme=settings.MILVUS_URI.split(':')[0], # Log scheme only
              collection=settings.MILVUS_COLLECTION_NAME,
-             embedding_dim=settings.EMBEDDING_DIMENSION, # Keep log info consistent for now
              consistency="Strong")
-    # --- END CORRECTION ---
 
     # 3. Haystack Components
     log.info("Initializing global Haystack components...")
@@ -2640,25 +2635,21 @@ try:
              length=settings.SPLITTER_CHUNK_SIZE,
              overlap=settings.SPLITTER_CHUNK_OVERLAP)
 
-    # Determine device for FastEmbed
-    if settings.USE_GPU:
-        try:
-            embedder_device = ComponentDevice.from_str("cuda:0")
-            log.info("GPU selected for FastEmbed based on settings.")
-        except Exception as gpu_err:
-            log.warning("GPU configured but FAILED to select, falling back to CPU.", error=str(gpu_err), setting_use_gpu=settings.USE_GPU)
-            embedder_device = ComponentDevice.from_str("cpu")
-    else:
-        embedder_device = ComponentDevice.from_str("cpu")
-        log.info("CPU selected for FastEmbed (USE_GPU is false).")
+    # --- Determine device for FastEmbed (Corrected based on provided diff) ---
+    # Haystack 1.25 usa ComponentDevice como simple string-enum.
+    # Basta pasar la cadena; no necesitamos inspeccionar '.type'
+    device_str = "cuda:0" if settings.USE_GPU else "cpu"
+    log.info("Selected device for FastEmbed", device=device_str)
 
     embedder = FastembedDocumentEmbedder(
         model=settings.FASTEMBED_MODEL,
-        device=embedder_device,
+        device=device_str, # Pass the string directly
         batch_size=256,
-        parallel=0 if embedder_device.type == "cpu" else None
+        # parallel=0 solo tiene sentido en CPU; comprobamos con el flag
+        parallel=0 if device_str.startswith("cpu") else None
     )
-    log.info("Global FastembedDocumentEmbedder initialized.", model=settings.FASTEMBED_MODEL, device=str(embedder_device))
+    log.info("Global FastembedDocumentEmbedder initialized.", model=settings.FASTEMBED_MODEL, device=device_str)
+    # --- End Correction ---
 
     log.info("Warming up FastEmbed model...")
     embedder.warm_up()
