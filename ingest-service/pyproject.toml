@@ -1,48 +1,44 @@
 [tool.poetry]
 name = "ingest-service"
-version = "0.1.7" # Increment version
-description = "Ingest service for Atenex B2B SaaS (Haystack/Postgres/Minio/Milvus/FastEmbed - CPU - Prefork)"
+# Incrementamos versión por refactorización mayor
+version = "0.2.0"
+description = "Ingest service for Atenex B2B SaaS (Postgres/Minio/Milvus/FastEmbed - CPU - Prefork - Haystack Removed)"
 authors = ["Atenex Team <dev@atenex.com>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.10"
+python = ">=3.10,<3.13"
 fastapi = "^0.110.0"
 uvicorn = {extras = ["standard"], version = "^0.28.0"}
 gunicorn = "^21.2.0"
 pydantic = {extras = ["email"], version = "^2.6.4"}
 pydantic-settings = "^2.2.1"
 celery = {extras = ["redis"], version = "^5.3.6"}
-gevent = "^23.9.1" # REMOVED as per plan
+# gevent ya no es necesario con prefork
 asyncpg = "^0.29.0" # Keep for API
 tenacity = "^8.2.3"
 python-multipart = "^0.0.9"
 structlog = "^24.1.0"
 minio = "^7.1.17"
 
-# --- Haystack Dependencies ---
-haystack-ai = "^2.0.1" # Or the stable version you use for Haystack 2.x
-pymilvus = "^2.4.1"
-milvus-haystack = ">=0.0.16"
+# --- Core Processing Dependencies (Haystack REMOVED) ---
+fastembed = ">=0.2.1,<0.3.0" # Standalone FastEmbed (includes ONNX runtime)
+pymilvus = ">=2.4.1,<2.5.0"  # Official Milvus client
 
-# --- Haystack Converter Dependencies ---
-pypdf = "^4.0.1"
-python-docx = "^1.1.0"
-markdown = "^3.5.1"
-beautifulsoup4 = "^4.12.3"
+# --- Converter Dependencies (Standalone) ---
+pypdf = ">=4.0.1,<5.0.0"
+python-docx = ">=1.1.0,<2.0.0"
+markdown = ">=3.5.1,<4.0.0"
+beautifulsoup4 = ">=4.12.3,<5.0.0"
+html2text = ">=2024.1.0,<2025.0.0" # For Markdown -> HTML -> Text conversion
 
-# --- FastEmbed & ONNX CPU Dependencies ---
-fastembed-haystack = "^1.3.0"
-onnxruntime = "^1.17.0"
-
-# --- HTTP Client ---
+# --- HTTP Client (API) ---
 httpx = {extras = ["http2"], version = "^0.27.0"}
 h2 = "^4.1.0"
 
-# --- Synchronous DB Dependencies (Added for Step 4.3) ---
+# --- Synchronous DB Dependencies (Worker) ---
 sqlalchemy = "^2.0.28"
 psycopg2-binary = "^2.9.9"
-
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"
