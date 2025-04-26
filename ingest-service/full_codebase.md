@@ -1,4 +1,4 @@
-# Estructura de la Codebase
+# Estructura de la Codebase INGEST-SERVICE
 
 ```
 app/
@@ -25,6 +25,7 @@ app/
 ├── services
 │   ├── __init__.py
 │   ├── base_client.py
+│   ├── ingest_pipeline.py
 │   └── minio_client.py
 └── tasks
     ├── __init__.py
@@ -2268,6 +2269,427 @@ class BaseServiceClient:
             raise
 ```
 
+## File: `app\services\ingest_pipeline.py`
+```py
+# ingest-service/app/services/ingest_pipeline.py
+from __future__ import annotations
+
+import pathlib
+import uuid
+import markdown # type: ignore
+import html2text # type: ignore
+import structlog
+from typing import List, Dict, Any, Callable, Optional
+
+# Direct library imports
+from bs4 import BeautifulSoup
+from pypdf import PdfReader
+from docx import Document as DocxDocument # Rename to avoid conflict with Haystack Document if ever used elsewhere
+from fastembed.embedding import TextEmbedding # Import specific class
+from pymilvus import (
+    Collection, CollectionSchema, FieldSchema, DataType, connections,
+    utility, MilvusException
+)
+
+# Local application imports
+from app.core.config import settings
+
+log = structlog.get_logger(__name__)
+
+# --------------- 1. TEXT EXTRACTION FUNCTIONS -----------------
+
+def _extract_from_pdf(file_path: pathlib.Path) -> str:
+    """Extracts text content from a PDF file."""
+    log.debug("Extracting text from PDF", path=str(file_path))
+    try:
+        reader = PdfReader(str(file_path))
+        text_content = "\n\n".join(page.extract_text() or "" for page in reader.pages)
+        log.info("PDF extraction successful", path=str(file_path), num_pages=len(reader.pages))
+        return text_content
+    except Exception as e:
+        log.error("Failed to extract text from PDF", path=str(file_path), error=str(e), exc_info=True)
+        raise ValueError(f"Error processing PDF {file_path.name}: {e}") from e
+
+def _extract_from_docx(file_path: pathlib.Path) -> str:
+    """Extracts text content from a DOCX file."""
+    log.debug("Extracting text from DOCX", path=str(file_path))
+    try:
+        doc = DocxDocument(str(file_path))
+        text_content = "\n\n".join(p.text for p in doc.paragraphs if p.text)
+        log.info("DOCX extraction successful", path=str(file_path), num_paragraphs=len(doc.paragraphs))
+        return text_content
+    except Exception as e:
+        log.error("Failed to extract text from DOCX", path=str(file_path), error=str(e), exc_info=True)
+        raise ValueError(f"Error processing DOCX {file_path.name}: {e}") from e
+
+def _extract_from_html(file_path: pathlib.Path) -> str:
+    """Extracts text content from an HTML file."""
+    log.debug("Extracting text from HTML", path=str(file_path))
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            soup = BeautifulSoup(f, "html.parser")
+        # Remove script and style elements
+        for script_or_style in soup(["script", "style"]):
+            script_or_style.decompose()
+        # Get text with line breaks
+        text_content = soup.get_text(separator="\n", strip=True)
+        log.info("HTML extraction successful", path=str(file_path))
+        return text_content
+    except Exception as e:
+        log.error("Failed to extract text from HTML", path=str(file_path), error=str(e), exc_info=True)
+        raise ValueError(f"Error processing HTML {file_path.name}: {e}") from e
+
+def _extract_from_md(file_path: pathlib.Path) -> str:
+    """Extracts text content from a Markdown file by converting to HTML first."""
+    log.debug("Extracting text from Markdown", path=str(file_path))
+    try:
+        md_content = file_path.read_text(encoding="utf-8")
+        html_content = markdown.markdown(md_content)
+        # Configure html2text
+        h = html2text.HTML2Text()
+        h.ignore_links = True
+        h.ignore_images = True
+        text_content = h.handle(html_content)
+        log.info("Markdown extraction successful", path=str(file_path))
+        return text_content
+    except Exception as e:
+        log.error("Failed to extract text from Markdown", path=str(file_path), error=str(e), exc_info=True)
+        raise ValueError(f"Error processing Markdown {file_path.name}: {e}") from e
+
+def _extract_from_txt(file_path: pathlib.Path) -> str:
+    """Extracts text content from a plain text file."""
+    log.debug("Extracting text from TXT", path=str(file_path))
+    try:
+        text_content = file_path.read_text(encoding="utf-8")
+        log.info("TXT extraction successful", path=str(file_path))
+        return text_content
+    except Exception as e:
+        log.error("Failed to extract text from TXT", path=str(file_path), error=str(e), exc_info=True)
+        raise ValueError(f"Error processing TXT {file_path.name}: {e}") from e
+
+# Mapping from MIME types to extractor functions
+EXTRACTORS: Dict[str, Callable[[pathlib.Path], str]] = {
+    "application/pdf": _extract_from_pdf,
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": _extract_from_docx,
+    "application/msword": _extract_from_docx, # Attempt DOCX extraction for .doc as well
+    "text/plain": _extract_from_txt,
+    "text/markdown": _extract_from_md,
+    "text/html": _extract_from_html,
+}
+
+# --------------- 2. CHUNKER FUNCTION -----------------
+
+def chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
+    """
+    Splits text into chunks based on word count with overlap.
+    Simple implementation, can be refined (e.g., sentence splitting).
+    """
+    if not text or text.isspace():
+        return []
+    # Basic whitespace split, consider more robust tokenization if needed
+    words = re.split(r'\s+', text.strip())
+    words = [word for word in words if word] # Remove empty strings
+
+    if not words:
+        return []
+
+    chunks: List[str] = []
+    current_pos = 0
+    while current_pos < len(words):
+        end_pos = min(current_pos + chunk_size, len(words))
+        chunk = " ".join(words[current_pos:end_pos])
+        chunks.append(chunk)
+
+        # Move the starting position for the next chunk
+        current_pos += chunk_size - chunk_overlap
+        # Ensure we don't get stuck if overlap is too large or chunk_size too small
+        if current_pos <= (end_pos - chunk_size): # Avoid infinite loops
+             current_pos = end_pos - chunk_overlap # Reset start point relative to end if stuck
+        if current_pos >= len(words): # Prevent starting past the end
+            break
+        # Make sure overlap doesn't push start index negative
+        current_pos = max(0, current_pos)
+
+
+    log.debug(f"Chunked text into {len(chunks)} chunks.", requested_size=chunk_size, overlap=chunk_overlap)
+    return chunks
+
+# --------------- 3. MILVUS HELPERS (using pymilvus) -----------------
+
+MILVUS_COLLECTION_NAME = settings.MILVUS_COLLECTION_NAME
+MILVUS_EMBEDDING_DIM = settings.EMBEDDING_DIMENSION
+MILVUS_PK_FIELD = "pk_id" # Changed primary key name to avoid conflict with 'id' if used elsewhere
+MILVUS_VECTOR_FIELD = "embedding"
+MILVUS_CONTENT_FIELD = "content"
+# Metadata fields for filtering
+MILVUS_COMPANY_ID_FIELD = "company_id"
+MILVUS_DOCUMENT_ID_FIELD = "document_id"
+MILVUS_FILENAME_FIELD = "file_name"
+
+_milvus_collection: Optional[Collection] = None
+_milvus_connected = False
+
+def _ensure_milvus_connection_and_collection() -> Collection:
+    """Connects to Milvus if not already connected and returns the Collection object."""
+    global _milvus_collection, _milvus_connected
+    alias = "default" # Standard alias for pymilvus
+
+    if not _milvus_connected:
+        uri = settings.MILVUS_URI
+        # pymilvus uses 'address' (host:port) or 'uri'
+        # Extract host/port if needed, but URI should work for http/https
+        log.info("Connecting to Milvus...", uri=uri, alias=alias, timeout=settings.MILVUS_GRPC_TIMEOUT)
+        try:
+            connections.connect(alias=alias, uri=uri, timeout=settings.MILVUS_GRPC_TIMEOUT)
+            _milvus_connected = True
+            log.info("Successfully connected to Milvus.")
+        except MilvusException as e:
+            log.critical("Failed to connect to Milvus", error=str(e), exc_info=True)
+            _milvus_connected = False
+            raise ConnectionError(f"Milvus connection failed: {e}") from e
+
+    if not _milvus_collection:
+        try:
+            if not utility.has_collection(MILVUS_COLLECTION_NAME, using=alias):
+                log.warning(f"Milvus collection '{MILVUS_COLLECTION_NAME}' not found. Creating...")
+                _create_milvus_collection(alias)
+            else:
+                log.info(f"Milvus collection '{MILVUS_COLLECTION_NAME}' exists.")
+
+            _milvus_collection = Collection(name=MILVUS_COLLECTION_NAME, using=alias)
+            # Load collection into memory for searching (important!)
+            log.info(f"Loading collection '{MILVUS_COLLECTION_NAME}' into memory...")
+            _milvus_collection.load()
+            log.info(f"Collection '{MILVUS_COLLECTION_NAME}' loaded.")
+
+        except MilvusException as e:
+            log.error(f"Failed to get or load Milvus collection '{MILVUS_COLLECTION_NAME}'", error=str(e), exc_info=True)
+            _milvus_collection = None # Reset on error
+            raise RuntimeError(f"Milvus collection error: {e}") from e
+
+    return _milvus_collection
+
+def _create_milvus_collection(alias: str):
+    """Creates the Milvus collection with the defined schema and index."""
+    log.info(f"Defining schema for collection '{MILVUS_COLLECTION_NAME}'")
+    # Define fields using pymilvus FieldSchema
+    fields = [
+        FieldSchema(name=MILVUS_PK_FIELD, dtype=DataType.INT64, is_primary=True, auto_id=True),
+        FieldSchema(name=MILVUS_VECTOR_FIELD, dtype=DataType.FLOAT_VECTOR, dim=MILVUS_EMBEDDING_DIM),
+        FieldSchema(name=MILVUS_CONTENT_FIELD, dtype=DataType.VARCHAR, max_length=settings.SPLITTER_CHUNK_SIZE * 4), # Allow longer content
+        FieldSchema(name=MILVUS_COMPANY_ID_FIELD, dtype=DataType.VARCHAR, max_length=64), # UUID string length = 36
+        FieldSchema(name=MILVUS_DOCUMENT_ID_FIELD, dtype=DataType.VARCHAR, max_length=64),
+        FieldSchema(name=MILVUS_FILENAME_FIELD, dtype=DataType.VARCHAR, max_length=512), # Allow longer filenames
+        # Add other metadata fields if needed, ensure they are indexed if used for filtering often
+    ]
+    schema = CollectionSchema(fields, description="Document Chunks for Atenex RAG")
+
+    log.info(f"Creating collection '{MILVUS_COLLECTION_NAME}'...")
+    try:
+        collection = Collection(name=MILVUS_COLLECTION_NAME, schema=schema, using=alias, consistency_level="Strong") # Use Strong consistency
+        log.info(f"Collection '{MILVUS_COLLECTION_NAME}' created. Creating index...")
+
+        # Create index on the vector field
+        # Use index parameters from settings
+        index_params = settings.MILVUS_INDEX_PARAMS
+        # Example: {"metric_type": "COSINE", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}}
+        log.info("Creating index for vector field", field_name=MILVUS_VECTOR_FIELD, index_params=index_params)
+        collection.create_index(field_name=MILVUS_VECTOR_FIELD, index_params=index_params)
+        log.info("Index created successfully.")
+
+        # Optional: Create index on metadata fields used for filtering
+        log.info("Creating scalar index for company_id field...")
+        collection.create_index(field_name=MILVUS_COMPANY_ID_FIELD, index_name="company_id_idx")
+        log.info("Creating scalar index for document_id field...")
+        collection.create_index(field_name=MILVUS_DOCUMENT_ID_FIELD, index_name="document_id_idx")
+        log.info("Scalar indexes created.")
+
+    except MilvusException as e:
+        log.error("Failed to create Milvus collection or index", collection_name=MILVUS_COLLECTION_NAME, error=str(e), exc_info=True)
+        raise RuntimeError(f"Milvus collection/index creation failed: {e}") from e
+
+
+def delete_milvus_chunks(company_id: str, document_id: str) -> int:
+    """Deletes chunks from Milvus based on company_id and document_id."""
+    del_log = log.bind(company_id=company_id, document_id=document_id)
+    try:
+        collection = _ensure_milvus_connection_and_collection()
+        # Construct the expression for deletion
+        expr = f'{MILVUS_COMPANY_ID_FIELD} == "{company_id}" and {MILVUS_DOCUMENT_ID_FIELD} == "{document_id}"'
+        del_log.info("Attempting to delete existing chunks from Milvus", filter_expr=expr)
+        # delete() returns a MutationResult object
+        delete_result = collection.delete(expr=expr)
+        deleted_count = delete_result.delete_count
+        del_log.info("Milvus deletion successful", deleted_count=deleted_count)
+        return deleted_count
+    except MilvusException as e:
+        del_log.error("Failed to delete chunks from Milvus", error=str(e), exc_info=True)
+        raise RuntimeError(f"Milvus deletion failed: {e}") from e
+    except Exception as e: # Catch potential connection errors etc.
+        del_log.exception("Unexpected error during Milvus chunk deletion", error=str(e))
+        raise RuntimeError(f"Unexpected Milvus deletion error: {e}") from e
+
+
+# --------------- 4. EMBEDDING MODEL (GLOBAL INSTANCE) -----------------
+
+# Initialize FastEmbed model once per worker process
+# Use device="cpu" explicitly as USE_GPU is False
+try:
+    log.info("Initializing FastEmbed model instance for pipeline...", model=settings.FASTEMBED_MODEL, device="cpu")
+    # We use TextEmbedding directly now, not the Haystack integration component
+    # Pass model_name directly. It handles device selection internally based on available runtimes.
+    # Set parallel=0 for CPU to avoid potential over-subscription of processes with Celery prefork.
+    embedding_model = TextEmbedding(
+        model_name=settings.FASTEMBED_MODEL,
+        cache_dir=os.environ.get("FASTEMBED_CACHE_DIR"), # Optional: configure cache
+        threads=None, # Let FastEmbed decide based on environment / CPU cores
+        parallel=0 # Set to 0 for CPU to disable multi-processing within fastembed
+    )
+    log.info("FastEmbed model instance initialized successfully.")
+except Exception as e:
+    log.critical("CRITICAL: Failed to initialize FastEmbed model instance!", error=str(e), exc_info=True)
+    embedding_model = None # Ensure it's None so pipeline function fails if model load fails
+
+
+# --------------- 5. MAIN INGEST FUNCTION -----------------
+
+def ingest_document_pipeline(
+    file_path: pathlib.Path,
+    company_id: str,
+    document_id: str,
+    content_type: str,
+    delete_existing: bool = True # Option to delete existing chunks before inserting new ones
+) -> int:
+    """
+    Processes a single document: extracts text, chunks, embeds, and inserts into Milvus.
+
+    Args:
+        file_path: Path to the downloaded document file.
+        company_id: The company ID for multi-tenancy.
+        document_id: The unique ID for the document.
+        content_type: The MIME type of the file.
+        delete_existing: If True, delete existing chunks for this company/document before inserting.
+
+    Returns:
+        The number of chunks successfully inserted into Milvus.
+
+    Raises:
+        ValueError: If the content type is unsupported or extraction fails.
+        ConnectionError: If connection to Milvus fails.
+        RuntimeError: For other Milvus or Embedding errors.
+    """
+    ingest_log = log.bind(
+        company_id=company_id,
+        document_id=document_id,
+        filename=file_path.name,
+        content_type=content_type
+    )
+    ingest_log.info("Starting ingestion pipeline for document")
+
+    # --- 0. Check if embedding model loaded ---
+    if not embedding_model:
+        ingest_log.error("FastEmbed model is not available. Cannot proceed.")
+        raise RuntimeError("Embedding model failed to initialize.")
+
+    # --- 1. Select Extractor ---
+    extractor = EXTRACTORS.get(content_type)
+    if not extractor:
+        ingest_log.error("Unsupported content type for extraction.")
+        raise ValueError(f"Unsupported content type: {content_type}")
+
+    # --- 2. Extract Text ---
+    ingest_log.debug("Extracting text content...")
+    try:
+        text_content = extractor(file_path)
+        if not text_content or text_content.isspace():
+            ingest_log.warning("No text content extracted from the document. Skipping embedding and insertion.")
+            return 0
+        ingest_log.info(f"Text extracted successfully, length: {len(text_content)} chars.")
+    except ValueError as ve: # Catch extraction errors raised by helpers
+        ingest_log.error("Text extraction failed.", error=str(ve))
+        raise # Re-raise the specific error
+
+    # --- 3. Chunk Text ---
+    ingest_log.debug("Chunking extracted text...")
+    chunks = chunk_text(
+        text_content,
+        chunk_size=settings.SPLITTER_CHUNK_SIZE,
+        chunk_overlap=settings.SPLITTER_CHUNK_OVERLAP
+    )
+    if not chunks:
+        ingest_log.warning("Text content resulted in zero chunks. Skipping embedding and insertion.")
+        return 0
+    ingest_log.info(f"Text chunked into {len(chunks)} chunks.")
+
+    # --- 4. Embed Chunks ---
+    ingest_log.debug(f"Generating embeddings for {len(chunks)} chunks...")
+    try:
+        # FastEmbed's embed method returns an iterator of numpy arrays
+        # We convert it to a list for insertion
+        embeddings = list(embedding_model.embed(chunks))
+        ingest_log.info(f"Embeddings generated successfully for {len(embeddings)} chunks.")
+        if len(embeddings) != len(chunks):
+            # This shouldn't happen with current fastembed versions, but good sanity check
+             ingest_log.warning("Mismatch between number of chunks and generated embeddings.", num_chunks=len(chunks), num_embeddings=len(embeddings))
+             # Decide how to handle: maybe trim lists? For now, log and continue.
+             min_len = min(len(chunks), len(embeddings))
+             chunks = chunks[:min_len]
+             embeddings = embeddings[:min_len]
+
+    except Exception as e:
+        ingest_log.error("Failed to generate embeddings", error=str(e), exc_info=True)
+        raise RuntimeError(f"Embedding generation failed: {e}") from e
+
+    # --- 5. Prepare Data for Milvus ---
+    data_to_insert = [
+        embeddings,
+        chunks,
+        [company_id] * len(chunks),
+        [document_id] * len(chunks),
+        [file_path.name] * len(chunks),
+    ]
+    # Ensure order matches the FieldSchema defined in _create_milvus_collection
+    # (excluding the auto-id primary key field)
+
+    # --- 6. Delete Existing Chunks (Optional) ---
+    if delete_existing:
+        try:
+            deleted_count = delete_milvus_chunks(company_id, document_id)
+            ingest_log.info(f"Deleted {deleted_count} existing chunks before insertion.")
+        except Exception as del_err:
+            # Log the error but proceed with insertion attempt
+            ingest_log.error("Failed to delete existing chunks, proceeding with insert anyway.", error=str(del_err))
+
+
+    # --- 7. Insert into Milvus ---
+    ingest_log.debug(f"Inserting {len(chunks)} chunks into Milvus collection '{MILVUS_COLLECTION_NAME}'...")
+    try:
+        collection = _ensure_milvus_connection_and_collection()
+        # Use the pymilvus insert method
+        mutation_result = collection.insert(data_to_insert)
+        inserted_count = mutation_result.insert_count
+
+        if inserted_count == len(chunks):
+            ingest_log.info(f"Successfully inserted {inserted_count} chunks into Milvus.")
+            # Ensure data is flushed to disk segment for persistence and visibility
+            log.debug("Flushing Milvus collection...")
+            collection.flush()
+            log.info("Milvus collection flushed.")
+        else:
+             # This might indicate a partial insert or an issue.
+             ingest_log.warning(f"Milvus insert result count ({inserted_count}) differs from chunks sent ({len(chunks)}).")
+             # Still return the reported count, but this warrants investigation if frequent.
+
+        return inserted_count
+
+    except MilvusException as e:
+        ingest_log.error("Failed to insert data into Milvus", error=str(e), exc_info=True)
+        raise RuntimeError(f"Milvus insertion failed: {e}") from e
+    except Exception as e: # Catch potential connection errors etc.
+        ingest_log.exception("Unexpected error during Milvus insertion", error=str(e))
+        raise RuntimeError(f"Unexpected Milvus insertion error: {e}") from e
+```
+
 ## File: `app\services\minio_client.py`
 ```py
 # ingest-service/app/services/minio_client.py
@@ -2542,44 +2964,33 @@ import os
 import tempfile
 import uuid
 import sys
-from typing import Optional, Dict, Any, List, Tuple, Type
+import pathlib # Use pathlib for paths
+from typing import Optional, Dict, Any
 
 import structlog
 from celery import Task
 from celery.exceptions import Ignore, Reject, MaxRetriesExceededError
-from celery.utils.log import get_task_logger # Use Celery's task logger
-
-# --- Haystack Dependencies ---
-from haystack.dataclasses import Document
-from haystack.document_stores.types import DuplicatePolicy
-from haystack.components.converters import (
-    PyPDFToDocument, MarkdownToDocument, HTMLToDocument, TextFileToDocument, DOCXToDocument
-)
-from haystack.components.preprocessors import DocumentSplitter
-from haystack.components.writers import DocumentWriter
-from haystack.utils import ComponentDevice # Keep import for potential future type checks or other uses
-
-# --- Milvus Dependencies ---
-from milvus_haystack import MilvusDocumentStore
-
-# --- FastEmbed Dependencies ---
-from haystack_integrations.components.embedders.fastembed import FastembedDocumentEmbedder
 
 # --- Custom Application Imports ---
 from app.core.config import settings
-# Import the specific sync functions needed
-from app.db.postgres_client import get_sync_engine, set_status_sync
-from app.models.domain import DocumentStatus
-from app.services.minio_client import MinioClient, MinioError
-from app.tasks.celery_app import celery_app
+from app.db.postgres_client import get_sync_engine, set_status_sync # Keep DB client
+from app.models.domain import DocumentStatus # Keep domain models
+from app.services.minio_client import MinioClient, MinioError # Keep MinIO client
+# --- Import the NEW pipeline function ---
+from app.services.ingest_pipeline import ingest_document_pipeline, EXTRACTORS # Import new pipeline and extractors map for validation
+from app.tasks.celery_app import celery_app # Keep Celery app
+
+# --- Initialize Structlog Logger ---
+# Get logger instance BEFORE defining task function if used inside
+task_struct_log = structlog.get_logger(__name__)
 
 # --- Synchronous Database Client Engine ---
 try:
     # Get the engine once when the module loads
     sync_engine = get_sync_engine()
+    task_struct_log.info("Synchronous DB engine initialized successfully for worker.")
 except Exception as db_init_err:
-    # Log critical error if engine fails to initialize
-    structlog.get_logger(__name__).critical(
+    task_struct_log.critical(
         "Failed to initialize synchronous DB engine! Worker tasks depending on DB will fail.",
         error=str(db_init_err),
         exc_info=True
@@ -2588,383 +2999,229 @@ except Exception as db_init_err:
 
 
 # --------------------------------------------------------------------------
-# Global Resource Initialization (Executed once per worker process)
+# Global Resource Initialization (Simplified)
 # --------------------------------------------------------------------------
-log = structlog.get_logger(__name__) # Module-level logger
-
-# Initialize resources in a try-except block to handle potential init failures
+# Resources needed directly by the task logic itself (excluding pipeline components)
 minio_client = None
-milvus_store = None
-splitter = None
-embedder = None
-writer = None
-CONVERTERS = {}
 
 try:
-    log.info("Initializing global resources for Celery worker process...")
-
-    # 1. MinIO Client (uses sync methods internally)
+    task_struct_log.info("Initializing global resources (MinIO Client) for Celery worker process...")
     minio_client = MinioClient()
-    log.info("Global MinIO client initialized.")
-
-    # 2. Milvus Document Store
-    milvus_connection_args = {"uri": settings.MILVUS_URI}
-    if settings.MILVUS_URI.lower().startswith("https"):
-        milvus_connection_args["secure"] = True
-
-    # NOTE: No 'dim' or 'embedding_dim' needed here for Haystack 2.x constructor
-    milvus_store = MilvusDocumentStore(
-        connection_args=milvus_connection_args,
-        collection_name=settings.MILVUS_COLLECTION_NAME,
-        consistency_level="Strong", # Ensure consistency for reads after writes
-    )
-    log.info("Global MilvusDocumentStore initialized.",
-             uri_scheme=settings.MILVUS_URI.split(':')[0],
-             collection=settings.MILVUS_COLLECTION_NAME,
-             consistency="Strong")
-
-    # 3. Haystack Components
-    log.info("Initializing global Haystack components...")
-    splitter = DocumentSplitter(
-        split_by=settings.SPLITTER_SPLIT_BY,
-        split_length=settings.SPLITTER_CHUNK_SIZE,
-        split_overlap=settings.SPLITTER_CHUNK_OVERLAP
-    )
-    log.info("Global DocumentSplitter initialized.",
-             split_by=settings.SPLITTER_SPLIT_BY,
-             length=settings.SPLITTER_CHUNK_SIZE,
-             overlap=settings.SPLITTER_CHUNK_OVERLAP)
-
-    # --- Determine device for FastEmbed (CORRECTED) ---
-    # Pass device as a simple string ("cpu" or "cuda:0") based on settings
-    # This resolves the TypeError: __init__() got an unexpected keyword argument 'device'
-    # because the argument name might be correct, but the type being passed before was wrong.
-    # Now we pass the expected string type.
-    device_str = "cuda:0" if settings.USE_GPU else "cpu"
-    log.info("Selected device for FastEmbed based on settings", device=device_str, use_gpu_setting=settings.USE_GPU)
-
-    embedder = FastembedDocumentEmbedder(
-        model=settings.FASTEMBED_MODEL,
-        # Pass the determined device string directly. This is the fix for the TypeError.
-        device=device_str,
-        batch_size=256, # Adjust batch size as needed
-        # parallel=0 makes sense for CPU, disables multiprocess parallelization within FastEmbed
-        parallel=0 if device_str.startswith("cpu") else None # Disable internal parallel if CPU
-    )
-    log.info("Global FastembedDocumentEmbedder initialized.", model=settings.FASTEMBED_MODEL, device=device_str, parallel=embedder.parallel)
-    # --- End Correction ---
-
-    log.info("Warming up FastEmbed model...")
-    embedder.warm_up()
-    log.info("Global FastEmbed model warmed up successfully.")
-
-    writer = DocumentWriter(
-        document_store=milvus_store,
-        policy=DuplicatePolicy.OVERWRITE, # Overwrite existing chunks for the same document ID
-        batch_size=512 # Adjust batch size as needed
-    )
-    log.info("Global DocumentWriter initialized.", policy="OVERWRITE", batch_size=512)
-
-    # 4. Converters Mapping
-    CONVERTERS = {
-        "application/pdf": PyPDFToDocument,
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": DOCXToDocument,
-        "application/msword": DOCXToDocument, # Also handle .doc via DOCX converter (may need additional libs like antiword if problematic)
-        "text/plain": TextFileToDocument,
-        "text/markdown": MarkdownToDocument,
-        "text/html": HTMLToDocument,
-    }
-    log.info("Global Converters mapping created.")
-
-    log.info("Global resources for Celery worker process initialized successfully.")
+    task_struct_log.info("Global MinIO client initialized.")
+    # Other resources like Milvus client, embedding model are now initialized
+    # within the ingest_pipeline module itself when first used.
 
 except Exception as e:
-    # Log the critical failure during initialization
-    log.critical("CRITICAL: Failed to initialize one or more global resources in worker process!", error=str(e), exc_info=True)
-    # Setting resources to None ensures the check within the task fails cleanly
-    minio_client = milvus_store = splitter = embedder = writer = None
-    # No need to re-raise here, the check inside the task will handle it
-
+    task_struct_log.critical("CRITICAL: Failed to initialize global MinIO client in worker process!", error=str(e), exc_info=True)
+    minio_client = None # Ensure it's None so the check below fails
 
 # --------------------------------------------------------------------------
-# Synchronous Celery Task Definition
+# Refactored Synchronous Celery Task Definition
 # --------------------------------------------------------------------------
 @celery_app.task(
     bind=True,
-    name="ingest.process_document", # Explicit name for clarity
-    autoretry_for=(Exception,), # Retry on general exceptions (network, temp issues)
-    # Exclude Reject and Ignore from automatic retries
-    exclude=(Reject, Ignore),
-    retry_backoff=True,      # Enable exponential backoff
-    retry_backoff_max=600,   # Max delay 600 seconds (10 minutes)
-    retry_jitter=True,       # Add jitter to delays
-    max_retries=3            # Max 3 retries (plus initial attempt)
+    name="ingest.process_document", # Keep explicit name
+    autoretry_for=(Exception,), # Retry on general exceptions (network, temp Milvus/Embedding issues)
+    exclude=(Reject, Ignore, ValueError, ConnectionError, RuntimeError), # Don't retry permanent errors from pipeline
+    retry_backoff=True,
+    retry_backoff_max=600,
+    retry_jitter=True,
+    max_retries=3
 )
-def process_document_sync(self: Task, *args, **kwargs) -> Dict[str, Any]:
+def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
     """
-    Synchronous Celery task to process a single document.
-    Downloads from MinIO, converts, chunks, embeds (CPU), and writes to Milvus.
-    Uses globally initialized resources and updates status in PostgreSQL synchronously.
+    Synchronous Celery task to process a document using the standalone pipeline.
+    Downloads from MinIO, then calls ingest_document_pipeline for conversion,
+    chunking, embedding (CPU), and writing to Milvus via pymilvus.
+    Updates status in PostgreSQL synchronously. Uses structlog for logging.
     """
+    # --- Extract arguments ---
     document_id_str = kwargs.get('document_id')
     company_id_str = kwargs.get('company_id')
     filename = kwargs.get('filename')
     content_type = kwargs.get('content_type')
 
-    # Use Celery's logger for task-specific context including attempt number
-    task_log = get_task_logger(f"{__name__}.{document_id_str}")
+    # --- Setup Logging Context ---
     task_id = self.request.id or "unknown_task_id"
     attempt = self.request.retries + 1
     max_attempts = (self.max_retries or 0) + 1
-    log_context = {"doc": filename, "doc_id": document_id_str, "company_id": company_id_str, "task_id": task_id, "attempt": f"{attempt}/{max_attempts}"}
-    task_log.info(f"Starting sync processing", **log_context)
+    # Use structlog for task-specific logging with context
+    log = task_struct_log.bind(
+        task_id=task_id,
+        attempt=f"{attempt}/{max_attempts}",
+        doc_id=document_id_str,
+        company_id=company_id_str,
+        filename=filename,
+        content_type=content_type
+    )
+    log.info("Starting standalone document processing task")
 
-    # --- Pre-checks for required arguments and global resources ---
+    # --- Pre-checks ---
     if not all([document_id_str, company_id_str, filename, content_type]):
-        task_log.error("Missing required arguments in task payload.", payload_kwargs=kwargs, **log_context)
-        # Use Reject for permanent failure due to bad input
+        log.error("Missing required arguments in task payload.", payload_kwargs=kwargs)
         raise Reject("Missing required arguments (doc_id, company_id, filename, content_type)", requeue=False)
 
-    # Check if global resources failed initialization (logged above)
-    if not sync_engine or not minio_client or not milvus_store or not splitter or not embedder or not writer:
-         task_log.critical("One or more global resources (DB, MinIO, Milvus, Haystack) are not initialized. Task cannot proceed.", **log_context)
-         # This is a worker setup issue, not task-specific. Reject permanently.
-         raise Reject("Worker process global resource initialization failed.", requeue=False)
+    # Check if essential global resources (DB engine, MinIO client) initialized
+    if not sync_engine or not minio_client:
+         log.critical("Core global resources (DB Engine or MinIO Client) are not initialized. Task cannot proceed.")
+         raise Reject("Worker process core resource initialization failed.", requeue=False)
 
     # --- Prepare variables ---
     try:
         doc_uuid = uuid.UUID(document_id_str)
     except ValueError:
-         task_log.error("Invalid document_id format received.", **log_context)
+         log.error("Invalid document_id format received.")
          raise Reject("Invalid document_id format.", requeue=False)
 
-    # Construct the object name used for MinIO storage
+    # Validate content type against new EXTRACTORS map
+    if content_type not in EXTRACTORS:
+        log.error(f"Unsupported content type provided: {content_type}")
+        raise Reject(f"Unsupported content type: {content_type}", requeue=False)
+
+
     object_name = f"{company_id_str}/{document_id_str}/{filename}"
-    temp_file_path = None
-    written_count = 0 # Track number of chunks written
+    temp_file_path_obj: Optional[pathlib.Path] = None # Store Path object
+    inserted_chunk_count = 0 # Track number of chunks inserted
 
     try:
-        # 1. Update status to PROCESSING (Synchronous DB call)
-        task_log.debug("Setting status to PROCESSING in DB.", **log_context)
+        # 1. Update status to PROCESSING
+        log.debug("Setting status to PROCESSING in DB.")
         status_updated = set_status_sync(
-            engine=sync_engine,
-            document_id=doc_uuid,
-            status=DocumentStatus.PROCESSING,
-            error_message=None # Clear any previous errors
+            engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.PROCESSING, error_message=None
         )
         if not status_updated:
-            task_log.warning("Failed to update status to PROCESSING (document possibly deleted?). Ignoring task.", **log_context)
-            raise Ignore() # Ignore if DB update fails (e.g., row gone)
-        task_log.info("Status set to PROCESSING.", **log_context)
+            log.warning("Failed to update status to PROCESSING (document possibly deleted?). Ignoring task.")
+            raise Ignore()
+        log.info("Status set to PROCESSING.")
 
-        # 2. Download file from MinIO (Synchronous) into a temporary directory
+        # 2. Download file from MinIO to temporary directory
         with tempfile.TemporaryDirectory() as temp_dir:
-            temp_file_path = os.path.join(temp_dir, filename)
-            task_log.info(f"Downloading MinIO object: {object_name} -> {temp_file_path}", **log_context)
-            minio_client.download_file_sync(object_name, temp_file_path) # Uses sync method
-            task_log.info("File downloaded successfully from MinIO.", **log_context)
+            temp_dir_path = pathlib.Path(temp_dir)
+            temp_file_path_obj = temp_dir_path / filename # Use pathlib Path object
+            log.info(f"Downloading MinIO object: {object_name} -> {str(temp_file_path_obj)}")
+            minio_client.download_file_sync(object_name, str(temp_file_path_obj))
+            log.info("File downloaded successfully from MinIO.")
 
-            # 3. Select Appropriate Haystack Converter based on content_type
-            ConverterClass = CONVERTERS.get(content_type)
-            if not ConverterClass:
-                task_log.error(f"Unsupported content type provided: {content_type}", **log_context)
-                # Permanent failure if file type is unsupported
-                raise Reject(f"Unsupported content type: {content_type}", requeue=False)
+            # 3. Execute Standalone Ingestion Pipeline
+            log.info("Executing standalone ingest pipeline (extract, chunk, embed, insert)...")
+            # Call the refactored pipeline function
+            # This function now handles extraction, chunking, embedding, and Milvus insertion
+            inserted_chunk_count = ingest_document_pipeline(
+                file_path=temp_file_path_obj,
+                company_id=company_id_str,
+                document_id=document_id_str,
+                content_type=content_type,
+                delete_existing=True # Ensure idempotency by default
+            )
+            log.info(f"Ingestion pipeline finished. Inserted chunks: {inserted_chunk_count}")
 
-            converter = ConverterClass()
-            task_log.debug(f"Using converter: {ConverterClass.__name__}", **log_context)
-
-            # 4. Execute Haystack Pipeline (Synchronous Steps)
-            task_log.info("Starting Haystack pipeline execution (Convert -> Meta -> Split -> Embed -> Write)...", **log_context)
-
-            # --- Step 4a: Conversion ---
-            task_log.debug("Running file conversion...", **log_context)
-            # Converters expect a list of sources
-            conversion_result = converter.run(sources=[temp_file_path])
-            # Extract the list of Haystack Document objects
-            docs: List[Document] = conversion_result.get("documents", [])
-            task_log.info(f"Conversion complete. Found {len(docs)} initial document(s).", **log_context)
-
-            # If conversion yields no documents, stop processing.
-            if not docs:
-                task_log.warning("Converter returned no documents. Nothing to process.", **log_context)
-                written_count = 0 # Ensure count is 0
-            else:
-                # --- Step 4b: Add Essential Metadata ---
-                task_log.debug("Adding standard metadata to documents...", **log_context)
-                for doc in docs:
-                    if doc.meta is None: doc.meta = {}
-                    # Add multi-tenant info and file context for filtering/retrieval
-                    doc.meta.update({
-                        "company_id": str(company_id_str), # Store as string for Milvus/filtering
-                        "document_id": str(document_id_str), # Store as string
-                        "file_name": str(filename),
-                        "file_type": str(content_type),
-                        # Add other relevant meta from original doc if needed
-                        # "source_page": doc.meta.get("page_number") # Example if converter provides it
-                    })
-                    # Clean potential problematic meta values (e.g., None)
-                    doc.meta = {k: v for k, v in doc.meta.items() if v is not None}
-
-
-                # --- Step 4c: Splitting ---
-                task_log.debug("Running document splitting...", **log_context)
-                split_result = splitter.run(documents=docs)
-                split_docs: List[Document] = split_result.get("documents", [])
-                task_log.info(f"Splitting complete. Generated {len(split_docs)} chunks.", **log_context)
-
-                if not split_docs:
-                    task_log.warning("Splitter returned no chunks after processing documents.", **log_context)
-                    written_count = 0
-                else:
-                    # --- Step 4d: Embedding ---
-                    task_log.debug(f"Running embedding for {len(split_docs)} chunks using {settings.FASTEMBED_MODEL} on {device_str}...", **log_context)
-                    embed_result = embedder.run(documents=split_docs)
-                    embedded_docs: List[Document] = embed_result.get("documents", [])
-                    task_log.info(f"Embedding complete for {len(embedded_docs)} chunks.", **log_context)
-
-                    if not embedded_docs:
-                       task_log.warning("Embedder returned no documents after processing chunks.", **log_context)
-                       written_count = 0
-                    else:
-                        # --- Step 4e: Writing to Milvus ---
-                        task_log.debug(f"Running writing of {len(embedded_docs)} embedded chunks to Milvus...", **log_context)
-                        write_result = writer.run(documents=embedded_docs)
-                        # Check the key returned by writer.run in Haystack 2.x (usually 'documents_written')
-                        written_count = write_result.get("documents_written", 0)
-
-                        task_log.info(f"Writing complete. Attempted to write {len(embedded_docs)} chunks, result reports {written_count} written.", **log_context)
-                        if written_count != len(embedded_docs):
-                             task_log.warning("Mismatch between chunks sent to writer and reported written count.", sent=len(embedded_docs), reported=written_count, **log_context)
-                             # Potentially retry or investigate Milvus logs if this happens often
-
-
-        # 5. Update status to PROCESSED (Synchronous DB call)
-        task_log.debug("Setting status to PROCESSED in DB.", **log_context)
+        # 4. Update status to PROCESSED
+        log.debug("Setting status to PROCESSED in DB.")
         final_status_updated = set_status_sync(
             engine=sync_engine,
             document_id=doc_uuid,
             status=DocumentStatus.PROCESSED,
-            chunk_count=written_count, # Store the actual count reported by the writer
-            error_message=None # Clear any previous error
+            chunk_count=inserted_chunk_count, # Store the actual count inserted
+            error_message=None
         )
         if not final_status_updated:
-             # This is unlikely if the first update worked, but handle defensively
-             task_log.warning("Failed to update status to PROCESSED after successful processing (document possibly deleted?).", **log_context)
-             # Task succeeded functionally, but DB state might be off. Log and finish.
+             log.warning("Failed to update status to PROCESSED after successful processing (document possibly deleted?).")
 
-        task_log.info(f"Document processing finished successfully. Final chunk count: {written_count}", **log_context)
-        # Return a result dictionary for Celery backend storage
-        return {"status": DocumentStatus.PROCESSED.value, "chunks_written": written_count, "document_id": document_id_str}
+        log.info(f"Document processing finished successfully. Final chunk count: {inserted_chunk_count}")
+        return {"status": DocumentStatus.PROCESSED.value, "chunks_inserted": inserted_chunk_count, "document_id": document_id_str}
 
+    # --- Specific Error Handling ---
     except MinioError as me:
-        # Handle specific MinIO errors (e.g., file not found)
-        task_log.error(f"MinIO Error during processing: {me}", **log_context, exc_info=True)
+        log.error(f"MinIO Error during processing: {me}", exc_info=True)
         error_msg = f"MinIO Error: {str(me)[:400]}"
         try: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg)
-        except Exception as db_err: task_log.critical("Failed to update status to ERROR after MinIO failure!", error=str(db_err), **log_context)
-        # If file not found, reject permanently. Otherwise, let Celery retry.
+        except Exception as db_err: log.critical("Failed to update status to ERROR after MinIO failure!", error=str(db_err))
         if "Object not found" in str(me):
             raise Reject(f"MinIO Error: Object not found: {object_name}", requeue=False) from me
-        else:
-            # Re-raise for Celery's autoretry
-            raise me
+        else: raise me # Let Celery retry other MinIO errors
+
+    except (ValueError, ConnectionError, RuntimeError) as pipeline_err:
+         # Catch specific, potentially non-retryable errors from the pipeline (e.g., unsupported type, Milvus connection)
+         log.error(f"Pipeline Error: {pipeline_err}", exc_info=True)
+         error_msg = f"Pipeline Error: {type(pipeline_err).__name__} - {str(pipeline_err)[:400]}"
+         try: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg)
+         except Exception as db_err: log.critical("Failed to update status to ERROR after pipeline failure!", error=str(db_err))
+         # Raise as Reject because these are likely config/setup/permanent issues
+         raise Reject(f"Pipeline failed: {error_msg}", requeue=False) from pipeline_err
 
     except Reject as r:
-         # Handle non-retryable rejections explicitly set in the code
-         task_log.error(f"Task rejected permanently: {r.reason}", **log_context)
-         try:
-              set_status_sync(
-                    engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR,
-                    error_message=f"Rejected: {r.reason}"[:500] # Truncate error message
-              )
-         except Exception as db_final_err:
-              task_log.critical("Failed to update status to ERROR after task rejection!", error=str(db_final_err), **log_context)
-         raise r # Re-raise Reject to notify Celery
+         log.error(f"Task rejected permanently: {r.reason}")
+         try: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=f"Rejected: {r.reason}"[:500])
+         except Exception as db_err: log.critical("Failed to update status to ERROR after task rejection!", error=str(db_err))
+         raise r
 
     except Ignore:
-         # Handle ignored tasks (e.g., DB update failed indicating doc was deleted)
-         task_log.info("Task ignored.", **log_context)
-         raise Ignore() # Re-raise Ignore
+         log.info("Task ignored.")
+         raise Ignore()
 
     except MaxRetriesExceededError as mree:
-        # Handle exceeding max retries
-        task_log.error("Max retries exceeded for task.", **log_context, exc_info=True)
-        error_msg = f"Max retries exceeded ({max_attempts}). Last error: {str(mree.cause)[:300]}"
+        log.error("Max retries exceeded for task.", exc_info=True)
+        final_error = mree.cause if mree.cause else mree
+        error_msg = f"Max retries exceeded ({max_attempts}). Last error: {type(final_error).__name__} - {str(final_error)[:300]}"
         try: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg)
-        except Exception as db_final_err: task_log.critical("Failed to update status to ERROR after max retries!", error=str(db_final_err), **log_context)
-        # Don't re-raise, let Celery handle the MaxRetriesExceededError state
+        except Exception as db_err: log.critical("Failed to update status to ERROR after max retries!", error=str(db_err))
+        # Do not re-raise; let Celery mark as failed
 
     except Exception as exc:
-        # Catch all other exceptions for retry or final failure
-        task_log.exception(f"An unexpected error occurred during document processing", **log_context, exc_info=True)
-        error_msg = f"Attempt {attempt} failed: {type(exc).__name__} - {str(exc)[:400]}" # Truncate
-        try:
-            set_status_sync( # Update DB to ERROR before retrying
-                engine=sync_engine,
-                document_id=doc_uuid,
-                status=DocumentStatus.ERROR,
-                error_message=error_msg
-            )
-            task_log.info("Set status to ERROR in DB before retrying/failing.", **log_context)
-        except Exception as db_final_err:
-             # Log critical failure, but still raise original exception for retry mechanism
-             task_log.critical("CRITICAL: Failed to update status to ERROR after processing failure!", error=str(db_final_err), **log_context)
+        # Catch-all for other unexpected errors (should trigger autoretry)
+        log.exception(f"An unexpected error occurred during document processing")
+        error_msg = f"Attempt {attempt} failed: {type(exc).__name__} - {str(exc)[:400]}"
+        try: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg)
+        except Exception as db_err: log.critical("CRITICAL: Failed to update status to ERROR after unexpected failure!", error=str(db_err))
+        raise exc # Re-raise to let Celery handle retry based on autoretry_for
 
-        # Re-raise the original exception to trigger Celery's autoretry logic
-        raise exc
-
-# Make the task instance easily accessible if needed elsewhere
-process_document_haystack_task = process_document_sync
+# Assign the refactored task function to the name expected by the API endpoint
+process_document_haystack_task = process_document_standalone
 ```
 
 ## File: `pyproject.toml`
 ```toml
 [tool.poetry]
 name = "ingest-service"
-version = "0.1.7" # Increment version
-description = "Ingest service for Atenex B2B SaaS (Haystack/Postgres/Minio/Milvus/FastEmbed - CPU - Prefork)"
+# Incrementamos versión por refactorización mayor
+version = "0.2.0"
+description = "Ingest service for Atenex B2B SaaS (Postgres/Minio/Milvus/FastEmbed - CPU - Prefork - Haystack Removed)"
 authors = ["Atenex Team <dev@atenex.com>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.10"
+python = ">=3.10,<3.13"
 fastapi = "^0.110.0"
 uvicorn = {extras = ["standard"], version = "^0.28.0"}
 gunicorn = "^21.2.0"
 pydantic = {extras = ["email"], version = "^2.6.4"}
 pydantic-settings = "^2.2.1"
 celery = {extras = ["redis"], version = "^5.3.6"}
-gevent = "^23.9.1" # REMOVED as per plan
+# gevent ya no es necesario con prefork
 asyncpg = "^0.29.0" # Keep for API
 tenacity = "^8.2.3"
 python-multipart = "^0.0.9"
 structlog = "^24.1.0"
 minio = "^7.1.17"
 
-# --- Haystack Dependencies ---
-haystack-ai = "^2.0.1" # Or the stable version you use for Haystack 2.x
-pymilvus = "^2.4.1"
-milvus-haystack = ">=0.0.16"
+# --- Core Processing Dependencies (Haystack REMOVED) ---
+fastembed = ">=0.2.1,<0.3.0" # Standalone FastEmbed (includes ONNX runtime)
+pymilvus = ">=2.4.1,<2.5.0"  # Official Milvus client
 
-# --- Haystack Converter Dependencies ---
-pypdf = "^4.0.1"
-python-docx = "^1.1.0"
-markdown = "^3.5.1"
-beautifulsoup4 = "^4.12.3"
+# --- Converter Dependencies (Standalone) ---
+pypdf = ">=4.0.1,<5.0.0"
+python-docx = ">=1.1.0,<2.0.0"
+markdown = ">=3.5.1,<4.0.0"
+beautifulsoup4 = ">=4.12.3,<5.0.0"
+html2text = ">=2024.1.0,<2025.0.0" # For Markdown -> HTML -> Text conversion
 
-# --- FastEmbed & ONNX CPU Dependencies ---
-fastembed-haystack = "^1.3.0"
-onnxruntime = "^1.17.0"
-
-# --- HTTP Client ---
+# --- HTTP Client (API) ---
 httpx = {extras = ["http2"], version = "^0.27.0"}
 h2 = "^4.1.0"
 
-# --- Synchronous DB Dependencies (Added for Step 4.3) ---
+# --- Synchronous DB Dependencies (Worker) ---
 sqlalchemy = "^2.0.28"
 psycopg2-binary = "^2.9.9"
-
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"

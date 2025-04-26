@@ -1,6 +1,8 @@
 # ingest-service/app/services/ingest_pipeline.py
 from __future__ import annotations
 
+import os
+import re
 import pathlib
 import uuid
 import markdown # type: ignore
