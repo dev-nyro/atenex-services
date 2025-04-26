@@ -13,17 +13,15 @@ from typing import List, Dict, Any, Callable, Optional
 # Direct library imports
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
-from docx import Document as DocxDocument # Rename to avoid conflict with Haystack Document if ever used elsewhere
-# >>>>>> LLM_FLAG: MODIFIED - TextEmbedding is imported in the worker now <<<<<<
-# from fastembed.embedding import TextEmbedding # Import specific class
-# >>>>>> LLM_FLAG: END MODIFIED <<<<<<
+from docx import Document as DocxDocument
+# LLM_FLAG: REMOVED - Global import of TextEmbedding removed from here
+# from fastembed.embedding import TextEmbedding
 from pymilvus import (
     Collection, CollectionSchema, FieldSchema, DataType, connections,
     utility, MilvusException
 )
-# >>>>>> LLM_FLAG: ADDED - Type hint import <<<<<<
-from fastembed.embedding import TextEmbedding # Still needed for type hinting
-# >>>>>> LLM_FLAG: END ADDED <<<<<<
+# LLM_FLAG: ADDED - Import only for type hinting
+from fastembed.embedding import TextEmbedding
 
 # Local application imports
 from app.core.config import settings
@@ -33,7 +31,6 @@ log = structlog.get_logger(__name__)
 # --------------- 1. TEXT EXTRACTION FUNCTIONS -----------------
 # LLM_FLAG: NO_CHANGE - Text extraction functions remain the same.
 def _extract_from_pdf(file_path: pathlib.Path) -> str:
-    """Extracts text content from a PDF file."""
     log.debug("Extracting text from PDF", path=str(file_path))
     try:
         reader = PdfReader(str(file_path))
@@ -45,7 +42,6 @@ def _extract_from_pdf(file_path: pathlib.Path) -> str:
         raise ValueError(f"Error processing PDF {file_path.name}: {e}") from e
 
 def _extract_from_docx(file_path: pathlib.Path) -> str:
-    """Extracts text content from a DOCX file."""
     log.debug("Extracting text from DOCX", path=str(file_path))
     try:
         doc = DocxDocument(str(file_path))
@@ -57,7 +53,6 @@ def _extract_from_docx(file_path: pathlib.Path) -> str:
         raise ValueError(f"Error processing DOCX {file_path.name}: {e}") from e
 
 def _extract_from_html(file_path: pathlib.Path) -> str:
-    """Extracts text content from an HTML file."""
     log.debug("Extracting text from HTML", path=str(file_path))
     try:
         with open(file_path, "r", encoding="utf-8") as f:
@@ -72,7 +67,6 @@ def _extract_from_html(file_path: pathlib.Path) -> str:
         raise ValueError(f"Error processing HTML {file_path.name}: {e}") from e
 
 def _extract_from_md(file_path: pathlib.Path) -> str:
-    """Extracts text content from a Markdown file by converting to HTML first."""
     log.debug("Extracting text from Markdown", path=str(file_path))
     try:
         md_content = file_path.read_text(encoding="utf-8")
@@ -88,7 +82,6 @@ def _extract_from_md(file_path: pathlib.Path) -> str:
         raise ValueError(f"Error processing Markdown {file_path.name}: {e}") from e
 
 def _extract_from_txt(file_path: pathlib.Path) -> str:
-    """Extracts text content from a plain text file."""
     log.debug("Extracting text from TXT", path=str(file_path))
     try:
         text_content = file_path.read_text(encoding="utf-8")
@@ -111,10 +104,6 @@ EXTRACTORS: Dict[str, Callable[[pathlib.Path], str]] = {
 # --------------- 2. CHUNKER FUNCTION -----------------
 # LLM_FLAG: NO_CHANGE - Keep chunker function as is.
 def chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
-    """
-    Splits text into chunks based on word count with overlap.
-    Simple implementation, can be refined (e.g., sentence splitting).
-    """
     if not text or text.isspace():
         return []
     words = re.split(r'\s+', text.strip())
@@ -155,7 +144,6 @@ _milvus_collection: Optional[Collection] = None
 _milvus_connected = False
 
 def _ensure_milvus_connection_and_collection() -> Collection:
-    """Connects to Milvus if not already connected and returns the Collection object."""
     global _milvus_collection, _milvus_connected
     alias = "default"
 
@@ -192,7 +180,6 @@ def _ensure_milvus_connection_and_collection() -> Collection:
     return _milvus_collection
 
 def _create_milvus_collection(alias: str):
-    """Creates the Milvus collection with the defined schema and index."""
     log.info(f"Defining schema for collection '{MILVUS_COLLECTION_NAME}'")
     fields = [
         FieldSchema(name=MILVUS_PK_FIELD, dtype=DataType.INT64, is_primary=True, auto_id=True),
@@ -225,7 +212,6 @@ def _create_milvus_collection(alias: str):
         raise RuntimeError(f"Milvus collection/index creation failed: {e}") from e
 
 def delete_milvus_chunks(company_id: str, document_id: str) -> int:
-    """Deletes chunks from Milvus based on company_id and document_id."""
     del_log = log.bind(company_id=company_id, document_id=document_id)
     try:
         collection = _ensure_milvus_connection_and_collection()
@@ -244,17 +230,18 @@ def delete_milvus_chunks(company_id: str, document_id: str) -> int:
 
 
 # --------------- 4. EMBEDDING MODEL INITIALIZATION REMOVED FROM GLOBAL SCOPE ---------------
-# LLM_FLAG: REMOVED - Global embedding_model initialization was here
+# LLM_FLAG: REMOVED - Global embedding_model initialization block was here.
+# The model instance will be passed as an argument to the pipeline function.
 
 # --------------- 5. MAIN INGEST FUNCTION (MODIFIED) -----------------
 
-# LLM_FLAG: MODIFIED - Added embedding_model argument
+# LLM_FLAG: MODIFIED - Added embedding_model argument to function signature
 def ingest_document_pipeline(
     file_path: pathlib.Path,
     company_id: str,
     document_id: str,
     content_type: str,
-    embedding_model: TextEmbedding, # Argument added
+    embedding_model: TextEmbedding, # This instance is now expected to be passed in
     delete_existing: bool = True
 ) -> int:
     """
@@ -265,7 +252,7 @@ def ingest_document_pipeline(
         company_id: The company ID for multi-tenancy.
         document_id: The unique ID for the document.
         content_type: The MIME type of the file.
-        embedding_model: The initialized FastEmbed TextEmbedding instance. # Added
+        embedding_model: The initialized FastEmbed TextEmbedding instance.
         delete_existing: If True, delete existing chunks for this company/document before inserting.
 
     Returns:

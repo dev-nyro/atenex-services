@@ -18,7 +18,7 @@ from app.services.minio_client import MinioClient, MinioError # Keep MinIO clien
 # --- Import the NEW pipeline function ---
 from app.services.ingest_pipeline import ingest_document_pipeline, EXTRACTORS # Import pipeline and extractors map
 from app.tasks.celery_app import celery_app # Keep Celery app
-# >>>>>> LLM_FLAG: ADDED - Import TextEmbedding here <<<<<<
+# >>>>>> LLM_FLAG: ADDED - Import TextEmbedding here for initialization <<<<<<
 from fastembed.embedding import TextEmbedding
 # >>>>>> LLM_FLAG: END ADDED <<<<<<
 
@@ -37,14 +37,14 @@ except Exception as db_init_err:
         error=str(db_init_err),
         exc_info=True
     )
-    # Keep sync_engine as None
+    # Keep sync_engine as None to be caught in task pre-check
 
 
 # --------------------------------------------------------------------------
 # Global Resource Initialization (Worker Specific - MODIFIED)
 # --------------------------------------------------------------------------
 minio_client = None
-# LLM_FLAG: ADDED - embedding_model initialized here
+# LLM_FLAG: ADDED - embedding_model initialized globally *for the worker process*
 embedding_model = None
 
 try:
@@ -63,9 +63,8 @@ try:
     task_struct_log.info("Global FastEmbed model instance initialized successfully for worker.")
 
 except Exception as e:
-    # Log critical failure for *either* resource
     task_struct_log.critical("CRITICAL: Failed to initialize global resources (MinIO or Embedding Model) in worker process!", error=str(e), exc_info=True)
-    # Ensure variables are None if initialization failed
+    # Ensure variables are None if initialization failed, will be caught in task pre-check
     if not isinstance(minio_client, MinioClient): minio_client = None
     if not isinstance(embedding_model, TextEmbedding): embedding_model = None
 
@@ -109,18 +108,16 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
         log.error("Missing required arguments in task payload.", payload_kwargs=kwargs)
         raise Reject("Missing required arguments (doc_id, company_id, filename, content_type)", requeue=False)
 
-    # LLM_FLAG: MODIFIED - Check all essential worker resources
+    # LLM_FLAG: MODIFIED - Check all essential worker resources are initialized
     if not sync_engine or not minio_client or not embedding_model:
          log.critical("Core global resources (DB Engine, MinIO Client, or Embedding Model) are not initialized. Task cannot proceed.")
-         if sync_engine:
+         if sync_engine and document_id_str: # Attempt to mark DB if possible
              try:
-                 # Attempt to set error status if possible
                  doc_uuid_for_error = uuid.UUID(document_id_str)
                  set_status_sync(engine=sync_engine, document_id=doc_uuid_for_error, status=DocumentStatus.ERROR, error_message="Worker core resource init failed.")
              except Exception as db_err:
                  log.critical("Failed to update status to ERROR after worker resource init failure!", error=str(db_err))
-         # Reject the task as it cannot run without essential resources
-         raise Reject("Worker process core resource initialization failed.", requeue=False)
+         raise Reject("Worker process core resource initialization failed.", requeue=False) # Reject permanently
 
     try:
         doc_uuid = uuid.UUID(document_id_str)
@@ -158,13 +155,13 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
 
             # 3. Execute Standalone Ingestion Pipeline
             log.info("Executing standalone ingest pipeline (extract, chunk, embed, insert)...")
-            # LLM_FLAG: MODIFIED - Pass the worker's embedding_model instance
+            # LLM_FLAG: MODIFIED - Pass the worker's global embedding_model instance
             inserted_chunk_count = ingest_document_pipeline(
                 file_path=temp_file_path_obj,
                 company_id=company_id_str,
                 document_id=document_id_str,
                 content_type=content_type,
-                embedding_model=embedding_model, # Pass the initialized model
+                embedding_model=embedding_model, # Pass the initialized model here
                 delete_existing=True
             )
             log.info(f"Ingestion pipeline finished. Inserted chunks: {inserted_chunk_count}")
