@@ -218,16 +218,28 @@ def _create_milvus_collection(alias: str) -> Collection:
 def delete_milvus_chunks(company_id: str, document_id: str) -> int:
     del_log = log.bind(company_id=company_id, document_id=document_id)
     try:
+        # Ensure collection is ready
         collection = _ensure_milvus_connection_and_collection()
+        # Construct filter for company/document
         expr = f'{MILVUS_COMPANY_ID_FIELD} == "{company_id}" and {MILVUS_DOCUMENT_ID_FIELD} == "{document_id}"'
-        del_log.info("Attempting to delete existing chunks from Milvus", filter_expr=expr)
-        delete_result = collection.delete(expr=expr)
-        deleted_count = delete_result.delete_count
-        del_log.info("Milvus deletion successful", deleted_count=deleted_count)
-        return deleted_count
+        del_log.info("Querying chunks to delete by primary key", filter_expr=expr)
+        # Get primary keys of matching entities
+        pk_results = collection.query(expr=expr, output_fields=[MILVUS_PK_FIELD])
+        pk_list = [str(item.get(MILVUS_PK_FIELD)) for item in pk_results]
+        if not pk_list:
+            del_log.info("No existing chunks to delete.")
+            return 0
+        delete_expr = f"{MILVUS_PK_FIELD} in [{', '.join(pk_list)}]"
+        del_log.info("Deleting chunks from Milvus", delete_expr=delete_expr)
+        delete_result = collection.delete(expr=delete_expr)
+        del_log.info("Milvus delete operation executed", deleted_count=delete_result.delete_count)
+        return delete_result.delete_count
     except MilvusException as e:
-        del_log.error("Failed to delete chunks from Milvus", error=str(e), exc_info=True)
-        raise RuntimeError(f"Milvus deletion failed: {e}") from e
+        del_log.error("Milvus delete error", error=str(e), exc_info=True)
+        return 0
+    except Exception as e:
+        del_log.exception("Unexpected error during Milvus delete", error=str(e))
+        return 0
     except Exception as e:
         del_log.exception("Unexpected error during Milvus chunk deletion", error=str(e))
         raise RuntimeError(f"Unexpected Milvus deletion error: {e}") from e
@@ -324,12 +336,15 @@ def ingest_document_pipeline(
         raise RuntimeError(f"Embedding generation failed: {e}") from e
 
     # --- 5. Prepare Data for Milvus ---
+    # Truncate chunk text to max_length defined in schema to avoid insertion errors
+    max_content_len = settings.SPLITTER_CHUNK_SIZE * 4
+    truncated_chunks = [c if len(c) <= max_content_len else c[:max_content_len] for c in chunks]
     data_to_insert = [
         embeddings,
-        chunks,
-        [company_id] * len(chunks),
-        [document_id] * len(chunks),
-        [file_path.name] * len(chunks),
+        truncated_chunks,
+        [company_id] * len(truncated_chunks),
+        [document_id] * len(truncated_chunks),
+        [file_path.name] * len(truncated_chunks),
     ]
 
     # --- 6. Delete Existing Chunks (Optional) ---

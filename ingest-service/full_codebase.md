@@ -169,11 +169,10 @@ def _get_milvus_collection_sync() -> Collection:
         #     log.error("Milvus collection not found by API helper", collection_name=MILVUS_COLLECTION_NAME)
         #     raise RuntimeError(f"Collection '{MILVUS_COLLECTION_NAME}' not found.")
 
-        # Load collection if not loaded (necessary for queries)
-        if not collection.is_loaded:
-            sync_milvus_log.info("Loading Milvus collection for sync helper...")
-            collection.load()
-            sync_milvus_log.info("Milvus collection loaded for sync helper.")
+        # Always load collection into memory (necessary for sync queries)
+        sync_milvus_log.info("Loading Milvus collection for sync helper...")
+        collection.load()
+        sync_milvus_log.info("Milvus collection loaded for sync helper.")
 
         return collection
     except MilvusException as e:
@@ -2208,24 +2207,25 @@ def _ensure_milvus_connection_and_collection() -> Collection:
             log.error("Failed to connect to Milvus.", error=str(e))
             raise RuntimeError(f"Milvus connection failed: {e}") from e
 
-    # Crear colección e índices si no existen
+    # Obtener o crear colección y garantizar esquema e índices
     if not utility.has_collection(MILVUS_COLLECTION_NAME, using=alias):
-        _milvus_collection = _create_milvus_collection(alias)
+        collection = _create_milvus_collection(alias)
     else:
-        # Obtener instancia existente
-        _milvus_collection = Collection(name=MILVUS_COLLECTION_NAME, using=alias)
-        existing_indexes = _milvus_collection.indexes
-        if not existing_indexes:
-            log.info("No Milvus indexes found, creando índice vectorial por defecto", field=MILVUS_VECTOR_FIELD)
-            index_params = settings.MILVUS_INDEX_PARAMS
-            _milvus_collection.create_index(field_name=MILVUS_VECTOR_FIELD, index_params=index_params)
+        collection = Collection(name=MILVUS_COLLECTION_NAME, using=alias)
+    # Asegurar índice vectorial existente
+    existing_indexes = collection.indexes
+    if not any(idx.field_name == MILVUS_VECTOR_FIELD for idx in existing_indexes):
+        log.info("Creando índice vectorial en colección Milvus", field=MILVUS_VECTOR_FIELD)
+        collection.create_index(field_name=MILVUS_VECTOR_FIELD, index_params=settings.MILVUS_INDEX_PARAMS)
+    # Asignar colección global
+    _milvus_collection = collection
 
     # Cargar colección en memoria
     try:
-        if not _milvus_collection.is_loaded:
-            log.info("Loading collection into memory...", collection=MILVUS_COLLECTION_NAME)
-            _milvus_collection.load()
-            log.info("Collection loaded.")
+        # Cargar la colección en memoria de forma indiscriminada (idempotente)
+        log.info("Loading collection into memory...", collection=MILVUS_COLLECTION_NAME)
+        _milvus_collection.load()
+        log.info("Collection loaded.")
     except MilvusException as e:
         log.error("Error loading Milvus collection", error=str(e))
         raise RuntimeError(f"Milvus collection error: {e}") from e
@@ -2748,12 +2748,10 @@ try:
             task_struct_log.info("Initializing FastEmbed model instance for worker...", model=settings.FASTEMBED_MODEL, device="cpu")
             embedding_model = TextEmbedding(
                 model_name=settings.FASTEMBED_MODEL,
-                cache_dir=os.environ.get("FASTEMBED_CACHE_DIR"), # Optional: configure cache
-                threads=None, # Let FastEmbed decide based on environment / CPU cores
-                # Set parallel to 0 or 1 for CPU to avoid potential conflicts with Celery prefork
-                # 0 might let FastEmbed manage internal parallelism, 1 disables it explicitly.
-                # Let's use 1 to be safer with prefork.
-                parallel=1
+                cache_dir=os.environ.get("FASTEMBED_CACHE_DIR"),
+                device="cpu",
+                threads=1,
+                parallel=0
             )
             task_struct_log.info("Global FastEmbed model instance initialized successfully for worker.")
         except Exception as emb_init_err:
@@ -2890,13 +2888,22 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
 
             # 3. Execute Standalone Ingestion Pipeline
             log.info("Executing standalone ingest pipeline (extract, chunk, embed, insert)...")
-            # Pass the initialized global embedding_model
+            # Lazy-init embedding model for this task to avoid multiprocessing hangs
+            from fastembed.embedding import TextEmbedding
+            task_struct_log.info("Initializing embedding model for this task...", model=settings.FASTEMBED_MODEL)
+            local_embedding_model = TextEmbedding(
+                model_name=settings.FASTEMBED_MODEL,
+                cache_dir=os.environ.get("FASTEMBED_CACHE_DIR"),
+                device="cpu",
+                threads=1,
+                parallel=0
+            )
             inserted_chunk_count = ingest_document_pipeline(
                 file_path=temp_file_path_obj,
                 company_id=company_id_str,
                 document_id=document_id_str,
                 content_type=content_type,
-                embedding_model=embedding_model, # Pass the initialized model here
+                embedding_model=local_embedding_model,
                 delete_existing=True
             )
             log.info(f"Ingestion pipeline finished. Inserted chunks: {inserted_chunk_count}")
