@@ -172,12 +172,10 @@ def _ensure_milvus_connection_and_collection() -> Collection:
 
     # Cargar colección en memoria
     try:
-        # Chequear si la colección ya está cargada en memoria
-        loaded_collections = utility.list_collections_in_memory()
-        if MILVUS_COLLECTION_NAME not in loaded_collections:
-            log.info("Loading collection into memory...", collection=MILVUS_COLLECTION_NAME)
-            _milvus_collection.load()
-            log.info("Collection loaded.")
+        # Cargar la colección en memoria de forma indiscriminada (idempotente)
+        log.info("Loading collection into memory...", collection=MILVUS_COLLECTION_NAME)
+        _milvus_collection.load()
+        log.info("Collection loaded.")
     except MilvusException as e:
         log.error("Error loading Milvus collection", error=str(e))
         raise RuntimeError(f"Milvus collection error: {e}") from e

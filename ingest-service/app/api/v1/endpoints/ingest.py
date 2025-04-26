@@ -110,11 +110,10 @@ def _get_milvus_collection_sync() -> Collection:
         #     log.error("Milvus collection not found by API helper", collection_name=MILVUS_COLLECTION_NAME)
         #     raise RuntimeError(f"Collection '{MILVUS_COLLECTION_NAME}' not found.")
 
-        # Load collection if not loaded (necessary for queries)
-        if not collection.is_loaded:
-            sync_milvus_log.info("Loading Milvus collection for sync helper...")
-            collection.load()
-            sync_milvus_log.info("Milvus collection loaded for sync helper.")
+        # Always load collection into memory (necessary for sync queries)
+        sync_milvus_log.info("Loading Milvus collection for sync helper...")
+        collection.load()
+        sync_milvus_log.info("Milvus collection loaded for sync helper.")
 
         return collection
     except MilvusException as e:
