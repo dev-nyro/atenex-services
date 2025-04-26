@@ -1046,13 +1046,14 @@ from pydantic import (
 import sys
 import json
 
-# --- Service Names en K8s (sin cambios) ---
+# --- Service Names en K8s ---
+# LLM_COMMENT: Update Milvus service name based on latest deployment
 POSTGRES_K8S_SVC = "postgresql-service.nyro-develop.svc.cluster.local"
 MINIO_K8S_SVC = "minio-service.nyro-develop.svc.cluster.local"
-MILVUS_K8S_SVC = "milvus-milvus.default.svc.cluster.local"
+MILVUS_K8S_SVC = "milvus-standalone.nyro-develop.svc.cluster.local" # Updated Milvus service name
 REDIS_K8S_SVC = "redis-service-master.nyro-develop.svc.cluster.local"
 
-# --- Defaults (sin cambios) ---
+# --- Defaults ---
 POSTGRES_K8S_PORT_DEFAULT = 5432
 POSTGRES_K8S_DB_DEFAULT = "atenex"
 POSTGRES_K8S_USER_DEFAULT = "postgres"
@@ -1060,8 +1061,10 @@ MINIO_K8S_PORT_DEFAULT = 9000
 MINIO_BUCKET_DEFAULT = "ingested-documents"
 MILVUS_K8S_PORT_DEFAULT = 19530
 MILVUS_DEFAULT_COLLECTION = "document_chunks_haystack"
-MILVUS_DEFAULT_INDEX_PARAMS = '{"metric_type": "COSINE", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}}'
-MILVUS_DEFAULT_SEARCH_PARAMS = '{"metric_type": "COSINE", "params": {"ef": 128}}'
+# --- CORRECTION: Changed metric_type from COSINE to IP ---
+MILVUS_DEFAULT_INDEX_PARAMS = '{"metric_type": "IP", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}}'
+MILVUS_DEFAULT_SEARCH_PARAMS = '{"metric_type": "IP", "params": {"ef": 128}}' # Also update search metric
+# ----------------------------------------------------------
 DEFAULT_FASTEMBED_MODEL = "BAAI/bge-large-en-v1.5" # Default for bge-large
 DEFAULT_FASTEMBED_DIM = 1024 # Default dimension for bge-large
 
@@ -1089,11 +1092,9 @@ class Settings(BaseSettings):
     POSTGRES_DB: str = POSTGRES_K8S_DB_DEFAULT
 
     # --- Milvus ---
-    MILVUS_URI: str = Field(default=f"http://{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}")
+    MILVUS_URI: str = Field(default=f"http://{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}") # Updated default to use correct service name
     MILVUS_COLLECTION_NAME: str = MILVUS_DEFAULT_COLLECTION
-    # --- ADDED: Milvus gRPC Timeout ---
     MILVUS_GRPC_TIMEOUT: int = 10 # Default timeout in seconds
-    # --- End Added ---
     MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name", "file_type"])
     MILVUS_CONTENT_FIELD: str = "content"
     MILVUS_EMBEDDING_FIELD: str = "embedding"
@@ -1144,13 +1145,6 @@ class Settings(BaseSettings):
     @classmethod
     def check_embedding_dimension(cls, v: int, info: ValidationInfo) -> int:
         if v <= 0: raise ValueError("EMBEDDING_DIMENSION must be a positive integer.")
-        # Optional: Add a warning if dimension doesn't match the default model's expected dimension
-        # This requires knowing the dimensions for each model name.
-        # Example:
-        # model_name = info.data.get('FASTEMBED_MODEL')
-        # expected_dims = {"BAAI/bge-large-en-v1.5": 1024, "BAAI/bge-base-en-v1.5": 768}
-        # if model_name in expected_dims and v != expected_dims[model_name]:
-        #     logging.warning(f"EMBEDDING_DIMENSION {v} might not match the expected dimension {expected_dims[model_name]} for model {model_name}")
         logging.debug(f"Using EMBEDDING_DIMENSION: {v}")
         return v
 
@@ -1166,7 +1160,10 @@ class Settings(BaseSettings):
     @classmethod
     def validate_milvus_uri(cls, v: str) -> str:
         if not v.startswith("http://") and not v.startswith("https://"):
-             raise ValueError(f"Invalid MILVUS_URI format: '{v}'. Must start with 'http://' or 'https://'")
+             # Allow relative paths for k8s service names implicitly
+             if "." not in v: # Basic check if it might be a k8s service name
+                 return f"http://{v}" # Assume http if no schema
+             raise ValueError(f"Invalid MILVUS_URI format: '{v}'. Must start with 'http://' or 'https://' or be a valid service name.")
         return v
 
 # --- Instancia Global ---
@@ -1193,14 +1190,14 @@ try:
     temp_log.info(f"  POSTGRES_PASSWORD:        {'*** SET ***' if settings.POSTGRES_PASSWORD else '!!! NOT SET !!!'}")
     temp_log.info(f"  MILVUS_URI:               {settings.MILVUS_URI}")
     temp_log.info(f"  MILVUS_COLLECTION_NAME:   {settings.MILVUS_COLLECTION_NAME}")
-    temp_log.info(f"  MILVUS_GRPC_TIMEOUT:      {settings.MILVUS_GRPC_TIMEOUT}s") # Log the timeout
+    temp_log.info(f"  MILVUS_GRPC_TIMEOUT:      {settings.MILVUS_GRPC_TIMEOUT}s")
     temp_log.info(f"  MINIO_ENDPOINT:           {settings.MINIO_ENDPOINT}")
     temp_log.info(f"  MINIO_BUCKET_NAME:        {settings.MINIO_BUCKET_NAME}")
     temp_log.info(f"  MINIO_ACCESS_KEY:         {'*** SET ***' if settings.MINIO_ACCESS_KEY else '!!! NOT SET !!!'}")
     temp_log.info(f"  MINIO_SECRET_KEY:         {'*** SET ***' if settings.MINIO_SECRET_KEY else '!!! NOT SET !!!'}")
     temp_log.info(f"  FASTEMBED_MODEL:          {settings.FASTEMBED_MODEL}")
     temp_log.info(f"  USE_GPU:                  {settings.USE_GPU}")
-    temp_log.info(f"  EMBEDDING_DIMENSION:      {settings.EMBEDDING_DIMENSION}") # Ensure this matches model!
+    temp_log.info(f"  EMBEDDING_DIMENSION:      {settings.EMBEDDING_DIMENSION}")
     temp_log.info(f"  SUPPORTED_CONTENT_TYPES:  {settings.SUPPORTED_CONTENT_TYPES}")
     temp_log.info(f"  SPLITTER_CHUNK_SIZE:      {settings.SPLITTER_CHUNK_SIZE}")
     temp_log.info(f"  SPLITTER_CHUNK_OVERLAP:   {settings.SPLITTER_CHUNK_OVERLAP}")
