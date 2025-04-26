@@ -14,13 +14,12 @@ from typing import List, Dict, Any, Callable, Optional
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from docx import Document as DocxDocument
-# LLM_FLAG: REMOVED - Global import of TextEmbedding removed from here
-# from fastembed.embedding import TextEmbedding
+# LLM_FLAG: REMOVED - Global import and initialization of TextEmbedding removed from here.
 from pymilvus import (
     Collection, CollectionSchema, FieldSchema, DataType, connections,
     utility, MilvusException
 )
-# LLM_FLAG: ADDED - Import only for type hinting
+# LLM_FLAG: ADDED - Import only for type hinting within the function signature.
 from fastembed.embedding import TextEmbedding
 
 # Local application imports
@@ -230,8 +229,7 @@ def delete_milvus_chunks(company_id: str, document_id: str) -> int:
 
 
 # --------------- 4. EMBEDDING MODEL INITIALIZATION REMOVED FROM GLOBAL SCOPE ---------------
-# LLM_FLAG: REMOVED - Global embedding_model initialization block was here.
-# The model instance will be passed as an argument to the pipeline function.
+# LLM_FLAG: REMOVED - Global embedding_model = TextEmbedding(...) block was here.
 
 # --------------- 5. MAIN INGEST FUNCTION (MODIFIED) -----------------
 
@@ -241,12 +239,11 @@ def ingest_document_pipeline(
     company_id: str,
     document_id: str,
     content_type: str,
-    embedding_model: TextEmbedding, # This instance is now expected to be passed in
+    embedding_model: TextEmbedding, # Argument added
     delete_existing: bool = True
 ) -> int:
     """
     Processes a single document: extracts text, chunks, embeds, and inserts into Milvus.
-
     Args:
         file_path: Path to the downloaded document file.
         company_id: The company ID for multi-tenancy.
@@ -254,10 +251,8 @@ def ingest_document_pipeline(
         content_type: The MIME type of the file.
         embedding_model: The initialized FastEmbed TextEmbedding instance.
         delete_existing: If True, delete existing chunks for this company/document before inserting.
-
     Returns:
         The number of chunks successfully inserted into Milvus.
-
     Raises:
         ValueError: If the content type is unsupported, extraction fails, or model not provided.
         ConnectionError: If connection to Milvus fails.
