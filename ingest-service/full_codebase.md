@@ -2067,17 +2067,14 @@ from typing import List, Dict, Any, Callable, Optional
 # Direct library imports
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
-from docx import Document as DocxDocument # Rename to avoid conflict with Haystack Document if ever used elsewhere
-# >>>>>> LLM_FLAG: MODIFIED - TextEmbedding is imported in the worker now <<<<<<
-# from fastembed.embedding import TextEmbedding # Import specific class
-# >>>>>> LLM_FLAG: END MODIFIED <<<<<<
+from docx import Document as DocxDocument
+# LLM_FLAG: REMOVED - Global import and initialization of TextEmbedding removed from here.
 from pymilvus import (
     Collection, CollectionSchema, FieldSchema, DataType, connections,
     utility, MilvusException
 )
-# >>>>>> LLM_FLAG: ADDED - Type hint import <<<<<<
-from fastembed.embedding import TextEmbedding # Still needed for type hinting
-# >>>>>> LLM_FLAG: END ADDED <<<<<<
+# LLM_FLAG: ADDED - Import only for type hinting within the function signature.
+from fastembed.embedding import TextEmbedding
 
 # Local application imports
 from app.core.config import settings
@@ -2087,7 +2084,6 @@ log = structlog.get_logger(__name__)
 # --------------- 1. TEXT EXTRACTION FUNCTIONS -----------------
 # LLM_FLAG: NO_CHANGE - Text extraction functions remain the same.
 def _extract_from_pdf(file_path: pathlib.Path) -> str:
-    """Extracts text content from a PDF file."""
     log.debug("Extracting text from PDF", path=str(file_path))
     try:
         reader = PdfReader(str(file_path))
@@ -2099,7 +2095,6 @@ def _extract_from_pdf(file_path: pathlib.Path) -> str:
         raise ValueError(f"Error processing PDF {file_path.name}: {e}") from e
 
 def _extract_from_docx(file_path: pathlib.Path) -> str:
-    """Extracts text content from a DOCX file."""
     log.debug("Extracting text from DOCX", path=str(file_path))
     try:
         doc = DocxDocument(str(file_path))
@@ -2111,7 +2106,6 @@ def _extract_from_docx(file_path: pathlib.Path) -> str:
         raise ValueError(f"Error processing DOCX {file_path.name}: {e}") from e
 
 def _extract_from_html(file_path: pathlib.Path) -> str:
-    """Extracts text content from an HTML file."""
     log.debug("Extracting text from HTML", path=str(file_path))
     try:
         with open(file_path, "r", encoding="utf-8") as f:
@@ -2126,7 +2120,6 @@ def _extract_from_html(file_path: pathlib.Path) -> str:
         raise ValueError(f"Error processing HTML {file_path.name}: {e}") from e
 
 def _extract_from_md(file_path: pathlib.Path) -> str:
-    """Extracts text content from a Markdown file by converting to HTML first."""
     log.debug("Extracting text from Markdown", path=str(file_path))
     try:
         md_content = file_path.read_text(encoding="utf-8")
@@ -2142,7 +2135,6 @@ def _extract_from_md(file_path: pathlib.Path) -> str:
         raise ValueError(f"Error processing Markdown {file_path.name}: {e}") from e
 
 def _extract_from_txt(file_path: pathlib.Path) -> str:
-    """Extracts text content from a plain text file."""
     log.debug("Extracting text from TXT", path=str(file_path))
     try:
         text_content = file_path.read_text(encoding="utf-8")
@@ -2165,10 +2157,6 @@ EXTRACTORS: Dict[str, Callable[[pathlib.Path], str]] = {
 # --------------- 2. CHUNKER FUNCTION -----------------
 # LLM_FLAG: NO_CHANGE - Keep chunker function as is.
 def chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
-    """
-    Splits text into chunks based on word count with overlap.
-    Simple implementation, can be refined (e.g., sentence splitting).
-    """
     if not text or text.isspace():
         return []
     words = re.split(r'\s+', text.strip())
@@ -2209,7 +2197,6 @@ _milvus_collection: Optional[Collection] = None
 _milvus_connected = False
 
 def _ensure_milvus_connection_and_collection() -> Collection:
-    """Connects to Milvus if not already connected and returns the Collection object."""
     global _milvus_collection, _milvus_connected
     alias = "default"
 
@@ -2246,7 +2233,6 @@ def _ensure_milvus_connection_and_collection() -> Collection:
     return _milvus_collection
 
 def _create_milvus_collection(alias: str):
-    """Creates the Milvus collection with the defined schema and index."""
     log.info(f"Defining schema for collection '{MILVUS_COLLECTION_NAME}'")
     fields = [
         FieldSchema(name=MILVUS_PK_FIELD, dtype=DataType.INT64, is_primary=True, auto_id=True),
@@ -2279,7 +2265,6 @@ def _create_milvus_collection(alias: str):
         raise RuntimeError(f"Milvus collection/index creation failed: {e}") from e
 
 def delete_milvus_chunks(company_id: str, document_id: str) -> int:
-    """Deletes chunks from Milvus based on company_id and document_id."""
     del_log = log.bind(company_id=company_id, document_id=document_id)
     try:
         collection = _ensure_milvus_connection_and_collection()
@@ -2298,11 +2283,11 @@ def delete_milvus_chunks(company_id: str, document_id: str) -> int:
 
 
 # --------------- 4. EMBEDDING MODEL INITIALIZATION REMOVED FROM GLOBAL SCOPE ---------------
-# LLM_FLAG: REMOVED - Global embedding_model initialization was here
+# LLM_FLAG: REMOVED - Global embedding_model = TextEmbedding(...) block was here.
 
 # --------------- 5. MAIN INGEST FUNCTION (MODIFIED) -----------------
 
-# LLM_FLAG: MODIFIED - Added embedding_model argument
+# LLM_FLAG: MODIFIED - Added embedding_model argument to function signature
 def ingest_document_pipeline(
     file_path: pathlib.Path,
     company_id: str,
@@ -2313,18 +2298,15 @@ def ingest_document_pipeline(
 ) -> int:
     """
     Processes a single document: extracts text, chunks, embeds, and inserts into Milvus.
-
     Args:
         file_path: Path to the downloaded document file.
         company_id: The company ID for multi-tenancy.
         document_id: The unique ID for the document.
         content_type: The MIME type of the file.
-        embedding_model: The initialized FastEmbed TextEmbedding instance. # Added
+        embedding_model: The initialized FastEmbed TextEmbedding instance.
         delete_existing: If True, delete existing chunks for this company/document before inserting.
-
     Returns:
         The number of chunks successfully inserted into Milvus.
-
     Raises:
         ValueError: If the content type is unsupported, extraction fails, or model not provided.
         ConnectionError: If connection to Milvus fails.
@@ -2721,7 +2703,7 @@ from app.services.minio_client import MinioClient, MinioError # Keep MinIO clien
 # --- Import the NEW pipeline function ---
 from app.services.ingest_pipeline import ingest_document_pipeline, EXTRACTORS # Import pipeline and extractors map
 from app.tasks.celery_app import celery_app # Keep Celery app
-# >>>>>> LLM_FLAG: ADDED - Import TextEmbedding here <<<<<<
+# >>>>>> LLM_FLAG: ADDED - Import TextEmbedding here for initialization <<<<<<
 from fastembed.embedding import TextEmbedding
 # >>>>>> LLM_FLAG: END ADDED <<<<<<
 
@@ -2740,14 +2722,14 @@ except Exception as db_init_err:
         error=str(db_init_err),
         exc_info=True
     )
-    # Keep sync_engine as None
+    # Keep sync_engine as None to be caught in task pre-check
 
 
 # --------------------------------------------------------------------------
 # Global Resource Initialization (Worker Specific - MODIFIED)
 # --------------------------------------------------------------------------
 minio_client = None
-# LLM_FLAG: ADDED - embedding_model initialized here
+# LLM_FLAG: ADDED - embedding_model initialized globally *for the worker process*
 embedding_model = None
 
 try:
@@ -2766,9 +2748,8 @@ try:
     task_struct_log.info("Global FastEmbed model instance initialized successfully for worker.")
 
 except Exception as e:
-    # Log critical failure for *either* resource
     task_struct_log.critical("CRITICAL: Failed to initialize global resources (MinIO or Embedding Model) in worker process!", error=str(e), exc_info=True)
-    # Ensure variables are None if initialization failed
+    # Ensure variables are None if initialization failed, will be caught in task pre-check
     if not isinstance(minio_client, MinioClient): minio_client = None
     if not isinstance(embedding_model, TextEmbedding): embedding_model = None
 
@@ -2812,18 +2793,16 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
         log.error("Missing required arguments in task payload.", payload_kwargs=kwargs)
         raise Reject("Missing required arguments (doc_id, company_id, filename, content_type)", requeue=False)
 
-    # LLM_FLAG: MODIFIED - Check all essential worker resources
+    # LLM_FLAG: MODIFIED - Check all essential worker resources are initialized
     if not sync_engine or not minio_client or not embedding_model:
          log.critical("Core global resources (DB Engine, MinIO Client, or Embedding Model) are not initialized. Task cannot proceed.")
-         if sync_engine:
+         if sync_engine and document_id_str: # Attempt to mark DB if possible
              try:
-                 # Attempt to set error status if possible
                  doc_uuid_for_error = uuid.UUID(document_id_str)
                  set_status_sync(engine=sync_engine, document_id=doc_uuid_for_error, status=DocumentStatus.ERROR, error_message="Worker core resource init failed.")
              except Exception as db_err:
                  log.critical("Failed to update status to ERROR after worker resource init failure!", error=str(db_err))
-         # Reject the task as it cannot run without essential resources
-         raise Reject("Worker process core resource initialization failed.", requeue=False)
+         raise Reject("Worker process core resource initialization failed.", requeue=False) # Reject permanently
 
     try:
         doc_uuid = uuid.UUID(document_id_str)
@@ -2861,13 +2840,13 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
 
             # 3. Execute Standalone Ingestion Pipeline
             log.info("Executing standalone ingest pipeline (extract, chunk, embed, insert)...")
-            # LLM_FLAG: MODIFIED - Pass the worker's embedding_model instance
+            # LLM_FLAG: MODIFIED - Pass the worker's global embedding_model instance
             inserted_chunk_count = ingest_document_pipeline(
                 file_path=temp_file_path_obj,
                 company_id=company_id_str,
                 document_id=document_id_str,
                 content_type=content_type,
-                embedding_model=embedding_model, # Pass the initialized model
+                embedding_model=embedding_model, # Pass the initialized model here
                 delete_existing=True
             )
             log.info(f"Ingestion pipeline finished. Inserted chunks: {inserted_chunk_count}")
