@@ -157,21 +157,24 @@ def _ensure_milvus_connection_and_collection() -> Collection:
             log.error("Failed to connect to Milvus.", error=str(e))
             raise RuntimeError(f"Milvus connection failed: {e}") from e
 
-    # Crear colección e índices si no existen
+    # Obtener o crear colección y garantizar esquema e índices
     if not utility.has_collection(MILVUS_COLLECTION_NAME, using=alias):
-        _milvus_collection = _create_milvus_collection(alias)
+        collection = _create_milvus_collection(alias)
     else:
-        # Obtener instancia existente
-        _milvus_collection = Collection(name=MILVUS_COLLECTION_NAME, using=alias)
-        existing_indexes = _milvus_collection.indexes
-        if not existing_indexes:
-            log.info("No Milvus indexes found, creando índice vectorial por defecto", field=MILVUS_VECTOR_FIELD)
-            index_params = settings.MILVUS_INDEX_PARAMS
-            _milvus_collection.create_index(field_name=MILVUS_VECTOR_FIELD, index_params=index_params)
+        collection = Collection(name=MILVUS_COLLECTION_NAME, using=alias)
+    # Asegurar índice vectorial existente
+    existing_indexes = collection.indexes
+    if not any(idx.field_name == MILVUS_VECTOR_FIELD for idx in existing_indexes):
+        log.info("Creando índice vectorial en colección Milvus", field=MILVUS_VECTOR_FIELD)
+        collection.create_index(field_name=MILVUS_VECTOR_FIELD, index_params=settings.MILVUS_INDEX_PARAMS)
+    # Asignar colección global
+    _milvus_collection = collection
 
     # Cargar colección en memoria
     try:
-        if not _milvus_collection.is_loaded:
+        # Chequear si la colección ya está cargada en memoria
+        loaded_collections = utility.list_collections_in_memory()
+        if MILVUS_COLLECTION_NAME not in loaded_collections:
             log.info("Loading collection into memory...", collection=MILVUS_COLLECTION_NAME)
             _milvus_collection.load()
             log.info("Collection loaded.")

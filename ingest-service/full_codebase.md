@@ -2201,35 +2201,38 @@ def _ensure_milvus_connection_and_collection() -> Collection:
         uri = settings.MILVUS_URI
         log.info("Connecting to Milvus...", uri=uri, alias=alias, timeout=settings.MILVUS_GRPC_TIMEOUT)
         try:
-            connections.connect(alias=alias, uri=uri, timeout=settings.MILVUS_GRPC_TIMEOUT)
+            connections.connect(alias=alias, uri=uri)
             _milvus_connected = True
-            log.info("Successfully connected to Milvus.")
+            log.info("Connected to Milvus.")
         except MilvusException as e:
-            log.critical("Failed to connect to Milvus", error=str(e), exc_info=True)
-            _milvus_connected = False
-            raise ConnectionError(f"Milvus connection failed: {e}") from e
+            log.error("Failed to connect to Milvus.", error=str(e))
+            raise RuntimeError(f"Milvus connection failed: {e}") from e
 
-    if not _milvus_collection:
-        try:
-            if not utility.has_collection(MILVUS_COLLECTION_NAME, using=alias):
-                log.warning(f"Milvus collection '{MILVUS_COLLECTION_NAME}' not found. Creating...")
-                _create_milvus_collection(alias)
-            else:
-                log.info(f"Milvus collection '{MILVUS_COLLECTION_NAME}' exists.")
+    # Crear colección e índices si no existen
+    if not utility.has_collection(MILVUS_COLLECTION_NAME, using=alias):
+        _milvus_collection = _create_milvus_collection(alias)
+    else:
+        # Obtener instancia existente
+        _milvus_collection = Collection(name=MILVUS_COLLECTION_NAME, using=alias)
+        existing_indexes = _milvus_collection.indexes
+        if not existing_indexes:
+            log.info("No Milvus indexes found, creando índice vectorial por defecto", field=MILVUS_VECTOR_FIELD)
+            index_params = settings.MILVUS_INDEX_PARAMS
+            _milvus_collection.create_index(field_name=MILVUS_VECTOR_FIELD, index_params=index_params)
 
-            _milvus_collection = Collection(name=MILVUS_COLLECTION_NAME, using=alias)
-            log.info(f"Loading collection '{MILVUS_COLLECTION_NAME}' into memory...")
+    # Cargar colección en memoria
+    try:
+        if not _milvus_collection.is_loaded:
+            log.info("Loading collection into memory...", collection=MILVUS_COLLECTION_NAME)
             _milvus_collection.load()
-            log.info(f"Collection '{MILVUS_COLLECTION_NAME}' loaded.")
-
-        except MilvusException as e:
-            log.error(f"Failed to get or load Milvus collection '{MILVUS_COLLECTION_NAME}'", error=str(e), exc_info=True)
-            _milvus_collection = None
-            raise RuntimeError(f"Milvus collection error: {e}") from e
+            log.info("Collection loaded.")
+    except MilvusException as e:
+        log.error("Error loading Milvus collection", error=str(e))
+        raise RuntimeError(f"Milvus collection error: {e}") from e
 
     return _milvus_collection
 
-def _create_milvus_collection(alias: str):
+def _create_milvus_collection(alias: str) -> Collection:
     log.info(f"Defining schema for collection '{MILVUS_COLLECTION_NAME}'")
     fields = [
         FieldSchema(name=MILVUS_PK_FIELD, dtype=DataType.INT64, is_primary=True, auto_id=True),
@@ -2260,6 +2263,7 @@ def _create_milvus_collection(alias: str):
     except MilvusException as e:
         log.error("Failed to create Milvus collection or index", collection_name=MILVUS_COLLECTION_NAME, error=str(e), exc_info=True)
         raise RuntimeError(f"Milvus collection/index creation failed: {e}") from e
+    return collection
 
 def delete_milvus_chunks(company_id: str, document_id: str) -> int:
     del_log = log.bind(company_id=company_id, document_id=document_id)
