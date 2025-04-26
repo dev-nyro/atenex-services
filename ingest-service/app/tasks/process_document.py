@@ -62,12 +62,10 @@ try:
             task_struct_log.info("Initializing FastEmbed model instance for worker...", model=settings.FASTEMBED_MODEL, device="cpu")
             embedding_model = TextEmbedding(
                 model_name=settings.FASTEMBED_MODEL,
-                cache_dir=os.environ.get("FASTEMBED_CACHE_DIR"), # Optional: configure cache
-                threads=None, # Let FastEmbed decide based on environment / CPU cores
-                # Set parallel to 0 or 1 for CPU to avoid potential conflicts with Celery prefork
-                # 0 might let FastEmbed manage internal parallelism, 1 disables it explicitly.
-                # Let's use 1 to be safer with prefork.
-                parallel=1
+                cache_dir=os.environ.get("FASTEMBED_CACHE_DIR"),
+                device="cpu",
+                threads=1,
+                parallel=0
             )
             task_struct_log.info("Global FastEmbed model instance initialized successfully for worker.")
         except Exception as emb_init_err:
@@ -204,13 +202,22 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
 
             # 3. Execute Standalone Ingestion Pipeline
             log.info("Executing standalone ingest pipeline (extract, chunk, embed, insert)...")
-            # Pass the initialized global embedding_model
+            # Lazy-init embedding model for this task to avoid multiprocessing hangs
+            from fastembed.embedding import TextEmbedding
+            task_struct_log.info("Initializing embedding model for this task...", model=settings.FASTEMBED_MODEL)
+            local_embedding_model = TextEmbedding(
+                model_name=settings.FASTEMBED_MODEL,
+                cache_dir=os.environ.get("FASTEMBED_CACHE_DIR"),
+                device="cpu",
+                threads=1,
+                parallel=0
+            )
             inserted_chunk_count = ingest_document_pipeline(
                 file_path=temp_file_path_obj,
                 company_id=company_id_str,
                 document_id=document_id_str,
                 content_type=content_type,
-                embedding_model=embedding_model, # Pass the initialized model here
+                embedding_model=local_embedding_model,
                 delete_existing=True
             )
             log.info(f"Ingestion pipeline finished. Inserted chunks: {inserted_chunk_count}")
