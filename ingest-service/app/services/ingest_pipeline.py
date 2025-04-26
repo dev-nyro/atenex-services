@@ -336,9 +336,9 @@ def ingest_document_pipeline(
         raise RuntimeError(f"Embedding generation failed: {e}") from e
 
     # --- 5. Prepare Data for Milvus ---
-    # Truncate chunk text to max_length defined in schema to avoid insertion errors
-    max_content_len = settings.SPLITTER_CHUNK_SIZE * 4
-    truncated_chunks = [c if len(c) <= max_content_len else c[:max_content_len] for c in chunks]
+    # Hardcode truncation to 4000 chars to match Milvus VARCHAR limit
+    max_content_len = 4000
+    truncated_chunks = [c[:max_content_len] for c in chunks]
     data_to_insert = [
         embeddings,
         truncated_chunks,
