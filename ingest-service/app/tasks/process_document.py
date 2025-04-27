@@ -177,6 +177,7 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
 
 
     object_name = f"{company_id_str}/{document_id_str}/{filename}"
+    log.debug(f"MinIO download object_name repr: {repr(object_name)}")
     temp_file_path_obj: Optional[pathlib.Path] = None
     inserted_chunk_count = 0
 

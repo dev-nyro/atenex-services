@@ -281,6 +281,7 @@ async def upload_document(
 
     try:
         file_content = await file.read()
+        endpoint_log.debug(f"MinIO upload object_name repr: {repr(file_path_in_storage)}")
         await minio_client.upload_file_async(
             object_name=file_path_in_storage, data=file_content, content_type=file.content_type
         )
