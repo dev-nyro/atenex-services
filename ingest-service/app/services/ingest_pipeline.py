@@ -322,23 +322,29 @@ def ingest_document_pipeline(
     # --- 4. Embed Chunks ---
     ingest_log.debug(f"Generating embeddings for {len(chunks)} chunks...")
     try:
-        # LLM_FLAG: MODIFIED - Use the passed embedding_model argument
         embeddings = list(embedding_model.embed(chunks))
         ingest_log.info(f"Embeddings generated successfully for {len(embeddings)} chunks.")
         if len(embeddings) != len(chunks):
-             ingest_log.warning("Mismatch between number of chunks and generated embeddings.", num_chunks=len(chunks), num_embeddings=len(embeddings))
-             min_len = min(len(chunks), len(embeddings))
-             chunks = chunks[:min_len]
-             embeddings = embeddings[:min_len]
+            ingest_log.warning("Mismatch between number of chunks and generated embeddings.", num_chunks=len(chunks), num_embeddings=len(embeddings))
+            min_len = min(len(chunks), len(embeddings))
+            chunks = chunks[:min_len]
+            embeddings = embeddings[:min_len]
 
     except Exception as e:
         ingest_log.error("Failed to generate embeddings", error=str(e), exc_info=True)
         raise RuntimeError(f"Embedding generation failed: {e}") from e
 
     # --- 5. Prepare Data for Milvus ---
-    # Hardcode truncation to 4000 chars to match Milvus VARCHAR limit
     max_content_len = 4000
     truncated_chunks = [c[:max_content_len] for c in chunks]
+    # Ensure embeddings and truncated_chunks are aligned
+    if len(truncated_chunks) != len(embeddings):
+        min_len = min(len(truncated_chunks), len(embeddings))
+        truncated_chunks = truncated_chunks[:min_len]
+        embeddings = embeddings[:min_len]
+    # Debug: log chunk lengths before insert
+    for idx, chunk in enumerate(truncated_chunks):
+        ingest_log.debug(f"Chunk {idx} length before insert: {len(chunk)}")
     data_to_insert = [
         embeddings,
         truncated_chunks,
@@ -356,19 +362,19 @@ def ingest_document_pipeline(
             ingest_log.error("Failed to delete existing chunks, proceeding with insert anyway.", error=str(del_err))
 
     # --- 7. Insert into Milvus ---
-    ingest_log.debug(f"Inserting {len(chunks)} chunks into Milvus collection '{MILVUS_COLLECTION_NAME}'...")
+    ingest_log.debug(f"Inserting {len(truncated_chunks)} chunks into Milvus collection '{MILVUS_COLLECTION_NAME}'...")
     try:
         collection = _ensure_milvus_connection_and_collection()
         mutation_result = collection.insert(data_to_insert)
         inserted_count = mutation_result.insert_count
 
-        if inserted_count == len(chunks):
+        if inserted_count == len(truncated_chunks):
             ingest_log.info(f"Successfully inserted {inserted_count} chunks into Milvus.")
             log.debug("Flushing Milvus collection...")
             collection.flush()
             log.info("Milvus collection flushed.")
         else:
-             ingest_log.warning(f"Milvus insert result count ({inserted_count}) differs from chunks sent ({len(chunks)}).")
+            ingest_log.warning(f"Milvus insert result count ({inserted_count}) differs from chunks sent ({len(truncated_chunks)}).")
 
         return inserted_count
 

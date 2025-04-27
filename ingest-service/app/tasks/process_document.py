@@ -192,14 +192,31 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
             raise Ignore()
         log.info("Status set to PROCESSING.")
 
-        # 2. Download file from MinIO to temporary directory
+        # 2. Download file from MinIO to temporary directory (with retry on NoSuchKey)
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_dir_path = pathlib.Path(temp_dir)
             temp_file_path_obj = temp_dir_path / filename
             log.info(f"Downloading MinIO object: {object_name} -> {str(temp_file_path_obj)}")
-            # Use the initialized global minio_client
-            minio_client.download_file_sync(object_name, str(temp_file_path_obj))
-            log.info("File downloaded successfully from MinIO.")
+            max_minio_retries = 5
+            minio_delay = 2  # seconds
+            for attempt_num in range(1, max_minio_retries + 1):
+                try:
+                    minio_client.download_file_sync(object_name, str(temp_file_path_obj))
+                    log.info("File downloaded successfully from MinIO.")
+                    break
+                except MinioError as me:
+                    # Only retry on NoSuchKey
+                    if "NoSuchKey" in str(me) or "Object not found" in str(me):
+                        log.warning(f"MinIO NoSuchKey on attempt {attempt_num}/{max_minio_retries}. Retrying in {minio_delay} seconds...", error=str(me))
+                        if attempt_num == max_minio_retries:
+                            log.error(f"File still not found in MinIO after {max_minio_retries} attempts. Aborting.")
+                            raise
+                        import time
+                        time.sleep(minio_delay)
+                        minio_delay *= 2  # Exponential backoff
+                        continue
+                    else:
+                        raise  # Other Minio errors are not retried
 
             # 3. Execute Standalone Ingestion Pipeline
             log.info("Executing standalone ingest pipeline (extract, chunk, embed, insert)...")
