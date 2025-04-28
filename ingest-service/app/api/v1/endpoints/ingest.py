@@ -196,6 +196,12 @@ def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
         503: {"model": ErrorDetail, "description": "Service Unavailable (DB or MinIO)"},
     }
 )
+@router.post(
+    "/ingest/upload",
+    response_model=IngestResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    include_in_schema=False
+)
 async def upload_document(
     request: Request,
     background_tasks: BackgroundTasks,
@@ -350,6 +356,11 @@ async def upload_document(
         500: {"model": ErrorDetail, "description": "Internal Server Error"},
         503: {"model": ErrorDetail, "description": "Service Unavailable (DB, MinIO, Milvus)"},
     }
+)
+@router.get(
+    "/ingest/status/{document_id}",
+    response_model=StatusResponse,
+    include_in_schema=False
 )
 async def get_document_status(
     request: Request,
@@ -512,6 +523,11 @@ async def get_document_status(
         503: {"model": ErrorDetail, "description": "Service Unavailable (DB, MinIO, Milvus)"},
     }
 )
+@router.get(
+    "/ingest/status",
+    response_model=List[StatusResponse],
+    include_in_schema=False
+)
 async def list_document_statuses(
     request: Request,
     limit: int = Query(30, ge=1, le=100),
@@ -670,6 +686,12 @@ async def list_document_statuses(
         503: {"model": ErrorDetail, "description": "Service Unavailable (DB or Celery)"},
     }
 )
+@router.post(
+    "/ingest/retry/{document_id}",
+    response_model=IngestResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    include_in_schema=False
+)
 async def retry_ingestion(
     request: Request,
     document_id: uuid.UUID = Path(..., description="The UUID of the document to retry"),
@@ -756,6 +778,11 @@ async def retry_ingestion(
         500: {"model": ErrorDetail, "description": "Internal Server Error"},
         503: {"model": ErrorDetail, "description": "Service Unavailable (DB, MinIO, Milvus)"},
     }
+)
+@router.delete(
+    "/ingest/{document_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    include_in_schema=False
 )
 async def delete_document_endpoint(
     request: Request,
