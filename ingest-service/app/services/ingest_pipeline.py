@@ -336,7 +336,13 @@ def ingest_document_pipeline(
 
     # --- 5. Prepare Data for Milvus ---
     max_content_len = 4000
-    truncated_chunks = [c[:max_content_len] for c in chunks]
+    def truncate_utf8_bytes(s, max_bytes):
+        b = s.encode('utf-8')
+        if len(b) <= max_bytes:
+            return s
+        # Truncate by bytes, decode ignoring incomplete chars
+        return b[:max_bytes].decode('utf-8', errors='ignore')
+    truncated_chunks = [truncate_utf8_bytes(c, max_content_len) for c in chunks]
     # Ensure embeddings and truncated_chunks are aligned
     if len(truncated_chunks) != len(embeddings):
         min_len = min(len(truncated_chunks), len(embeddings))
@@ -344,7 +350,7 @@ def ingest_document_pipeline(
         embeddings = embeddings[:min_len]
     # Debug: log chunk lengths before insert
     for idx, chunk in enumerate(truncated_chunks):
-        ingest_log.debug(f"Chunk {idx} length before insert: {len(chunk)}")
+        ingest_log.debug(f"Chunk {idx} length before insert: {len(chunk)} bytes: {len(chunk.encode('utf-8'))}")
     data_to_insert = [
         embeddings,
         truncated_chunks,
