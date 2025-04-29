@@ -130,19 +130,12 @@ def _get_milvus_chunk_count_sync(document_id: str, company_id: str) -> int:
         expr = f'{MILVUS_COMPANY_ID_FIELD} == "{company_id}" and {MILVUS_DOCUMENT_ID_FIELD} == "{document_id}"'
         count_log.debug("Attempting to query Milvus chunk count", filter_expr=expr)
 
-        # Use query with count(*) aggregation
-        # Note: Ensure output_fields includes "count(*)" exactly
+        # Query for PK field and count results (workaround for unsupported count(*))
         query_res = collection.query(
             expr=expr,
-            output_fields=["count(*)"]
+            output_fields=["pk_id"]
         )
-
-        # Extract count from the result (structure might vary slightly based on pymilvus version)
-        # Typically it's in the first dictionary of the list under 'count(*)'
-        count = 0
-        if query_res and isinstance(query_res, list) and len(query_res) > 0:
-           count = query_res[0].get("count(*)", 0)
-
+        count = len(query_res) if query_res else 0
         count_log.info("Milvus chunk count successful (pymilvus)", count=count)
         return count
     except RuntimeError as re: # Catch collection/connection error
