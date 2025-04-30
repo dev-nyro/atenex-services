@@ -574,13 +574,21 @@ async def list_document_statuses(
             try:
                 live_minio_exists = await minio_client.check_file_exists_async(minio_path_db)
                 if not live_minio_exists and doc_updated_status_enum not in [DocumentStatus.ERROR, DocumentStatus.PENDING]:
-                     if doc_updated_status_enum != DocumentStatus.ERROR:
-                         doc_needs_update=True; doc_updated_status_enum=DocumentStatus.ERROR; doc_updated_error_msg="File missing from storage."; doc_updated_chunk_count=0
+                    if doc_updated_status_enum != DocumentStatus.ERROR:
+                        doc_needs_update = True
+                        doc_updated_status_enum = DocumentStatus.ERROR
+                        doc_updated_error_msg = "File missing from storage."
+                        doc_updated_chunk_count = 0
             except Exception as e:
-                check_log.error("MinIO check failed for list item", error=str(e)); live_minio_exists = False
+                check_log.error("MinIO check failed for list item", error=str(e))
+                live_minio_exists = False
                 if doc_updated_status_enum != DocumentStatus.ERROR:
-                    doc_needs_update=True; doc_updated_status_enum=DocumentStatus.ERROR; doc_updated_error_msg=(doc_updated_error_msg or "")+f" MinIO check error."; doc_updated_chunk_count=0
-        else: live_minio_exists = False
+                    doc_needs_update = True
+                    doc_updated_status_enum = DocumentStatus.ERROR
+                    doc_updated_error_msg = (doc_updated_error_msg or "") + f" MinIO check error."
+                    doc_updated_chunk_count = 0
+        else:
+            live_minio_exists = False
 
         live_milvus_chunk_count = -1
         loop = asyncio.get_running_loop()
@@ -590,7 +598,7 @@ async def list_document_statuses(
                 if doc_updated_status_enum != DocumentStatus.ERROR:
                     doc_needs_update = True
                     doc_updated_status_enum = DocumentStatus.ERROR
-                    doc_updated_err_msg = (doc_updated_err_msg or "") + " Failed Milvus count."
+                    doc_updated_error_msg = (doc_updated_error_msg or "") + " Failed Milvus count."
             elif live_milvus_chunk_count > 0:
                 # Si hay chunks y el archivo existe, y el estado es error o uploaded, corregir a PROCESSED
                 if live_minio_exists and doc_updated_status_enum in [DocumentStatus.ERROR, DocumentStatus.UPLOADED]:
@@ -598,7 +606,7 @@ async def list_document_statuses(
                     doc_needs_update = True
                     doc_updated_status_enum = DocumentStatus.PROCESSED
                     doc_updated_chunk_count = live_milvus_chunk_count
-                    doc_updated_err_msg = None
+                    doc_updated_error_msg = None
                 elif doc_updated_status_enum == DocumentStatus.PROCESSED and doc_updated_chunk_count != live_milvus_chunk_count:
                     doc_needs_update = True
                     doc_updated_chunk_count = live_milvus_chunk_count
@@ -607,19 +615,25 @@ async def list_document_statuses(
                     doc_needs_update = True
                     doc_updated_status_enum = DocumentStatus.ERROR
                     doc_updated_chunk_count = 0
-                    doc_updated_err_msg = (doc_updated_err_msg or "") + " Processed data missing."
+                    doc_updated_error_msg = (doc_updated_error_msg or "") + " Processed data missing."
                 elif doc_updated_status_enum == DocumentStatus.ERROR and doc_updated_chunk_count != 0:
                     doc_needs_update = True
                     doc_updated_chunk_count = 0
         except Exception as e:
-            check_log.exception("Unexpected error during Milvus count check for list item", error=str(e)); live_milvus_chunk_count = -1
+            check_log.exception("Unexpected error during Milvus count check for list item", error=str(e))
+            live_milvus_chunk_count = -1
             if doc_updated_status_enum != DocumentStatus.ERROR:
-                doc_needs_update=True; doc_updated_status_enum=DocumentStatus.ERROR; doc_updated_error_msg=(doc_updated_error_msg or "")+f" Error checking Milvus."
+                doc_needs_update = True
+                doc_updated_status_enum = DocumentStatus.ERROR
+                doc_updated_error_msg = (doc_updated_error_msg or "") + f" Error checking Milvus."
 
         return {
-            "db_data": doc_db_data, "needs_update": doc_needs_update,
-            "updated_status_enum": doc_updated_status_enum, "updated_chunk_count": doc_updated_chunk_count,
-            "final_error_message": doc_updated_error_msg, "live_minio_exists": live_minio_exists,
+            "db_data": doc_db_data,
+            "needs_update": doc_needs_update,
+            "updated_status_enum": doc_updated_status_enum,
+            "updated_chunk_count": doc_updated_chunk_count,
+            "final_error_message": doc_updated_error_msg,
+            "live_minio_exists": live_minio_exists,
             "live_milvus_chunk_count": live_milvus_chunk_count
         }
 
