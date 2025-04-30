@@ -444,24 +444,25 @@ async def get_document_status(
                 updated_status_enum = DocumentStatus.ERROR
                 updated_error_message = (updated_error_message or "") + " Failed Milvus count check."
         elif milvus_chunk_count > 0:
-            if updated_status_enum == DocumentStatus.UPLOADED:
-                status_log.warning("Inconsistency: Chunks found but DB status is 'uploaded'. Correcting.")
+            # Si hay chunks y el archivo existe, y el estado es error o uploaded, corregir a PROCESSED
+            if minio_exists and updated_status_enum in [DocumentStatus.ERROR, DocumentStatus.UPLOADED]:
+                status_log.warning("Inconsistency: Chunks found and file exists but DB status is not 'processed'. Corrigiendo.")
                 needs_update = True
                 updated_status_enum = DocumentStatus.PROCESSED
                 updated_chunk_count = milvus_chunk_count
                 updated_error_message = None
             elif updated_status_enum == DocumentStatus.PROCESSED:
                 if updated_chunk_count != milvus_chunk_count:
-                     status_log.warning("Inconsistency: DB chunk count differs from live Milvus count.", db_count=updated_chunk_count, live_count=milvus_chunk_count)
-                     needs_update = True
-                     updated_chunk_count = milvus_chunk_count
+                    status_log.warning("Inconsistency: DB chunk count differs from live Milvus count.", db_count=updated_chunk_count, live_count=milvus_chunk_count)
+                    needs_update = True
+                    updated_chunk_count = milvus_chunk_count
         elif milvus_chunk_count == 0:
             if updated_status_enum == DocumentStatus.PROCESSED:
-                 status_log.warning("Inconsistency: DB status 'processed' but no chunks found. Correcting.")
-                 needs_update = True
-                 updated_status_enum = DocumentStatus.ERROR
-                 updated_chunk_count = 0
-                 updated_error_message = (updated_error_message or "") + " Processed data missing."
+                status_log.warning("Inconsistency: DB status 'processed' but no chunks found. Correcting.")
+                needs_update = True
+                updated_status_enum = DocumentStatus.ERROR
+                updated_chunk_count = 0
+                updated_error_message = (updated_error_message or "") + " Processed data missing."
             elif updated_status_enum == DocumentStatus.ERROR and updated_chunk_count != 0:
                 needs_update = True
                 updated_chunk_count = 0
@@ -586,18 +587,30 @@ async def list_document_statuses(
         try:
             live_milvus_chunk_count = await loop.run_in_executor(None, _get_milvus_chunk_count_sync, doc_id_str, company_id)
             if live_milvus_chunk_count == -1:
-                 if doc_updated_status_enum != DocumentStatus.ERROR:
-                     doc_needs_update=True; doc_updated_status_enum=DocumentStatus.ERROR; doc_updated_error_msg=(doc_updated_error_msg or "")+" Failed Milvus count."
+                if doc_updated_status_enum != DocumentStatus.ERROR:
+                    doc_needs_update = True
+                    doc_updated_status_enum = DocumentStatus.ERROR
+                    doc_updated_err_msg = (doc_updated_err_msg or "") + " Failed Milvus count."
             elif live_milvus_chunk_count > 0:
-                 if doc_updated_status_enum == DocumentStatus.UPLOADED:
-                     doc_needs_update=True; doc_updated_status_enum=DocumentStatus.PROCESSED; doc_updated_chunk_count=live_milvus_chunk_count; doc_updated_error_msg=None
-                 elif doc_updated_status_enum == DocumentStatus.PROCESSED and doc_updated_chunk_count != live_milvus_chunk_count:
-                     doc_needs_update=True; doc_updated_chunk_count=live_milvus_chunk_count
+                # Si hay chunks y el archivo existe, y el estado es error o uploaded, corregir a PROCESSED
+                if live_minio_exists and doc_updated_status_enum in [DocumentStatus.ERROR, DocumentStatus.UPLOADED]:
+                    check_log.warning("Inconsistency: Chunks found and file exists but DB status is not 'processed'. Corrigiendo.")
+                    doc_needs_update = True
+                    doc_updated_status_enum = DocumentStatus.PROCESSED
+                    doc_updated_chunk_count = live_milvus_chunk_count
+                    doc_updated_err_msg = None
+                elif doc_updated_status_enum == DocumentStatus.PROCESSED and doc_updated_chunk_count != live_milvus_chunk_count:
+                    doc_needs_update = True
+                    doc_updated_chunk_count = live_milvus_chunk_count
             elif live_milvus_chunk_count == 0:
-                 if doc_updated_status_enum == DocumentStatus.PROCESSED:
-                     doc_needs_update=True; doc_updated_status_enum=DocumentStatus.ERROR; doc_updated_chunk_count=0; doc_updated_error_msg=(doc_updated_error_msg or "")+" Processed data missing."
-                 elif doc_updated_status_enum == DocumentStatus.ERROR and doc_updated_chunk_count != 0:
-                     doc_needs_update=True; doc_updated_chunk_count=0
+                if doc_updated_status_enum == DocumentStatus.PROCESSED:
+                    doc_needs_update = True
+                    doc_updated_status_enum = DocumentStatus.ERROR
+                    doc_updated_chunk_count = 0
+                    doc_updated_err_msg = (doc_updated_err_msg or "") + " Processed data missing."
+                elif doc_updated_status_enum == DocumentStatus.ERROR and doc_updated_chunk_count != 0:
+                    doc_needs_update = True
+                    doc_updated_chunk_count = 0
         except Exception as e:
             check_log.exception("Unexpected error during Milvus count check for list item", error=str(e)); live_milvus_chunk_count = -1
             if doc_updated_status_enum != DocumentStatus.ERROR:

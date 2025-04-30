@@ -189,19 +189,12 @@ def _get_milvus_chunk_count_sync(document_id: str, company_id: str) -> int:
         expr = f'{MILVUS_COMPANY_ID_FIELD} == "{company_id}" and {MILVUS_DOCUMENT_ID_FIELD} == "{document_id}"'
         count_log.debug("Attempting to query Milvus chunk count", filter_expr=expr)
 
-        # Use query with count(*) aggregation
-        # Note: Ensure output_fields includes "count(*)" exactly
+        # Query for PK field and count results (workaround for unsupported count(*))
         query_res = collection.query(
             expr=expr,
-            output_fields=["count(*)"]
+            output_fields=["pk_id"]
         )
-
-        # Extract count from the result (structure might vary slightly based on pymilvus version)
-        # Typically it's in the first dictionary of the list under 'count(*)'
-        count = 0
-        if query_res and isinstance(query_res, list) and len(query_res) > 0:
-           count = query_res[0].get("count(*)", 0)
-
+        count = len(query_res) if query_res else 0
         count_log.info("Milvus chunk count successful (pymilvus)", count=count)
         return count
     except RuntimeError as re: # Catch collection/connection error
@@ -254,6 +247,12 @@ def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
         500: {"model": ErrorDetail, "description": "Internal Server Error"},
         503: {"model": ErrorDetail, "description": "Service Unavailable (DB or MinIO)"},
     }
+)
+@router.post(
+    "/ingest/upload",
+    response_model=IngestResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    include_in_schema=False
 )
 async def upload_document(
     request: Request,
@@ -340,6 +339,7 @@ async def upload_document(
 
     try:
         file_content = await file.read()
+        endpoint_log.debug(f"MinIO upload object_name repr: {repr(file_path_in_storage)}")
         await minio_client.upload_file_async(
             object_name=file_path_in_storage, data=file_content, content_type=file.content_type
         )
@@ -408,6 +408,11 @@ async def upload_document(
         500: {"model": ErrorDetail, "description": "Internal Server Error"},
         503: {"model": ErrorDetail, "description": "Service Unavailable (DB, MinIO, Milvus)"},
     }
+)
+@router.get(
+    "/ingest/status/{document_id}",
+    response_model=StatusResponse,
+    include_in_schema=False
 )
 async def get_document_status(
     request: Request,
@@ -570,6 +575,11 @@ async def get_document_status(
         503: {"model": ErrorDetail, "description": "Service Unavailable (DB, MinIO, Milvus)"},
     }
 )
+@router.get(
+    "/ingest/status",
+    response_model=List[StatusResponse],
+    include_in_schema=False
+)
 async def list_document_statuses(
     request: Request,
     limit: int = Query(30, ge=1, le=100),
@@ -728,6 +738,12 @@ async def list_document_statuses(
         503: {"model": ErrorDetail, "description": "Service Unavailable (DB or Celery)"},
     }
 )
+@router.post(
+    "/ingest/retry/{document_id}",
+    response_model=IngestResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    include_in_schema=False
+)
 async def retry_ingestion(
     request: Request,
     document_id: uuid.UUID = Path(..., description="The UUID of the document to retry"),
@@ -814,6 +830,11 @@ async def retry_ingestion(
         500: {"model": ErrorDetail, "description": "Internal Server Error"},
         503: {"model": ErrorDetail, "description": "Service Unavailable (DB, MinIO, Milvus)"},
     }
+)
+@router.delete(
+    "/ingest/{document_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    include_in_schema=False
 )
 async def delete_document_endpoint(
     request: Request,
@@ -2268,16 +2289,28 @@ def _create_milvus_collection(alias: str) -> Collection:
 def delete_milvus_chunks(company_id: str, document_id: str) -> int:
     del_log = log.bind(company_id=company_id, document_id=document_id)
     try:
+        # Ensure collection is ready
         collection = _ensure_milvus_connection_and_collection()
+        # Construct filter for company/document
         expr = f'{MILVUS_COMPANY_ID_FIELD} == "{company_id}" and {MILVUS_DOCUMENT_ID_FIELD} == "{document_id}"'
-        del_log.info("Attempting to delete existing chunks from Milvus", filter_expr=expr)
-        delete_result = collection.delete(expr=expr)
-        deleted_count = delete_result.delete_count
-        del_log.info("Milvus deletion successful", deleted_count=deleted_count)
-        return deleted_count
+        del_log.info("Querying chunks to delete by primary key", filter_expr=expr)
+        # Get primary keys of matching entities
+        pk_results = collection.query(expr=expr, output_fields=[MILVUS_PK_FIELD])
+        pk_list = [str(item.get(MILVUS_PK_FIELD)) for item in pk_results]
+        if not pk_list:
+            del_log.info("No existing chunks to delete.")
+            return 0
+        delete_expr = f"{MILVUS_PK_FIELD} in [{', '.join(pk_list)}]"
+        del_log.info("Deleting chunks from Milvus", delete_expr=delete_expr)
+        delete_result = collection.delete(expr=delete_expr)
+        del_log.info("Milvus delete operation executed", deleted_count=delete_result.delete_count)
+        return delete_result.delete_count
     except MilvusException as e:
-        del_log.error("Failed to delete chunks from Milvus", error=str(e), exc_info=True)
-        raise RuntimeError(f"Milvus deletion failed: {e}") from e
+        del_log.error("Milvus delete error", error=str(e), exc_info=True)
+        return 0
+    except Exception as e:
+        del_log.exception("Unexpected error during Milvus delete", error=str(e))
+        return 0
     except Exception as e:
         del_log.exception("Unexpected error during Milvus chunk deletion", error=str(e))
         raise RuntimeError(f"Unexpected Milvus deletion error: {e}") from e
@@ -2360,26 +2393,41 @@ def ingest_document_pipeline(
     # --- 4. Embed Chunks ---
     ingest_log.debug(f"Generating embeddings for {len(chunks)} chunks...")
     try:
-        # LLM_FLAG: MODIFIED - Use the passed embedding_model argument
         embeddings = list(embedding_model.embed(chunks))
         ingest_log.info(f"Embeddings generated successfully for {len(embeddings)} chunks.")
         if len(embeddings) != len(chunks):
-             ingest_log.warning("Mismatch between number of chunks and generated embeddings.", num_chunks=len(chunks), num_embeddings=len(embeddings))
-             min_len = min(len(chunks), len(embeddings))
-             chunks = chunks[:min_len]
-             embeddings = embeddings[:min_len]
+            ingest_log.warning("Mismatch between number of chunks and generated embeddings.", num_chunks=len(chunks), num_embeddings=len(embeddings))
+            min_len = min(len(chunks), len(embeddings))
+            chunks = chunks[:min_len]
+            embeddings = embeddings[:min_len]
 
     except Exception as e:
         ingest_log.error("Failed to generate embeddings", error=str(e), exc_info=True)
         raise RuntimeError(f"Embedding generation failed: {e}") from e
 
     # --- 5. Prepare Data for Milvus ---
+    max_content_len = 4000
+    def truncate_utf8_bytes(s, max_bytes):
+        b = s.encode('utf-8')
+        if len(b) <= max_bytes:
+            return s
+        # Truncate by bytes, decode ignoring incomplete chars
+        return b[:max_bytes].decode('utf-8', errors='ignore')
+    truncated_chunks = [truncate_utf8_bytes(c, max_content_len) for c in chunks]
+    # Ensure embeddings and truncated_chunks are aligned
+    if len(truncated_chunks) != len(embeddings):
+        min_len = min(len(truncated_chunks), len(embeddings))
+        truncated_chunks = truncated_chunks[:min_len]
+        embeddings = embeddings[:min_len]
+    # Debug: log chunk lengths before insert
+    for idx, chunk in enumerate(truncated_chunks):
+        ingest_log.debug(f"Chunk {idx} length before insert: {len(chunk)} bytes: {len(chunk.encode('utf-8'))}")
     data_to_insert = [
         embeddings,
-        chunks,
-        [company_id] * len(chunks),
-        [document_id] * len(chunks),
-        [file_path.name] * len(chunks),
+        truncated_chunks,
+        [company_id] * len(truncated_chunks),
+        [document_id] * len(truncated_chunks),
+        [file_path.name] * len(truncated_chunks),
     ]
 
     # --- 6. Delete Existing Chunks (Optional) ---
@@ -2391,19 +2439,19 @@ def ingest_document_pipeline(
             ingest_log.error("Failed to delete existing chunks, proceeding with insert anyway.", error=str(del_err))
 
     # --- 7. Insert into Milvus ---
-    ingest_log.debug(f"Inserting {len(chunks)} chunks into Milvus collection '{MILVUS_COLLECTION_NAME}'...")
+    ingest_log.debug(f"Inserting {len(truncated_chunks)} chunks into Milvus collection '{MILVUS_COLLECTION_NAME}'...")
     try:
         collection = _ensure_milvus_connection_and_collection()
         mutation_result = collection.insert(data_to_insert)
         inserted_count = mutation_result.insert_count
 
-        if inserted_count == len(chunks):
+        if inserted_count == len(truncated_chunks):
             ingest_log.info(f"Successfully inserted {inserted_count} chunks into Milvus.")
             log.debug("Flushing Milvus collection...")
             collection.flush()
             log.info("Milvus collection flushed.")
         else:
-             ingest_log.warning(f"Milvus insert result count ({inserted_count}) differs from chunks sent ({len(chunks)}).")
+            ingest_log.warning(f"Milvus insert result count ({inserted_count}) differs from chunks sent ({len(truncated_chunks)}).")
 
         return inserted_count
 
@@ -2611,7 +2659,11 @@ class MinioClient:
             raise MinioError(f"Unexpected error downloading {object_name}", e) from e
 
     def check_file_exists_sync(self, object_name: str) -> bool:
-        """Synchronously checks if a file exists in MinIO."""
+        """Synchronously checks if a file exists in MinIO. Strips bucket prefix if present."""
+        # Defensive: Remove bucket name prefix if present
+        if object_name.startswith(self.bucket_name + "/"):
+            self.log.warning("Object name included bucket prefix, stripping it for MinIO API.", original_object_name=object_name)
+            object_name = object_name[len(self.bucket_name) + 1:]
         check_log = self.log.bind(bucket=self.bucket_name, object_name=object_name)
         client = self._get_client()
         try:
@@ -2625,8 +2677,8 @@ class MinioClient:
             check_log.error("S3Error checking object existence (sync)", error_code=getattr(e, 'code', 'Unknown'), error_details=str(e))
             raise MinioError(f"S3 error checking existence for {object_name}", e) from e
         except Exception as e:
-             check_log.exception("Unexpected error checking object existence (sync)", error=str(e))
-             raise MinioError(f"Unexpected error checking existence for {object_name}", e) from e
+            check_log.exception("Unexpected error checking object existence (sync)", error=str(e))
+            raise MinioError(f"Unexpected error checking existence for {object_name}", e) from e
 
     def delete_file_sync(self, object_name: str):
         """Synchronously deletes a file from MinIO."""
@@ -2863,6 +2915,7 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
 
 
     object_name = f"{company_id_str}/{document_id_str}/{filename}"
+    log.debug(f"MinIO download object_name repr: {repr(object_name)}")
     temp_file_path_obj: Optional[pathlib.Path] = None
     inserted_chunk_count = 0
 
@@ -2877,14 +2930,31 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
             raise Ignore()
         log.info("Status set to PROCESSING.")
 
-        # 2. Download file from MinIO to temporary directory
+        # 2. Download file from MinIO to temporary directory (with retry on NoSuchKey)
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_dir_path = pathlib.Path(temp_dir)
             temp_file_path_obj = temp_dir_path / filename
             log.info(f"Downloading MinIO object: {object_name} -> {str(temp_file_path_obj)}")
-            # Use the initialized global minio_client
-            minio_client.download_file_sync(object_name, str(temp_file_path_obj))
-            log.info("File downloaded successfully from MinIO.")
+            max_minio_retries = 5
+            minio_delay = 2  # seconds
+            for attempt_num in range(1, max_minio_retries + 1):
+                try:
+                    minio_client.download_file_sync(object_name, str(temp_file_path_obj))
+                    log.info("File downloaded successfully from MinIO.")
+                    break
+                except MinioError as me:
+                    # Only retry on NoSuchKey
+                    if "NoSuchKey" in str(me) or "Object not found" in str(me):
+                        log.warning(f"MinIO NoSuchKey on attempt {attempt_num}/{max_minio_retries}. Retrying in {minio_delay} seconds...", error=str(me))
+                        if attempt_num == max_minio_retries:
+                            log.error(f"File still not found in MinIO after {max_minio_retries} attempts. Aborting.")
+                            raise
+                        import time
+                        time.sleep(minio_delay)
+                        minio_delay *= 2  # Exponential backoff
+                        continue
+                    else:
+                        raise  # Other Minio errors are not retried
 
             # 3. Execute Standalone Ingestion Pipeline
             log.info("Executing standalone ingest pipeline (extract, chunk, embed, insert)...")
