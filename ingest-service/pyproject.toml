@@ -20,6 +20,9 @@ python-multipart = "^0.0.9"
 structlog = "^24.1.0"
 minio = "^7.1.17"
 
+# --- ONNX Runtime ---
+onnxruntime = "^1.18.0"
+
 # --- Core Processing Dependencies (REFACTORIZADO) ---
 pymupdf = "^1.25.0"                # PyMuPDF for PDF extraction
 sentence-transformers = "^2.7"     # For MiniLM embeddings
