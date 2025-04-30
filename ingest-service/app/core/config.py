@@ -11,10 +11,9 @@ import sys
 import json
 
 # --- Service Names en K8s ---
-# LLM_COMMENT: Update Milvus service name based on latest deployment
 POSTGRES_K8S_SVC = "postgresql-service.nyro-develop.svc.cluster.local"
 MINIO_K8S_SVC = "minio-service.nyro-develop.svc.cluster.local"
-MILVUS_K8S_SVC = "milvus-standalone.nyro-develop.svc.cluster.local" # Updated Milvus service name
+MILVUS_K8S_SVC = "milvus-standalone.nyro-develop.svc.cluster.local"
 REDIS_K8S_SVC = "redis-service-master.nyro-develop.svc.cluster.local"
 
 # --- Defaults ---
@@ -24,13 +23,11 @@ POSTGRES_K8S_USER_DEFAULT = "postgres"
 MINIO_K8S_PORT_DEFAULT = 9000
 MINIO_BUCKET_DEFAULT = "ingested-documents"
 MILVUS_K8S_PORT_DEFAULT = 19530
-MILVUS_DEFAULT_COLLECTION = "document_chunks_haystack"
-# --- CORRECTION: Changed metric_type from COSINE to IP ---
+MILVUS_DEFAULT_COLLECTION = "document_chunks_minilm" # Cambiado nombre default
 MILVUS_DEFAULT_INDEX_PARAMS = '{"metric_type": "IP", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}}'
-MILVUS_DEFAULT_SEARCH_PARAMS = '{"metric_type": "IP", "params": {"ef": 128}}' # Also update search metric
-# ----------------------------------------------------------
-DEFAULT_FASTEMBED_MODEL = "BAAI/bge-large-en-v1.5" # Default for bge-large
-DEFAULT_FASTEMBED_DIM = 1024 # Default dimension for bge-large
+MILVUS_DEFAULT_SEARCH_PARAMS = '{"metric_type": "IP", "params": {"ef": 128}}'
+DEFAULT_EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_EMBEDDING_DIM = 384 # <- Actualizado para MiniLM
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -47,7 +44,6 @@ class Settings(BaseSettings):
     CELERY_BROKER_URL: RedisDsn = Field(default_factory=lambda: RedisDsn(f"redis://{REDIS_K8S_SVC}:{REDIS_K8S_PORT_DEFAULT}/0"))
     CELERY_RESULT_BACKEND: RedisDsn = Field(default_factory=lambda: RedisDsn(f"redis://{REDIS_K8S_SVC}:{REDIS_K8S_PORT_DEFAULT}/1"))
 
-
     # --- Database ---
     POSTGRES_USER: str = POSTGRES_K8S_USER_DEFAULT
     POSTGRES_PASSWORD: SecretStr
@@ -56,12 +52,13 @@ class Settings(BaseSettings):
     POSTGRES_DB: str = POSTGRES_K8S_DB_DEFAULT
 
     # --- Milvus ---
-    MILVUS_URI: str = Field(default=f"http://{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}") # Updated default to use correct service name
+    MILVUS_URI: str = Field(default=f"http://{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}")
     MILVUS_COLLECTION_NAME: str = MILVUS_DEFAULT_COLLECTION
-    MILVUS_GRPC_TIMEOUT: int = 10 # Default timeout in seconds
-    MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name", "file_type"])
+    MILVUS_GRPC_TIMEOUT: int = 10
+    MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name"])
     MILVUS_CONTENT_FIELD: str = "content"
     MILVUS_EMBEDDING_FIELD: str = "embedding"
+    MILVUS_CONTENT_FIELD_MAX_LENGTH: int = 20000 # Límite de bytes para el campo de texto en Milvus
     MILVUS_INDEX_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_INDEX_PARAMS))
     MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_SEARCH_PARAMS))
 
@@ -72,11 +69,14 @@ class Settings(BaseSettings):
     MINIO_BUCKET_NAME: str = MINIO_BUCKET_DEFAULT
     MINIO_USE_SECURE: bool = False
 
-    # --- Embeddings ---
-    FASTEMBED_MODEL: str = DEFAULT_FASTEMBED_MODEL
-    USE_GPU: bool = False
-    EMBEDDING_DIMENSION: int = DEFAULT_FASTEMBED_DIM # Default matches FASTEMBED_MODEL
-    OPENAI_API_KEY: Optional[SecretStr] = None
+    # --- Embeddings (ACTUALIZADO) ---
+    EMBEDDING_MODEL_ID: str = Field(default=DEFAULT_EMBEDDING_MODEL_ID)
+    EMBEDDING_DIMENSION: int = Field(default=DEFAULT_EMBEDDING_DIM)
+    # OPENAI_API_KEY: Optional[SecretStr] = None # Opcional, no usado en ingesta
+
+    # --- ELIMINADO ---
+    # FASTEMBED_MODEL: str = ...
+    # USE_GPU: bool = False
 
     # --- Clients ---
     HTTP_CLIENT_TIMEOUT: int = 60
@@ -92,9 +92,9 @@ class Settings(BaseSettings):
         "text/markdown",
         "text/html"
     ])
-    SPLITTER_CHUNK_SIZE: int = 1000
-    SPLITTER_CHUNK_OVERLAP: int = 250
-    SPLITTER_SPLIT_BY: str = "word"
+    SPLITTER_CHUNK_SIZE: int = Field(default=1000)
+    SPLITTER_CHUNK_OVERLAP: int = Field(default=200)
+    # SPLITTER_SPLIT_BY: str = "word" # No relevante para el splitter actual
 
     # --- Validators ---
     @field_validator("LOG_LEVEL")
@@ -109,6 +109,11 @@ class Settings(BaseSettings):
     @classmethod
     def check_embedding_dimension(cls, v: int, info: ValidationInfo) -> int:
         if v <= 0: raise ValueError("EMBEDDING_DIMENSION must be a positive integer.")
+        model_id = info.data.get('EMBEDDING_MODEL_ID', DEFAULT_EMBEDDING_MODEL_ID)
+        if 'all-MiniLM-L6-v2' in model_id and v != 384:
+             logging.warning(f"Configured EMBEDDING_DIMENSION ({v}) differs from standard MiniLM dimension (384).")
+        elif 'bge-large' in model_id and v != 1024:
+             logging.warning(f"Configured EMBEDDING_DIMENSION ({v}) differs from standard BGE-Large dimension (1024).")
         logging.debug(f"Using EMBEDDING_DIMENSION: {v}")
         return v
 
@@ -124,9 +129,8 @@ class Settings(BaseSettings):
     @classmethod
     def validate_milvus_uri(cls, v: str) -> str:
         if not v.startswith("http://") and not v.startswith("https://"):
-             # Allow relative paths for k8s service names implicitly
-             if "." not in v: # Basic check if it might be a k8s service name
-                 return f"http://{v}" # Assume http if no schema
+             if "." not in v:
+                 return f"http://{v}"
              raise ValueError(f"Invalid MILVUS_URI format: '{v}'. Must start with 'http://' or 'https://' or be a valid service name.")
         return v
 
@@ -159,8 +163,7 @@ try:
     temp_log.info(f"  MINIO_BUCKET_NAME:        {settings.MINIO_BUCKET_NAME}")
     temp_log.info(f"  MINIO_ACCESS_KEY:         {'*** SET ***' if settings.MINIO_ACCESS_KEY else '!!! NOT SET !!!'}")
     temp_log.info(f"  MINIO_SECRET_KEY:         {'*** SET ***' if settings.MINIO_SECRET_KEY else '!!! NOT SET !!!'}")
-    temp_log.info(f"  FASTEMBED_MODEL:          {settings.FASTEMBED_MODEL}")
-    temp_log.info(f"  USE_GPU:                  {settings.USE_GPU}")
+    temp_log.info(f"  EMBEDDING_MODEL_ID:       {settings.EMBEDDING_MODEL_ID}")
     temp_log.info(f"  EMBEDDING_DIMENSION:      {settings.EMBEDDING_DIMENSION}")
     temp_log.info(f"  SUPPORTED_CONTENT_TYPES:  {settings.SUPPORTED_CONTENT_TYPES}")
     temp_log.info(f"  SPLITTER_CHUNK_SIZE:      {settings.SPLITTER_CHUNK_SIZE}")

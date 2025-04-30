@@ -1,8 +1,7 @@
 [tool.poetry]
 name = "ingest-service"
-# Incrementamos versión por refactorización mayor
-version = "0.2.0"
-description = "Ingest service for Atenex B2B SaaS (Postgres/Minio/Milvus/FastEmbed - CPU - Prefork - Haystack Removed)"
+version = "0.3.0" # Incrementamos versión por refactorización MiniLM/PyMuPDF
+description = "Ingest service for Atenex B2B SaaS (Postgres/Minio/Milvus/SentenceTransformers - CPU - Prefork)"
 authors = ["Atenex Team <dev@atenex.com>"]
 readme = "README.md"
 
@@ -21,24 +20,28 @@ python-multipart = "^0.0.9"
 structlog = "^24.1.0"
 minio = "^7.1.17"
 
-# --- Core Processing Dependencies (Haystack REMOVED) ---
-fastembed = ">=0.2.1,<0.3.0" # Standalone FastEmbed (includes ONNX runtime)
-pymilvus = ">=2.4.1,<2.5.0"  # Official Milvus client
+# --- Core Processing Dependencies (REFACTORIZADO) ---
+pymupdf = "^1.25.0"                # PyMuPDF for PDF extraction
+sentence-transformers = "^2.7"     # For MiniLM embeddings
+pymilvus = ">=2.4.1,<2.5.0"         # Official Milvus client
 
-# --- Converter Dependencies (Standalone) ---
-pypdf = ">=4.0.1,<5.0.0"
+# --- Converter Dependencies (Standalone - MANTENER) ---
+# pypdf = ">=4.0.1,<5.0.0"          # ELIMINADO/COMENTADO - Reemplazado por PyMuPDF
 python-docx = ">=1.1.0,<2.0.0"
 markdown = ">=3.5.1,<4.0.0"
 beautifulsoup4 = ">=4.12.3,<5.0.0"
-html2text = ">=2024.1.0,<2025.0.0" # For Markdown -> HTML -> Text conversion
+html2text = ">=2024.1.0,<2025.0.0"  # For Markdown -> HTML -> Text conversion
 
-# --- HTTP Client (API) ---
+# --- HTTP Client (API - MANTENER) ---
 httpx = {extras = ["http2"], version = "^0.27.0"}
 h2 = "^4.1.0"
 
-# --- Synchronous DB Dependencies (Worker) ---
+# --- Synchronous DB Dependencies (Worker - MANTENER) ---
 sqlalchemy = "^2.0.28"
 psycopg2-binary = "^2.9.9"
+
+# --- ELIMINADO ---
+# fastembed = ">=0.2.1,<0.3.0"      # ELIMINADO
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"

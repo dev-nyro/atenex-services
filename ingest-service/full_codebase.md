@@ -25,8 +25,17 @@ app/
 ├── services
 │   ├── __init__.py
 │   ├── base_client.py
+│   ├── embedder.py
+│   ├── extractors
+│   │   ├── __init__.py
+│   │   ├── docx_extractor.py
+│   │   ├── html_extractor.py
+│   │   ├── md_extractor.py
+│   │   ├── pdf_extractor.py
+│   │   └── txt_extractor.py
 │   ├── ingest_pipeline.py
-│   └── minio_client.py
+│   ├── minio_client.py
+│   └── text_splitter.py
 └── tasks
     ├── __init__.py
     ├── celery_app.py
@@ -503,24 +512,25 @@ async def get_document_status(
                 updated_status_enum = DocumentStatus.ERROR
                 updated_error_message = (updated_error_message or "") + " Failed Milvus count check."
         elif milvus_chunk_count > 0:
-            if updated_status_enum == DocumentStatus.UPLOADED:
-                status_log.warning("Inconsistency: Chunks found but DB status is 'uploaded'. Correcting.")
+            # Si hay chunks y el archivo existe, y el estado es error o uploaded, corregir a PROCESSED
+            if minio_exists and updated_status_enum in [DocumentStatus.ERROR, DocumentStatus.UPLOADED]:
+                status_log.warning("Inconsistency: Chunks found and file exists but DB status is not 'processed'. Corrigiendo.")
                 needs_update = True
                 updated_status_enum = DocumentStatus.PROCESSED
                 updated_chunk_count = milvus_chunk_count
                 updated_error_message = None
             elif updated_status_enum == DocumentStatus.PROCESSED:
                 if updated_chunk_count != milvus_chunk_count:
-                     status_log.warning("Inconsistency: DB chunk count differs from live Milvus count.", db_count=updated_chunk_count, live_count=milvus_chunk_count)
-                     needs_update = True
-                     updated_chunk_count = milvus_chunk_count
+                    status_log.warning("Inconsistency: DB chunk count differs from live Milvus count.", db_count=updated_chunk_count, live_count=milvus_chunk_count)
+                    needs_update = True
+                    updated_chunk_count = milvus_chunk_count
         elif milvus_chunk_count == 0:
             if updated_status_enum == DocumentStatus.PROCESSED:
-                 status_log.warning("Inconsistency: DB status 'processed' but no chunks found. Correcting.")
-                 needs_update = True
-                 updated_status_enum = DocumentStatus.ERROR
-                 updated_chunk_count = 0
-                 updated_error_message = (updated_error_message or "") + " Processed data missing."
+                status_log.warning("Inconsistency: DB status 'processed' but no chunks found. Correcting.")
+                needs_update = True
+                updated_status_enum = DocumentStatus.ERROR
+                updated_chunk_count = 0
+                updated_error_message = (updated_error_message or "") + " Processed data missing."
             elif updated_status_enum == DocumentStatus.ERROR and updated_chunk_count != 0:
                 needs_update = True
                 updated_chunk_count = 0
@@ -645,18 +655,30 @@ async def list_document_statuses(
         try:
             live_milvus_chunk_count = await loop.run_in_executor(None, _get_milvus_chunk_count_sync, doc_id_str, company_id)
             if live_milvus_chunk_count == -1:
-                 if doc_updated_status_enum != DocumentStatus.ERROR:
-                     doc_needs_update=True; doc_updated_status_enum=DocumentStatus.ERROR; doc_updated_error_msg=(doc_updated_error_msg or "")+" Failed Milvus count."
+                if doc_updated_status_enum != DocumentStatus.ERROR:
+                    doc_needs_update = True
+                    doc_updated_status_enum = DocumentStatus.ERROR
+                    doc_updated_err_msg = (doc_updated_err_msg or "") + " Failed Milvus count."
             elif live_milvus_chunk_count > 0:
-                 if doc_updated_status_enum == DocumentStatus.UPLOADED:
-                     doc_needs_update=True; doc_updated_status_enum=DocumentStatus.PROCESSED; doc_updated_chunk_count=live_milvus_chunk_count; doc_updated_error_msg=None
-                 elif doc_updated_status_enum == DocumentStatus.PROCESSED and doc_updated_chunk_count != live_milvus_chunk_count:
-                     doc_needs_update=True; doc_updated_chunk_count=live_milvus_chunk_count
+                # Si hay chunks y el archivo existe, y el estado es error o uploaded, corregir a PROCESSED
+                if live_minio_exists and doc_updated_status_enum in [DocumentStatus.ERROR, DocumentStatus.UPLOADED]:
+                    check_log.warning("Inconsistency: Chunks found and file exists but DB status is not 'processed'. Corrigiendo.")
+                    doc_needs_update = True
+                    doc_updated_status_enum = DocumentStatus.PROCESSED
+                    doc_updated_chunk_count = live_milvus_chunk_count
+                    doc_updated_err_msg = None
+                elif doc_updated_status_enum == DocumentStatus.PROCESSED and doc_updated_chunk_count != live_milvus_chunk_count:
+                    doc_needs_update = True
+                    doc_updated_chunk_count = live_milvus_chunk_count
             elif live_milvus_chunk_count == 0:
-                 if doc_updated_status_enum == DocumentStatus.PROCESSED:
-                     doc_needs_update=True; doc_updated_status_enum=DocumentStatus.ERROR; doc_updated_chunk_count=0; doc_updated_error_msg=(doc_updated_error_msg or "")+" Processed data missing."
-                 elif doc_updated_status_enum == DocumentStatus.ERROR and doc_updated_chunk_count != 0:
-                     doc_needs_update=True; doc_updated_chunk_count=0
+                if doc_updated_status_enum == DocumentStatus.PROCESSED:
+                    doc_needs_update = True
+                    doc_updated_status_enum = DocumentStatus.ERROR
+                    doc_updated_chunk_count = 0
+                    doc_updated_err_msg = (doc_updated_err_msg or "") + " Processed data missing."
+                elif doc_updated_status_enum == DocumentStatus.ERROR and doc_updated_chunk_count != 0:
+                    doc_needs_update = True
+                    doc_updated_chunk_count = 0
         except Exception as e:
             check_log.exception("Unexpected error during Milvus count check for list item", error=str(e)); live_milvus_chunk_count = -1
             if doc_updated_status_enum != DocumentStatus.ERROR:
@@ -1067,10 +1089,9 @@ import sys
 import json
 
 # --- Service Names en K8s ---
-# LLM_COMMENT: Update Milvus service name based on latest deployment
 POSTGRES_K8S_SVC = "postgresql-service.nyro-develop.svc.cluster.local"
 MINIO_K8S_SVC = "minio-service.nyro-develop.svc.cluster.local"
-MILVUS_K8S_SVC = "milvus-standalone.nyro-develop.svc.cluster.local" # Updated Milvus service name
+MILVUS_K8S_SVC = "milvus-standalone.nyro-develop.svc.cluster.local"
 REDIS_K8S_SVC = "redis-service-master.nyro-develop.svc.cluster.local"
 
 # --- Defaults ---
@@ -1080,13 +1101,11 @@ POSTGRES_K8S_USER_DEFAULT = "postgres"
 MINIO_K8S_PORT_DEFAULT = 9000
 MINIO_BUCKET_DEFAULT = "ingested-documents"
 MILVUS_K8S_PORT_DEFAULT = 19530
-MILVUS_DEFAULT_COLLECTION = "document_chunks_haystack"
-# --- CORRECTION: Changed metric_type from COSINE to IP ---
+MILVUS_DEFAULT_COLLECTION = "document_chunks_minilm" # Cambiado nombre default
 MILVUS_DEFAULT_INDEX_PARAMS = '{"metric_type": "IP", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}}'
-MILVUS_DEFAULT_SEARCH_PARAMS = '{"metric_type": "IP", "params": {"ef": 128}}' # Also update search metric
-# ----------------------------------------------------------
-DEFAULT_FASTEMBED_MODEL = "BAAI/bge-large-en-v1.5" # Default for bge-large
-DEFAULT_FASTEMBED_DIM = 1024 # Default dimension for bge-large
+MILVUS_DEFAULT_SEARCH_PARAMS = '{"metric_type": "IP", "params": {"ef": 128}}'
+DEFAULT_EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_EMBEDDING_DIM = 384 # <- Actualizado para MiniLM
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -1103,7 +1122,6 @@ class Settings(BaseSettings):
     CELERY_BROKER_URL: RedisDsn = Field(default_factory=lambda: RedisDsn(f"redis://{REDIS_K8S_SVC}:{REDIS_K8S_PORT_DEFAULT}/0"))
     CELERY_RESULT_BACKEND: RedisDsn = Field(default_factory=lambda: RedisDsn(f"redis://{REDIS_K8S_SVC}:{REDIS_K8S_PORT_DEFAULT}/1"))
 
-
     # --- Database ---
     POSTGRES_USER: str = POSTGRES_K8S_USER_DEFAULT
     POSTGRES_PASSWORD: SecretStr
@@ -1112,12 +1130,13 @@ class Settings(BaseSettings):
     POSTGRES_DB: str = POSTGRES_K8S_DB_DEFAULT
 
     # --- Milvus ---
-    MILVUS_URI: str = Field(default=f"http://{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}") # Updated default to use correct service name
+    MILVUS_URI: str = Field(default=f"http://{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}")
     MILVUS_COLLECTION_NAME: str = MILVUS_DEFAULT_COLLECTION
-    MILVUS_GRPC_TIMEOUT: int = 10 # Default timeout in seconds
-    MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name", "file_type"])
+    MILVUS_GRPC_TIMEOUT: int = 10
+    MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name"])
     MILVUS_CONTENT_FIELD: str = "content"
     MILVUS_EMBEDDING_FIELD: str = "embedding"
+    MILVUS_CONTENT_FIELD_MAX_LENGTH: int = 20000 # Límite de bytes para el campo de texto en Milvus
     MILVUS_INDEX_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_INDEX_PARAMS))
     MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_SEARCH_PARAMS))
 
@@ -1128,11 +1147,14 @@ class Settings(BaseSettings):
     MINIO_BUCKET_NAME: str = MINIO_BUCKET_DEFAULT
     MINIO_USE_SECURE: bool = False
 
-    # --- Embeddings ---
-    FASTEMBED_MODEL: str = DEFAULT_FASTEMBED_MODEL
-    USE_GPU: bool = False
-    EMBEDDING_DIMENSION: int = DEFAULT_FASTEMBED_DIM # Default matches FASTEMBED_MODEL
-    OPENAI_API_KEY: Optional[SecretStr] = None
+    # --- Embeddings (ACTUALIZADO) ---
+    EMBEDDING_MODEL_ID: str = Field(default=DEFAULT_EMBEDDING_MODEL_ID)
+    EMBEDDING_DIMENSION: int = Field(default=DEFAULT_EMBEDDING_DIM)
+    # OPENAI_API_KEY: Optional[SecretStr] = None # Opcional, no usado en ingesta
+
+    # --- ELIMINADO ---
+    # FASTEMBED_MODEL: str = ...
+    # USE_GPU: bool = False
 
     # --- Clients ---
     HTTP_CLIENT_TIMEOUT: int = 60
@@ -1148,9 +1170,9 @@ class Settings(BaseSettings):
         "text/markdown",
         "text/html"
     ])
-    SPLITTER_CHUNK_SIZE: int = 1000
-    SPLITTER_CHUNK_OVERLAP: int = 250
-    SPLITTER_SPLIT_BY: str = "word"
+    SPLITTER_CHUNK_SIZE: int = Field(default=1000)
+    SPLITTER_CHUNK_OVERLAP: int = Field(default=200)
+    # SPLITTER_SPLIT_BY: str = "word" # No relevante para el splitter actual
 
     # --- Validators ---
     @field_validator("LOG_LEVEL")
@@ -1165,6 +1187,11 @@ class Settings(BaseSettings):
     @classmethod
     def check_embedding_dimension(cls, v: int, info: ValidationInfo) -> int:
         if v <= 0: raise ValueError("EMBEDDING_DIMENSION must be a positive integer.")
+        model_id = info.data.get('EMBEDDING_MODEL_ID', DEFAULT_EMBEDDING_MODEL_ID)
+        if 'all-MiniLM-L6-v2' in model_id and v != 384:
+             logging.warning(f"Configured EMBEDDING_DIMENSION ({v}) differs from standard MiniLM dimension (384).")
+        elif 'bge-large' in model_id and v != 1024:
+             logging.warning(f"Configured EMBEDDING_DIMENSION ({v}) differs from standard BGE-Large dimension (1024).")
         logging.debug(f"Using EMBEDDING_DIMENSION: {v}")
         return v
 
@@ -1180,9 +1207,8 @@ class Settings(BaseSettings):
     @classmethod
     def validate_milvus_uri(cls, v: str) -> str:
         if not v.startswith("http://") and not v.startswith("https://"):
-             # Allow relative paths for k8s service names implicitly
-             if "." not in v: # Basic check if it might be a k8s service name
-                 return f"http://{v}" # Assume http if no schema
+             if "." not in v:
+                 return f"http://{v}"
              raise ValueError(f"Invalid MILVUS_URI format: '{v}'. Must start with 'http://' or 'https://' or be a valid service name.")
         return v
 
@@ -1215,8 +1241,7 @@ try:
     temp_log.info(f"  MINIO_BUCKET_NAME:        {settings.MINIO_BUCKET_NAME}")
     temp_log.info(f"  MINIO_ACCESS_KEY:         {'*** SET ***' if settings.MINIO_ACCESS_KEY else '!!! NOT SET !!!'}")
     temp_log.info(f"  MINIO_SECRET_KEY:         {'*** SET ***' if settings.MINIO_SECRET_KEY else '!!! NOT SET !!!'}")
-    temp_log.info(f"  FASTEMBED_MODEL:          {settings.FASTEMBED_MODEL}")
-    temp_log.info(f"  USE_GPU:                  {settings.USE_GPU}")
+    temp_log.info(f"  EMBEDDING_MODEL_ID:       {settings.EMBEDDING_MODEL_ID}")
     temp_log.info(f"  EMBEDDING_DIMENSION:      {settings.EMBEDDING_DIMENSION}")
     temp_log.info(f"  SUPPORTED_CONTENT_TYPES:  {settings.SUPPORTED_CONTENT_TYPES}")
     temp_log.info(f"  SPLITTER_CHUNK_SIZE:      {settings.SPLITTER_CHUNK_SIZE}")
@@ -2067,142 +2092,222 @@ class BaseServiceClient:
             raise
 ```
 
+## File: `app\services\embedder.py`
+```py
+from functools import lru_cache
+from typing import List, Optional
+from sentence_transformers import SentenceTransformer
+import structlog
+import numpy as np
+from app.core.config import settings
+
+log = structlog.get_logger(__name__)
+
+MODEL_ID = getattr(settings, 'EMBEDDING_MODEL_ID', 'all-MiniLM-L6-v2')
+EXPECTED_DIM = getattr(settings, 'EMBEDDING_DIMENSION', 384)
+
+_model_instance: Optional[SentenceTransformer] = None
+
+def get_embedding_model() -> SentenceTransformer:
+    global _model_instance
+    if _model_instance is None:
+        log.info("Loading SentenceTransformer model", model_id=MODEL_ID)
+        _model_instance = SentenceTransformer(MODEL_ID)
+        # Validar dimensión
+        test_vec = _model_instance.encode(["test"])
+        if test_vec.shape[1] != EXPECTED_DIM:
+            raise ValueError(f"Embedding dimension mismatch: expected {EXPECTED_DIM}, got {test_vec.shape[1]}")
+        log.info("Model loaded and validated", dimension=test_vec.shape[1])
+    return _model_instance
+
+def embed_chunks(chunks: List[str]) -> List[List[float]]:
+    model = get_embedding_model()
+    log.debug("Generating embeddings for chunks", num_chunks=len(chunks))
+    embeddings = model.encode(chunks, show_progress_bar=False)
+    return embeddings.tolist()
+
+```
+
+## File: `app\services\extractors\__init__.py`
+```py
+
+```
+
+## File: `app\services\extractors\docx_extractor.py`
+```py
+import io
+import docx  # python-docx
+import structlog
+
+log = structlog.get_logger(__name__)
+
+class DocxExtractionError(Exception):
+    pass
+
+def extract_text_from_docx(file_bytes: bytes, filename: str = "unknown.docx") -> str:
+    """Extrae texto de los bytes de un DOCX preservando saltos de párrafo."""
+    log.debug("Extracting text from DOCX bytes", filename=filename)
+    try:
+        doc = docx.Document(io.BytesIO(file_bytes))
+        text = "\n".join([p.text for p in doc.paragraphs])
+        log.info("DOCX extraction successful", filename=filename, num_paragraphs=len(doc.paragraphs))
+        return text
+    except Exception as e:
+        log.error("DOCX extraction failed", filename=filename, error=str(e))
+        raise DocxExtractionError(f"Error extracting DOCX: {filename}") from e
+
+```
+
+## File: `app\services\extractors\html_extractor.py`
+```py
+from bs4 import BeautifulSoup
+import structlog
+
+log = structlog.get_logger(__name__)
+
+class HtmlExtractionError(Exception):
+    pass
+
+def extract_text_from_html(file_bytes: bytes, filename: str = "unknown.html", encoding: str = "utf-8") -> str:
+    """Extrae texto de los bytes de un archivo HTML."""
+    log.debug("Extracting text from HTML bytes", filename=filename)
+    try:
+        html = file_bytes.decode(encoding)
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text(separator="\n")
+        log.info("HTML extraction successful", filename=filename, length=len(text))
+        return text
+    except Exception as e:
+        log.error("HTML extraction failed", filename=filename, error=str(e))
+        raise HtmlExtractionError(f"Error extracting HTML: {filename}") from e
+
+```
+
+## File: `app\services\extractors\md_extractor.py`
+```py
+import markdown
+import html2text
+import structlog
+
+log = structlog.get_logger(__name__)
+
+class MdExtractionError(Exception):
+    pass
+
+def extract_text_from_md(file_bytes: bytes, filename: str = "unknown.md", encoding: str = "utf-8") -> str:
+    """Extrae texto de los bytes de un archivo Markdown."""
+    log.debug("Extracting text from MD bytes", filename=filename)
+    try:
+        md_text = file_bytes.decode(encoding)
+        html = markdown.markdown(md_text)
+        text = html2text.html2text(html)
+        log.info("MD extraction successful", filename=filename, length=len(text))
+        return text
+    except Exception as e:
+        log.error("MD extraction failed", filename=filename, error=str(e))
+        raise MdExtractionError(f"Error extracting MD: {filename}") from e
+
+```
+
+## File: `app\services\extractors\pdf_extractor.py`
+```py
+import fitz  # PyMuPDF
+import structlog
+
+log = structlog.get_logger(__name__)
+
+class PdfExtractionError(Exception):
+    pass
+
+def extract_text_from_pdf(file_bytes: bytes, filename: str = "unknown.pdf") -> str:
+    """Extrae texto plano de los bytes de un PDF usando PyMuPDF."""
+    log.debug("Extracting text from PDF bytes", filename=filename)
+    try:
+        with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+            text_content = ""
+            for page_num, page in enumerate(doc):
+                try:
+                    text_content += page.get_text("text") + "\n"
+                except Exception as page_err:
+                    log.warning("Error extracting text from PDF page", filename=filename, page=page_num + 1, error=str(page_err))
+            log.info("PDF extraction successful", filename=filename, num_pages=len(doc))
+            return text_content
+    except Exception as e:
+        log.error("PDF extraction failed", filename=filename, error=str(e))
+        raise PdfExtractionError(f"Error extracting PDF: {filename}") from e
+
+```
+
+## File: `app\services\extractors\txt_extractor.py`
+```py
+import structlog
+
+log = structlog.get_logger(__name__)
+
+class TxtExtractionError(Exception):
+    pass
+
+def extract_text_from_txt(file_bytes: bytes, filename: str = "unknown.txt", encoding: str = "utf-8") -> str:
+    """Extrae texto de los bytes de un archivo TXT."""
+    log.debug("Extracting text from TXT bytes", filename=filename)
+    try:
+        text = file_bytes.decode(encoding)
+        log.info("TXT extraction successful", filename=filename, length=len(text))
+        return text
+    except Exception as e:
+        log.error("TXT extraction failed", filename=filename, error=str(e))
+        raise TxtExtractionError(f"Error extracting TXT: {filename}") from e
+
+```
+
 ## File: `app\services\ingest_pipeline.py`
 ```py
 # ingest-service/app/services/ingest_pipeline.py
 from __future__ import annotations
 
 import os
-import re
-import pathlib
 import uuid
-import markdown # type: ignore
-import html2text # type: ignore
 import structlog
-from typing import List, Dict, Any, Callable, Optional
+from typing import List, Dict, Any, Optional
 
 # Direct library imports
-from bs4 import BeautifulSoup
-from pypdf import PdfReader
-from docx import Document as DocxDocument
-# LLM_FLAG: REMOVED - Global import and initialization of TextEmbedding removed from here.
 from pymilvus import (
     Collection, CollectionSchema, FieldSchema, DataType, connections,
     utility, MilvusException
 )
-# LLM_FLAG: ADDED - Import only for type hinting within the function signature.
-from fastembed.embedding import TextEmbedding
+# LLM_FLAG: Type hinting only
+from sentence_transformers import SentenceTransformer
 
 # Local application imports
 from app.core.config import settings
+# LLM_FLAG: Import NEW helpers
+from .extractors.pdf_extractor import extract_text_from_pdf, PdfExtractionError
+from .extractors.docx_extractor import extract_text_from_docx, DocxExtractionError
+from .extractors.txt_extractor import extract_text_from_txt, TxtExtractionError
+from .extractors.md_extractor import extract_text_from_md, MdExtractionError
+from .extractors.html_extractor import extract_text_from_html, HtmlExtractionError
+from .text_splitter import split_text
+from .embedder import embed_chunks
 
 log = structlog.get_logger(__name__)
 
-# --------------- 1. TEXT EXTRACTION FUNCTIONS -----------------
-# LLM_FLAG: NO_CHANGE - Text extraction functions remain the same.
-def _extract_from_pdf(file_path: pathlib.Path) -> str:
-    log.debug("Extracting text from PDF", path=str(file_path))
-    try:
-        reader = PdfReader(str(file_path))
-        text_content = "\n\n".join(page.extract_text() or "" for page in reader.pages)
-        log.info("PDF extraction successful", path=str(file_path), num_pages=len(reader.pages))
-        return text_content
-    except Exception as e:
-        log.error("Failed to extract text from PDF", path=str(file_path), error=str(e), exc_info=True)
-        raise ValueError(f"Error processing PDF {file_path.name}: {e}") from e
-
-def _extract_from_docx(file_path: pathlib.Path) -> str:
-    log.debug("Extracting text from DOCX", path=str(file_path))
-    try:
-        doc = DocxDocument(str(file_path))
-        text_content = "\n\n".join(p.text for p in doc.paragraphs if p.text)
-        log.info("DOCX extraction successful", path=str(file_path), num_paragraphs=len(doc.paragraphs))
-        return text_content
-    except Exception as e:
-        log.error("Failed to extract text from DOCX", path=str(file_path), error=str(e), exc_info=True)
-        raise ValueError(f"Error processing DOCX {file_path.name}: {e}") from e
-
-def _extract_from_html(file_path: pathlib.Path) -> str:
-    log.debug("Extracting text from HTML", path=str(file_path))
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            soup = BeautifulSoup(f, "html.parser")
-        for script_or_style in soup(["script", "style"]):
-            script_or_style.decompose()
-        text_content = soup.get_text(separator="\n", strip=True)
-        log.info("HTML extraction successful", path=str(file_path))
-        return text_content
-    except Exception as e:
-        log.error("Failed to extract text from HTML", path=str(file_path), error=str(e), exc_info=True)
-        raise ValueError(f"Error processing HTML {file_path.name}: {e}") from e
-
-def _extract_from_md(file_path: pathlib.Path) -> str:
-    log.debug("Extracting text from Markdown", path=str(file_path))
-    try:
-        md_content = file_path.read_text(encoding="utf-8")
-        html_content = markdown.markdown(md_content)
-        h = html2text.HTML2Text()
-        h.ignore_links = True
-        h.ignore_images = True
-        text_content = h.handle(html_content)
-        log.info("Markdown extraction successful", path=str(file_path))
-        return text_content
-    except Exception as e:
-        log.error("Failed to extract text from Markdown", path=str(file_path), error=str(e), exc_info=True)
-        raise ValueError(f"Error processing Markdown {file_path.name}: {e}") from e
-
-def _extract_from_txt(file_path: pathlib.Path) -> str:
-    log.debug("Extracting text from TXT", path=str(file_path))
-    try:
-        text_content = file_path.read_text(encoding="utf-8")
-        log.info("TXT extraction successful", path=str(file_path))
-        return text_content
-    except Exception as e:
-        log.error("Failed to extract text from TXT", path=str(file_path), error=str(e), exc_info=True)
-        raise ValueError(f"Error processing TXT {file_path.name}: {e}") from e
-
-# LLM_FLAG: NO_CHANGE - Keep extractor map
-EXTRACTORS: Dict[str, Callable[[pathlib.Path], str]] = {
-    "application/pdf": _extract_from_pdf,
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": _extract_from_docx,
-    "application/msword": _extract_from_docx,
-    "text/plain": _extract_from_txt,
-    "text/markdown": _extract_from_md,
-    "text/html": _extract_from_html,
+# --- Mapeo de Content-Type a Funciones Extractoras (ACTUALIZADO) ---
+EXTRACTORS = {
+    "application/pdf": extract_text_from_pdf,
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": extract_text_from_docx,
+    "application/msword": extract_text_from_docx,
+    "text/plain": extract_text_from_txt,
+    "text/markdown": extract_text_from_md,
+    "text/html": extract_text_from_html,
 }
+EXTRACTION_ERRORS = (
+    PdfExtractionError, DocxExtractionError, TxtExtractionError,
+    MdExtractionError, HtmlExtractionError, ValueError # Include generic ValueError too
+)
 
-# --------------- 2. CHUNKER FUNCTION -----------------
-# LLM_FLAG: NO_CHANGE - Keep chunker function as is.
-def chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
-    if not text or text.isspace():
-        return []
-    words = re.split(r'\s+', text.strip())
-    words = [word for word in words if word]
-
-    if not words:
-        return []
-
-    chunks: List[str] = []
-    current_pos = 0
-    while current_pos < len(words):
-        end_pos = min(current_pos + chunk_size, len(words))
-        chunk = " ".join(words[current_pos:end_pos])
-        chunks.append(chunk)
-
-        current_pos += chunk_size - chunk_overlap
-        if current_pos <= (end_pos - chunk_size):
-             current_pos = end_pos - chunk_overlap
-        if current_pos >= len(words):
-            break
-        current_pos = max(0, current_pos)
-
-    log.debug(f"Chunked text into {len(chunks)} chunks.", requested_size=chunk_size, overlap=chunk_overlap)
-    return chunks
-
-# --------------- 3. MILVUS HELPERS (using pymilvus) -----------------
-# LLM_FLAG: NO_CHANGE - Keep Milvus constants and helpers.
+# --- Constantes Milvus (Dimensión ACTUALIZADA) ---
 MILVUS_COLLECTION_NAME = settings.MILVUS_COLLECTION_NAME
-MILVUS_EMBEDDING_DIM = settings.EMBEDDING_DIMENSION
+MILVUS_EMBEDDING_DIM = settings.EMBEDDING_DIMENSION # From config (e.g., 384)
 MILVUS_PK_FIELD = "pk_id"
 MILVUS_VECTOR_FIELD = "embedding"
 MILVUS_CONTENT_FIELD = "content"
@@ -2215,150 +2320,139 @@ _milvus_connected = False
 
 def _ensure_milvus_connection_and_collection() -> Collection:
     global _milvus_collection, _milvus_connected
-    alias = "default"
-
-    if not _milvus_connected:
+    alias = "pipeline_worker"
+    if not _milvus_connected or alias not in connections.list_connections():
         uri = settings.MILVUS_URI
-        log.info("Connecting to Milvus...", uri=uri, alias=alias, timeout=settings.MILVUS_GRPC_TIMEOUT)
+        log.info("Connecting to Milvus for pipeline worker...", uri=uri, alias=alias, timeout=settings.MILVUS_GRPC_TIMEOUT)
         try:
-            connections.connect(alias=alias, uri=uri)
+            connections.connect(alias=alias, uri=uri, timeout=settings.MILVUS_GRPC_TIMEOUT)
             _milvus_connected = True
-            log.info("Connected to Milvus.")
+            log.info("Connected to Milvus for pipeline worker.")
         except MilvusException as e:
-            log.error("Failed to connect to Milvus.", error=str(e))
-            raise RuntimeError(f"Milvus connection failed: {e}") from e
+            log.error("Failed to connect to Milvus for pipeline worker.", error=str(e))
+            _milvus_connected = False
+            raise ConnectionError(f"Milvus connection failed: {e}") from e
+        except Exception as e:
+            log.error("Unexpected error connecting to Milvus for pipeline worker.", error=str(e))
+            _milvus_connected = False
+            raise ConnectionError(f"Unexpected Milvus connection error: {e}") from e
 
-    # Obtener o crear colección y garantizar esquema e índices
-    if not utility.has_collection(MILVUS_COLLECTION_NAME, using=alias):
-        collection = _create_milvus_collection(alias)
-    else:
-        collection = Collection(name=MILVUS_COLLECTION_NAME, using=alias)
-    # Asegurar índice vectorial existente
-    existing_indexes = collection.indexes
-    if not any(idx.field_name == MILVUS_VECTOR_FIELD for idx in existing_indexes):
-        log.info("Creando índice vectorial en colección Milvus", field=MILVUS_VECTOR_FIELD)
-        collection.create_index(field_name=MILVUS_VECTOR_FIELD, index_params=settings.MILVUS_INDEX_PARAMS)
-    # Asignar colección global
-    _milvus_collection = collection
+    if _milvus_collection is None:
+        if not utility.has_collection(MILVUS_COLLECTION_NAME, using=alias):
+            log.warning(f"Milvus collection '{MILVUS_COLLECTION_NAME}' not found. Attempting to create.")
+            try:
+                collection = _create_milvus_collection(alias)
+            except Exception as create_e:
+                log.critical("Failed to create Milvus collection", error=str(create_e), exc_info=True)
+                raise RuntimeError(f"Milvus collection creation failed: {create_e}") from create_e
+        else:
+            collection = Collection(name=MILVUS_COLLECTION_NAME, using=alias)
+            log.debug(f"Using existing Milvus collection '{MILVUS_COLLECTION_NAME}'.")
+            try:
+                 if not any(idx.field_name == MILVUS_VECTOR_FIELD for idx in collection.indexes):
+                     log.warning(f"Vector index missing on field '{MILVUS_VECTOR_FIELD}'. Creating...")
+                     collection.create_index(field_name=MILVUS_VECTOR_FIELD, index_params=settings.MILVUS_INDEX_PARAMS)
+                     log.info(f"Vector index created for '{MILVUS_VECTOR_FIELD}'.")
+            except Exception as idx_e:
+                 log.error("Failed to check or create index on existing collection", error=str(idx_e))
 
-    # Cargar colección en memoria
-    try:
-        # Cargar la colección en memoria de forma indiscriminada (idempotente)
-        log.info("Loading collection into memory...", collection=MILVUS_COLLECTION_NAME)
-        _milvus_collection.load()
-        log.info("Collection loaded.")
-    except MilvusException as e:
-        log.error("Error loading Milvus collection", error=str(e))
-        raise RuntimeError(f"Milvus collection error: {e}") from e
+        try:
+            log.info("Loading Milvus collection into memory...", collection_name=collection.name)
+            collection.load()
+            log.info("Milvus collection loaded into memory.")
+        except MilvusException as load_e:
+            log.error("Failed to load Milvus collection into memory", error=str(load_e))
+            raise RuntimeError(f"Milvus collection load failed: {load_e}") from load_e
+
+        _milvus_collection = collection
+
+    # LLM_FLAG: Sanity check return type
+    if not isinstance(_milvus_collection, Collection):
+        log.critical("Milvus collection object is unexpectedly None or invalid type after initialization attempt.")
+        raise RuntimeError("Failed to obtain a valid Milvus collection object.")
 
     return _milvus_collection
 
 def _create_milvus_collection(alias: str) -> Collection:
-    log.info(f"Defining schema for collection '{MILVUS_COLLECTION_NAME}'")
+    log.info(f"Defining schema for collection '{MILVUS_COLLECTION_NAME}' with dim={MILVUS_EMBEDDING_DIM}")
     fields = [
         FieldSchema(name=MILVUS_PK_FIELD, dtype=DataType.INT64, is_primary=True, auto_id=True),
         FieldSchema(name=MILVUS_VECTOR_FIELD, dtype=DataType.FLOAT_VECTOR, dim=MILVUS_EMBEDDING_DIM),
-        FieldSchema(name=MILVUS_CONTENT_FIELD, dtype=DataType.VARCHAR, max_length=settings.SPLITTER_CHUNK_SIZE * 4),
+        FieldSchema(name=MILVUS_CONTENT_FIELD, dtype=DataType.VARCHAR, max_length=settings.MILVUS_CONTENT_FIELD_MAX_LENGTH),
         FieldSchema(name=MILVUS_COMPANY_ID_FIELD, dtype=DataType.VARCHAR, max_length=64),
         FieldSchema(name=MILVUS_DOCUMENT_ID_FIELD, dtype=DataType.VARCHAR, max_length=64),
         FieldSchema(name=MILVUS_FILENAME_FIELD, dtype=DataType.VARCHAR, max_length=512),
     ]
-    schema = CollectionSchema(fields, description="Document Chunks for Atenex RAG")
-
+    schema = CollectionSchema(fields, description="Document Chunks for Atenex RAG (SentenceTransformer)")
     log.info(f"Creating collection '{MILVUS_COLLECTION_NAME}'...")
     try:
         collection = Collection(name=MILVUS_COLLECTION_NAME, schema=schema, using=alias, consistency_level="Strong")
-        log.info(f"Collection '{MILVUS_COLLECTION_NAME}' created. Creating index...")
+        log.info(f"Collection '{MILVUS_COLLECTION_NAME}' created. Creating indexes...")
 
         index_params = settings.MILVUS_INDEX_PARAMS
         log.info("Creating index for vector field", field_name=MILVUS_VECTOR_FIELD, index_params=index_params)
         collection.create_index(field_name=MILVUS_VECTOR_FIELD, index_params=index_params)
-        log.info("Index created successfully.")
 
         log.info("Creating scalar index for company_id field...")
         collection.create_index(field_name=MILVUS_COMPANY_ID_FIELD, index_name="company_id_idx")
         log.info("Creating scalar index for document_id field...")
         collection.create_index(field_name=MILVUS_DOCUMENT_ID_FIELD, index_name="document_id_idx")
-        log.info("Scalar indexes created.")
 
+        log.info("All indexes created successfully.")
+        return collection
     except MilvusException as e:
         log.error("Failed to create Milvus collection or index", collection_name=MILVUS_COLLECTION_NAME, error=str(e), exc_info=True)
         raise RuntimeError(f"Milvus collection/index creation failed: {e}") from e
-    return collection
 
 def delete_milvus_chunks(company_id: str, document_id: str) -> int:
     del_log = log.bind(company_id=company_id, document_id=document_id)
     try:
-        # Ensure collection is ready
         collection = _ensure_milvus_connection_and_collection()
-        # Construct filter for company/document
         expr = f'{MILVUS_COMPANY_ID_FIELD} == "{company_id}" and {MILVUS_DOCUMENT_ID_FIELD} == "{document_id}"'
         del_log.info("Querying chunks to delete by primary key", filter_expr=expr)
-        # Get primary keys of matching entities
+
         pk_results = collection.query(expr=expr, output_fields=[MILVUS_PK_FIELD])
-        pk_list = [str(item.get(MILVUS_PK_FIELD)) for item in pk_results]
-        if not pk_list:
-            del_log.info("No existing chunks to delete.")
+        num_to_delete = len(pk_results)
+
+        if num_to_delete == 0:
+            del_log.info("No existing chunks found in Milvus to delete.")
             return 0
-        delete_expr = f"{MILVUS_PK_FIELD} in [{', '.join(pk_list)}]"
-        del_log.info("Deleting chunks from Milvus", delete_expr=delete_expr)
-        delete_result = collection.delete(expr=delete_expr)
-        del_log.info("Milvus delete operation executed", deleted_count=delete_result.delete_count)
-        return delete_result.delete_count
+
+        del_log.info(f"Attempting to delete {num_to_delete} chunks from Milvus using expression.")
+        delete_result = collection.delete(expr=expr)
+        actual_deleted_count = delete_result.delete_count
+        del_log.info("Milvus delete operation executed", deleted_count=actual_deleted_count)
+
+        if actual_deleted_count != num_to_delete:
+            del_log.warning("Mismatch between expected chunks to delete and actual deleted count",
+                            expected=num_to_delete, actual=actual_deleted_count)
+
+        return actual_deleted_count
     except MilvusException as e:
         del_log.error("Milvus delete error", error=str(e), exc_info=True)
         return 0
     except Exception as e:
-        del_log.exception("Unexpected error during Milvus delete", error=str(e))
-        return 0
-    except Exception as e:
-        del_log.exception("Unexpected error during Milvus chunk deletion", error=str(e))
+        del_log.exception("Unexpected error during Milvus chunk deletion")
         raise RuntimeError(f"Unexpected Milvus deletion error: {e}") from e
 
 
-# --------------- 4. EMBEDDING MODEL INITIALIZATION REMOVED FROM GLOBAL SCOPE ---------------
-# LLM_FLAG: REMOVED - Global embedding_model = TextEmbedding(...) block was here.
-
-# --------------- 5. MAIN INGEST FUNCTION (MODIFIED) -----------------
-
-# LLM_FLAG: MODIFIED - Added embedding_model argument to function signature
+# --- REFACTORIZADO: Main Ingestion Pipeline Function ---
 def ingest_document_pipeline(
-    file_path: pathlib.Path,
+    file_bytes: bytes,
+    filename: str,
     company_id: str,
     document_id: str,
     content_type: str,
-    embedding_model: TextEmbedding, # Argument added
+    embedding_model: SentenceTransformer, # LLM_FLAG: Type updated
     delete_existing: bool = True
 ) -> int:
-    """
-    Processes a single document: extracts text, chunks, embeds, and inserts into Milvus.
-    Args:
-        file_path: Path to the downloaded document file.
-        company_id: The company ID for multi-tenancy.
-        document_id: The unique ID for the document.
-        content_type: The MIME type of the file.
-        embedding_model: The initialized FastEmbed TextEmbedding instance.
-        delete_existing: If True, delete existing chunks for this company/document before inserting.
-    Returns:
-        The number of chunks successfully inserted into Milvus.
-    Raises:
-        ValueError: If the content type is unsupported, extraction fails, or model not provided.
-        ConnectionError: If connection to Milvus fails.
-        RuntimeError: For other Milvus or Embedding errors.
-    """
     ingest_log = log.bind(
         company_id=company_id,
         document_id=document_id,
-        filename=file_path.name,
+        filename=filename,
         content_type=content_type
     )
-    ingest_log.info("Starting ingestion pipeline for document")
-
-    # --- 0. Check if embedding model was provided ---
-    # LLM_FLAG: MODIFIED - Check the passed embedding_model argument
-    if not embedding_model:
-        ingest_log.error("Embedding model was not provided to the pipeline function.")
-        raise ValueError("Embedding model instance is required for the pipeline.")
+    ingest_log.info("Starting REFACTORED ingestion pipeline (MiniLM/PyMuPDF)")
 
     # --- 1. Select Extractor ---
     extractor = EXTRACTORS.get(content_type)
@@ -2367,91 +2461,97 @@ def ingest_document_pipeline(
         raise ValueError(f"Unsupported content type: {content_type}")
 
     # --- 2. Extract Text ---
-    ingest_log.debug("Extracting text content...")
+    ingest_log.debug("Extracting text content from bytes...")
     try:
-        text_content = extractor(file_path)
+        text_content = extractor(file_bytes, filename=filename)
         if not text_content or text_content.isspace():
             ingest_log.warning("No text content extracted from the document. Skipping.")
             return 0
         ingest_log.info(f"Text extracted successfully, length: {len(text_content)} chars.")
-    except ValueError as ve:
-        ingest_log.error("Text extraction failed.", error=str(ve))
-        raise
+    except EXTRACTION_ERRORS as ve:
+        ingest_log.error("Text extraction failed.", error=str(ve), exc_info=True)
+        raise ValueError(f"Extraction failed for {filename}: {ve}") from ve
+    except Exception as e:
+        ingest_log.exception("Unexpected error during text extraction")
+        raise RuntimeError(f"Unexpected extraction error: {e}") from e
 
     # --- 3. Chunk Text ---
     ingest_log.debug("Chunking extracted text...")
-    chunks = chunk_text(
-        text_content,
-        chunk_size=settings.SPLITTER_CHUNK_SIZE,
-        chunk_overlap=settings.SPLITTER_CHUNK_OVERLAP
-    )
-    if not chunks:
-        ingest_log.warning("Text content resulted in zero chunks. Skipping.")
-        return 0
-    ingest_log.info(f"Text chunked into {len(chunks)} chunks.")
+    try:
+        chunks = split_text(text_content)
+        if not chunks:
+            ingest_log.warning("Text content resulted in zero chunks. Skipping.")
+            return 0
+        ingest_log.info(f"Text chunked into {len(chunks)} chunks.")
+    except Exception as e:
+        ingest_log.error("Failed to chunk text", error=str(e), exc_info=True)
+        raise RuntimeError(f"Chunking failed: {e}") from e
 
     # --- 4. Embed Chunks ---
     ingest_log.debug(f"Generating embeddings for {len(chunks)} chunks...")
     try:
-        embeddings = list(embedding_model.embed(chunks))
+        embeddings = embed_chunks(chunks)
         ingest_log.info(f"Embeddings generated successfully for {len(embeddings)} chunks.")
         if len(embeddings) != len(chunks):
-            ingest_log.warning("Mismatch between number of chunks and generated embeddings.", num_chunks=len(chunks), num_embeddings=len(embeddings))
-            min_len = min(len(chunks), len(embeddings))
-            chunks = chunks[:min_len]
-            embeddings = embeddings[:min_len]
-
+            ingest_log.error("CRITICAL: Mismatch between number of chunks and generated embeddings!",
+                             num_chunks=len(chunks), num_embeddings=len(embeddings))
+            raise RuntimeError("Embedding count mismatch error.")
+        if embeddings and len(embeddings[0]) != MILVUS_EMBEDDING_DIM:
+             ingest_log.error("CRITICAL: Generated embedding dimension mismatch!",
+                              actual_dim=len(embeddings[0]), expected_dim=MILVUS_EMBEDDING_DIM)
+             raise RuntimeError("Embedding dimension mismatch error.")
     except Exception as e:
         ingest_log.error("Failed to generate embeddings", error=str(e), exc_info=True)
         raise RuntimeError(f"Embedding generation failed: {e}") from e
 
     # --- 5. Prepare Data for Milvus ---
-    max_content_len = 4000
+    max_content_len = settings.MILVUS_CONTENT_FIELD_MAX_LENGTH
     def truncate_utf8_bytes(s, max_bytes):
-        b = s.encode('utf-8')
-        if len(b) <= max_bytes:
-            return s
-        # Truncate by bytes, decode ignoring incomplete chars
+        b = s.encode('utf-8', errors='ignore')
+        if len(b) <= max_bytes: return s
         return b[:max_bytes].decode('utf-8', errors='ignore')
+
     truncated_chunks = [truncate_utf8_bytes(c, max_content_len) for c in chunks]
-    # Ensure embeddings and truncated_chunks are aligned
-    if len(truncated_chunks) != len(embeddings):
-        min_len = min(len(truncated_chunks), len(embeddings))
-        truncated_chunks = truncated_chunks[:min_len]
-        embeddings = embeddings[:min_len]
-    # Debug: log chunk lengths before insert
-    for idx, chunk in enumerate(truncated_chunks):
-        ingest_log.debug(f"Chunk {idx} length before insert: {len(chunk)} bytes: {len(chunk.encode('utf-8'))}")
+
     data_to_insert = [
         embeddings,
         truncated_chunks,
-        [company_id] * len(truncated_chunks),
-        [document_id] * len(truncated_chunks),
-        [file_path.name] * len(truncated_chunks),
+        [company_id] * len(chunks),
+        [document_id] * len(chunks),
+        [filename] * len(chunks),
     ]
+    field_names_for_insert = [
+        MILVUS_VECTOR_FIELD, MILVUS_CONTENT_FIELD, MILVUS_COMPANY_ID_FIELD,
+        MILVUS_DOCUMENT_ID_FIELD, MILVUS_FILENAME_FIELD
+    ]
+    ingest_log.debug(f"Prepared {len(chunks)} entities for Milvus insertion.", fields=field_names_for_insert)
 
-    # --- 6. Delete Existing Chunks (Optional) ---
+    # --- 6. Delete Existing Chunks ---
     if delete_existing:
+        ingest_log.info("Attempting to delete existing chunks before insertion...")
         try:
             deleted_count = delete_milvus_chunks(company_id, document_id)
-            ingest_log.info(f"Deleted {deleted_count} existing chunks before insertion.")
+            ingest_log.info(f"Deleted {deleted_count} existing chunks.")
         except Exception as del_err:
             ingest_log.error("Failed to delete existing chunks, proceeding with insert anyway.", error=str(del_err))
 
     # --- 7. Insert into Milvus ---
-    ingest_log.debug(f"Inserting {len(truncated_chunks)} chunks into Milvus collection '{MILVUS_COLLECTION_NAME}'...")
+    ingest_log.debug(f"Inserting {len(chunks)} chunks into Milvus collection '{MILVUS_COLLECTION_NAME}'...")
     try:
         collection = _ensure_milvus_connection_and_collection()
         mutation_result = collection.insert(data_to_insert)
         inserted_count = mutation_result.insert_count
 
-        if inserted_count == len(truncated_chunks):
+        if inserted_count == len(chunks):
             ingest_log.info(f"Successfully inserted {inserted_count} chunks into Milvus.")
-            log.debug("Flushing Milvus collection...")
-            collection.flush()
-            log.info("Milvus collection flushed.")
         else:
-            ingest_log.warning(f"Milvus insert result count ({inserted_count}) differs from chunks sent ({len(truncated_chunks)}).")
+            ingest_log.error(f"CRITICAL: Milvus insert count mismatch!",
+                             expected=len(chunks), inserted=inserted_count, pk_errors=mutation_result.err_indices)
+            return 0 # Indicate partial/failed insert
+
+        ingest_log.debug("Flushing Milvus collection...")
+        collection.flush()
+        ingest_log.info("Milvus collection flushed.")
 
         return inserted_count
 
@@ -2459,7 +2559,7 @@ def ingest_document_pipeline(
         ingest_log.error("Failed to insert data into Milvus", error=str(e), exc_info=True)
         raise RuntimeError(f"Milvus insertion failed: {e}") from e
     except Exception as e:
-        ingest_log.exception("Unexpected error during Milvus insertion", error=str(e))
+        ingest_log.exception("Unexpected error during Milvus insertion")
         raise RuntimeError(f"Unexpected Milvus insertion error: {e}") from e
 ```
 
@@ -2696,6 +2796,38 @@ class MinioClient:
             # Allow process to continue
 ```
 
+## File: `app\services\text_splitter.py`
+```py
+import re
+from typing import List
+import structlog
+from app.core.config import settings
+
+log = structlog.get_logger(__name__)
+
+CHUNK_SIZE = getattr(settings, 'SPLITTER_CHUNK_SIZE', 1000)
+CHUNK_OVERLAP = getattr(settings, 'SPLITTER_CHUNK_OVERLAP', 250)
+
+def split_text(text: str) -> List[str]:
+    """
+    Divide el texto en chunks de tamaño CHUNK_SIZE con solapamiento CHUNK_OVERLAP.
+    """
+    log.debug("Splitting text into chunks", chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+    words = text.split()
+    chunks = []
+    start = 0
+    while start < len(words):
+        end = min(start + CHUNK_SIZE, len(words))
+        chunk = " ".join(words[start:end])
+        chunks.append(chunk)
+        if end == len(words):
+            break
+        start += CHUNK_SIZE - CHUNK_OVERLAP
+    log.info("Text split into chunks", num_chunks=len(chunks))
+    return chunks
+
+```
+
 ## File: `app\tasks\__init__.py`
 ```py
 
@@ -2741,109 +2873,88 @@ import os
 import tempfile
 import uuid
 import sys
-import pathlib # Use pathlib for paths
+import pathlib
+import time
 from typing import Optional, Dict, Any
 
 import structlog
 from celery import Task
 from celery.exceptions import Ignore, Reject, MaxRetriesExceededError
-# LLM_FLAG: ADDED - Import TextEmbedding for type hinting and conditional init
-from fastembed.embedding import TextEmbedding
-from sqlalchemy import Engine # Import Engine for type hinting
+from celery.signals import worker_process_init
+from sqlalchemy import Engine
+# LLM_FLAG: Import correct embedding components
+from sentence_transformers import SentenceTransformer
+from app.services.embedder import get_embedding_model # Function to load/cache model
 
 # --- Custom Application Imports ---
 from app.core.config import settings
-from app.db.postgres_client import get_sync_engine, set_status_sync # Keep DB client
-from app.models.domain import DocumentStatus # Keep domain models
-from app.services.minio_client import MinioClient, MinioError # Keep MinIO client
-# --- Import the NEW pipeline function ---
-from app.services.ingest_pipeline import ingest_document_pipeline, EXTRACTORS # Import pipeline and extractors map
-from app.tasks.celery_app import celery_app # Keep Celery app
+from app.db.postgres_client import get_sync_engine, set_status_sync
+from app.models.domain import DocumentStatus
+from app.services.minio_client import MinioClient, MinioError
+# LLM_FLAG: Import REFACTORIZADO pipeline and EXTRACTORS map
+from app.services.ingest_pipeline import ingest_document_pipeline, EXTRACTORS, EXTRACTION_ERRORS
+from app.tasks.celery_app import celery_app
 
-
-# --- Initialize Structlog Logger ---
 task_struct_log = structlog.get_logger(__name__)
-
-# --- Detect if running as Celery Worker ---
-# A common way to detect if running under Celery worker context
 IS_WORKER = "worker" in sys.argv
 
-# --- Initialize Global Resources Conditionally ---
+# --- Global Resources for Worker Process ---
 sync_engine: Optional[Engine] = None
 minio_client: Optional[MinioClient] = None
-embedding_model: Optional[TextEmbedding] = None
+# LLM_FLAG: Variable to hold the loaded embedding model per worker process
+worker_embedding_model: Optional[SentenceTransformer] = None
 
-# LLM_FLAG: MODIFIED - Initialize resources conditionally based on IS_WORKER
-try:
-    task_struct_log.info("Initializing global resources for process...", is_worker=IS_WORKER)
-
-    # MinIO Client is needed by both (though API should ideally use async)
-    # Initialize globally for now, but mark for potential async refactor in API
-    minio_client = MinioClient()
-    task_struct_log.info("Global MinIO client initialized.")
-
-    if IS_WORKER:
-        # Resources needed ONLY by the worker
-        task_struct_log.info("Initializing worker-specific resources (DB Engine, Embedding Model)...")
-        try:
+# LLM_FLAG: Initialize resources at worker startup
+@worker_process_init.connect(weak=False)
+def init_worker_resources(**kwargs):
+    global sync_engine, minio_client, worker_embedding_model
+    log = task_struct_log.bind(signal="worker_process_init")
+    log.info("Worker process initializing resources...")
+    try:
+        if sync_engine is None:
             sync_engine = get_sync_engine()
-            task_struct_log.info("Synchronous DB engine initialized successfully for worker.")
-        except Exception as db_init_err:
-            task_struct_log.critical(
-                "Failed to initialize synchronous DB engine! Worker tasks depending on DB will fail.",
-                error=str(db_init_err),
-                exc_info=True
-            )
-            # sync_engine remains None
+            log.info("Synchronous DB engine initialized.")
+        else:
+             log.info("Synchronous DB engine already initialized.")
 
-        try:
-            task_struct_log.info("Initializing FastEmbed model instance for worker...", model=settings.FASTEMBED_MODEL, device="cpu")
-            embedding_model = TextEmbedding(
-                model_name=settings.FASTEMBED_MODEL,
-                cache_dir=os.environ.get("FASTEMBED_CACHE_DIR"),
-                device="cpu",
-                threads=1,
-                parallel=0
-            )
-            task_struct_log.info("Global FastEmbed model instance initialized successfully for worker.")
-        except Exception as emb_init_err:
-             task_struct_log.critical(
-                 "Failed to initialize FastEmbed model! Worker tasks depending on embeddings will fail.",
-                 error=str(emb_init_err),
-                 exc_info=True
-             )
-             # embedding_model remains None
-    else:
-         task_struct_log.info("Running in API context. Skipping worker-specific resource initialization (DB Engine, Embedding Model).")
+        if minio_client is None:
+            minio_client = MinioClient()
+            log.info("MinIO client initialized.")
+        else:
+            log.info("MinIO client already initialized.")
 
-except Exception as global_init_err:
-    task_struct_log.critical("CRITICAL: Failed during global resource initialization!", error=str(global_init_err), exc_info=True)
-    # Ensure potentially failed initializations result in None
-    if not isinstance(minio_client, MinioClient): minio_client = None
-    if IS_WORKER: # Only nullify worker resources if we expected them
-        if not isinstance(sync_engine, Engine): sync_engine = None
-        if not isinstance(embedding_model, TextEmbedding): embedding_model = None
+        if worker_embedding_model is None:
+            log.info("Preloading embedding model...")
+            worker_embedding_model = get_embedding_model() # This handles loading and caching
+            log.info("Embedding model preloaded.")
+        else:
+            log.info("Embedding model already preloaded.")
+
+    except Exception as e:
+        log.critical("CRITICAL FAILURE during worker resource initialization!", error=str(e), exc_info=True)
+        # Set to None so pre-checks in task will fail cleanly
+        sync_engine = None
+        minio_client = None
+        worker_embedding_model = None
 
 # --------------------------------------------------------------------------
-# Refactored Synchronous Celery Task Definition (MODIFIED Pre-checks)
+# Refactored Celery Task Definition
 # --------------------------------------------------------------------------
 @celery_app.task(
     bind=True,
     name="ingest.process_document",
     autoretry_for=(Exception,),
-    # Exclude errors that indicate non-transient problems or config issues
-    exclude=(Reject, Ignore, ValueError, ConnectionError, RuntimeError, TypeError),
+    # LLM_FLAG: Exclude specific non-retriable errors
+    exclude=(Reject, Ignore, ValueError, ConnectionError, RuntimeError, TypeError, *EXTRACTION_ERRORS),
     retry_backoff=True,
-    retry_backoff_max=600, # Max ~10 minutes backoff
+    retry_backoff_max=600,
     retry_jitter=True,
-    max_retries=3 # Retry up to 3 times for transient errors
+    max_retries=3
 )
 def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
     """
-    Synchronous Celery task to process a document using the standalone pipeline.
-    Downloads from MinIO, then calls ingest_document_pipeline for conversion,
-    chunking, embedding (CPU), and writing to Milvus via pymilvus.
-    Updates status in PostgreSQL synchronously. Uses structlog for logging.
+    Refactored Celery task: Downloads from MinIO, passes bytes to the new pipeline
+    (using SentenceTransformer, PyMuPDF, etc.), updates status sync.
     """
     document_id_str = kwargs.get('document_id')
     company_id_str = kwargs.get('company_id')
@@ -2857,11 +2968,10 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
         task_id=task_id, attempt=f"{attempt}/{max_attempts}", doc_id=document_id_str,
         company_id=company_id_str, filename=filename, content_type=content_type
     )
-    log.info("Starting standalone document processing task")
+    log.info("Starting REFACTORED standalone document processing task (MiniLM/PyMuPDF)")
 
     # --- Pre-checks ---
     if not IS_WORKER:
-         # This should ideally not happen if imports are managed well, but safety first.
          log.critical("Task function called outside of a worker context! Rejecting.")
          raise Reject("Task running outside worker context.", requeue=False)
 
@@ -2869,36 +2979,30 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
         log.error("Missing required arguments in task payload.", payload_kwargs=kwargs)
         raise Reject("Missing required arguments (doc_id, company_id, filename, content_type)", requeue=False)
 
-    # --- Check if Worker Resources Initialized Correctly ---
-    # These checks run *inside* the task execution for robustness
+    # LLM_FLAG: Check worker resources were initialized correctly
     if not sync_engine:
          log.critical("Worker Sync DB Engine is not initialized. Task cannot proceed.")
-         # Attempting DB update here is difficult without the engine. Reject permanently.
          raise Reject("Worker sync DB engine initialization failed.", requeue=False)
-
-    if not embedding_model:
-         log.critical("Worker Embedding Model is not initialized. Task cannot proceed.")
-         # Attempt to update DB status via the (hopefully existing) sync_engine
-         if document_id_str:
-             try:
-                 doc_uuid_for_error = uuid.UUID(document_id_str)
-                 set_status_sync(engine=sync_engine, document_id=doc_uuid_for_error, status=DocumentStatus.ERROR, error_message="Worker embedding model init failed.")
-             except Exception as db_err:
-                 log.critical("Failed to update status to ERROR after worker embedding model init failure!", error=str(db_err))
-         raise Reject("Worker embedding model initialization failed.", requeue=False)
-
+    if not worker_embedding_model: # Check the global variable holding the model
+         log.critical("Worker Embedding Model (SentenceTransformer) is not available/loaded. Task cannot proceed.")
+         error_msg = "Worker embedding model init/preload failed."
+         doc_uuid_err = None
+         try: doc_uuid_err = uuid.UUID(document_id_str)
+         except ValueError: pass
+         if doc_uuid_err:
+             try: set_status_sync(engine=sync_engine, document_id=doc_uuid_err, status=DocumentStatus.ERROR, error_message=error_msg)
+             except Exception as db_err: log.critical("Failed to update status after embedding model check failure!", error=str(db_err))
+         raise Reject(error_msg, requeue=False)
     if not minio_client:
          log.critical("Worker MinIO Client is not initialized. Task cannot proceed.")
-         # Attempt to update DB status via sync_engine
-         if document_id_str:
-              try:
-                  doc_uuid_for_error = uuid.UUID(document_id_str)
-                  set_status_sync(engine=sync_engine, document_id=doc_uuid_for_error, status=DocumentStatus.ERROR, error_message="Worker MinIO client init failed.")
-              except Exception as db_err:
-                  log.critical("Failed to update status to ERROR after worker MinIO client init failure!", error=str(db_err))
-         raise Reject("Worker MinIO client initialization failed.", requeue=False)
-    # --- End Pre-checks ---
-
+         error_msg = "Worker MinIO client init failed."
+         doc_uuid_err = None
+         try: doc_uuid_err = uuid.UUID(document_id_str)
+         except ValueError: pass
+         if doc_uuid_err:
+              try: set_status_sync(engine=sync_engine, document_id=doc_uuid_err, status=DocumentStatus.ERROR, error_message=error_msg)
+              except Exception as db_err: log.critical("Failed to update status after MinIO client check failure!", error=str(db_err))
+         raise Reject(error_msg, requeue=False)
 
     try:
         doc_uuid = uuid.UUID(document_id_str)
@@ -2911,13 +3015,12 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
         error_msg = f"Unsupported content type: {content_type}"
         try: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg)
         except Exception as db_err: log.critical("Failed to update status to ERROR for unsupported type!", error=str(db_err))
-        raise Reject(error_msg, requeue=False)
-
+        raise Reject(error_msg, requeue=False) # Non-retriable
 
     object_name = f"{company_id_str}/{document_id_str}/{filename}"
-    log.debug(f"MinIO download object_name repr: {repr(object_name)}")
     temp_file_path_obj: Optional[pathlib.Path] = None
     inserted_chunk_count = 0
+    file_bytes: Optional[bytes] = None
 
     try:
         # 1. Update status to PROCESSING
@@ -2930,53 +3033,53 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
             raise Ignore()
         log.info("Status set to PROCESSING.")
 
-        # 2. Download file from MinIO to temporary directory (with retry on NoSuchKey)
+        # 2. Download file and read bytes
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_dir_path = pathlib.Path(temp_dir)
             temp_file_path_obj = temp_dir_path / filename
             log.info(f"Downloading MinIO object: {object_name} -> {str(temp_file_path_obj)}")
-            max_minio_retries = 5
-            minio_delay = 2  # seconds
+
+            max_minio_retries = 3 # Adjusted retries for download
+            minio_delay = 2
             for attempt_num in range(1, max_minio_retries + 1):
                 try:
                     minio_client.download_file_sync(object_name, str(temp_file_path_obj))
                     log.info("File downloaded successfully from MinIO.")
-                    break
+                    # Read file into bytes immediately after download
+                    log.debug(f"Reading downloaded file into bytes: {str(temp_file_path_obj)}")
+                    file_bytes = temp_file_path_obj.read_bytes()
+                    log.info(f"File content read into memory ({len(file_bytes)} bytes).")
+                    break # Exit retry loop on success
                 except MinioError as me:
-                    # Only retry on NoSuchKey
                     if "NoSuchKey" in str(me) or "Object not found" in str(me):
-                        log.warning(f"MinIO NoSuchKey on attempt {attempt_num}/{max_minio_retries}. Retrying in {minio_delay} seconds...", error=str(me))
+                        log.warning(f"MinIO NoSuchKey on download attempt {attempt_num}/{max_minio_retries}. Retrying in {minio_delay}s...", error=str(me))
                         if attempt_num == max_minio_retries:
                             log.error(f"File still not found in MinIO after {max_minio_retries} attempts. Aborting.")
-                            raise
-                        import time
+                            raise # Re-raise the final MinioError
                         time.sleep(minio_delay)
-                        minio_delay *= 2  # Exponential backoff
-                        continue
+                        minio_delay *= 2
                     else:
-                        raise  # Other Minio errors are not retried
+                        log.error("Non-retriable MinIO error during download", error=str(me))
+                        raise # Re-raise other Minio errors
+                except Exception as read_err:
+                    log.error("Failed to read downloaded file into bytes", error=str(read_err), exc_info=True)
+                    raise RuntimeError(f"Failed to read temp file: {read_err}") from read_err
+            # Check if file_bytes was successfully read
+            if file_bytes is None:
+                 raise RuntimeError("File download or read failed, bytes not available.")
 
-            # 3. Execute Standalone Ingestion Pipeline
-            log.info("Executing standalone ingest pipeline (extract, chunk, embed, insert)...")
-            # Lazy-init embedding model for this task to avoid multiprocessing hangs
-            from fastembed.embedding import TextEmbedding
-            task_struct_log.info("Initializing embedding model for this task...", model=settings.FASTEMBED_MODEL)
-            local_embedding_model = TextEmbedding(
-                model_name=settings.FASTEMBED_MODEL,
-                cache_dir=os.environ.get("FASTEMBED_CACHE_DIR"),
-                device="cpu",
-                threads=1,
-                parallel=0
-            )
+            # 3. Execute Refactored Ingestion Pipeline
+            log.info("Executing refactored ingest pipeline...")
             inserted_chunk_count = ingest_document_pipeline(
-                file_path=temp_file_path_obj,
+                file_bytes=file_bytes,
+                filename=filename,
                 company_id=company_id_str,
                 document_id=document_id_str,
                 content_type=content_type,
-                embedding_model=local_embedding_model,
+                embedding_model=worker_embedding_model, # Pass the loaded model
                 delete_existing=True
             )
-            log.info(f"Ingestion pipeline finished. Inserted chunks: {inserted_chunk_count}")
+            log.info(f"Ingestion pipeline finished. Inserted chunks reported: {inserted_chunk_count}")
 
         # 4. Update status to PROCESSED
         log.debug("Setting status to PROCESSED in DB.")
@@ -2995,60 +3098,52 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
 
     # --- Error Handling ---
     except MinioError as me:
-        log.error(f"MinIO Error during processing: {me}", exc_info=True)
+        log.error(f"MinIO Error during processing", error=str(me), exc_info=True)
         error_msg = f"MinIO Error: {str(me)[:400]}"
         try: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg)
-        except Exception as db_err: log.critical("Failed to update status to ERROR after MinIO failure!", error=str(db_err))
+        except Exception as db_err: log.critical("Failed to update status after MinIO failure!", error=str(db_err))
         if "Object not found" in str(me):
-            # If the object is not found, it's not a transient error. Reject permanently.
             raise Reject(f"MinIO Error: Object not found: {object_name}", requeue=False) from me
         else:
-            # For other S3 errors, raise to allow Celery's autoretry mechanism
-            raise me # Will be caught by autoretry_for=(Exception,)
+            raise me # Allow retry for other potential MinIO errors
 
-    except (ValueError, ConnectionError, RuntimeError, TypeError) as pipeline_err:
-         # These are likely non-recoverable errors from the pipeline logic or Milvus/DB connection issues
-         # that might persist. Reject permanently after marking as error.
-         log.error(f"Pipeline/Connection Error: {pipeline_err}", exc_info=True)
+    except (*EXTRACTION_ERRORS, ValueError, RuntimeError, TypeError) as pipeline_err:
+         # Catches extraction errors, embedding errors, chunking errors, Milvus errors, etc.
+         # Considered non-retriable by default based on 'exclude' tuple
+         log.error(f"Pipeline Error: {pipeline_err}", exc_info=True)
          error_msg = f"Pipeline Error: {type(pipeline_err).__name__} - {str(pipeline_err)[:400]}"
          try: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg)
-         except Exception as db_err: log.critical("Failed to update status to ERROR after pipeline failure!", error=str(db_err))
-         # Reject instead of raising to prevent retries for these specific error types
+         except Exception as db_err: log.critical("Failed to update status after pipeline failure!", error=str(db_err))
          raise Reject(f"Pipeline failed: {error_msg}", requeue=False) from pipeline_err
 
     except Reject as r:
-         # If Reject is raised explicitly (e.g., from pre-checks)
          log.error(f"Task rejected permanently: {r.reason}")
-         # Attempt to set status one last time if possible and ID is valid
          if sync_engine and doc_uuid:
              try: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=f"Rejected: {r.reason}"[:500])
-             except Exception as db_err: log.critical("Failed to update status to ERROR after task rejection!", error=str(db_err))
-         raise r # Re-raise Reject
+             except Exception as db_err: log.critical("Failed to update status after task rejection!", error=str(db_err))
+         raise r
 
     except Ignore:
-         # If Ignore is raised explicitly
          log.info("Task ignored.")
-         raise Ignore() # Re-raise Ignore
+         raise Ignore()
 
     except MaxRetriesExceededError as mree:
-        # This happens after autoretry_for fails max_retries times
         log.error("Max retries exceeded for task.", exc_info=True)
         final_error = mree.cause if mree.cause else mree
         error_msg = f"Max retries exceeded ({max_attempts}). Last error: {type(final_error).__name__} - {str(final_error)[:300]}"
         try: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg)
         except Exception as db_err: log.critical("Failed to update status to ERROR after max retries!", error=str(db_err))
-        # Do not raise here, Celery handles logging MaxRetriesExceededError
+        # Let Celery handle logging MaxRetriesExceededError
 
     except Exception as exc:
-        # Catch any other unexpected exception to allow Celery's autoretry
-        log.exception(f"An unexpected error occurred during document processing, will retry if attempts remain.")
+        # Catch-all for unexpected errors, triggers Celery's autoretry
+        log.exception(f"An unexpected error occurred, will retry if attempts remain.")
         error_msg = f"Attempt {attempt} failed: {type(exc).__name__} - {str(exc)[:400]}"
         try: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg)
-        except Exception as db_err: log.critical("CRITICAL: Failed to update status to ERROR after unexpected failure!", error=str(db_err))
-        # Raise the original exception to trigger Celery's retry mechanism defined in autoretry_for
+        except Exception as db_err: log.critical("CRITICAL: Failed to update status after unexpected failure!", error=str(db_err))
         raise exc
 
-# LLM_FLAG: NO_CHANGE - Keep task alias assignment
+# LLM_FLAG: Keeping alias for potential external references
 process_document_haystack_task = process_document_standalone
 ```
 
@@ -3056,9 +3151,8 @@ process_document_haystack_task = process_document_standalone
 ```toml
 [tool.poetry]
 name = "ingest-service"
-# Incrementamos versión por refactorización mayor
-version = "0.2.0"
-description = "Ingest service for Atenex B2B SaaS (Postgres/Minio/Milvus/FastEmbed - CPU - Prefork - Haystack Removed)"
+version = "0.3.0" # Incrementamos versión por refactorización MiniLM/PyMuPDF
+description = "Ingest service for Atenex B2B SaaS (Postgres/Minio/Milvus/SentenceTransformers - CPU - Prefork)"
 authors = ["Atenex Team <dev@atenex.com>"]
 readme = "README.md"
 
@@ -3077,24 +3171,28 @@ python-multipart = "^0.0.9"
 structlog = "^24.1.0"
 minio = "^7.1.17"
 
-# --- Core Processing Dependencies (Haystack REMOVED) ---
-fastembed = ">=0.2.1,<0.3.0" # Standalone FastEmbed (includes ONNX runtime)
-pymilvus = ">=2.4.1,<2.5.0"  # Official Milvus client
+# --- Core Processing Dependencies (REFACTORIZADO) ---
+pymupdf = "^1.25.0"                # PyMuPDF for PDF extraction
+sentence-transformers = "^2.7"     # For MiniLM embeddings
+pymilvus = ">=2.4.1,<2.5.0"         # Official Milvus client
 
-# --- Converter Dependencies (Standalone) ---
-pypdf = ">=4.0.1,<5.0.0"
+# --- Converter Dependencies (Standalone - MANTENER) ---
+# pypdf = ">=4.0.1,<5.0.0"          # ELIMINADO/COMENTADO - Reemplazado por PyMuPDF
 python-docx = ">=1.1.0,<2.0.0"
 markdown = ">=3.5.1,<4.0.0"
 beautifulsoup4 = ">=4.12.3,<5.0.0"
-html2text = ">=2024.1.0,<2025.0.0" # For Markdown -> HTML -> Text conversion
+html2text = ">=2024.1.0,<2025.0.0"  # For Markdown -> HTML -> Text conversion
 
-# --- HTTP Client (API) ---
+# --- HTTP Client (API - MANTENER) ---
 httpx = {extras = ["http2"], version = "^0.27.0"}
 h2 = "^4.1.0"
 
-# --- Synchronous DB Dependencies (Worker) ---
+# --- Synchronous DB Dependencies (Worker - MANTENER) ---
 sqlalchemy = "^2.0.28"
 psycopg2-binary = "^2.9.9"
+
+# --- ELIMINADO ---
+# fastembed = ">=0.2.1,<0.3.0"      # ELIMINADO
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"
