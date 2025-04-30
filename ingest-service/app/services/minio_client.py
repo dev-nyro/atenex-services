@@ -192,7 +192,11 @@ class MinioClient:
             raise MinioError(f"Unexpected error downloading {object_name}", e) from e
 
     def check_file_exists_sync(self, object_name: str) -> bool:
-        """Synchronously checks if a file exists in MinIO."""
+        """Synchronously checks if a file exists in MinIO. Strips bucket prefix if present."""
+        # Defensive: Remove bucket name prefix if present
+        if object_name.startswith(self.bucket_name + "/"):
+            self.log.warning("Object name included bucket prefix, stripping it for MinIO API.", original_object_name=object_name)
+            object_name = object_name[len(self.bucket_name) + 1:]
         check_log = self.log.bind(bucket=self.bucket_name, object_name=object_name)
         client = self._get_client()
         try:
@@ -206,8 +210,8 @@ class MinioClient:
             check_log.error("S3Error checking object existence (sync)", error_code=getattr(e, 'code', 'Unknown'), error_details=str(e))
             raise MinioError(f"S3 error checking existence for {object_name}", e) from e
         except Exception as e:
-             check_log.exception("Unexpected error checking object existence (sync)", error=str(e))
-             raise MinioError(f"Unexpected error checking existence for {object_name}", e) from e
+            check_log.exception("Unexpected error checking object existence (sync)", error=str(e))
+            raise MinioError(f"Unexpected error checking existence for {object_name}", e) from e
 
     def delete_file_sync(self, object_name: str):
         """Synchronously deletes a file from MinIO."""
