@@ -192,7 +192,7 @@ class MinioClient:
             raise MinioError(f"Unexpected error downloading {object_name}", e) from e
 
     def check_file_exists_sync(self, object_name: str) -> bool:
-        """Synchronously checks if a file exists in MinIO. Strips bucket prefix if present."""
+        """Synchronously checks if a file exists in MinIO. Strips bucket prefix if present. If stat_object fails, tries list_objects as fallback for multipart uploads."""
         # Defensive: Remove bucket name prefix if present
         if object_name.startswith(self.bucket_name + "/"):
             self.log.warning("Object name included bucket prefix, stripping it for MinIO API.", original_object_name=object_name)
@@ -201,12 +201,31 @@ class MinioClient:
         client = self._get_client()
         try:
             client.stat_object(self.bucket_name, object_name)
-            check_log.debug("Object exists in MinIO (sync check).")
+            check_log.debug("Object exists in MinIO (sync check, stat_object).")
             return True
         except S3Error as e:
             if getattr(e, 'code', None) in ('NoSuchKey', 'NoSuchBucket'):
-                check_log.debug("Object not found in MinIO (sync check)", code=e.code)
-                return False
+                check_log.debug("stat_object: Object not found, trying list_objects fallback", code=e.code)
+                # Fallback: try to find as multipart (directory-style) object
+                found = False
+                try:
+                    # List objects with the prefix, non-recursive, to see if any part exists
+                    objects = list(client.list_objects(self.bucket_name, prefix=object_name, recursive=True))
+                    for obj in objects:
+                        check_log.debug("list_objects fallback: found candidate", candidate_name=obj.object_name)
+                        # Accept if the object_name matches exactly or is a part of a multipart upload
+                        if obj.object_name == object_name or obj.object_name.startswith(object_name + "/"):
+                            found = True
+                            break
+                    if found:
+                        check_log.info("Object found in MinIO via list_objects fallback (multipart or directory-style)")
+                        return True
+                    else:
+                        check_log.debug("Object not found in MinIO via list_objects fallback")
+                        return False
+                except Exception as le:
+                    check_log.error("list_objects fallback failed", error=str(le))
+                    return False
             check_log.error("S3Error checking object existence (sync)", error_code=getattr(e, 'code', 'Unknown'), error_details=str(e))
             raise MinioError(f"S3 error checking existence for {object_name}", e) from e
         except Exception as e:
