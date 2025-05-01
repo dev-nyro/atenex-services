@@ -280,16 +280,37 @@ async def upload_document(
 
     try:
         file_content = await file.read()
-        endpoint_log.debug(f"MinIO upload object_name repr: {repr(file_path_in_storage)}")
-        await minio_client.upload_file_async(
-            object_name=file_path_in_storage, data=file_content, content_type=file.content_type
-        )
-        endpoint_log.info("File uploaded successfully to MinIO", object_name=file_path_in_storage)
+        endpoint_log.info("[INGEST] Preparando subida a MinIO", object_name=file_path_in_storage, filename=file.filename, size=len(file_content), content_type=file.content_type)
+        try:
+            await minio_client.upload_file_async(
+                object_name=file_path_in_storage, data=file_content, content_type=file.content_type
+            )
+            endpoint_log.info("[INGEST] File uploaded successfully to MinIO", object_name=file_path_in_storage)
+        except Exception as upload_exc:
+            endpoint_log.error("[INGEST] Exception during MinIO upload", object_name=file_path_in_storage, error=str(upload_exc))
+            raise
+
+        # --- Validación extra: verificar que el archivo existe en MinIO ---
+        try:
+            file_exists = await minio_client.check_file_exists_async(file_path_in_storage)
+            endpoint_log.info("[INGEST] MinIO existence check after upload", object_name=file_path_in_storage, exists=file_exists)
+        except Exception as check_exc:
+            endpoint_log.error("[INGEST] Exception during MinIO existence check", object_name=file_path_in_storage, error=str(check_exc))
+            file_exists = False
+
+        if not file_exists:
+            endpoint_log.error("[INGEST] File not found in MinIO after upload", object_name=file_path_in_storage, filename=file.filename)
+            async with get_db_conn() as conn:
+                await api_db_retry_strategy(db_client.update_document_status)(
+                    document_id=document_id, status=DocumentStatus.ERROR, error_message="File not found in MinIO after upload", conn=conn
+                )
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="File not found in MinIO after upload.")
+
         async with get_db_conn() as conn:
             await api_db_retry_strategy(db_client.update_document_status)(
                 document_id=document_id, status=DocumentStatus.UPLOADED, conn=conn # Use keyword arg for conn
             )
-        endpoint_log.info("Document status updated to 'uploaded'", document_id=str(document_id))
+        endpoint_log.info("[INGEST] Document status updated to 'uploaded'", document_id=str(document_id))
     except MinioError as me:
         endpoint_log.error("Failed to upload file to MinIO", object_name=file_path_in_storage, error=str(me))
         try:
