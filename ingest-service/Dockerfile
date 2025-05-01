@@ -35,9 +35,9 @@ COPY pyproject.toml poetry.lock* ./
 
 
 # Debug: mostrar binario poetry y versión
-RUN ls -l /opt/poetry/bin && /opt/poetry/bin/poetry --version
+RUN ls -l /opt/poetry/bin && ls -l /opt/poetry/venv/bin && /opt/poetry/venv/bin/poetry --version
 # Forzar PATH correcto antes de instalar dependencias
-RUN /opt/poetry/bin/poetry install --no-root --only main
+RUN /opt/poetry/venv/bin/poetry install --no-root --only main
 
 # ---- Stage 2: Final Image ----
 # Use the same slim base image for the final stage
