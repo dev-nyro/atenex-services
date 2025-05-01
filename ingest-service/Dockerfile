@@ -3,18 +3,16 @@
 # LLM_COMMENT: Builder stage to install dependencies including build tools.
 FROM python:3.10-slim as builder
 
-# Set environment variables
+# Set environment variables (Simplified and PATH corrected)
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     POETRY_VERSION=1.7.1 \
     POETRY_HOME="/opt/poetry" \
-    PATH="$POETRY_HOME/bin:$PATH" \
+    # LLM_COMMENT: Correctly add POETRY_HOME/bin to the PATH for subsequent RUN commands.
+    PATH="/opt/poetry/bin:$PATH" \
     POETRY_NO_INTERACTION=1 \
-    # LLM_COMMENT: Install into a standard location within the builder stage.
-    POETRY_VIRTUALENVS_CREATE=false \
-    # LLM_COMMENT: Define standard paths for Python packages.
-    PYTHONPATH="/usr/local/lib/python3.10/site-packages" \
-    PIP_TARGET="/usr/local/lib/python3.10/site-packages"
+    # LLM_COMMENT: Install globally within this stage's Python environment.
+    POETRY_VIRTUALENVS_CREATE=false
 
 # Install system build dependencies and curl
 # LLM_COMMENT: Install build tools needed for some Python packages + curl for Poetry.
@@ -22,9 +20,13 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends curl build-essential && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Poetry
-# LLM_COMMENT: Install Poetry itself.
+# Install Poetry using the official installer
+# LLM_COMMENT: The installer script will place the `poetry` executable/shim in $POETRY_HOME/bin which is now in PATH.
 RUN curl -sSL https://install.python-poetry.org | python3 - --version ${POETRY_VERSION}
+
+# --- Verification Step ---
+# LLM_COMMENT: Verify poetry command is accessible via PATH immediately after installation.
+RUN poetry --version
 
 # Set working directory for builder
 WORKDIR /build
@@ -33,11 +35,10 @@ WORKDIR /build
 # LLM_COMMENT: Copy dependency files to leverage cache.
 COPY pyproject.toml poetry.lock* ./
 
-
-# Debug: mostrar binario poetry y versión
-RUN ls -l /opt/poetry/bin && ls -l /opt/poetry/venv/bin && /opt/poetry/venv/bin/poetry --version
-# Forzar PATH correcto antes de instalar dependencias
-RUN /opt/poetry/venv/bin/poetry install --no-root --only main
+# Install project dependencies using the lock file via the PATH
+# LLM_COMMENT: Run poetry install. Uses the 'poetry' command found via PATH.
+# LLM_COMMENT: --only main: Installs only main dependencies (no dev).
+RUN poetry install --no-root --only main
 
 # ---- Stage 2: Final Image ----
 # Use the same slim base image for the final stage
@@ -48,19 +49,20 @@ FROM python:3.10-slim
 # LLM_COMMENT: Set runtime environment variables.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    # LLM_COMMENT: Set path for application execution.
-    WORKDIR="/app"
-
-# Install ONLY runtime system dependencies (if any are needed, e.g., libpq for psycopg2 if not binary)
-# RUN apt-get update && apt-get install -y --no-install-recommends some-runtime-lib && rm -rf /var/lib/apt/lists/*
-# LLM_COMMENT: Currently, no runtime system dependencies seem explicitly required beyond what python-slim provides. Add if necessary.
+    # LLM_COMMENT: WORKDIR variable is not standard, use /app directly.
+    WORKDIR_PATH="/app"
 
 # Set working directory
-WORKDIR ${WORKDIR}
+WORKDIR ${WORKDIR_PATH}
+
+# Install ONLY runtime system dependencies (if any are needed)
+# RUN apt-get update && apt-get install -y --no-install-recommends some-runtime-lib && rm -rf /var/lib/apt/lists/*
+# LLM_COMMENT: Currently, no runtime system dependencies seem explicitly required.
 
 # Copy installed dependencies from the builder stage
-# LLM_COMMENT: Copy only the installed packages from the builder stage. This is the key step.
+# LLM_COMMENT: Copy only the installed packages from the builder stage's global site-packages.
 COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
+# LLM_COMMENT: Copy any executables installed by dependencies (like gunicorn, celery) from the builder's bin.
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copy the application code
