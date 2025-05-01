@@ -956,4 +956,4 @@ async def delete_document_endpoint(
     if errors: delete_log.warning("Document deletion process completed with non-critical errors", errors=errors)
 
     delete_log.info("Document deletion process finished.")
-    return None # Return 204 No Content
+    return None # Return 204 No Conten
