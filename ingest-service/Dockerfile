@@ -34,11 +34,12 @@ WORKDIR /build
 COPY pyproject.toml poetry.lock* ./
 
 
-# Install project dependencies using the lock file, including dev dependencies if needed for build
-# LLM_COMMENT: Install dependencies. We install them globally in the builder stage's Python env.
-# LLM_COMMENT: DO NOT run any code here that triggers model downloads.
-RUN /opt/poetry/bin/poetry install --no-root --only main
-# RUN /opt/poetry/bin/poetry install --no-root # Use this if any dev dependency IS required for building a main dependency
+# Debug: mostrar binario poetry y versión
+RUN ls -l /opt/poetry/bin && /opt/poetry/bin/poetry --version
+# Forzar PATH correcto antes de instalar dependencias
+ENV PATH="/opt/poetry/bin:$PATH"
+RUN poetry install --no-root --only main
+# RUN poetry install --no-root # Use this if any dev dependency IS required for building a main dependency
 
 
 # ---- Stage 2: Final Image ----
