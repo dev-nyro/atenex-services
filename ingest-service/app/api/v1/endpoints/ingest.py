@@ -416,6 +416,8 @@ async def get_document_status(
         status_log.exception("Error fetching document status from DB", error=str(e))
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error fetching status.")
 
+
+    from datetime import datetime, timedelta, timezone
     needs_update = False
     current_status_enum = DocumentStatus(doc_data['status'])
     current_chunk_count = doc_data.get('chunk_count')
@@ -424,34 +426,62 @@ async def get_document_status(
     updated_chunk_count = current_chunk_count
     updated_error_message = current_error_message
 
+    # Parse last update time for grace period logic
+    updated_at = doc_data.get('updated_at')
+    now_utc = datetime.now(timezone.utc)
+    updated_at_dt = None
+    if updated_at:
+        if isinstance(updated_at, datetime):
+            updated_at_dt = updated_at.astimezone(timezone.utc)
+        else:
+            try:
+                updated_at_dt = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
+            except Exception:
+                updated_at_dt = None
+
+    GRACE_PERIOD_SECONDS = 120  # 2 minutos
+
     minio_path = doc_data.get('file_path')
     minio_exists = False
     if not minio_path:
-         status_log.warning("MinIO file path missing in DB record", db_id=doc_data['id'])
-         if updated_status_enum not in [DocumentStatus.ERROR, DocumentStatus.PENDING]:
-             needs_update = True
-             updated_status_enum = DocumentStatus.ERROR
-             updated_error_message = (updated_error_message or "") + " File path missing."
+        status_log.warning("MinIO file path missing in DB record", db_id=doc_data['id'])
+        if updated_status_enum not in [DocumentStatus.ERROR, DocumentStatus.PENDING]:
+            # Solo permitir cambio a error si no está en processed recientemente
+            if not (updated_status_enum == DocumentStatus.PROCESSED and updated_at_dt and (now_utc - updated_at_dt).total_seconds() < GRACE_PERIOD_SECONDS):
+                needs_update = True
+                updated_status_enum = DocumentStatus.ERROR
+                updated_error_message = (updated_error_message or "") + " File path missing."
+            else:
+                status_log.warning("Grace period: no se cambia a ERROR por falta de file_path, status=processed reciente")
     else:
         status_log.debug("Checking MinIO for file existence", object_name=minio_path)
         try:
             minio_exists = await minio_client.check_file_exists_async(minio_path)
             status_log.info("MinIO existence check complete", exists=minio_exists)
             if not minio_exists and updated_status_enum not in [DocumentStatus.ERROR, DocumentStatus.PENDING]:
-                 status_log.warning("File missing in MinIO but DB status suggests otherwise.", current_db_status=updated_status_enum.value)
-                 if updated_status_enum != DocumentStatus.ERROR:
-                     needs_update = True
-                     updated_status_enum = DocumentStatus.ERROR
-                     updated_error_message = "File missing from storage."
-                     updated_chunk_count = 0
+                status_log.warning("File missing in MinIO but DB status suggests otherwise.", current_db_status=updated_status_enum.value)
+                if updated_status_enum != DocumentStatus.ERROR:
+                    # Solo permitir cambio a error si no está en processed recientemente
+                    if not (updated_status_enum == DocumentStatus.PROCESSED and updated_at_dt and (now_utc - updated_at_dt).total_seconds() < GRACE_PERIOD_SECONDS):
+                        needs_update = True
+                        updated_status_enum = DocumentStatus.ERROR
+                        updated_error_message = "File missing from storage."
+                        updated_chunk_count = 0
+                    else:
+                        status_log.warning("Grace period: no se cambia a ERROR por falta de archivo en MinIO, status=processed reciente")
         except Exception as minio_e:
             status_log.error("MinIO check failed", error=str(minio_e))
             minio_exists = False
             if updated_status_enum != DocumentStatus.ERROR:
-                 needs_update = True
-                 updated_status_enum = DocumentStatus.ERROR
-                 updated_error_message = (updated_error_message or "") + f" MinIO check error ({type(minio_e).__name__})."
-                 updated_chunk_count = 0
+                # Solo permitir cambio a error si no está en processed recientemente
+                if not (updated_status_enum == DocumentStatus.PROCESSED and updated_at_dt and (now_utc - updated_at_dt).total_seconds() < GRACE_PERIOD_SECONDS):
+                    needs_update = True
+                    updated_status_enum = DocumentStatus.ERROR
+                    updated_error_message = (updated_error_message or "") + f" MinIO check error ({type(minio_e).__name__})."
+                    updated_chunk_count = 0
+                else:
+                    status_log.warning("Grace period: no se cambia a ERROR por excepción en MinIO, status=processed reciente")
+
 
     status_log.debug("Checking Milvus for chunk count using pymilvus helper...")
     loop = asyncio.get_running_loop()
@@ -466,9 +496,13 @@ async def get_document_status(
         if milvus_chunk_count == -1:
             status_log.error("Milvus count check failed (returned -1).")
             if updated_status_enum != DocumentStatus.ERROR:
-                needs_update = True
-                updated_status_enum = DocumentStatus.ERROR
-                updated_error_message = (updated_error_message or "") + " Failed Milvus count check."
+                # Solo permitir cambio a error si no está en processed recientemente
+                if not (updated_status_enum == DocumentStatus.PROCESSED and updated_at_dt and (now_utc - updated_at_dt).total_seconds() < GRACE_PERIOD_SECONDS):
+                    needs_update = True
+                    updated_status_enum = DocumentStatus.ERROR
+                    updated_error_message = (updated_error_message or "") + " Failed Milvus count check."
+                else:
+                    status_log.warning("Grace period: no se cambia a ERROR por fallo en Milvus, status=processed reciente")
         elif milvus_chunk_count > 0:
             # Si hay chunks y el archivo existe, y el estado es error o uploaded, corregir a PROCESSED
             if minio_exists and updated_status_enum in [DocumentStatus.ERROR, DocumentStatus.UPLOADED]:
@@ -485,10 +519,14 @@ async def get_document_status(
         elif milvus_chunk_count == 0:
             if updated_status_enum == DocumentStatus.PROCESSED:
                 status_log.warning("Inconsistency: DB status 'processed' but no chunks found. Correcting.")
-                needs_update = True
-                updated_status_enum = DocumentStatus.ERROR
-                updated_chunk_count = 0
-                updated_error_message = (updated_error_message or "") + " Processed data missing."
+                # Solo permitir cambio a error si no está en processed recientemente
+                if not (updated_status_enum == DocumentStatus.PROCESSED and updated_at_dt and (now_utc - updated_at_dt).total_seconds() < GRACE_PERIOD_SECONDS):
+                    needs_update = True
+                    updated_status_enum = DocumentStatus.ERROR
+                    updated_chunk_count = 0
+                    updated_error_message = (updated_error_message or "") + " Processed data missing."
+                else:
+                    status_log.warning("Grace period: no se cambia a ERROR por chunks=0, status=processed reciente")
             elif updated_status_enum == DocumentStatus.ERROR and updated_chunk_count != 0:
                 needs_update = True
                 updated_chunk_count = 0
@@ -497,9 +535,13 @@ async def get_document_status(
         status_log.exception("Unexpected error during Milvus count check execution", error=str(e))
         milvus_chunk_count = -1
         if updated_status_enum != DocumentStatus.ERROR:
-            needs_update = True
-            updated_status_enum = DocumentStatus.ERROR
-            updated_error_message = (updated_error_message or "") + f" Error checking Milvus ({type(e).__name__})."
+            # Solo permitir cambio a error si no está en processed recientemente
+            if not (updated_status_enum == DocumentStatus.PROCESSED and updated_at_dt and (now_utc - updated_at_dt).total_seconds() < GRACE_PERIOD_SECONDS):
+                needs_update = True
+                updated_status_enum = DocumentStatus.ERROR
+                updated_error_message = (updated_error_message or "") + f" Error checking Milvus ({type(e).__name__})."
+            else:
+                status_log.warning("Grace period: no se cambia a ERROR por excepción en Milvus, status=processed reciente")
 
     if needs_update:
         status_log.warning("Inconsistency detected, updating document status in DB",
