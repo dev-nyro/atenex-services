@@ -1,3 +1,6 @@
+def normalize_filename(filename: str) -> str:
+    """Normaliza el nombre de archivo eliminando espacios al inicio/final y espacios duplicados."""
+    return " ".join(filename.strip().split())
 # ingest-service/app/api/v1/endpoints/ingest.py
 import uuid
 import mimetypes
@@ -221,8 +224,10 @@ async def upload_document(
         endpoint_log.warning("Missing X-User-ID header")
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing required header: X-User-ID")
 
+    # Normalizar el nombre del archivo
+    normalized_filename = normalize_filename(file.filename)
     endpoint_log = endpoint_log.bind(company_id=company_id, user_id=user_id,
-                                     filename=file.filename, content_type=file.content_type)
+                                     filename=normalized_filename, content_type=file.content_type)
     endpoint_log.info("Processing document ingestion request from gateway")
 
     if file.content_type not in settings.SUPPORTED_CONTENT_TYPES:
@@ -247,13 +252,13 @@ async def upload_document(
     try:
         async with get_db_conn() as conn:
             existing_doc = await api_db_retry_strategy(db_client.find_document_by_name_and_company)(
-                conn=conn, filename=file.filename, company_id=company_uuid
+                conn=conn, filename=normalized_filename, company_id=company_uuid
             )
             if existing_doc and existing_doc['status'] != DocumentStatus.ERROR.value:
                  endpoint_log.warning("Duplicate document detected", document_id=existing_doc['id'], status=existing_doc['status'])
                  raise HTTPException(
                      status_code=status.HTTP_409_CONFLICT,
-                     detail=f"Document '{file.filename}' already exists with status '{existing_doc['status']}'. Delete it first or wait for processing."
+                     detail=f"Document '{normalized_filename}' already exists with status '{existing_doc['status']}'. Delete it first or wait for processing."
                  )
             elif existing_doc:
                  endpoint_log.info("Found existing document in error state, proceeding with upload.", document_id=existing_doc['id'])
@@ -263,13 +268,13 @@ async def upload_document(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error checking for duplicates.")
 
     document_id = uuid.uuid4()
-    file_path_in_storage = f"{company_id}/{document_id}/{file.filename}"
+    file_path_in_storage = f"{company_id}/{document_id}/{normalized_filename}"
 
     try:
         async with get_db_conn() as conn:
             await api_db_retry_strategy(db_client.create_document_record)(
                 conn=conn, doc_id=document_id, company_id=company_uuid,
-                filename=file.filename, file_type=file.content_type,
+                filename=normalized_filename, file_type=file.content_type,
                 file_path=file_path_in_storage, status=DocumentStatus.PENDING,
                 metadata=metadata
             )
@@ -280,7 +285,7 @@ async def upload_document(
 
     try:
         file_content = await file.read()
-        endpoint_log.info("[INGEST] Preparando subida a MinIO", object_name=file_path_in_storage, filename=file.filename, size=len(file_content), content_type=file.content_type)
+        endpoint_log.info("[INGEST] Preparando subida a MinIO", object_name=file_path_in_storage, filename=normalized_filename, size=len(file_content), content_type=file.content_type)
         try:
             await minio_client.upload_file_async(
                 object_name=file_path_in_storage, data=file_content, content_type=file.content_type
@@ -299,7 +304,7 @@ async def upload_document(
             file_exists = False
 
         if not file_exists:
-            endpoint_log.error("[INGEST] File not found in MinIO after upload", object_name=file_path_in_storage, filename=file.filename)
+            endpoint_log.error("[INGEST] File not found in MinIO after upload", object_name=file_path_in_storage, filename=normalized_filename)
             async with get_db_conn() as conn:
                 await api_db_retry_strategy(db_client.update_document_status)(
                     document_id=document_id, status=DocumentStatus.ERROR, error_message="File not found in MinIO after upload", conn=conn
@@ -337,7 +342,7 @@ async def upload_document(
     try:
         task_payload = {
             "document_id": str(document_id), "company_id": company_id,
-            "filename": file.filename, "content_type": file.content_type
+            "filename": normalized_filename, "content_type": file.content_type
         }
         # Use the imported task instance (now points to process_document_standalone)
         task = process_document_task.delay(**task_payload)

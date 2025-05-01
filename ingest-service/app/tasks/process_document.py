@@ -1,3 +1,6 @@
+def normalize_filename(filename: str) -> str:
+    """Normaliza el nombre de archivo eliminando espacios al inicio/final y espacios duplicados."""
+    return " ".join(filename.strip().split())
 # ingest-service/app/tasks/process_document.py
 import os
 import tempfile
@@ -147,7 +150,8 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
         except Exception as db_err: log.critical("Failed to update status to ERROR for unsupported type!", error=str(db_err))
         raise Reject(error_msg, requeue=False) # Non-retriable
 
-    object_name = f"{company_id_str}/{document_id_str}/{filename}"
+    normalized_filename = normalize_filename(filename) if filename else filename
+    object_name = f"{company_id_str}/{document_id_str}/{normalized_filename}"
     temp_file_path_obj: Optional[pathlib.Path] = None
     inserted_chunk_count = 0
     file_bytes: Optional[bytes] = None
@@ -166,7 +170,7 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
         # 2. Download file and read bytes
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_dir_path = pathlib.Path(temp_dir)
-            temp_file_path_obj = temp_dir_path / filename
+            temp_file_path_obj = temp_dir_path / normalized_filename
             log.info(f"Downloading MinIO object: {object_name} -> {str(temp_file_path_obj)}")
 
             max_minio_retries = 3 # Adjusted retries for download
@@ -200,16 +204,16 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
 
             # 3. Execute Refactored Ingestion Pipeline
             log.info("Executing refactored ingest pipeline...")
-            inserted_chunk_count = ingest_document_pipeline(
-                file_bytes=file_bytes,
-                filename=filename,
-                company_id=company_id_str,
-                document_id=document_id_str,
-                content_type=content_type,
-                embedding_model=worker_embedding_model, # Pass the loaded model
-                delete_existing=True
-            )
-            log.info(f"Ingestion pipeline finished. Inserted chunks reported: {inserted_chunk_count}")
+        inserted_chunk_count = ingest_document_pipeline(
+            file_bytes=file_bytes,
+            filename=normalized_filename,
+            company_id=company_id_str,
+            document_id=document_id_str,
+            content_type=content_type,
+            embedding_model=worker_embedding_model, # Pass the loaded model
+            delete_existing=True
+        )
+        log.info(f"Ingestion pipeline finished. Inserted chunks reported: {inserted_chunk_count}")
 
         # 4. Update status to PROCESSED
         log.debug("Setting status to PROCESSED in DB.")
