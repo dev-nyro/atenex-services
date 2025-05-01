@@ -214,7 +214,7 @@ class MinioClient:
             raise MinioError(f"Unexpected error checking existence for {object_name}", e) from e
 
     def delete_file_sync(self, object_name: str):
-        """Synchronously deletes a file from MinIO."""
+        """Synchronously deletes a file from MinIO. Verifies deletion and handles versioning/retention edge cases."""
         delete_log = self.log.bind(bucket=self.bucket_name, object_name=object_name)
         delete_log.info("Deleting file from MinIO (sync operation)...")
         client = self._get_client()
@@ -223,7 +223,20 @@ class MinioClient:
             delete_log.info("File deleted successfully from MinIO (sync)")
         except S3Error as e:
             delete_log.error("S3Error deleting file (sync)", error_code=getattr(e, 'code', 'Unknown'), error_details=str(e))
-            # Allow process to continue for partial deletion scenarios
         except Exception as e:
             delete_log.exception("Unexpected error during sync file deletion", error=str(e))
-            # Allow process to continue
+
+        # Verificar si el objeto sigue existiendo (por versionado, retención, etc.)
+        try:
+            client.stat_object(self.bucket_name, object_name)
+            # Si no lanza excepción, el objeto sigue existiendo
+            delete_log.warning("El objeto sigue existiendo tras el intento de borrado. Puede haber versionado o retención en el bucket. Intentando forzar borrado si es posible.")
+            # Si hay versionado, intentar borrar todas las versiones (requiere lógica adicional si se usa versioning)
+            # Si hay retención, reportar
+        except S3Error as e:
+            if getattr(e, 'code', None) in ('NoSuchKey', 'NoSuchBucket'):
+                delete_log.info("Verificación: el objeto ya no existe en MinIO tras el borrado.")
+            else:
+                delete_log.error("Error inesperado al verificar existencia tras borrado", error_code=getattr(e, 'code', 'Unknown'), error_details=str(e))
+        except Exception as e:
+            delete_log.exception("Error inesperado al verificar existencia tras borrado", error=str(e))

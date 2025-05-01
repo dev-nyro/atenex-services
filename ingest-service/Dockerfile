@@ -40,6 +40,9 @@ COPY pyproject.toml poetry.lock* ./
 # LLM_COMMENT: --only main: Installs only main dependencies (no dev).
 RUN poetry install --no-root --only main
 
+# LLM_FIX: Eliminar el cache de modelos HuggingFace para reducir el tamaño de la imagen.
+RUN rm -rf /root/.cache/huggingface
+
 # ---- Stage 2: Final Image ----
 # Use the same slim base image for the final stage
 # LLM_COMMENT: Final stage using the same slim base.
