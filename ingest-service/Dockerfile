@@ -1,57 +1,77 @@
-# ingest-service/Dockerfile
-# Use a specific Python version slim image
-# LLM_COMMENT: Using Python 3.10 slim as base.
-FROM python:3.10-slim
+# ---- Stage 1: Builder ----
+# Use a specific Python version slim image as builder base
+# LLM_COMMENT: Builder stage to install dependencies including build tools.
+FROM python:3.10-slim as builder
 
-# Set environment variables using key=value format
-# LLM_COMMENT: Standard Python environment variables.
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-# LLM_COMMENT: Poetry configuration variables. Use standard create=false.
-ENV POETRY_VERSION=1.7.1
-ENV POETRY_HOME="/opt/poetry"
-ENV PATH="$POETRY_HOME/bin:$PATH"
-ENV POETRY_NO_INTERACTION=1
-# LLM_COMMENT: Ensure Poetry installs packages globally within the container's Python environment.
-ENV POETRY_VIRTUALENVS_CREATE=false
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    POETRY_VERSION=1.7.1 \
+    POETRY_HOME="/opt/poetry" \
+    PATH="$POETRY_HOME/bin:$PATH" \
+    POETRY_NO_INTERACTION=1 \
+    # LLM_COMMENT: Install into a standard location within the builder stage.
+    POETRY_VIRTUALENVS_CREATE=false \
+    # LLM_COMMENT: Define standard paths for Python packages.
+    PYTHONPATH="/usr/local/lib/python3.10/site-packages" \
+    PIP_TARGET="/usr/local/lib/python3.10/site-packages"
 
-# Install system dependencies including curl and build tools
-# LLM_COMMENT: Install build-essential for packages needing compilation and curl for Poetry install script.
+# Install system build dependencies and curl
+# LLM_COMMENT: Install build tools needed for some Python packages + curl for Poetry.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl build-essential && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Poetry using the official installer
-# LLM_COMMENT: Download and execute the Poetry installer script.
+# Install Poetry
+# LLM_COMMENT: Install Poetry itself.
 RUN curl -sSL https://install.python-poetry.org | python3 - --version ${POETRY_VERSION}
 
-# Set working directory
-# LLM_COMMENT: Set the application's working directory.
-WORKDIR /app
+# Set working directory for builder
+WORKDIR /build
 
-# Copy ONLY the dependency definition files first to leverage Docker cache
-# LLM_COMMENT: Copy pyproject.toml AND poetry.lock. The presence of poetry.lock is crucial for reproducible builds.
+# Copy ONLY the dependency definition files
+# LLM_COMMENT: Copy dependency files to leverage cache.
 COPY pyproject.toml poetry.lock* ./
 
-# Install project dependencies using the lock file
-# LLM_COMMENT: Run poetry install. It will use poetry.lock if present, ensuring exact dependencies are installed.
-# LLM_COMMENT: --no-root: Skip installing the project package itself.
-# LLM_COMMENT: --no-dev: Skip installing development dependencies.
-RUN poetry install --no-root --no-dev
+# Install project dependencies using the lock file, including dev dependencies if needed for build
+# LLM_COMMENT: Install dependencies. We install them globally in the builder stage's Python env.
+# LLM_COMMENT: DO NOT run any code here that triggers model downloads.
+RUN poetry install --no-root --only main
+# RUN poetry install --no-root # Use this if any dev dependency IS required for building a main dependency
 
-# Verify ONNX Runtime providers in a separate layer AFTER installation is complete
-# LLM_COMMENT: This step verifies if onnxruntime (provided by onnxruntime-gpu) was installed correctly and can be imported.
-RUN python -c "import onnxruntime; print('ONNX Runtime available providers:', onnxruntime.get_available_providers())"
 
-# Copy the application code into the container
-# LLM_COMMENT: Copy the application source code.
+# ---- Stage 2: Final Image ----
+# Use the same slim base image for the final stage
+# LLM_COMMENT: Final stage using the same slim base.
+FROM python:3.10-slim
+
+# Set environment variables for the final image (no POETRY needed here)
+# LLM_COMMENT: Set runtime environment variables.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    # LLM_COMMENT: Set path for application execution.
+    WORKDIR="/app"
+
+# Install ONLY runtime system dependencies (if any are needed, e.g., libpq for psycopg2 if not binary)
+# RUN apt-get update && apt-get install -y --no-install-recommends some-runtime-lib && rm -rf /var/lib/apt/lists/*
+# LLM_COMMENT: Currently, no runtime system dependencies seem explicitly required beyond what python-slim provides. Add if necessary.
+
+# Set working directory
+WORKDIR ${WORKDIR}
+
+# Copy installed dependencies from the builder stage
+# LLM_COMMENT: Copy only the installed packages from the builder stage. This is the key step.
+COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Copy the application code
+# LLM_COMMENT: Copy application code.
 COPY ./app /app/app
 
-# Expose the port the app runs on (relevant for API, not worker, but good practice)
-# LLM_COMMENT: Expose the port defined for the service (typically for the API part).
+# Expose the port the API runs on
+# LLM_COMMENT: Expose the API port.
 EXPOSE 8000
 
-# Set the command to run the application using Gunicorn (for API deployment)
-# For the worker deployment, this CMD will be overridden by command/args in Kubernetes YAML
-# LLM_COMMENT: Default command to run the API server. This will be overridden for the Celery worker deployment.
+# Set the default command to run the API (can be overridden)
+# LLM_COMMENT: Default command for API. Workers will override this in Kubernetes YAML.
 CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "4", "-b", "0.0.0.0:8000", "app.main:app"]

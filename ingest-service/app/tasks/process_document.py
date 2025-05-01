@@ -1,6 +1,3 @@
-def normalize_filename(filename: str) -> str:
-    """Normaliza el nombre de archivo eliminando espacios al inicio/final y espacios duplicados."""
-    return " ".join(filename.strip().split())
 # ingest-service/app/tasks/process_document.py
 import os
 import tempfile
@@ -13,81 +10,114 @@ from typing import Optional, Dict, Any
 import structlog
 from celery import Task
 from celery.exceptions import Ignore, Reject, MaxRetriesExceededError
+# LLM_FLAG: ADDED - Import Celery signal
 from celery.signals import worker_process_init
-from sqlalchemy import Engine
-# LLM_FLAG: Import correct embedding components
-from sentence_transformers import SentenceTransformer
-from app.services.embedder import get_embedding_model # Function to load/cache model
+from sqlalchemy import Engine # Import Engine for type hinting
+# LLM_FLAG: ADDED - Import TextEmbedding for type hinting and lazy loading
+from fastembed.embedding import TextEmbedding
 
 # --- Custom Application Imports ---
 from app.core.config import settings
-from app.db.postgres_client import get_sync_engine, set_status_sync
-from app.models.domain import DocumentStatus
-from app.services.minio_client import MinioClient, MinioError
-# LLM_FLAG: Import REFACTORIZADO pipeline and EXTRACTORS map
-from app.services.ingest_pipeline import ingest_document_pipeline, EXTRACTORS, EXTRACTION_ERRORS
-from app.tasks.celery_app import celery_app
+from app.db.postgres_client import get_sync_engine, set_status_sync # Keep DB client
+from app.models.domain import DocumentStatus # Keep domain models
+from app.services.minio_client import MinioClient, MinioError # Keep MinIO client
+# --- Import the NEW pipeline function ---
+from app.services.ingest_pipeline import ingest_document_pipeline, EXTRACTORS, EXTRACTION_ERRORS # Import pipeline and extractors map
+from app.tasks.celery_app import celery_app # Keep Celery app
 
+
+# --- Initialize Structlog Logger ---
 task_struct_log = structlog.get_logger(__name__)
+
+# --- Detect if running as Celery Worker ---
+# A common way to detect if running under Celery worker context
 IS_WORKER = "worker" in sys.argv
 
-# --- Global Resources for Worker Process ---
+# --- Global Resources for Worker Process (Initialize to None) ---
 sync_engine: Optional[Engine] = None
 minio_client: Optional[MinioClient] = None
 # LLM_FLAG: Variable to hold the loaded embedding model per worker process
-worker_embedding_model: Optional[SentenceTransformer] = None
+worker_embedding_model: Optional[TextEmbedding] = None
 
-# LLM_FLAG: Initialize resources at worker startup
+# LLM_FLAG: Initialize resources at worker startup using Celery signal
 @worker_process_init.connect(weak=False)
 def init_worker_resources(**kwargs):
+    """Initializes resources needed by each Celery worker process."""
     global sync_engine, minio_client, worker_embedding_model
     log = task_struct_log.bind(signal="worker_process_init")
     log.info("Worker process initializing resources...")
-    try:
-        if sync_engine is None:
+
+    # Initialize DB Engine if not already done
+    if sync_engine is None:
+        try:
             sync_engine = get_sync_engine()
-            log.info("Synchronous DB engine initialized.")
-        else:
-             log.info("Synchronous DB engine already initialized.")
+            log.info("Synchronous DB engine initialized for worker process.")
+        except Exception as db_init_err:
+            log.critical("Failed to initialize synchronous DB engine for worker!", error=str(db_init_err), exc_info=True)
+            sync_engine = None # Ensure it's None on failure
+    else:
+        log.debug("Synchronous DB engine already initialized for worker process.")
 
-        if minio_client is None:
+    # Initialize MinIO Client if not already done
+    if minio_client is None:
+        try:
             minio_client = MinioClient()
-            log.info("MinIO client initialized.")
-        else:
-            log.info("MinIO client already initialized.")
+            log.info("MinIO client initialized for worker process.")
+        except Exception as minio_init_err:
+            log.critical("Failed to initialize MinIO client for worker!", error=str(minio_init_err), exc_info=True)
+            minio_client = None # Ensure it's None on failure
+    else:
+        log.debug("MinIO client already initialized for worker process.")
 
-        if worker_embedding_model is None:
-            log.info("Preloading embedding model...")
-            worker_embedding_model = get_embedding_model() # This handles loading and caching
-            log.info("Embedding model preloaded.")
-        else:
-            log.info("Embedding model already preloaded.")
+    # Initialize Embedding Model if not already done
+    if worker_embedding_model is None:
+        log.info("Initializing FastEmbed model instance for worker process...", model=settings.FASTEMBED_MODEL, device="cpu")
+        try:
+            # LLM_FLAG: This is where the model download will happen *at runtime* within the worker process
+            worker_embedding_model = TextEmbedding(
+                model_name=settings.FASTEMBED_MODEL,
+                cache_dir=os.environ.get("FASTEMBED_CACHE_DIR"), # Allows overriding cache dir via env var
+                device="cpu", # Explicitly CPU
+                threads=1,    # Limit threads for ONNX CPU inference if needed
+                parallel=0    # Set parallel processing count if applicable
+            )
+            # Optional: Perform a dummy embedding to ensure download/load is complete
+            # list(worker_embedding_model.embed(["test"]))
+            log.info("FastEmbed model instance initialized successfully for worker process.")
+        except Exception as emb_init_err:
+             log.critical("Failed to initialize FastEmbed model for worker!", error=str(emb_init_err), exc_info=True)
+             worker_embedding_model = None # Ensure it's None on failure
+    else:
+        log.debug("FastEmbed model already initialized for worker process.")
 
-    except Exception as e:
-        log.critical("CRITICAL FAILURE during worker resource initialization!", error=str(e), exc_info=True)
-        # Set to None so pre-checks in task will fail cleanly
-        sync_engine = None
-        minio_client = None
-        worker_embedding_model = None
+    # Final check after initialization attempts
+    if not all([sync_engine, minio_client, worker_embedding_model]):
+         log.critical("One or more critical resources failed to initialize for this worker process!")
+         # Depending on the app's resilience strategy, you might want the worker process to exit
+         # or continue but have tasks fail the pre-checks.
+
 
 # --------------------------------------------------------------------------
-# Refactored Celery Task Definition
+# Refactored Synchronous Celery Task Definition (Checks use worker globals)
 # --------------------------------------------------------------------------
 @celery_app.task(
     bind=True,
     name="ingest.process_document",
     autoretry_for=(Exception,),
-    # LLM_FLAG: Exclude specific non-retriable errors
+    # Exclude errors that indicate non-transient problems or config issues
     exclude=(Reject, Ignore, ValueError, ConnectionError, RuntimeError, TypeError, *EXTRACTION_ERRORS),
     retry_backoff=True,
-    retry_backoff_max=600,
+    retry_backoff_max=600, # Max ~10 minutes backoff
     retry_jitter=True,
-    max_retries=3
+    max_retries=3 # Retry up to 3 times for transient errors
 )
 def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
     """
-    Refactored Celery task: Downloads from MinIO, passes bytes to the new pipeline
-    (using SentenceTransformer, PyMuPDF, etc.), updates status sync.
+    Synchronous Celery task to process a document using the standalone pipeline.
+    Downloads from MinIO, then calls ingest_document_pipeline for conversion,
+    chunking, embedding (CPU), and writing to Milvus via pymilvus.
+    Updates status in PostgreSQL synchronously. Uses structlog for logging.
+    Relies on resources initialized by worker_process_init.
     """
     document_id_str = kwargs.get('document_id')
     company_id_str = kwargs.get('company_id')
@@ -101,9 +131,9 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
         task_id=task_id, attempt=f"{attempt}/{max_attempts}", doc_id=document_id_str,
         company_id=company_id_str, filename=filename, content_type=content_type
     )
-    log.info("Starting REFACTORED standalone document processing task (MiniLM/PyMuPDF)")
+    log.info("Starting standalone document processing task")
 
-    # --- Pre-checks ---
+    # --- Pre-checks (Rely on globals set by worker_process_init) ---
     if not IS_WORKER:
          log.critical("Task function called outside of a worker context! Rejecting.")
          raise Reject("Task running outside worker context.", requeue=False)
@@ -112,12 +142,14 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
         log.error("Missing required arguments in task payload.", payload_kwargs=kwargs)
         raise Reject("Missing required arguments (doc_id, company_id, filename, content_type)", requeue=False)
 
-    # LLM_FLAG: Check worker resources were initialized correctly
-    if not sync_engine:
-         log.critical("Worker Sync DB Engine is not initialized. Task cannot proceed.")
+    # --- Check if Worker Resources Initialized Correctly ---
+    # Check the global variables populated by the init signal
+    if sync_engine is None:
+         log.critical("Worker Sync DB Engine is not available (init failed). Task cannot proceed.")
          raise Reject("Worker sync DB engine initialization failed.", requeue=False)
-    if not worker_embedding_model: # Check the global variable holding the model
-         log.critical("Worker Embedding Model (SentenceTransformer) is not available/loaded. Task cannot proceed.")
+
+    if worker_embedding_model is None: # Check the global variable holding the model
+         log.critical("Worker Embedding Model is not available (init failed). Task cannot proceed.")
          error_msg = "Worker embedding model init/preload failed."
          doc_uuid_err = None
          try: doc_uuid_err = uuid.UUID(document_id_str)
@@ -126,8 +158,9 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
              try: set_status_sync(engine=sync_engine, document_id=doc_uuid_err, status=DocumentStatus.ERROR, error_message=error_msg)
              except Exception as db_err: log.critical("Failed to update status after embedding model check failure!", error=str(db_err))
          raise Reject(error_msg, requeue=False)
-    if not minio_client:
-         log.critical("Worker MinIO Client is not initialized. Task cannot proceed.")
+
+    if minio_client is None:
+         log.critical("Worker MinIO Client is not available (init failed). Task cannot proceed.")
          error_msg = "Worker MinIO client init failed."
          doc_uuid_err = None
          try: doc_uuid_err = uuid.UUID(document_id_str)
@@ -136,6 +169,8 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
               try: set_status_sync(engine=sync_engine, document_id=doc_uuid_err, status=DocumentStatus.ERROR, error_message=error_msg)
               except Exception as db_err: log.critical("Failed to update status after MinIO client check failure!", error=str(db_err))
          raise Reject(error_msg, requeue=False)
+    # --- End Pre-checks ---
+
 
     try:
         doc_uuid = uuid.UUID(document_id_str)
@@ -148,10 +183,10 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
         error_msg = f"Unsupported content type: {content_type}"
         try: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg)
         except Exception as db_err: log.critical("Failed to update status to ERROR for unsupported type!", error=str(db_err))
-        raise Reject(error_msg, requeue=False) # Non-retriable
+        raise Reject(error_msg, requeue=False)
 
-    normalized_filename = normalize_filename(filename) if filename else filename
-    object_name = f"{company_id_str}/{document_id_str}/{normalized_filename}"
+
+    object_name = f"{company_id_str}/{document_id_str}/{filename}"
     temp_file_path_obj: Optional[pathlib.Path] = None
     inserted_chunk_count = 0
     file_bytes: Optional[bytes] = None
@@ -167,53 +202,35 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
             raise Ignore()
         log.info("Status set to PROCESSING.")
 
-        # 2. Download file and read bytes
+        # 2. Download file from MinIO and read bytes
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_dir_path = pathlib.Path(temp_dir)
-            temp_file_path_obj = temp_dir_path / normalized_filename
+            temp_file_path_obj = temp_dir_path / filename # Use original filename for temp file
             log.info(f"Downloading MinIO object: {object_name} -> {str(temp_file_path_obj)}")
+            # Use the initialized global minio_client
+            minio_client.download_file_sync(object_name, str(temp_file_path_obj))
+            log.info("File downloaded successfully from MinIO.")
+            # Read file content into bytes
+            file_bytes = temp_file_path_obj.read_bytes()
+            log.info(f"Read {len(file_bytes)} bytes from downloaded file.")
 
-            max_minio_retries = 3 # Adjusted retries for download
-            minio_delay = 2
-            for attempt_num in range(1, max_minio_retries + 1):
-                try:
-                    minio_client.download_file_sync(object_name, str(temp_file_path_obj))
-                    log.info("File downloaded successfully from MinIO.")
-                    # Read file into bytes immediately after download
-                    log.debug(f"Reading downloaded file into bytes: {str(temp_file_path_obj)}")
-                    file_bytes = temp_file_path_obj.read_bytes()
-                    log.info(f"File content read into memory ({len(file_bytes)} bytes).")
-                    break # Exit retry loop on success
-                except MinioError as me:
-                    if "NoSuchKey" in str(me) or "Object not found" in str(me):
-                        log.warning(f"MinIO NoSuchKey on download attempt {attempt_num}/{max_minio_retries}. Retrying in {minio_delay}s...", error=str(me))
-                        if attempt_num == max_minio_retries:
-                            log.error(f"File still not found in MinIO after {max_minio_retries} attempts. Aborting.")
-                            raise # Re-raise the final MinioError
-                        time.sleep(minio_delay)
-                        minio_delay *= 2
-                    else:
-                        log.error("Non-retriable MinIO error during download", error=str(me))
-                        raise # Re-raise other Minio errors
-                except Exception as read_err:
-                    log.error("Failed to read downloaded file into bytes", error=str(read_err), exc_info=True)
-                    raise RuntimeError(f"Failed to read temp file: {read_err}") from read_err
-            # Check if file_bytes was successfully read
-            if file_bytes is None:
-                 raise RuntimeError("File download or read failed, bytes not available.")
+        # Ensure bytes were read
+        if file_bytes is None:
+             raise RuntimeError("Failed to read downloaded file bytes.")
 
-            # 3. Execute Refactored Ingestion Pipeline
-            log.info("Executing refactored ingest pipeline...")
+        # 3. Execute Standalone Ingestion Pipeline
+        log.info("Executing standalone ingest pipeline (extract, chunk, embed, insert)...")
+        # Pass the model instance loaded by the worker init signal
         inserted_chunk_count = ingest_document_pipeline(
-            file_bytes=file_bytes,
-            filename=normalized_filename,
+            file_bytes=file_bytes,           # Pass bytes instead of path
+            filename=filename,               # Pass original filename
             company_id=company_id_str,
             document_id=document_id_str,
             content_type=content_type,
-            embedding_model=worker_embedding_model, # Pass the loaded model
+            embedding_model=worker_embedding_model, # Use the preloaded model
             delete_existing=True
         )
-        log.info(f"Ingestion pipeline finished. Inserted chunks reported: {inserted_chunk_count}")
+        log.info(f"Ingestion pipeline finished. Inserted chunks: {inserted_chunk_count}")
 
         # 4. Update status to PROCESSED
         log.debug("Setting status to PROCESSED in DB.")
@@ -230,52 +247,61 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
         log.info(f"Document processing finished successfully. Final chunk count: {inserted_chunk_count}")
         return {"status": DocumentStatus.PROCESSED.value, "chunks_inserted": inserted_chunk_count, "document_id": document_id_str}
 
-    # --- Error Handling ---
+    # --- Error Handling (Mostly unchanged, relies on exclude tuple now for non-retriable errors) ---
     except MinioError as me:
-        log.error(f"MinIO Error during processing", error=str(me), exc_info=True)
+        log.error(f"MinIO Error during processing: {me}", exc_info=True)
         error_msg = f"MinIO Error: {str(me)[:400]}"
         try: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg)
-        except Exception as db_err: log.critical("Failed to update status after MinIO failure!", error=str(db_err))
+        except Exception as db_err: log.critical("Failed to update status to ERROR after MinIO failure!", error=str(db_err))
         if "Object not found" in str(me):
+            # If the object is not found, it's not a transient error. Reject permanently.
             raise Reject(f"MinIO Error: Object not found: {object_name}", requeue=False) from me
         else:
-            raise me # Allow retry for other potential MinIO errors
+            # For other S3 errors, raise to allow Celery's autoretry mechanism
+            raise me # Will be caught by autoretry_for=(Exception,)
 
-    except (*EXTRACTION_ERRORS, ValueError, RuntimeError, TypeError) as pipeline_err:
-         # Catches extraction errors, embedding errors, chunking errors, Milvus errors, etc.
-         # Considered non-retriable by default based on 'exclude' tuple
-         log.error(f"Pipeline Error: {pipeline_err}", exc_info=True)
+    except (*EXTRACTION_ERRORS, ValueError, ConnectionError, RuntimeError, TypeError) as pipeline_err:
+         # These are likely non-recoverable errors from the pipeline or config issues.
+         # They are listed in 'exclude', so Celery won't retry them automatically.
+         # We log, set status to ERROR, and raise Reject manually.
+         log.error(f"Pipeline/Connection Error: {pipeline_err}", exc_info=True)
          error_msg = f"Pipeline Error: {type(pipeline_err).__name__} - {str(pipeline_err)[:400]}"
          try: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg)
-         except Exception as db_err: log.critical("Failed to update status after pipeline failure!", error=str(db_err))
+         except Exception as db_err: log.critical("Failed to update status to ERROR after pipeline failure!", error=str(db_err))
+         # Reject instead of raising to prevent retries for these specific error types
          raise Reject(f"Pipeline failed: {error_msg}", requeue=False) from pipeline_err
 
     except Reject as r:
+         # If Reject is raised explicitly (e.g., from pre-checks)
          log.error(f"Task rejected permanently: {r.reason}")
+         # Attempt to set status one last time if possible and ID is valid
          if sync_engine and doc_uuid:
              try: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=f"Rejected: {r.reason}"[:500])
-             except Exception as db_err: log.critical("Failed to update status after task rejection!", error=str(db_err))
-         raise r
+             except Exception as db_err: log.critical("Failed to update status to ERROR after task rejection!", error=str(db_err))
+         raise r # Re-raise Reject
 
     except Ignore:
+         # If Ignore is raised explicitly
          log.info("Task ignored.")
-         raise Ignore()
+         raise Ignore() # Re-raise Ignore
 
     except MaxRetriesExceededError as mree:
+        # This happens after autoretry_for fails max_retries times
         log.error("Max retries exceeded for task.", exc_info=True)
         final_error = mree.cause if mree.cause else mree
         error_msg = f"Max retries exceeded ({max_attempts}). Last error: {type(final_error).__name__} - {str(final_error)[:300]}"
         try: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg)
         except Exception as db_err: log.critical("Failed to update status to ERROR after max retries!", error=str(db_err))
-        # Let Celery handle logging MaxRetriesExceededError
+        # Do not raise here, Celery handles logging MaxRetriesExceededError
 
     except Exception as exc:
-        # Catch-all for unexpected errors, triggers Celery's autoretry
-        log.exception(f"An unexpected error occurred, will retry if attempts remain.")
+        # Catch any other unexpected exception to allow Celery's autoretry
+        log.exception(f"An unexpected error occurred during document processing, will retry if attempts remain.")
         error_msg = f"Attempt {attempt} failed: {type(exc).__name__} - {str(exc)[:400]}"
         try: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg)
-        except Exception as db_err: log.critical("CRITICAL: Failed to update status after unexpected failure!", error=str(db_err))
+        except Exception as db_err: log.critical("CRITICAL: Failed to update status to ERROR after unexpected failure!", error=str(db_err))
+        # Raise the original exception to trigger Celery's retry mechanism defined in autoretry_for
         raise exc
 
-# LLM_FLAG: Keeping alias for potential external references
+# LLM_FLAG: NO_CHANGE - Keep task alias assignment
 process_document_haystack_task = process_document_standalone

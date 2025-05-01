@@ -1,0 +1,44 @@
+# Archivo: .dockerignore
+
+# Entornos virtuales locales
+.venv
+venv
+
+# Dependencias de Poetry/Pip
+.poetry/
+.pip_cache/
+
+# Metadatos Git
+.git
+.gitignore
+.gitattributes
+
+# Archivos Python compilados y cachés
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Cachés y resultados de pruebas
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Archivos de configuración local/IDE
+.env*
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Archivos específicos del SO
+*.DS_Store
+Thumbs.db
+
+# Logs locales
+*.log
+
+# Construcciones/Distribuciones locales
+dist/
+build/
+*.egg-info/

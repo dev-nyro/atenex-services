@@ -66,6 +66,9 @@ app/
 
 ## File: `app\api\v1\endpoints\ingest.py`
 ```py
+def normalize_filename(filename: str) -> str:
+    """Normaliza el nombre de archivo eliminando espacios al inicio/final y espacios duplicados."""
+    return " ".join(filename.strip().split())
 # ingest-service/app/api/v1/endpoints/ingest.py
 import uuid
 import mimetypes
@@ -289,8 +292,10 @@ async def upload_document(
         endpoint_log.warning("Missing X-User-ID header")
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing required header: X-User-ID")
 
+    # Normalizar el nombre del archivo
+    normalized_filename = normalize_filename(file.filename)
     endpoint_log = endpoint_log.bind(company_id=company_id, user_id=user_id,
-                                     filename=file.filename, content_type=file.content_type)
+                                     filename=normalized_filename, content_type=file.content_type)
     endpoint_log.info("Processing document ingestion request from gateway")
 
     if file.content_type not in settings.SUPPORTED_CONTENT_TYPES:
@@ -315,13 +320,13 @@ async def upload_document(
     try:
         async with get_db_conn() as conn:
             existing_doc = await api_db_retry_strategy(db_client.find_document_by_name_and_company)(
-                conn=conn, filename=file.filename, company_id=company_uuid
+                conn=conn, filename=normalized_filename, company_id=company_uuid
             )
             if existing_doc and existing_doc['status'] != DocumentStatus.ERROR.value:
                  endpoint_log.warning("Duplicate document detected", document_id=existing_doc['id'], status=existing_doc['status'])
                  raise HTTPException(
                      status_code=status.HTTP_409_CONFLICT,
-                     detail=f"Document '{file.filename}' already exists with status '{existing_doc['status']}'. Delete it first or wait for processing."
+                     detail=f"Document '{normalized_filename}' already exists with status '{existing_doc['status']}'. Delete it first or wait for processing."
                  )
             elif existing_doc:
                  endpoint_log.info("Found existing document in error state, proceeding with upload.", document_id=existing_doc['id'])
@@ -331,13 +336,13 @@ async def upload_document(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error checking for duplicates.")
 
     document_id = uuid.uuid4()
-    file_path_in_storage = f"{company_id}/{document_id}/{file.filename}"
+    file_path_in_storage = f"{company_id}/{document_id}/{normalized_filename}"
 
     try:
         async with get_db_conn() as conn:
             await api_db_retry_strategy(db_client.create_document_record)(
                 conn=conn, doc_id=document_id, company_id=company_uuid,
-                filename=file.filename, file_type=file.content_type,
+                filename=normalized_filename, file_type=file.content_type,
                 file_path=file_path_in_storage, status=DocumentStatus.PENDING,
                 metadata=metadata
             )
@@ -348,16 +353,37 @@ async def upload_document(
 
     try:
         file_content = await file.read()
-        endpoint_log.debug(f"MinIO upload object_name repr: {repr(file_path_in_storage)}")
-        await minio_client.upload_file_async(
-            object_name=file_path_in_storage, data=file_content, content_type=file.content_type
-        )
-        endpoint_log.info("File uploaded successfully to MinIO", object_name=file_path_in_storage)
+        endpoint_log.info("[INGEST] Preparando subida a MinIO", object_name=file_path_in_storage, filename=normalized_filename, size=len(file_content), content_type=file.content_type)
+        try:
+            await minio_client.upload_file_async(
+                object_name=file_path_in_storage, data=file_content, content_type=file.content_type
+            )
+            endpoint_log.info("[INGEST] File uploaded successfully to MinIO", object_name=file_path_in_storage)
+        except Exception as upload_exc:
+            endpoint_log.error("[INGEST] Exception during MinIO upload", object_name=file_path_in_storage, error=str(upload_exc))
+            raise
+
+        # --- Validación extra: verificar que el archivo existe en MinIO ---
+        try:
+            file_exists = await minio_client.check_file_exists_async(file_path_in_storage)
+            endpoint_log.info("[INGEST] MinIO existence check after upload", object_name=file_path_in_storage, exists=file_exists)
+        except Exception as check_exc:
+            endpoint_log.error("[INGEST] Exception during MinIO existence check", object_name=file_path_in_storage, error=str(check_exc))
+            file_exists = False
+
+        if not file_exists:
+            endpoint_log.error("[INGEST] File not found in MinIO after upload", object_name=file_path_in_storage, filename=normalized_filename)
+            async with get_db_conn() as conn:
+                await api_db_retry_strategy(db_client.update_document_status)(
+                    document_id=document_id, status=DocumentStatus.ERROR, error_message="File not found in MinIO after upload", conn=conn
+                )
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="File not found in MinIO after upload.")
+
         async with get_db_conn() as conn:
             await api_db_retry_strategy(db_client.update_document_status)(
                 document_id=document_id, status=DocumentStatus.UPLOADED, conn=conn # Use keyword arg for conn
             )
-        endpoint_log.info("Document status updated to 'uploaded'", document_id=str(document_id))
+        endpoint_log.info("[INGEST] Document status updated to 'uploaded'", document_id=str(document_id))
     except MinioError as me:
         endpoint_log.error("Failed to upload file to MinIO", object_name=file_path_in_storage, error=str(me))
         try:
@@ -384,7 +410,7 @@ async def upload_document(
     try:
         task_payload = {
             "document_id": str(document_id), "company_id": company_id,
-            "filename": file.filename, "content_type": file.content_type
+            "filename": normalized_filename, "content_type": file.content_type
         }
         # Use the imported task instance (now points to process_document_standalone)
         task = process_document_task.delay(**task_payload)
@@ -642,13 +668,21 @@ async def list_document_statuses(
             try:
                 live_minio_exists = await minio_client.check_file_exists_async(minio_path_db)
                 if not live_minio_exists and doc_updated_status_enum not in [DocumentStatus.ERROR, DocumentStatus.PENDING]:
-                     if doc_updated_status_enum != DocumentStatus.ERROR:
-                         doc_needs_update=True; doc_updated_status_enum=DocumentStatus.ERROR; doc_updated_error_msg="File missing from storage."; doc_updated_chunk_count=0
+                    if doc_updated_status_enum != DocumentStatus.ERROR:
+                        doc_needs_update = True
+                        doc_updated_status_enum = DocumentStatus.ERROR
+                        doc_updated_error_msg = "File missing from storage."
+                        doc_updated_chunk_count = 0
             except Exception as e:
-                check_log.error("MinIO check failed for list item", error=str(e)); live_minio_exists = False
+                check_log.error("MinIO check failed for list item", error=str(e))
+                live_minio_exists = False
                 if doc_updated_status_enum != DocumentStatus.ERROR:
-                    doc_needs_update=True; doc_updated_status_enum=DocumentStatus.ERROR; doc_updated_error_msg=(doc_updated_error_msg or "")+f" MinIO check error."; doc_updated_chunk_count=0
-        else: live_minio_exists = False
+                    doc_needs_update = True
+                    doc_updated_status_enum = DocumentStatus.ERROR
+                    doc_updated_error_msg = (doc_updated_error_msg or "") + f" MinIO check error."
+                    doc_updated_chunk_count = 0
+        else:
+            live_minio_exists = False
 
         live_milvus_chunk_count = -1
         loop = asyncio.get_running_loop()
@@ -658,7 +692,7 @@ async def list_document_statuses(
                 if doc_updated_status_enum != DocumentStatus.ERROR:
                     doc_needs_update = True
                     doc_updated_status_enum = DocumentStatus.ERROR
-                    doc_updated_err_msg = (doc_updated_err_msg or "") + " Failed Milvus count."
+                    doc_updated_error_msg = (doc_updated_error_msg or "") + " Failed Milvus count."
             elif live_milvus_chunk_count > 0:
                 # Si hay chunks y el archivo existe, y el estado es error o uploaded, corregir a PROCESSED
                 if live_minio_exists and doc_updated_status_enum in [DocumentStatus.ERROR, DocumentStatus.UPLOADED]:
@@ -666,7 +700,7 @@ async def list_document_statuses(
                     doc_needs_update = True
                     doc_updated_status_enum = DocumentStatus.PROCESSED
                     doc_updated_chunk_count = live_milvus_chunk_count
-                    doc_updated_err_msg = None
+                    doc_updated_error_msg = None
                 elif doc_updated_status_enum == DocumentStatus.PROCESSED and doc_updated_chunk_count != live_milvus_chunk_count:
                     doc_needs_update = True
                     doc_updated_chunk_count = live_milvus_chunk_count
@@ -675,19 +709,25 @@ async def list_document_statuses(
                     doc_needs_update = True
                     doc_updated_status_enum = DocumentStatus.ERROR
                     doc_updated_chunk_count = 0
-                    doc_updated_err_msg = (doc_updated_err_msg or "") + " Processed data missing."
+                    doc_updated_error_msg = (doc_updated_error_msg or "") + " Processed data missing."
                 elif doc_updated_status_enum == DocumentStatus.ERROR and doc_updated_chunk_count != 0:
                     doc_needs_update = True
                     doc_updated_chunk_count = 0
         except Exception as e:
-            check_log.exception("Unexpected error during Milvus count check for list item", error=str(e)); live_milvus_chunk_count = -1
+            check_log.exception("Unexpected error during Milvus count check for list item", error=str(e))
+            live_milvus_chunk_count = -1
             if doc_updated_status_enum != DocumentStatus.ERROR:
-                doc_needs_update=True; doc_updated_status_enum=DocumentStatus.ERROR; doc_updated_error_msg=(doc_updated_error_msg or "")+f" Error checking Milvus."
+                doc_needs_update = True
+                doc_updated_status_enum = DocumentStatus.ERROR
+                doc_updated_error_msg = (doc_updated_error_msg or "") + f" Error checking Milvus."
 
         return {
-            "db_data": doc_db_data, "needs_update": doc_needs_update,
-            "updated_status_enum": doc_updated_status_enum, "updated_chunk_count": doc_updated_chunk_count,
-            "final_error_message": doc_updated_error_msg, "live_minio_exists": live_minio_exists,
+            "db_data": doc_db_data,
+            "needs_update": doc_needs_update,
+            "updated_status_enum": doc_updated_status_enum,
+            "updated_chunk_count": doc_updated_chunk_count,
+            "final_error_message": doc_updated_error_msg,
+            "live_minio_exists": live_minio_exists,
             "live_milvus_chunk_count": live_milvus_chunk_count
         }
 
@@ -1995,7 +2035,7 @@ async def health_check():
 
 # --- Local execution ---
 if __name__ == "__main__":
-    port = 8001 # Default port for ingest-service
+    port = 8001
     log_level_str = settings.LOG_LEVEL.lower()
     print(f"----- Starting {settings.PROJECT_NAME} locally on port {port} -----")
     uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True, log_level=log_level_str)
@@ -2868,6 +2908,9 @@ log.info("Celery app configured", broker=settings.CELERY_BROKER_URL)
 
 ## File: `app\tasks\process_document.py`
 ```py
+def normalize_filename(filename: str) -> str:
+    """Normaliza el nombre de archivo eliminando espacios al inicio/final y espacios duplicados."""
+    return " ".join(filename.strip().split())
 # ingest-service/app/tasks/process_document.py
 import os
 import tempfile
@@ -3017,7 +3060,8 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
         except Exception as db_err: log.critical("Failed to update status to ERROR for unsupported type!", error=str(db_err))
         raise Reject(error_msg, requeue=False) # Non-retriable
 
-    object_name = f"{company_id_str}/{document_id_str}/{filename}"
+    normalized_filename = normalize_filename(filename) if filename else filename
+    object_name = f"{company_id_str}/{document_id_str}/{normalized_filename}"
     temp_file_path_obj: Optional[pathlib.Path] = None
     inserted_chunk_count = 0
     file_bytes: Optional[bytes] = None
@@ -3036,7 +3080,7 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
         # 2. Download file and read bytes
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_dir_path = pathlib.Path(temp_dir)
-            temp_file_path_obj = temp_dir_path / filename
+            temp_file_path_obj = temp_dir_path / normalized_filename
             log.info(f"Downloading MinIO object: {object_name} -> {str(temp_file_path_obj)}")
 
             max_minio_retries = 3 # Adjusted retries for download
@@ -3070,16 +3114,16 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
 
             # 3. Execute Refactored Ingestion Pipeline
             log.info("Executing refactored ingest pipeline...")
-            inserted_chunk_count = ingest_document_pipeline(
-                file_bytes=file_bytes,
-                filename=filename,
-                company_id=company_id_str,
-                document_id=document_id_str,
-                content_type=content_type,
-                embedding_model=worker_embedding_model, # Pass the loaded model
-                delete_existing=True
-            )
-            log.info(f"Ingestion pipeline finished. Inserted chunks reported: {inserted_chunk_count}")
+        inserted_chunk_count = ingest_document_pipeline(
+            file_bytes=file_bytes,
+            filename=normalized_filename,
+            company_id=company_id_str,
+            document_id=document_id_str,
+            content_type=content_type,
+            embedding_model=worker_embedding_model, # Pass the loaded model
+            delete_existing=True
+        )
+        log.info(f"Ingestion pipeline finished. Inserted chunks reported: {inserted_chunk_count}")
 
         # 4. Update status to PROCESSED
         log.debug("Setting status to PROCESSED in DB.")
@@ -3170,6 +3214,9 @@ tenacity = "^8.2.3"
 python-multipart = "^0.0.9"
 structlog = "^24.1.0"
 minio = "^7.1.17"
+
+# --- ONNX Runtime ---
+onnxruntime = "^1.18.0"
 
 # --- Core Processing Dependencies (REFACTORIZADO) ---
 pymupdf = "^1.25.0"                # PyMuPDF for PDF extraction
