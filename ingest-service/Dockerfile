@@ -33,11 +33,12 @@ WORKDIR /build
 # LLM_COMMENT: Copy dependency files to leverage cache.
 COPY pyproject.toml poetry.lock* ./
 
+
 # Install project dependencies using the lock file, including dev dependencies if needed for build
 # LLM_COMMENT: Install dependencies. We install them globally in the builder stage's Python env.
 # LLM_COMMENT: DO NOT run any code here that triggers model downloads.
-RUN poetry install --no-root --only main
-# RUN poetry install --no-root # Use this if any dev dependency IS required for building a main dependency
+RUN /opt/poetry/bin/poetry install --no-root --only main
+# RUN /opt/poetry/bin/poetry install --no-root # Use this if any dev dependency IS required for building a main dependency
 
 
 # ---- Stage 2: Final Image ----
