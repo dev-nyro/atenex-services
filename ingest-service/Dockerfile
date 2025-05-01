@@ -37,10 +37,7 @@ COPY pyproject.toml poetry.lock* ./
 # Debug: mostrar binario poetry y versión
 RUN ls -l /opt/poetry/bin && /opt/poetry/bin/poetry --version
 # Forzar PATH correcto antes de instalar dependencias
-ENV PATH="/opt/poetry/bin:$PATH"
-RUN poetry install --no-root --only main
-# RUN poetry install --no-root # Use this if any dev dependency IS required for building a main dependency
-
+RUN /opt/poetry/bin/poetry install --no-root --only main
 
 # ---- Stage 2: Final Image ----
 # Use the same slim base image for the final stage
