@@ -1,68 +1,68 @@
-# Atenex Ingest Service (Microservicio de Ingesta) v0.3.0 - (SentenceTransformers/Pymilvus)
+# Atenex Ingest Service (Microservicio de Ingesta) v0.3.0 - (Cloud SQL/GCS/Zilliz Cloud)
 
 ## 1. Visión General
 
-El **Ingest Service** es un microservicio clave dentro de la plataforma Atenex. Su responsabilidad principal es recibir documentos subidos por los usuarios (PDF, DOCX, TXT, HTML, MD), procesarlos de manera asíncrona utilizando un **pipeline personalizado**, almacenar los archivos originales en **MinIO** y finalmente indexar el contenido procesado en bases de datos (**PostgreSQL** para metadatos y **Milvus** para vectores) para su uso posterior en búsquedas semánticas y generación de respuestas por LLMs.
+El **Ingest Service** es un microservicio clave dentro de la plataforma Atenex. Su responsabilidad principal es recibir documentos subidos por los usuarios (PDF, DOCX, TXT, HTML, MD), procesarlos de manera asíncrona utilizando un **pipeline personalizado**, almacenar los archivos originales en **Google Cloud Storage (GCS)** y finalmente indexar el contenido procesado en bases de datos (**Cloud SQL para PostgreSQL** para metadatos y **Zilliz Cloud** para vectores) para su uso posterior en búsquedas semánticas y generación de respuestas por LLMs.
 
-Este servicio ha sido **refactorizado** para eliminar la dependencia de Haystack AI, utilizando en su lugar librerías independientes como **SentenceTransformers** (`sentence-transformers/all-MiniLM-L6-v2` por defecto) para la generación de embeddings (ejecutados localmente en CPU y cargados una vez por proceso worker), **Pymilvus** para la interacción directa con Milvus, y convertidores de documentos standalone (`PyMuPDF`, `python-docx`, etc.). El worker de Celery opera de forma **síncrona** para las operaciones de base de datos (usando SQLAlchemy) y MinIO.
+Este servicio ha sido **refactorizado** para utilizar servicios gestionados de GCP y Zilliz Cloud, y librerías independientes como **SentenceTransformers** (`sentence-transformers/all-MiniLM-L6-v2` por defecto) para la generación de embeddings (ejecutados localmente en CPU y cargados una vez por proceso worker), **Pymilvus** para la interacción directa con Zilliz Cloud, **Cloud SQL Python Connector** para conectar a PostgreSQL, `google-cloud-storage` para GCS, y convertidores de documentos standalone (`PyMuPDF`, `python-docx`, etc.). El worker de Celery opera de forma **síncrona** para las operaciones de base de datos (usando SQLAlchemy) y GCS.
 
 **Flujo principal:**
 
 1.  **Recepción:** La API (`POST /api/v1/ingest/upload`) recibe el archivo (`file`) y metadatos opcionales (`metadata_json`). Requiere los headers `X-Company-ID` y `X-User-ID` inyectados por el API Gateway. Normaliza el nombre del archivo recibido.
 2.  **Validación:** Verifica el tipo de archivo (`Content-Type`) contra los tipos soportados y valida el formato JSON de los metadatos. Previene subida de duplicados (mismo nombre normalizado, misma compañía, estado no-error).
 3.  **Persistencia Inicial (API - Async):**
-    *   Crea un registro inicial del documento en **PostgreSQL** (tabla `documents`) con estado `pending` usando `asyncpg`.
-    *   Guarda el archivo original en **MinIO** (bucket configurado, ej. `ingested-documents`) bajo la ruta `company_id/document_id/normalized_filename` usando el cliente `minio-py` (asíncrono vía `run_in_executor`). Verifica que el archivo exista en MinIO tras la subida.
-    *   Actualiza el registro en PostgreSQL a estado `uploaded`.
+    *   Crea un registro inicial del documento en **Cloud SQL (PostgreSQL)** (tabla `documents`) con estado `pending` usando el conector y `asyncpg`.
+    *   Guarda el archivo original en **GCS** (bucket configurado, ej. `atenex`) bajo la ruta `company_id/document_id/normalized_filename` usando el cliente `google-cloud-storage` (asíncrono vía `run_in_executor`). Verifica que el archivo exista en GCS tras la subida.
+    *   Actualiza el registro en Cloud SQL a estado `uploaded`.
 4.  **Encolado:** Dispara una tarea asíncrona usando **Celery** (con **Redis** como broker) para el procesamiento pesado (`process_document_standalone`).
 5.  **Respuesta API:** La API responde inmediatamente `202 Accepted` con el `document_id`, `task_id` de Celery y el estado `uploaded`.
 6.  **Procesamiento Asíncrono (Worker Celery - Sync Ops):**
-    *   **Inicialización del Worker:** Al iniciar cada proceso worker (`@worker_process_init`), se cargan y cachean los recursos necesarios: conexión síncrona a DB (SQLAlchemy Engine), cliente MinIO, y el modelo de **SentenceTransformer** configurado.
+    *   **Inicialización del Worker:** Al iniciar cada proceso worker (`@worker_process_init`), se cargan y cachean los recursos necesarios: conexión síncrona a Cloud SQL (SQLAlchemy Engine vía conector), cliente GCS, y el modelo de **SentenceTransformer** configurado.
     *   La tarea Celery (`process_document.py` -> `process_document_standalone`) recoge el trabajo.
-    *   **Pre-checks:** Verifica que los recursos del worker (DB Engine síncrono, modelo SentenceTransformer, cliente MinIO) estén inicializados correctamente. Falla si no lo están.
-    *   Actualiza el estado en PostgreSQL a `processing` (limpiando `error_message`) usando el cliente **síncrono** de DB (`SQLAlchemy` + `psycopg2`).
-    *   Descarga el archivo de MinIO usando el cliente **síncrono** de MinIO y lo lee en memoria como bytes.
+    *   **Pre-checks:** Verifica que los recursos del worker (DB Engine síncrono, modelo SentenceTransformer, cliente GCS) estén inicializados correctamente. Falla si no lo están.
+    *   Actualiza el estado en Cloud SQL a `processing` (limpiando `error_message`) usando el cliente **síncrono** de DB (`SQLAlchemy` + `psycopg2` vía conector).
+    *   Descarga el archivo como **bytes** desde GCS usando el cliente **síncrono** de GCS (`read_file_sync`).
     *   **Ejecuta el Pipeline Personalizado (`ingest_document_pipeline`):**
         *   **Conversión:** Selecciona el extractor de texto adecuado (`PyMuPDF`, `python-docx`, `BeautifulSoup`, etc.) según el `Content-Type` y procesa los bytes del archivo. Falla si no es soportado o la extracción falla.
         *   **Chunking:** Divide el texto extraído en fragmentos (chunks) usando una función personalizada (`text_splitter.py`).
         *   **Embedding:** Genera vectores de embedding para cada chunk usando la instancia del modelo **SentenceTransformer** cargada por el worker (`embedder.py`).
-        *   **Truncado (Contenido):** Trunca el texto de los chunks si exceden el `MILVUS_CONTENT_FIELD_MAX_LENGTH` configurado para evitar errores en Milvus.
-        *   **Indexación:** Escribe los chunks (contenido truncado, vector y metadatos como `company_id`, `document_id`, `file_name`) en **Milvus** (colección configurada, ej. `document_chunks_minilm`) usando el cliente **Pymilvus**. Elimina chunks existentes para el documento si `delete_existing=True`.
-    *   **Actualización Final (Worker - Sync):** Actualiza el estado del documento en PostgreSQL a `processed` y registra el número real de chunks escritos (`chunk_count`) usando el cliente DB **síncrono**. Si ocurre un error durante el pipeline, actualiza a `error` y guarda un mensaje descriptivo en `error_message`.
+        *   **Truncado (Contenido):** Trunca el texto de los chunks si exceden el `MILVUS_CONTENT_FIELD_MAX_LENGTH` configurado para evitar errores en Zilliz Cloud.
+        *   **Indexación:** Escribe los chunks (contenido truncado, vector y metadatos como `company_id`, `document_id`, `file_name`) en **Zilliz Cloud** (colección configurada, ej. `atenex-vector-db`) usando el cliente **Pymilvus**. Elimina chunks existentes para el documento si `delete_existing=True`.
+    *   **Actualización Final (Worker - Sync):** Actualiza el estado del documento en Cloud SQL a `processed` y registra el número real de chunks escritos (`chunk_count`) usando el cliente DB **síncrono**. Si ocurre un error durante el pipeline, actualiza a `error` y guarda un mensaje descriptivo en `error_message`.
 7.  **Consulta de Estado (API - Async):** La API expone endpoints para consultar el estado:
-    *   `GET /api/v1/ingest/status/{document_id}`: Estado de un documento específico, incluyendo verificación en tiempo real de existencia en MinIO (async) y conteo de chunks en Milvus (usando helpers **síncronos** de **Pymilvus** ejecutados en `run_in_executor`). Puede actualizar el estado en DB si detecta inconsistencias (con un pequeño periodo de gracia tras `processed`).
-    *   `GET /api/v1/ingest/status`: Lista paginada de estados. Realiza verificaciones en MinIO/Milvus en paralelo para cada documento listado y actualiza la DB con el estado real encontrado antes de devolver la respuesta.
+    *   `GET /api/v1/ingest/status/{document_id}`: Estado de un documento específico, incluyendo verificación en tiempo real de existencia en GCS (async) y conteo de chunks en Zilliz Cloud (usando helpers **síncronos** de **Pymilvus** ejecutados en `run_in_executor`). Puede actualizar el estado en DB si detecta inconsistencias (con un pequeño periodo de gracia tras `processed`).
+    *   `GET /api/v1/ingest/status`: Lista paginada de estados. Realiza verificaciones en GCS/Zilliz en paralelo para cada documento listado y actualiza la DB con el estado real encontrado antes de devolver la respuesta.
 8.  **Reintento de Ingesta:** Permite reintentar la ingesta de un documento en estado `error` (`POST /api/v1/ingest/retry/{document_id}`). Actualiza el estado a `processing` y limpia `error_message` (async), y encola de nuevo la tarea `process_document_standalone`.
-9.  **Eliminación Completa:** El endpoint `DELETE /api/v1/ingest/{document_id}` elimina los chunks asociados en **Milvus** (usando helpers síncronos de Pymilvus en executor), el archivo original en **MinIO** (async) y el registro en **PostgreSQL** (async).
+9.  **Eliminación Completa:** El endpoint `DELETE /api/v1/ingest/{document_id}` elimina los chunks asociados en **Zilliz Cloud** (usando helpers síncronos de Pymilvus en executor), el archivo original en **GCS** (async) y el registro en **Cloud SQL** (async).
 
-## 2. Arquitectura General del Proyecto (Actualizado)
+## 2. Arquitectura General del Proyecto (Refactorizado GCP/Zilliz)
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#E0F2F7', 'edgeLabelBackground':'#fff', 'tertiaryColor': '#FFFACD', 'lineColor': '#666', 'nodeBorder': '#333'}}}%%
 graph TD
     A[Usuario/Cliente Externo] -->|HTTPS / REST API<br/>(via API Gateway)| I["<strong>Atenex Ingest Service API</strong><br/>(FastAPI - Async)"]
 
-    subgraph KubernetesCluster ["Kubernetes Cluster"]
+    subgraph KubernetesCluster ["Kubernetes Cluster (GKE)"]
 
         subgraph Namespace_nyro_develop ["Namespace: nyro-develop"]
             direction TB
 
             %% API Interactions (Async) %%
-            I -- GET /status, DELETE /{id} --> DBAsync[(PostgreSQL<br/>'atenex' DB<br/><b>asyncpg</b>)]
-            I -- POST /upload, RETRY --> DBAsync
-            I -- GET /status, POST /upload, DELETE /{id} --> S3[(MinIO<br/>'ingested-documents' Bucket<br/><b>minio-py (async helper)</b>)]
-            I -- POST /upload, RETRY --> Q([Redis<br/>Celery Broker])
-            I -- GET /status, DELETE /{id} -->|Pymilvus Sync Helper<br/>(via Executor)| MDB[(Milvus<br/>Collection Name from Config<br/>(e.g., 'document_chunks_minilm')<br/><b>Pymilvus</b>)]
+            I -- GET /status, DELETE /{id} -->|Cloud SQL Connector| SQL[("Cloud SQL (PostgreSQL)<br/>'atenex' DB")]
+            I -- POST /upload, RETRY -->|Cloud SQL Connector| SQL
+            I -- GET /status, POST /upload, DELETE /{id} -->|GCS Client (Async)| GCS[("Google Cloud Storage<br/>Bucket 'atenex'")]
+            I -- POST /upload, RETRY --> Q([Redis<br/>Celery Broker<br/>(Interno o Memorystore)])
+            I -- GET /status, DELETE /{id} -->|Pymilvus Sync Helper<br/>(via Executor)| ZLZ[("Zilliz Cloud<br/>Collection 'atenex-vector-db'")]
 
             %% Worker Interactions (Sync) %%
             W(Celery Worker<br/><b>Prefork - Sync Ops</b><br/><i>process_document_standalone</i>) -- Picks Task --> Q
             W -- Initialize Process (@worker_process_init) --> ST((SentenceTransformer<br/>Model from Config<br/><b>Local CPU</b>))
-            W -- Update Status --> DBSync[(PostgreSQL<br/>'atenex' DB<br/><b>SQLAlchemy/psycopg2</b>)]
-            W -- Download Bytes --> S3Sync[(MinIO<br/>'ingested-documents' Bucket<br/><b>minio-py (sync)</b>)]
+            W -- Update Status -->|Cloud SQL Connector<br/>(SQLAlchemy)| SQL
+            W -- Read Bytes -->|GCS Client (Sync)| GCS
             W -- Execute Pipeline --> Pipe["<strong>Custom Pipeline</strong><br/>(Extract, Chunk, Embed, Index)"]
             Pipe -- Convert --> Libs[("Standalone Extractors<br/>(PyMuPDF, python-docx...)")]
             Pipe -- Embed --> ST
-            Pipe -- Index/Delete Existing --> MDB
+            Pipe -- Index/Delete Existing --> ZLZ
 
         end
 
@@ -72,40 +72,39 @@ graph TD
     style I fill:#C8E6C9,stroke:#333,stroke-width:2px
     style W fill:#BBDEFB,stroke:#333,stroke-width:2px
     style Pipe fill:#FFECB3,stroke:#666,stroke-width:1px
-    style DBAsync fill:#F8BBD0,stroke:#333,stroke-width:1px
-    style DBSync fill:#F8BBD0,stroke:#333,stroke-width:1px
-    style S3 fill:#FFF9C4,stroke:#333,stroke-width:1px
-    style S3Sync fill:#FFF9C4,stroke:#333,stroke-width:1px
+    style SQL fill:#F8BBD0,stroke:#333,stroke-width:1px
+    style GCS fill:#FFF9C4,stroke:#333,stroke-width:1px
     style Q fill:#FFCDD2,stroke:#333,stroke-width:1px
-    style MDB fill:#B2EBF2,stroke:#333,stroke-width:1px
+    style ZLZ fill:#B2EBF2,stroke:#333,stroke-width:1px
     style ST fill:#D1C4E9,stroke:#333,stroke-width:1px
     style Libs fill:#CFD8DC,stroke:#333,stroke-width:1px
 ```
-*Diagrama actualizado reflejando el uso de SentenceTransformer local, PyMuPDF, Pymilvus, operaciones síncronas en el worker (DB, MinIO), helpers Pymilvus en la API, y carga del modelo en `worker_process_init`.*
+*Diagrama actualizado reflejando el uso de Cloud SQL, GCS, Zilliz Cloud, y la interacción vía conectores/clientes específicos.*
 
-## 3. Características Clave (Actualizado)
+## 3. Características Clave (Refactorizado GCP/Zilliz)
 
 *   **API RESTful:** Endpoints para ingesta (`/upload`), consulta de estado (`/status`, `/status/{id}`), reintento (`/retry/{document_id}`) y eliminación completa (`/{document_id}`). Normaliza nombres de archivo.
 *   **Procesamiento Asíncrono:** Celery y Redis para orquestación de tareas.
-*   **Worker Síncrono con Inicialización Eficiente:** El worker Celery (`prefork`) realiza operaciones de I/O (DB, MinIO) y procesamiento de forma síncrona. El modelo de embedding (`SentenceTransformer`) se carga **una vez por proceso worker** al inicio para evitar sobrecarga.
-*   **Almacenamiento:** MinIO para archivos, PostgreSQL para metadatos/estado (incluyendo `error_message`), Milvus para vectores.
-*   **Pipeline Personalizado (Sin Haystack):**
+*   **Worker Síncrono con Inicialización Eficiente:** El worker Celery (`prefork`) realiza operaciones de I/O (DB, GCS) y procesamiento de forma síncrona. El modelo de embedding (`SentenceTransformer`) se carga **una vez por proceso worker** al inicio.
+*   **Almacenamiento Gestionado:** **GCS** para archivos, **Cloud SQL (PostgreSQL)** para metadatos/estado (incluyendo `error_message`), **Zilliz Cloud** para vectores.
+*   **Pipeline Personalizado:**
     *   Conversión de documentos usando librerías standalone (`PyMuPDF`, `python-docx`, `BeautifulSoup`, etc.).
     *   Chunking de texto mediante función personalizada (`text_splitter.py`).
     *   Embedding usando **SentenceTransformers** (ejecución local en CPU, modelo configurable vía `EMBEDDING_MODEL_ID`).
-    *   Truncado de texto de chunks para ajustarse al límite de Milvus (`MILVUS_CONTENT_FIELD_MAX_LENGTH`).
-    *   Indexación y borrado en Milvus usando **Pymilvus**.
-*   **Multi-tenancy:** Aislamiento por `company_id` (en DB, MinIO path, y metadatos Milvus).
-*   **Estado Actualizado:** `GET /status` y `GET /status/{id}` verifican MinIO/Milvus en tiempo real (usando helpers Pymilvus) y actualizan la DB si es necesario (con periodo de gracia).
-*   **Eliminación Completa:** `DELETE /{id}` elimina datos de PostgreSQL, MinIO y Milvus.
+    *   Truncado de texto de chunks para ajustarse al límite de Zilliz Cloud (`MILVUS_CONTENT_FIELD_MAX_LENGTH`).
+    *   Indexación y borrado en Zilliz Cloud usando **Pymilvus**.
+*   **Multi-tenancy:** Aislamiento por `company_id` (en DB, GCS path, y metadatos Zilliz).
+*   **Estado Actualizado:** `GET /status` y `GET /status/{id}` verifican GCS/Zilliz en tiempo real y actualizan la DB si es necesario (con periodo de gracia).
+*   **Eliminación Completa:** `DELETE /{id}` elimina datos de Cloud SQL, GCS y Zilliz Cloud.
+*   **Autenticación GCP:** Utiliza **Workload Identity** para conectar a Cloud SQL y GCS de forma segura.
 *   **Configuración Centralizada y Logging Estructurado (JSON).**
 *   **Manejo de Errores:** Tareas Celery con reintentos para errores transitorios y registro de errores persistentes en la DB. Exclusión de reintentos para errores de extracción no recuperables.
 
 ## 4. Requisitos de la base de datos (IMPORTANTE)
 
 > **¡IMPORTANTE!**
-> La tabla `documents` en PostgreSQL **debe tener la columna** `error_message TEXT` para que el servicio funcione correctamente.
-> Si ves errores como `column "error_message" of relation "documents" does not exist`, ejecuta la siguiente migración SQL:
+> La tabla `documents` en tu instancia de **Cloud SQL (PostgreSQL)** **debe tener la columna** `error_message TEXT` para que el servicio funcione correctamente.
+> Si ves errores como `column "error_message" of relation "documents" does not exist`, ejecuta la siguiente migración SQL en tu instancia de Cloud SQL:
 
 ```sql
 -- Asegúrate de que la columna exista
@@ -120,7 +119,7 @@ ALTER TABLE documents ALTER COLUMN file_path TYPE VARCHAR(2048); -- Aumentado po
 -- company_id UUID NOT NULL
 -- file_name VARCHAR(1024) NOT NULL -- Ver longitud
 -- file_type VARCHAR(100) NOT NULL
--- file_path VARCHAR(2048) -- Almacena la ruta en MinIO, ver longitud
+-- file_path VARCHAR(2048) -- Almacena la ruta en GCS, ver longitud
 -- metadata JSONB
 -- status VARCHAR(50) NOT NULL
 -- chunk_count INTEGER DEFAULT 0
@@ -133,22 +132,19 @@ ALTER TABLE documents ALTER COLUMN file_path TYPE VARCHAR(2048); -- Aumentado po
 -- CREATE INDEX IF NOT EXISTS idx_documents_company_filename ON documents(company_id, file_name); -- Para check de duplicados
 ```
 
-Esto es necesario para que los endpoints de estado y manejo de errores funcionen correctamente.
-
-## 5. Pila Tecnológica Principal (Actualizado)
+## 5. Pila Tecnológica Principal (Refactorizado GCP/Zilliz)
 
 *   **Lenguaje:** Python 3.10+
 *   **Framework API:** FastAPI
-*   **Procesamiento Asíncrono (Orquestación):** Celery, Redis
-*   **Base de Datos Relacional (Cliente API):** PostgreSQL (via **asyncpg**)
-*   **Base de Datos Relacional (Cliente Worker):** PostgreSQL (via **SQLAlchemy** + **psycopg2-binary**)
-*   **Base de Datos Vectorial (Cliente API/Worker):** Milvus (via **Pymilvus**)
-*   **Almacenamiento de Objetos (Cliente API/Worker):** MinIO (via **minio-py**)
+*   **Procesamiento Asíncrono (Orquestación):** Celery, Redis (interno K8s o Memorystore)
+*   **Base de Datos Relacional:** **Cloud SQL para PostgreSQL** (via `cloud-sql-python-connector` con `asyncpg` y `psycopg2`)
+*   **Base de Datos Vectorial:** **Zilliz Cloud** (via **Pymilvus**)
+*   **Almacenamiento de Objetos:** **Google Cloud Storage (GCS)** (via `google-cloud-storage`)
 *   **Modelo de Embeddings (Ingesta):** **SentenceTransformers** (ej. `sentence-transformers/all-MiniLM-L6-v2`, ejecución local en CPU por defecto, modelo configurable). ONNX Runtime es una dependencia transitiva.
 *   **Convertidores de Documentos:** **PyMuPDF (fitz)**, python-docx, BeautifulSoup4, Markdown, html2text
 *   **Despliegue:** Docker, Kubernetes (GKE)
 
-## 6. Estructura de la Codebase (Actualizado)
+## 6. Estructura de la Codebase (Refactorizado GCP/Zilliz)
 
 ```
 ingest-service/
@@ -160,152 +156,97 @@ ingest-service/
 │   │       ├── __init__.py
 │   │       ├── endpoints/
 │   │       │   ├── __init__.py
-│   │       │   └── ingest.py       # Endpoints API (FastAPI, async)
-│   │       └── schemas.py        # Schemas Pydantic (Request/Response)
-│   ├── core/                     # Configuración, Logging
+│   │       │   └── ingest.py       # Endpoints API (usa GCSClient, Cloud SQL pool)
+│   │       └── schemas.py
+│   ├── core/                     # Configuración, Logging (actualizado)
 │   │   ├── __init__.py
-│   │   ├── config.py
+│   │   ├── config.py             # Contiene GCS_BUCKET_NAME, POSTGRES_INSTANCE_CONNECTION_NAME, ZILLIZ_*, etc.
 │   │   └── logging_config.py
 │   ├── db/
 │   │   ├── __init__.py
-│   │   └── postgres_client.py    # Cliente DB: Async (asyncpg) para API, Sync (SQLAlchemy) para Worker
-│   ├── main.py                   # Entrypoint FastAPI, lifespan, middleware, health check
+│   │   └── postgres_client.py    # Cliente DB (usa Cloud SQL Connector)
+│   ├── main.py
 │   ├── models/
 │   │   ├── __init__.py
-│   │   └── domain.py             # Enum DocumentStatus
+│   │   └── domain.py
 │   ├── services/
 │   │   ├── __init__.py
-│   │   ├── base_client.py        # (Opcional) Base para otros clientes HTTP
-│   │   ├── embedder.py           # Lógica de embedding (SentenceTransformers)
-│   │   ├── extractors/           # Módulos extractores por tipo de archivo
-│   │   │   ├── __init__.py
-│   │   │   ├── docx_extractor.py
-│   │   │   ├── html_extractor.py
-│   │   │   ├── md_extractor.py
-│   │   │   ├── pdf_extractor.py  # Usa PyMuPDF
-│   │   │   └── txt_extractor.py
-│   │   ├── ingest_pipeline.py    # Lógica del pipeline (usa extractors, splitter, embedder)
-│   │   ├── minio_client.py       # Cliente MinIO (métodos sync y async helper)
-│   │   └── text_splitter.py      # Lógica de chunking de texto
+│   │   ├── base_client.py
+│   │   ├── embedder.py           # Sin cambios
+│   │   ├── extractors/           # Sin cambios
+│   │   │   ├── ...
+│   │   ├── gcs_client.py         # NUEVO: Cliente GCS
+│   │   ├── ingest_pipeline.py    # Actualizado para Zilliz
+│   │   └── text_splitter.py      # Sin cambios
 │   └── tasks/
 │       ├── __init__.py
-│       ├── celery_app.py         # Configuración de la app Celery
-│       └── process_document.py   # Tarea Celery `process_document_standalone` (usa pipeline, sync DB/MinIO, carga modelo en init)
-├── k8s/                          # Configuración Kubernetes (No incluida en análisis)
-│   ├── ...
-├── Dockerfile                    # Define imagen Docker (Multi-etapa recomendado)
-├── pyproject.toml                # Dependencias (Poetry) - Refleja SentenceTransformers, PyMuPDF, Pymilvus, etc.
+│       ├── celery_app.py         # Sin cambios (si Redis es interno)
+│       └── process_document.py   # Actualizado para usar GCSClient, Cloud SQL Engine, Zilliz, pasar bytes
+├── k8s/                          # Configuración Kubernetes
+│   ├── configmap.yaml            # ACTUALIZADO con nuevas variables
+│   ├── deployment-api.yaml       # ACTUALIZADO (imagen, resources, serviceAccountName)
+│   ├── deployment-worker.yaml    # ACTUALIZADO (imagen, resources, concurrency, serviceAccountName)
+│   ├── secret.example.yaml     # ESTRUCTURA ACTUALIZADA (quitar MinIO, añadir Zilliz)
+│   └── service.yaml              # Sin cambios
+├── Dockerfile                    # (Recomendado Multi-etapa)
+├── pyproject.toml                # ACTUALIZADO con nuevas dependencias
 ├── poetry.lock
-└── README.md                     # Este archivo
+└── README.md                     # Este archivo (actualizado)
 ```
 
-## 7. Configuración (Kubernetes)
+## 7. Configuración (Kubernetes - Refactorizado)
 
-El servicio se configura principalmente mediante variables de entorno (o un ConfigMap/Secret en Kubernetes). Claves importantes (prefijo `INGEST_`):
+Configuración mediante `ingest-service-config` (ConfigMap) y `ingest-service-secrets` (Secret) en namespace `nyro-develop`.
 
-*   **`POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_SERVER`, `POSTGRES_PORT`, `POSTGRES_DB`**: Conexión a PostgreSQL. Usada por API (asyncpg) y Worker (psycopg2).
-*   **`MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, `MINIO_BUCKET_NAME`**: Conexión a MinIO.
-*   **`MILVUS_URI`**: URI de conexión a Milvus (ej. `http://milvus-standalone.nyro-develop.svc.cluster.local:19530`).
-*   **`MILVUS_COLLECTION_NAME`**: Nombre de la colección en Milvus (ej. `document_chunks_minilm`).
-*   **`MILVUS_CONTENT_FIELD_MAX_LENGTH`**: Longitud máxima en bytes para el campo de texto en Milvus (ej. `20000`).
-*   **`CELERY_BROKER_URL`, `CELERY_RESULT_BACKEND`**: URLs de Redis para Celery.
-*   **`EMBEDDING_MODEL_ID`**: ID del modelo SentenceTransformer a usar (ej. `sentence-transformers/all-MiniLM-L6-v2`).
-*   **`EMBEDDING_DIMENSION`**: Dimensión de los vectores generados por el modelo (ej. 384 para `all-MiniLM-L6-v2`). Debe coincidir con el modelo.
-*   **`LOG_LEVEL`**: Nivel de logging (ej. `INFO`, `DEBUG`).
-*   `SUPPORTED_CONTENT_TYPES`, `SPLITTER_CHUNK_SIZE`, `SPLITTER_CHUNK_OVERLAP`: Parámetros del pipeline.
+### ConfigMap (`ingest-service-config`) - Resumen Clave
 
-## 8. API Endpoints (Actualizado)
+*   `INGEST_POSTGRES_INSTANCE_CONNECTION_NAME`: "praxis-study-458413-f4:southamerica-west1:atenex-db"
+*   `INGEST_POSTGRES_USER`: "postgres"
+*   `INGEST_POSTGRES_DB`: "atenex"
+*   `INGEST_GCS_BUCKET_NAME`: "atenex"
+*   `INGEST_ZILLIZ_URI`: "https://in03-0afab716eb46d7f.serverless.gcp-us-west1.cloud.zilliz.com"
+*   `INGEST_MILVUS_COLLECTION_NAME`: "atenex-vector-db"
+*   `INGEST_EMBEDDING_MODEL_ID`: "sentence-transformers/all-MiniLM-L6-v2"
+*   `INGEST_EMBEDDING_DIMENSION`: "384"
+*   `INGEST_CELERY_BROKER_URL`, `INGEST_CELERY_RESULT_BACKEND`: (Apuntan a Redis interno)
 
-Prefijo base: `/api/v1/ingest` (y alias `/api/v1` para compatibilidad si es necesario)
+### Secret (`ingest-service-secrets`) - Resumen Clave
 
----
+*   `INGEST_POSTGRES_PASSWORD`: (Contraseña de tu Cloud SQL)
+*   `INGEST_ZILLIZ_API_KEY`: (Tu clave API de Zilliz Cloud)
 
-### Health Check
+## 8. API Endpoints
 
-*   **Endpoint:** `GET /` (Raíz del servicio)
-*   **Descripción:** Verifica disponibilidad básica del servicio.
-*   **Respuesta OK (`200 OK`):** `OK` (Texto plano)
+*Sin cambios en la interfaz pública de los endpoints.*
 
----
+## 9. Dependencias Externas Clave (Refactorizado)
 
-### Ingestar Documento
+*   **Cloud SQL para PostgreSQL:** Almacenamiento de metadatos y estado.
+*   **Zilliz Cloud:** Base de datos vectorial.
+*   **Google Cloud Storage (GCS):** Almacenamiento de objetos.
+*   **Redis:** Broker y backend de resultados para Celery (interno K8s o Memorystore).
+*   **(Implícito) Modelo SentenceTransformer:** Descargado/cacheado por el worker.
 
-*   **Endpoint:** `POST /upload` (Alias: `POST /ingest/upload`)
-*   **Descripción:** Inicia la ingesta asíncrona. Normaliza el nombre de archivo. Previene duplicados.
-*   **Headers Requeridos:** `X-Company-ID`, `X-User-ID`
-*   **Request Body:** `multipart/form-data` (`file`, `metadata_json` opcional)
-*   **Respuesta (`202 Accepted`):** `schemas.IngestResponse`
+## 10. Pipeline de Ingesta Personalizado (`ingest_document_pipeline`)
 
----
+El flujo interno ahora usa GCS y Zilliz Cloud:
 
-### Consultar Estado de Ingesta (Documento Individual)
-
-*   **Endpoint:** `GET /status/{document_id}` (Alias: `GET /ingest/status/{document_id}`)
-*   **Descripción:** Obtiene estado detallado, **verificando en tiempo real MinIO y Milvus (usando Pymilvus helpers)**. Puede actualizar el estado en DB si detecta inconsistencias (con periodo de gracia).
-*   **Headers Requeridos:** `X-Company-ID`
-*   **Path Parameters:** `document_id` (UUID)
-*   **Respuesta (`200 OK`):** `schemas.StatusResponse` (incluye `minio_exists`, `milvus_chunk_count`, `error_message`, etc.).
-
----
-
-### Listar Estados de Ingesta (Paginado)
-
-*   **Endpoint:** `GET /status` (Alias: `GET /ingest/status`)
-*   **Descripción:** Obtiene lista paginada. **Realiza verificaciones en MinIO/Milvus en paralelo (usando Pymilvus helpers) para cada documento y actualiza el estado/chunks en la DB.** Devuelve los datos actualizados.
-*   **Headers Requeridos:** `X-Company-ID`
-*   **Query Parameters:** `limit`, `offset`
-*   **Respuesta (`200 OK`):** `List[schemas.StatusResponse]` (incluye `minio_exists`, `milvus_chunk_count`, etc.).
-
----
-
-### Reintentar Ingesta de Documento con Error
-
-*   **Endpoint:** `POST /retry/{document_id}` (Alias: `POST /ingest/retry/{document_id}`)
-*   **Descripción:** Reintenta la ingesta si el estado es 'error'. Actualiza estado a 'processing', limpia `error_message` y reenvió la tarea `process_document_standalone`.
-*   **Headers Requeridos:** `X-Company-ID`, `X-User-ID`
-*   **Path Parameters:** `document_id` (UUID)
-*   **Respuesta (`202 Accepted`):** `schemas.IngestResponse`
-
----
-
-### Eliminar Documento
-
-*   **Endpoint:** `DELETE /{document_id}` (Alias: `DELETE /ingest/{document_id}`)
-*   **Descripción:** Elimina completamente el documento: registro en PostgreSQL (async), archivo en MinIO (async), y chunks en Milvus (usando Pymilvus helpers sync). Verifica propiedad.
-*   **Headers Requeridos:** `X-Company-ID`
-*   **Path Parameters:** `document_id` (UUID)
-*   **Respuesta Exitosa (`204 No Content`):** Éxito.
-*   **Respuestas Error:** `404 Not Found`, `500 Internal Server Error`, `503 Service Unavailable`.
-
----
-
-## 9. Dependencias Externas Clave (Actualizado)
-
-*   **PostgreSQL:** Almacenamiento de metadatos y estado.
-*   **Milvus:** Base de datos vectorial para chunks y embeddings.
-*   **MinIO:** Almacenamiento de objetos para los archivos originales.
-*   **Redis:** Broker y backend de resultados para Celery.
-*   **(Implícita) Modelo SentenceTransformer:** El modelo de embedding (ej. `sentence-transformers/all-MiniLM-L6-v2`) debe ser descargable por el worker (generalmente la primera vez que el worker llama a `get_embedding_model`). La caché se almacena localmente en el worker (potencialmente en un volumen si se monta).
-
-## 10. Pipeline de Ingesta Personalizado (`ingest_document_pipeline` en `app/services/ingest_pipeline.py`)
-
-El worker Celery ejecuta esta función síncrona:
-
-1.  **Extracción de Texto:** Se selecciona un extractor basado en `content_type` (ej. `PyMuPDF` para PDF, `python-docx` para DOCX) del directorio `app/services/extractors`. Procesa los `bytes` del archivo.
-2.  **Chunking:** El texto extraído se divide en chunks usando la función `split_text` de `app/services/text_splitter.py`.
-3.  **Embedding:** Se generan los vectores para cada chunk usando la instancia de **SentenceTransformer** cargada por el worker (`app/services/embedder.py`).
-4.  **Truncado de Texto:** Se asegura que el texto de cada chunk no exceda `settings.MILVUS_CONTENT_FIELD_MAX_LENGTH` antes de la inserción.
-5.  **Escritura en Milvus:** Los chunks (contenido truncado, vector, metadatos) se insertan en la colección Milvus usando **Pymilvus**. Se pueden borrar los chunks existentes previamente.
+1.  **Extracción de Texto:** Igual (PyMuPDF, etc.), procesa `bytes`.
+2.  **Chunking:** Igual (`text_splitter.py`).
+3.  **Embedding:** Igual (SentenceTransformer cargado en worker).
+4.  **Truncado de Texto:** Igual.
+5.  **Escritura en Zilliz Cloud:** Usa `Pymilvus` configurado con URI/Token de Zilliz.
 
 ## 11. TODO / Mejoras Futuras
 
-*   **Optimización `GET /status` (Lista):** Si las verificaciones paralelas en `GET /status` resultan demasiado lentas bajo carga, considerar estrategias alternativas (ej. endpoint de refresco asíncrono, job de reconciliación periódico, caché).
-*   **Soporte GPU para SentenceTransformer:** Investigar y habilitar opcionalmente el uso de GPU en el worker (requiere imagen Docker base diferente y dependencias CUDA/cuDNN) si hay hardware disponible y el volumen lo justifica.
-*   **Worker Asíncrono:** Evaluar la migración del worker a un modelo asíncrono (ej. `aio-celery`, `arq`) para potencialmente mejorar el rendimiento y la utilización de recursos, aunque aumenta la complejidad.
-*   **Tests Unitarios y de Integración:** Expandir la cobertura de tests para los nuevos componentes (extractores, embedder, splitter, pipeline).
-*   **Observabilidad:** Mejorar métricas (Prometheus), tracing distribuido (OpenTelemetry) y logging detallado.
-*   **Manejo Avanzado de Errores:** Implementar patrones más sofisticados para errores específicos (ej. OCR para PDFs basados en imágenes si PyMuPDF no extrae texto).
-*   **Gestión de Modelos:** Facilitar la configuración y descarga de diferentes modelos SentenceTransformer.
+*   **Migrar Redis a Memorystore:** Altamente recomendado para producción.
+*   **Optimización `GET /status` (Lista).**
+*   **Soporte GPU para SentenceTransformer.**
+*   **Worker Asíncrono.**
+*   **Tests Unitarios y de Integración.**
+*   **Observabilidad.**
+*   **Manejo Avanzado de Errores.**
+*   **Gestión de Modelos.**
 
 ## 12. Licencia
 
