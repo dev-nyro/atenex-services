@@ -26,7 +26,7 @@ from app.core.config import settings
 from app.db import postgres_client as db_client
 from app.models.domain import DocumentStatus
 from app.api.v1.schemas import IngestResponse, StatusResponse, PaginatedStatusResponse, ErrorDetail
-from app.services.minio_client import MinioClient, MinioError
+from app.services.gcs_client import GCSClient, GCSError
 from app.tasks.celery_app import celery_app
 # Import the specific task instance registered in process_document.py
 # Note: The task name might change if you renamed the function in process_document.py
@@ -44,14 +44,15 @@ router = APIRouter()
 
 # --- Helper Functions ---
 
-# LLM_FLAG: NO_CHANGE - Minio Client Dependency
-def get_minio_client():
-    """Dependency to get Minio client instance."""
+
+# GCS Client Dependency
+def get_gcs_client():
+    """Dependency to get GCS client instance."""
     try:
-        client = MinioClient()
+        client = GCSClient()
         return client
     except Exception as e:
-        log.exception("Failed to initialize MinioClient dependency", error=str(e))
+        log.exception("Failed to initialize GCSClient dependency", error=str(e))
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Storage service configuration error."
@@ -86,42 +87,37 @@ async def get_db_conn():
 
 def _get_milvus_collection_sync() -> Collection:
     """Synchronously connects to Milvus and returns the Collection object."""
-    alias = "api_sync_helper" # Use a different alias for API helpers if desired
+    alias = "api_sync_helper_zilliz"
     sync_milvus_log = log.bind(component="MilvusHelperSync", alias=alias)
 
     # Check if connection exists for this alias
     if alias not in connections.list_connections():
-        sync_milvus_log.info("Connecting to Milvus for sync helper...")
+        sync_milvus_log.info("Connecting to Zilliz Cloud for sync helper...")
         try:
             connections.connect(
                 alias=alias,
-                uri=settings.MILVUS_URI,
-                timeout=settings.MILVUS_GRPC_TIMEOUT
+                uri=settings.ZILLIZ_URI,
+                token=settings.ZILLIZ_API_KEY.get_secret_value(),
+                secure=True
             )
-            sync_milvus_log.info("Milvus connection established for sync helper.")
+            sync_milvus_log.info("Zilliz Cloud connection established for sync helper.")
         except MilvusException as e:
-            sync_milvus_log.error("Failed to connect to Milvus for sync helper", error=str(e))
-            raise RuntimeError(f"Milvus connection failed for API helper: {e}") from e
+            sync_milvus_log.error("Failed to connect to Zilliz Cloud for sync helper", error=str(e))
+            raise RuntimeError(f"Zilliz connection failed for API helper: {e}") from e
     else:
-        sync_milvus_log.debug("Reusing existing Milvus connection for sync helper.")
+        sync_milvus_log.debug("Reusing existing Zilliz connection for sync helper.")
 
     # Get the collection object
     try:
         collection = Collection(name=MILVUS_COLLECTION_NAME, using=alias)
-        # Optional: Check if collection exists if creation isn't guaranteed by worker
-        # if not utility.has_collection(MILVUS_COLLECTION_NAME, using=alias):
-        #     log.error("Milvus collection not found by API helper", collection_name=MILVUS_COLLECTION_NAME)
-        #     raise RuntimeError(f"Collection '{MILVUS_COLLECTION_NAME}' not found.")
-
         # Always load collection into memory (necessary for sync queries)
-        sync_milvus_log.info("Loading Milvus collection for sync helper...")
+        sync_milvus_log.info("Loading Zilliz collection for sync helper...")
         collection.load()
-        sync_milvus_log.info("Milvus collection loaded for sync helper.")
-
+        sync_milvus_log.info("Zilliz collection loaded for sync helper.")
         return collection
     except MilvusException as e:
-        sync_milvus_log.error("Failed to get or load Milvus collection for sync helper", error=str(e))
-        raise RuntimeError(f"Milvus collection access error for API helper: {e}") from e
+        sync_milvus_log.error("Failed to get or load Zilliz collection for sync helper", error=str(e))
+        raise RuntimeError(f"Zilliz collection access error for API helper: {e}") from e
 
 
 def _get_milvus_chunk_count_sync(document_id: str, company_id: str) -> int:
@@ -139,7 +135,7 @@ def _get_milvus_chunk_count_sync(document_id: str, company_id: str) -> int:
             output_fields=["pk_id"]
         )
         count = len(query_res) if query_res else 0
-        count_log.info("Milvus chunk count successful (pymilvus)", count=count)
+        count_log.info("Zilliz chunk count successful (pymilvus)", count=count)
         return count
     except RuntimeError as re: # Catch collection/connection error
         count_log.error("Failed to get Milvus count due to connection/collection error", error=str(re))
@@ -162,7 +158,7 @@ def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
         delete_log.info("Attempting to delete chunks from Milvus (pymilvus)", filter_expr=expr)
 
         delete_result = collection.delete(expr=expr)
-        delete_log.info("Milvus delete operation executed (pymilvus)", deleted_count=delete_result.delete_count)
+        delete_log.info("Zilliz delete operation executed (pymilvus)", deleted_count=delete_result.delete_count)
         # Consider success even if delete_count is 0 (nothing to delete)
         return True
     except RuntimeError as re: # Catch collection/connection error
@@ -203,10 +199,10 @@ async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     metadata_json: Optional[str] = Form(None),
-    minio_client: MinioClient = Depends(get_minio_client),
+    gcs_client: GCSClient = Depends(get_gcs_client),
 ):
     """
-    Receives a document file and optional metadata, saves it to MinIO,
+    Receives a document file and optional metadata, saves it to GCS,
     creates a record in PostgreSQL, and queues a Celery task for processing.
     """
     company_id = request.headers.get("X-Company-ID")
@@ -285,22 +281,22 @@ async def upload_document(
 
     try:
         file_content = await file.read()
-        endpoint_log.info("[INGEST] Preparando subida a MinIO", object_name=file_path_in_storage, filename=normalized_filename, size=len(file_content), content_type=file.content_type)
+        endpoint_log.info("[INGEST] Preparando subida a GCS", object_name=file_path_in_storage, filename=normalized_filename, size=len(file_content), content_type=file.content_type)
         try:
-            await minio_client.upload_file_async(
+            await gcs_client.upload_file_async(
                 object_name=file_path_in_storage, data=file_content, content_type=file.content_type
             )
-            endpoint_log.info("[INGEST] File uploaded successfully to MinIO", object_name=file_path_in_storage)
+            endpoint_log.info("[INGEST] File uploaded successfully to GCS", object_name=file_path_in_storage)
         except Exception as upload_exc:
-            endpoint_log.error("[INGEST] Exception during MinIO upload", object_name=file_path_in_storage, error=str(upload_exc))
+            endpoint_log.error("[INGEST] Exception during GCS upload", object_name=file_path_in_storage, error=str(upload_exc))
             raise
 
-        # --- Validación extra: verificar que el archivo existe en MinIO ---
+        # --- Validación extra: verificar que el archivo existe en GCS ---
         try:
-            file_exists = await minio_client.check_file_exists_async(file_path_in_storage)
-            endpoint_log.info("[INGEST] MinIO existence check after upload", object_name=file_path_in_storage, exists=file_exists)
+            file_exists = await gcs_client.check_file_exists_async(file_path_in_storage)
+            endpoint_log.info("[INGEST] GCS existence check after upload", object_name=file_path_in_storage, exists=file_exists)
         except Exception as check_exc:
-            endpoint_log.error("[INGEST] Exception during MinIO existence check", object_name=file_path_in_storage, error=str(check_exc))
+            endpoint_log.error("[INGEST] Exception during GCS existence check", object_name=file_path_in_storage, error=str(check_exc))
             file_exists = False
 
         if not file_exists:

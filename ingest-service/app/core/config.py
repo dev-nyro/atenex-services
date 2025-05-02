@@ -44,30 +44,28 @@ class Settings(BaseSettings):
     CELERY_BROKER_URL: RedisDsn = Field(default_factory=lambda: RedisDsn(f"redis://{REDIS_K8S_SVC}:{REDIS_K8S_PORT_DEFAULT}/0"))
     CELERY_RESULT_BACKEND: RedisDsn = Field(default_factory=lambda: RedisDsn(f"redis://{REDIS_K8S_SVC}:{REDIS_K8S_PORT_DEFAULT}/1"))
 
-    # --- Database ---
+
+    # --- Database (Cloud SQL) ---
     POSTGRES_USER: str = POSTGRES_K8S_USER_DEFAULT
     POSTGRES_PASSWORD: SecretStr
-    POSTGRES_SERVER: str = POSTGRES_K8S_SVC
-    POSTGRES_PORT: int = POSTGRES_K8S_PORT_DEFAULT
     POSTGRES_DB: str = POSTGRES_K8S_DB_DEFAULT
+    POSTGRES_INSTANCE_CONNECTION_NAME: str = "praxis-study-458413-f4:southamerica-west1:atenex-db"
+    POSTGRES_IP_TYPE: str = "PRIVATE"  # Opcional, default PRIVATE
 
-    # --- Milvus ---
-    MILVUS_URI: str = Field(default=f"http://{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}")
-    MILVUS_COLLECTION_NAME: str = MILVUS_DEFAULT_COLLECTION
+    # --- GCS ---
+    GCS_BUCKET_NAME: str = "atenex"
+
+    # --- Zilliz Cloud (Vector DB) ---
+    ZILLIZ_URI: str = "https://in03-0afab716eb46d7f.serverless.gcp-us-west1.cloud.zilliz.com"
+    ZILLIZ_API_KEY: SecretStr
+    MILVUS_COLLECTION_NAME: str = "atenex-vector-db"
     MILVUS_GRPC_TIMEOUT: int = 10
     MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name"])
     MILVUS_CONTENT_FIELD: str = "content"
     MILVUS_EMBEDDING_FIELD: str = "embedding"
-    MILVUS_CONTENT_FIELD_MAX_LENGTH: int = 20000 # Límite de bytes para el campo de texto en Milvus
+    MILVUS_CONTENT_FIELD_MAX_LENGTH: int = 20000
     MILVUS_INDEX_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_INDEX_PARAMS))
     MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_SEARCH_PARAMS))
-
-    # --- MinIO ---
-    MINIO_ENDPOINT: str = Field(default=f"{MINIO_K8S_SVC}:{MINIO_K8S_PORT_DEFAULT}")
-    MINIO_ACCESS_KEY: SecretStr
-    MINIO_SECRET_KEY: SecretStr
-    MINIO_BUCKET_NAME: str = MINIO_BUCKET_DEFAULT
-    MINIO_USE_SECURE: bool = False
 
     # --- Embeddings (ACTUALIZADO) ---
     EMBEDDING_MODEL_ID: str = Field(default=DEFAULT_EMBEDDING_MODEL_ID)
@@ -117,21 +115,12 @@ class Settings(BaseSettings):
         logging.debug(f"Using EMBEDDING_DIMENSION: {v}")
         return v
 
-    @field_validator('POSTGRES_PASSWORD', 'MINIO_ACCESS_KEY', 'MINIO_SECRET_KEY', mode='before')
+    @field_validator('POSTGRES_PASSWORD', 'ZILLIZ_API_KEY', mode='before')
     @classmethod
     def check_required_secret_value_present(cls, v: Any, info: ValidationInfo) -> Any:
         if v is None or v == "":
-             field_name = info.field_name if info.field_name else "Unknown Secret Field"
-             raise ValueError(f"Required secret field '{field_name}' cannot be empty.")
-        return v
-
-    @field_validator('MILVUS_URI', mode='before')
-    @classmethod
-    def validate_milvus_uri(cls, v: str) -> str:
-        if not v.startswith("http://") and not v.startswith("https://"):
-             if "." not in v:
-                 return f"http://{v}"
-             raise ValueError(f"Invalid MILVUS_URI format: '{v}'. Must start with 'http://' or 'https://' or be a valid service name.")
+            field_name = info.field_name if info.field_name else "Unknown Secret Field"
+            raise ValueError(f"Required secret field '{field_name}' cannot be empty.")
         return v
 
 # --- Instancia Global ---
@@ -144,6 +133,7 @@ if not temp_log.handlers:
     temp_log.setLevel(logging.INFO)
 
 try:
+
     temp_log.info("Loading Ingest Service settings...")
     settings = Settings()
     temp_log.info("--- Ingest Service Settings Loaded ---")
@@ -152,17 +142,16 @@ try:
     temp_log.info(f"  API_V1_STR:               {settings.API_V1_STR}")
     temp_log.info(f"  CELERY_BROKER_URL:        {settings.CELERY_BROKER_URL}")
     temp_log.info(f"  CELERY_RESULT_BACKEND:    {settings.CELERY_RESULT_BACKEND}")
-    temp_log.info(f"  POSTGRES_SERVER:          {settings.POSTGRES_SERVER}:{settings.POSTGRES_PORT}")
+    temp_log.info(f"  POSTGRES_INSTANCE_CONNECTION_NAME: {settings.POSTGRES_INSTANCE_CONNECTION_NAME}")
     temp_log.info(f"  POSTGRES_DB:              {settings.POSTGRES_DB}")
     temp_log.info(f"  POSTGRES_USER:            {settings.POSTGRES_USER}")
     temp_log.info(f"  POSTGRES_PASSWORD:        {'*** SET ***' if settings.POSTGRES_PASSWORD else '!!! NOT SET !!!'}")
-    temp_log.info(f"  MILVUS_URI:               {settings.MILVUS_URI}")
+    temp_log.info(f"  POSTGRES_IP_TYPE:         {settings.POSTGRES_IP_TYPE}")
+    temp_log.info(f"  GCS_BUCKET_NAME:          {settings.GCS_BUCKET_NAME}")
+    temp_log.info(f"  ZILLIZ_URI:               {settings.ZILLIZ_URI}")
+    temp_log.info(f"  ZILLIZ_API_KEY:           {'*** SET ***' if settings.ZILLIZ_API_KEY else '!!! NOT SET !!!'}")
     temp_log.info(f"  MILVUS_COLLECTION_NAME:   {settings.MILVUS_COLLECTION_NAME}")
     temp_log.info(f"  MILVUS_GRPC_TIMEOUT:      {settings.MILVUS_GRPC_TIMEOUT}s")
-    temp_log.info(f"  MINIO_ENDPOINT:           {settings.MINIO_ENDPOINT}")
-    temp_log.info(f"  MINIO_BUCKET_NAME:        {settings.MINIO_BUCKET_NAME}")
-    temp_log.info(f"  MINIO_ACCESS_KEY:         {'*** SET ***' if settings.MINIO_ACCESS_KEY else '!!! NOT SET !!!'}")
-    temp_log.info(f"  MINIO_SECRET_KEY:         {'*** SET ***' if settings.MINIO_SECRET_KEY else '!!! NOT SET !!!'}")
     temp_log.info(f"  EMBEDDING_MODEL_ID:       {settings.EMBEDDING_MODEL_ID}")
     temp_log.info(f"  EMBEDDING_DIMENSION:      {settings.EMBEDDING_DIMENSION}")
     temp_log.info(f"  SUPPORTED_CONTENT_TYPES:  {settings.SUPPORTED_CONTENT_TYPES}")

@@ -1,3 +1,6 @@
+from google.cloud.sql.connector import Connector, IPTypes
+from sqlalchemy.pool import NullPool
+_connector: Optional[Connector] = None
 # ingest-service/app/db/postgres_client.py
 import uuid
 from typing import Any, Optional, Dict, List, Tuple
@@ -27,68 +30,50 @@ _sync_engine_dsn: Optional[str] = None
 # --- Async Pool Management (No changes) ---
 # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - DB Async Pool Management
 async def get_db_pool() -> asyncpg.Pool:
-    global _pool
+    global _pool, _connector
     if _pool is None or _pool._closed:
-        log.info(
-            "Creating PostgreSQL connection pool...",
-            host=settings.POSTGRES_SERVER,
-            port=settings.POSTGRES_PORT,
-            user=settings.POSTGRES_USER,
-            db=settings.POSTGRES_DB
-        )
-        try:
-            def _json_encoder(value):
-                return json.dumps(value)
-
-            def _json_decoder(value):
-                return json.loads(value)
-
-            async def init_connection(conn):
-                await conn.set_type_codec(
-                    'jsonb',
-                    encoder=_json_encoder,
-                    decoder=_json_decoder,
-                    schema='pg_catalog',
-                    format='text'
-                )
-                await conn.set_type_codec(
-                    'json',
-                    encoder=_json_encoder,
-                    decoder=_json_decoder,
-                    schema='pg_catalog',
-                    format='text'
-                )
-
-            _pool = await asyncpg.create_pool(
+        log.info("Creating PostgreSQL connection pool using Cloud SQL Python Connector...", instance=settings.POSTGRES_INSTANCE_CONNECTION_NAME)
+        if _connector is None:
+            _connector = Connector()
+        def getconn():
+            return _connector.connect(
+                settings.POSTGRES_INSTANCE_CONNECTION_NAME,
+                "asyncpg",
                 user=settings.POSTGRES_USER,
                 password=settings.POSTGRES_PASSWORD.get_secret_value(),
-                database=settings.POSTGRES_DB,
-                host=settings.POSTGRES_SERVER,
-                port=settings.POSTGRES_PORT,
-                min_size=2,
-                max_size=10,
-                timeout=30.0,
-                command_timeout=60.0,
-                init=init_connection,
-                statement_cache_size=0
+                db=settings.POSTGRES_DB,
+                ip_type=IPTypes.PRIVATE if settings.POSTGRES_IP_TYPE.upper() == "PRIVATE" else IPTypes.PUBLIC
             )
-            log.info("PostgreSQL async connection pool created successfully.")
-        except (asyncpg.exceptions.InvalidPasswordError, OSError, ConnectionRefusedError) as conn_err:
-            log.critical(
-                "CRITICAL: Failed to connect to PostgreSQL (async pool)",
-                error=str(conn_err),
-                exc_info=True
+        def _json_encoder(value):
+            return json.dumps(value)
+        def _json_decoder(value):
+            return json.loads(value)
+        async def init_connection(conn):
+            await conn.set_type_codec(
+                'jsonb',
+                encoder=_json_encoder,
+                decoder=_json_decoder,
+                schema='pg_catalog',
+                format='text'
             )
-            _pool = None
-            raise ConnectionError(f"Failed to connect to PostgreSQL (async pool): {conn_err}") from conn_err
-        except Exception as e:
-            log.critical(
-                "CRITICAL: Failed to create PostgreSQL async connection pool",
-                error=str(e),
-                exc_info=True
+            await conn.set_type_codec(
+                'json',
+                encoder=_json_encoder,
+                decoder=_json_decoder,
+                schema='pg_catalog',
+                format='text'
             )
-            _pool = None
-            raise RuntimeError(f"Failed to create PostgreSQL async pool: {e}") from e
+        _pool = await asyncpg.create_pool(
+            min_size=2,
+            max_size=10,
+            timeout=30.0,
+            command_timeout=60.0,
+            init=init_connection,
+            statement_cache_size=0,
+            connection_class=None,
+            connection_factory=getconn
+        )
+        log.info("PostgreSQL async connection pool created successfully (Cloud SQL Connector).")
     return _pool
 
 async def close_db_pool():
@@ -125,54 +110,56 @@ def get_sync_engine() -> Engine:
     Caches the engine globally per process.
     Requires `sqlalchemy` and `psycopg2-binary` to be installed.
     """
-    global _sync_engine, _sync_engine_dsn
+    global _sync_engine, _connector
     sync_log = log.bind(component="SyncEngine")
-
-    # Construct DSN only once or if settings changed (not really possible here, but good practice)
-    if not _sync_engine_dsn:
-         _sync_engine_dsn = f"postgresql+psycopg2://{settings.POSTGRES_USER}:{settings.POSTGRES_PASSWORD.get_secret_value()}@{settings.POSTGRES_SERVER}:{settings.POSTGRES_PORT}/{settings.POSTGRES_DB}"
-
+    if _connector is None:
+        _connector = Connector()
+    def getconn():
+        return _connector.connect(
+            settings.POSTGRES_INSTANCE_CONNECTION_NAME,
+            "pg8000",
+            user=settings.POSTGRES_USER,
+            password=settings.POSTGRES_PASSWORD.get_secret_value(),
+            db=settings.POSTGRES_DB,
+            ip_type=IPTypes.PRIVATE if settings.POSTGRES_IP_TYPE.upper() == "PRIVATE" else IPTypes.PUBLIC
+        )
     if _sync_engine is None:
-        sync_log.info("Creating SQLAlchemy synchronous engine...")
+        sync_log.info("Creating SQLAlchemy synchronous engine using Cloud SQL Connector...")
         try:
-            # Example pool settings for sync engine (adjust based on worker concurrency)
-            # `pool_size` should ideally match or be slightly larger than Celery worker concurrency (`-c`)
-            # `max_overflow` allows temporary extra connections under load.
             _sync_engine = create_engine(
-                _sync_engine_dsn,
-                pool_size=5, # Example: Start with slightly more than worker -c 4
-                max_overflow=5,
-                pool_timeout=30, # Seconds to wait for a connection from the pool
-                pool_recycle=1800 # Recycle connections older than 30 mins
-                # Add connect_args for SSL if needed: connect_args={'sslmode': 'require'}
+                "postgresql+pg8000://",
+                creator=getconn,
+                poolclass=NullPool
             )
-            # Optional: Test connection on creation
             with _sync_engine.connect() as conn_test:
                 conn_test.execute(text("SELECT 1"))
-            sync_log.info("SQLAlchemy synchronous engine created and tested successfully.")
+            sync_log.info("SQLAlchemy synchronous engine created and tested successfully (Cloud SQL Connector).")
         except ImportError as ie:
-            sync_log.critical("SQLAlchemy or psycopg2 not installed! Cannot create sync engine.", error=str(ie))
-            raise RuntimeError("Missing SQLAlchemy/psycopg2 dependency") from ie
+            sync_log.critical("SQLAlchemy or pg8000 not installed! Cannot create sync engine.", error=str(ie))
+            raise RuntimeError("Missing SQLAlchemy/pg8000 dependency") from ie
         except SQLAlchemyError as sa_err:
             sync_log.critical("Failed to create or connect SQLAlchemy synchronous engine", error=str(sa_err), exc_info=True)
-            _sync_engine = None # Ensure it's None on failure
+            _sync_engine = None
             raise ConnectionError(f"Failed to connect sync engine: {sa_err}") from sa_err
         except Exception as e:
-             sync_log.critical("Unexpected error creating SQLAlchemy synchronous engine", error=str(e), exc_info=True)
-             _sync_engine = None
-             raise RuntimeError(f"Unexpected error creating sync engine: {e}") from e
-
+            sync_log.critical("Unexpected error creating SQLAlchemy synchronous engine", error=str(e), exc_info=True)
+            _sync_engine = None
+            raise RuntimeError(f"Unexpected error creating sync engine: {e}") from e
     return _sync_engine
 
 def dispose_sync_engine():
     """Disposes of the synchronous engine pool."""
-    global _sync_engine
+    global _sync_engine, _connector
     sync_log = log.bind(component="SyncEngine")
     if _sync_engine:
         sync_log.info("Disposing SQLAlchemy synchronous engine pool...")
         _sync_engine.dispose()
         _sync_engine = None
         sync_log.info("SQLAlchemy synchronous engine pool disposed.")
+    if _connector:
+        _connector.close()
+        _connector = None
+        sync_log.info("Cloud SQL connector closed.")
 # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - DB Sync Engine Management
 
 

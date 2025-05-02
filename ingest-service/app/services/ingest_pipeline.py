@@ -56,61 +56,61 @@ _milvus_connected = False
 
 def _ensure_milvus_connection_and_collection() -> Collection:
     global _milvus_collection, _milvus_connected
-    alias = "pipeline_worker"
+    alias = "pipeline_worker_zilliz"
     if not _milvus_connected or alias not in connections.list_connections():
-        uri = settings.MILVUS_URI
-        log.info("Connecting to Milvus for pipeline worker...", uri=uri, alias=alias, timeout=settings.MILVUS_GRPC_TIMEOUT)
+        uri = settings.ZILLIZ_URI
+        token = settings.ZILLIZ_API_KEY.get_secret_value()
+        log.info("Connecting to Zilliz Cloud for pipeline worker...", uri=uri, alias=alias)
         try:
-            connections.connect(alias=alias, uri=uri, timeout=settings.MILVUS_GRPC_TIMEOUT)
+            connections.connect(alias=alias, uri=uri, token=token, secure=True)
             _milvus_connected = True
-            log.info("Connected to Milvus for pipeline worker.")
+            log.info("Connected to Zilliz Cloud for pipeline worker.")
         except MilvusException as e:
-            log.error("Failed to connect to Milvus for pipeline worker.", error=str(e))
+            log.error("Failed to connect to Zilliz Cloud for pipeline worker.", error=str(e))
             _milvus_connected = False
-            raise ConnectionError(f"Milvus connection failed: {e}") from e
+            raise ConnectionError(f"Zilliz connection failed: {e}") from e
         except Exception as e:
-            log.error("Unexpected error connecting to Milvus for pipeline worker.", error=str(e))
+            log.error("Unexpected error connecting to Zilliz Cloud for pipeline worker.", error=str(e))
             _milvus_connected = False
-            raise ConnectionError(f"Unexpected Milvus connection error: {e}") from e
+            raise ConnectionError(f"Unexpected Zilliz connection error: {e}") from e
 
     if _milvus_collection is None:
         if not utility.has_collection(MILVUS_COLLECTION_NAME, using=alias):
-            log.warning(f"Milvus collection '{MILVUS_COLLECTION_NAME}' not found. Attempting to create.")
+            log.warning(f"Zilliz collection '{MILVUS_COLLECTION_NAME}' not found. Attempting to create.")
             try:
                 collection = _create_milvus_collection(alias)
             except Exception as create_e:
-                log.critical("Failed to create Milvus collection", error=str(create_e), exc_info=True)
-                raise RuntimeError(f"Milvus collection creation failed: {create_e}") from create_e
+                log.critical("Failed to create Zilliz collection", error=str(create_e), exc_info=True)
+                raise RuntimeError(f"Zilliz collection creation failed: {create_e}") from create_e
         else:
             collection = Collection(name=MILVUS_COLLECTION_NAME, using=alias)
-            log.debug(f"Using existing Milvus collection '{MILVUS_COLLECTION_NAME}'.")
+            log.debug(f"Using existing Zilliz collection '{MILVUS_COLLECTION_NAME}'.")
             try:
-                 if not any(idx.field_name == MILVUS_VECTOR_FIELD for idx in collection.indexes):
-                     log.warning(f"Vector index missing on field '{MILVUS_VECTOR_FIELD}'. Creating...")
-                     collection.create_index(field_name=MILVUS_VECTOR_FIELD, index_params=settings.MILVUS_INDEX_PARAMS)
-                     log.info(f"Vector index created for '{MILVUS_VECTOR_FIELD}'.")
+                if not any(idx.field_name == MILVUS_VECTOR_FIELD for idx in collection.indexes):
+                    log.warning(f"Vector index missing on field '{MILVUS_VECTOR_FIELD}'. Creating...")
+                    collection.create_index(field_name=MILVUS_VECTOR_FIELD, index_params=settings.MILVUS_INDEX_PARAMS)
+                    log.info(f"Vector index created for '{MILVUS_VECTOR_FIELD}'.")
             except Exception as idx_e:
-                 log.error("Failed to check or create index on existing collection", error=str(idx_e))
+                log.error("Failed to check or create index on existing collection", error=str(idx_e))
 
         try:
-            log.info("Loading Milvus collection into memory...", collection_name=collection.name)
+            log.info("Loading Zilliz collection into memory...", collection_name=collection.name)
             collection.load()
-            log.info("Milvus collection loaded into memory.")
+            log.info("Zilliz collection loaded into memory.")
         except MilvusException as load_e:
-            log.error("Failed to load Milvus collection into memory", error=str(load_e))
-            raise RuntimeError(f"Milvus collection load failed: {load_e}") from load_e
+            log.error("Failed to load Zilliz collection into memory", error=str(load_e))
+            raise RuntimeError(f"Zilliz collection load failed: {load_e}") from load_e
 
         _milvus_collection = collection
 
-    # LLM_FLAG: Sanity check return type
     if not isinstance(_milvus_collection, Collection):
-        log.critical("Milvus collection object is unexpectedly None or invalid type after initialization attempt.")
-        raise RuntimeError("Failed to obtain a valid Milvus collection object.")
+        log.critical("Zilliz collection object is unexpectedly None or invalid type after initialization attempt.")
+        raise RuntimeError("Failed to obtain a valid Zilliz collection object.")
 
     return _milvus_collection
 
 def _create_milvus_collection(alias: str) -> Collection:
-    log.info(f"Defining schema for collection '{MILVUS_COLLECTION_NAME}' with dim={MILVUS_EMBEDDING_DIM}")
+    log.info(f"Defining schema for collection '{settings.MILVUS_COLLECTION_NAME}' with dim={MILVUS_EMBEDDING_DIM}")
     fields = [
         FieldSchema(name=MILVUS_PK_FIELD, dtype=DataType.INT64, is_primary=True, auto_id=True),
         FieldSchema(name=MILVUS_VECTOR_FIELD, dtype=DataType.FLOAT_VECTOR, dim=MILVUS_EMBEDDING_DIM),
@@ -120,10 +120,10 @@ def _create_milvus_collection(alias: str) -> Collection:
         FieldSchema(name=MILVUS_FILENAME_FIELD, dtype=DataType.VARCHAR, max_length=512),
     ]
     schema = CollectionSchema(fields, description="Document Chunks for Atenex RAG (SentenceTransformer)")
-    log.info(f"Creating collection '{MILVUS_COLLECTION_NAME}'...")
+    log.info(f"Creating collection '{settings.MILVUS_COLLECTION_NAME}'...")
     try:
-        collection = Collection(name=MILVUS_COLLECTION_NAME, schema=schema, using=alias, consistency_level="Strong")
-        log.info(f"Collection '{MILVUS_COLLECTION_NAME}' created. Creating indexes...")
+        collection = Collection(name=settings.MILVUS_COLLECTION_NAME, schema=schema, using=alias, consistency_level="Strong")
+        log.info(f"Collection '{settings.MILVUS_COLLECTION_NAME}' created. Creating indexes...")
 
         index_params = settings.MILVUS_INDEX_PARAMS
         log.info("Creating index for vector field", field_name=MILVUS_VECTOR_FIELD, index_params=index_params)
@@ -137,8 +137,8 @@ def _create_milvus_collection(alias: str) -> Collection:
         log.info("All indexes created successfully.")
         return collection
     except MilvusException as e:
-        log.error("Failed to create Milvus collection or index", collection_name=MILVUS_COLLECTION_NAME, error=str(e), exc_info=True)
-        raise RuntimeError(f"Milvus collection/index creation failed: {e}") from e
+        log.error("Failed to create Zilliz collection or index", collection_name=settings.MILVUS_COLLECTION_NAME, error=str(e), exc_info=True)
+        raise RuntimeError(f"Zilliz collection/index creation failed: {e}") from e
 
 def delete_milvus_chunks(company_id: str, document_id: str) -> int:
     del_log = log.bind(company_id=company_id, document_id=document_id)
@@ -151,13 +151,13 @@ def delete_milvus_chunks(company_id: str, document_id: str) -> int:
         num_to_delete = len(pk_results)
 
         if num_to_delete == 0:
-            del_log.info("No existing chunks found in Milvus to delete.")
+            del_log.info("No existing chunks found in Zilliz to delete.")
             return 0
 
-        del_log.info(f"Attempting to delete {num_to_delete} chunks from Milvus using expression.")
+        del_log.info(f"Attempting to delete {num_to_delete} chunks from Zilliz using expression.")
         delete_result = collection.delete(expr=expr)
         actual_deleted_count = delete_result.delete_count
-        del_log.info("Milvus delete operation executed", deleted_count=actual_deleted_count)
+        del_log.info("Zilliz delete operation executed", deleted_count=actual_deleted_count)
 
         if actual_deleted_count != num_to_delete:
             del_log.warning("Mismatch between expected chunks to delete and actual deleted count",
@@ -165,11 +165,11 @@ def delete_milvus_chunks(company_id: str, document_id: str) -> int:
 
         return actual_deleted_count
     except MilvusException as e:
-        del_log.error("Milvus delete error", error=str(e), exc_info=True)
+        del_log.error("Zilliz delete error", error=str(e), exc_info=True)
         return 0
     except Exception as e:
-        del_log.exception("Unexpected error during Milvus chunk deletion")
-        raise RuntimeError(f"Unexpected Milvus deletion error: {e}") from e
+        del_log.exception("Unexpected error during Zilliz chunk deletion")
+        raise RuntimeError(f"Unexpected Zilliz deletion error: {e}") from e
 
 
 # --- REFACTORIZADO: Main Ingestion Pipeline Function ---

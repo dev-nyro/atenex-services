@@ -18,7 +18,10 @@ asyncpg = "^0.29.0" # Keep for API
 tenacity = "^8.2.3"
 python-multipart = "^0.0.9"
 structlog = "^24.1.0"
-minio = "^7.1.17"
+
+google-cloud-storage = "^2.16.0"
+cloud-sql-python-connector = {extras = ["asyncpg", "psycopg2"], version = "^1.5.0"}
+google-auth = "^2.29.0"
 
 # --- ONNX Runtime ---
 onnxruntime = "^1.18.0"
