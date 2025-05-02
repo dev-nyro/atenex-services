@@ -12,7 +12,7 @@ import json
 
 # --- Service Names en K8s ---
 POSTGRES_K8S_SVC = "postgresql-service.nyro-develop.svc.cluster.local"
-MINIO_K8S_SVC = "minio-service.nyro-develop.svc.cluster.local"
+# MINIO_K8S_SVC = "minio-service.nyro-develop.svc.cluster.local" # REMOVED
 MILVUS_K8S_SVC = "milvus-standalone.nyro-develop.svc.cluster.local"
 REDIS_K8S_SVC = "redis-service-master.nyro-develop.svc.cluster.local"
 
@@ -20,14 +20,14 @@ REDIS_K8S_SVC = "redis-service-master.nyro-develop.svc.cluster.local"
 POSTGRES_K8S_PORT_DEFAULT = 5432
 POSTGRES_K8S_DB_DEFAULT = "atenex"
 POSTGRES_K8S_USER_DEFAULT = "postgres"
-MINIO_K8S_PORT_DEFAULT = 9000
-MINIO_BUCKET_DEFAULT = "ingested-documents"
+# MINIO_K8S_PORT_DEFAULT = 9000 # REMOVED
+# MINIO_BUCKET_DEFAULT = "ingested-documents" # REMOVED
 MILVUS_K8S_PORT_DEFAULT = 19530
-MILVUS_DEFAULT_COLLECTION = "document_chunks_minilm" # Cambiado nombre default
+MILVUS_DEFAULT_COLLECTION = "document_chunks_minilm"
 MILVUS_DEFAULT_INDEX_PARAMS = '{"metric_type": "IP", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}}'
 MILVUS_DEFAULT_SEARCH_PARAMS = '{"metric_type": "IP", "params": {"ef": 128}}'
 DEFAULT_EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
-DEFAULT_EMBEDDING_DIM = 384 # <- Actualizado para MiniLM
+DEFAULT_EMBEDDING_DIM = 384
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -62,21 +62,20 @@ class Settings(BaseSettings):
     MILVUS_INDEX_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_INDEX_PARAMS))
     MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_SEARCH_PARAMS))
 
-    # --- MinIO ---
-    MINIO_ENDPOINT: str = Field(default=f"{MINIO_K8S_SVC}:{MINIO_K8S_PORT_DEFAULT}")
-    MINIO_ACCESS_KEY: SecretStr
-    MINIO_SECRET_KEY: SecretStr
-    MINIO_BUCKET_NAME: str = MINIO_BUCKET_DEFAULT
-    MINIO_USE_SECURE: bool = False
+    # --- MinIO (REMOVED) ---
+    # MINIO_ENDPOINT: str = Field(default=f"{MINIO_K8S_SVC}:{MINIO_K8S_PORT_DEFAULT}")
+    # MINIO_ACCESS_KEY: SecretStr
+    # MINIO_SECRET_KEY: SecretStr
+    # MINIO_BUCKET_NAME: str = MINIO_BUCKET_DEFAULT
+    # MINIO_USE_SECURE: bool = False
+
+    # --- Google Cloud Storage (GCS) ---
+    GCS_BUCKET_NAME: str = Field(default="atenex", description="Name of the Google Cloud Storage bucket for storing original files.")
+    # GOOGLE_APPLICATION_CREDENTIALS environment variable should be set in the deployment environment
 
     # --- Embeddings (ACTUALIZADO) ---
     EMBEDDING_MODEL_ID: str = Field(default=DEFAULT_EMBEDDING_MODEL_ID)
     EMBEDDING_DIMENSION: int = Field(default=DEFAULT_EMBEDDING_DIM)
-    # OPENAI_API_KEY: Optional[SecretStr] = None # Opcional, no usado en ingesta
-
-    # --- ELIMINADO ---
-    # FASTEMBED_MODEL: str = ...
-    # USE_GPU: bool = False
 
     # --- Clients ---
     HTTP_CLIENT_TIMEOUT: int = 60
@@ -94,7 +93,6 @@ class Settings(BaseSettings):
     ])
     SPLITTER_CHUNK_SIZE: int = Field(default=1000)
     SPLITTER_CHUNK_OVERLAP: int = Field(default=200)
-    # SPLITTER_SPLIT_BY: str = "word" # No relevante para el splitter actual
 
     # --- Validators ---
     @field_validator("LOG_LEVEL")
@@ -117,7 +115,8 @@ class Settings(BaseSettings):
         logging.debug(f"Using EMBEDDING_DIMENSION: {v}")
         return v
 
-    @field_validator('POSTGRES_PASSWORD', 'MINIO_ACCESS_KEY', 'MINIO_SECRET_KEY', mode='before')
+    # @field_validator('POSTGRES_PASSWORD', 'MINIO_ACCESS_KEY', 'MINIO_SECRET_KEY', mode='before') # MODIFIED VALIDATOR
+    @field_validator('POSTGRES_PASSWORD', mode='before')
     @classmethod
     def check_required_secret_value_present(cls, v: Any, info: ValidationInfo) -> Any:
         if v is None or v == "":
@@ -129,7 +128,7 @@ class Settings(BaseSettings):
     @classmethod
     def validate_milvus_uri(cls, v: str) -> str:
         if not v.startswith("http://") and not v.startswith("https://"):
-             if "." not in v:
+             if "." not in v: # Assume k8s service name
                  return f"http://{v}"
              raise ValueError(f"Invalid MILVUS_URI format: '{v}'. Must start with 'http://' or 'https://' or be a valid service name.")
         return v
@@ -159,10 +158,14 @@ try:
     temp_log.info(f"  MILVUS_URI:               {settings.MILVUS_URI}")
     temp_log.info(f"  MILVUS_COLLECTION_NAME:   {settings.MILVUS_COLLECTION_NAME}")
     temp_log.info(f"  MILVUS_GRPC_TIMEOUT:      {settings.MILVUS_GRPC_TIMEOUT}s")
-    temp_log.info(f"  MINIO_ENDPOINT:           {settings.MINIO_ENDPOINT}")
-    temp_log.info(f"  MINIO_BUCKET_NAME:        {settings.MINIO_BUCKET_NAME}")
-    temp_log.info(f"  MINIO_ACCESS_KEY:         {'*** SET ***' if settings.MINIO_ACCESS_KEY else '!!! NOT SET !!!'}")
-    temp_log.info(f"  MINIO_SECRET_KEY:         {'*** SET ***' if settings.MINIO_SECRET_KEY else '!!! NOT SET !!!'}")
+    # --- REMOVED MINIO LOGS ---
+    # temp_log.info(f"  MINIO_ENDPOINT:           {settings.MINIO_ENDPOINT}")
+    # temp_log.info(f"  MINIO_BUCKET_NAME:        {settings.MINIO_BUCKET_NAME}")
+    # temp_log.info(f"  MINIO_ACCESS_KEY:         {'*** SET ***' if settings.MINIO_ACCESS_KEY else '!!! NOT SET !!!'}")
+    # temp_log.info(f"  MINIO_SECRET_KEY:         {'*** SET ***' if settings.MINIO_SECRET_KEY else '!!! NOT SET !!!'}")
+    # temp_log.info(f"  MINIO_USE_SECURE:         {settings.MINIO_USE_SECURE}")
+    # --- ADDED GCS LOG ---
+    temp_log.info(f"  GCS_BUCKET_NAME:          {settings.GCS_BUCKET_NAME}")
     temp_log.info(f"  EMBEDDING_MODEL_ID:       {settings.EMBEDDING_MODEL_ID}")
     temp_log.info(f"  EMBEDDING_DIMENSION:      {settings.EMBEDDING_DIMENSION}")
     temp_log.info(f"  SUPPORTED_CONTENT_TYPES:  {settings.SUPPORTED_CONTENT_TYPES}")

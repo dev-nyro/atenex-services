@@ -2,9 +2,9 @@
 
 ## 1. Visión General
 
-El **Ingest Service** es un microservicio clave dentro de la plataforma Atenex. Su responsabilidad principal es recibir documentos subidos por los usuarios (PDF, DOCX, TXT, HTML, MD), procesarlos de manera asíncrona utilizando un **pipeline personalizado** (que ya **NO** utiliza Haystack), almacenar los archivos originales en **MinIO** y finalmente indexar el contenido procesado en bases de datos (**PostgreSQL** para metadatos y **Milvus** para vectores) para su uso posterior en búsquedas semánticas y generación de respuestas por LLMs.
+El **Ingest Service** es un microservicio clave dentro de la plataforma Atenex. Su responsabilidad principal es recibir documentos subidos por los usuarios (PDF, DOCX, TXT, HTML, MD), procesarlos de manera asíncrona utilizando un **pipeline personalizado** (que ya **NO** utiliza Haystack), almacenar los archivos originales en **Google Cloud Storage (GCS)** (bucket `atenex`) y finalmente indexar el contenido procesado en bases de datos (**PostgreSQL** para metadatos y **Milvus** para vectores) para su uso posterior en búsquedas semánticas y generación de respuestas por LLMs.
 
-Este servicio ha sido **refactorizado** para eliminar la dependencia de Haystack AI, utilizando en su lugar librerías independientes como **FastEmbed** para la generación de embeddings (ejecutados localmente en CPU por defecto), **Pymilvus** para la interacción directa con Milvus, y convertidores de documentos standalone (`pypdf`, `python-docx`, etc.). El worker de Celery ahora opera de forma **síncrona** para las operaciones de base de datos (usando SQLAlchemy) y MinIO.
+Este servicio ha sido **refactorizado** para eliminar la dependencia de Haystack AI, utilizando en su lugar librerías independientes como **FastEmbed** para la generación de embeddings (ejecutados localmente en CPU por defecto), **Pymilvus** para la interacción directa con Milvus, y convertidores de documentos standalone (`pypdf`, `python-docx`, etc.). El worker de Celery ahora opera de forma **síncrona** para las operaciones de base de datos (usando SQLAlchemy) y GCS.
 
 **Flujo principal:**
 

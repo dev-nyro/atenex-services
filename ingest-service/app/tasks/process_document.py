@@ -23,7 +23,7 @@ from app.services.embedder import get_embedding_model # Function to load/cache m
 from app.core.config import settings
 from app.db.postgres_client import get_sync_engine, set_status_sync
 from app.models.domain import DocumentStatus
-from app.services.minio_client import MinioClient, MinioError
+from app.services.gcs_client import GCSClient, GCSClientError
 # LLM_FLAG: Import REFACTORIZADO pipeline and EXTRACTORS map
 from app.services.ingest_pipeline import ingest_document_pipeline, EXTRACTORS, EXTRACTION_ERRORS
 from app.tasks.celery_app import celery_app
@@ -33,14 +33,14 @@ IS_WORKER = "worker" in sys.argv
 
 # --- Global Resources for Worker Process ---
 sync_engine: Optional[Engine] = None
-minio_client: Optional[MinioClient] = None
+gcs_client: Optional[GCSClient] = None
 # LLM_FLAG: Variable to hold the loaded embedding model per worker process
 worker_embedding_model: Optional[SentenceTransformer] = None
 
 # LLM_FLAG: Initialize resources at worker startup
 @worker_process_init.connect(weak=False)
 def init_worker_resources(**kwargs):
-    global sync_engine, minio_client, worker_embedding_model
+    global sync_engine, gcs_client, worker_embedding_model
     log = task_struct_log.bind(signal="worker_process_init")
     log.info("Worker process initializing resources...")
     try:
@@ -50,11 +50,12 @@ def init_worker_resources(**kwargs):
         else:
              log.info("Synchronous DB engine already initialized.")
 
-        if minio_client is None:
-            minio_client = MinioClient()
-            log.info("MinIO client initialized.")
+
+        if gcs_client is None:
+            gcs_client = GCSClient()
+            log.info("GCS client initialized.")
         else:
-            log.info("MinIO client already initialized.")
+            log.info("GCS client already initialized.")
 
         if worker_embedding_model is None:
             log.info("Preloading embedding model...")
@@ -67,7 +68,7 @@ def init_worker_resources(**kwargs):
         log.critical("CRITICAL FAILURE during worker resource initialization!", error=str(e), exc_info=True)
         # Set to None so pre-checks in task will fail cleanly
         sync_engine = None
-        minio_client = None
+        gcs_client = None
         worker_embedding_model = None
 
 # --------------------------------------------------------------------------
@@ -126,15 +127,15 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
              try: set_status_sync(engine=sync_engine, document_id=doc_uuid_err, status=DocumentStatus.ERROR, error_message=error_msg)
              except Exception as db_err: log.critical("Failed to update status after embedding model check failure!", error=str(db_err))
          raise Reject(error_msg, requeue=False)
-    if not minio_client:
-         log.critical("Worker MinIO Client is not initialized. Task cannot proceed.")
-         error_msg = "Worker MinIO client init failed."
+    if not gcs_client:
+         log.critical("Worker GCS Client is not initialized. Task cannot proceed.")
+         error_msg = "Worker GCS client init failed."
          doc_uuid_err = None
          try: doc_uuid_err = uuid.UUID(document_id_str)
          except ValueError: pass
          if doc_uuid_err:
               try: set_status_sync(engine=sync_engine, document_id=doc_uuid_err, status=DocumentStatus.ERROR, error_message=error_msg)
-              except Exception as db_err: log.critical("Failed to update status after MinIO client check failure!", error=str(db_err))
+              except Exception as db_err: log.critical("Failed to update status after GCS client check failure!", error=str(db_err))
          raise Reject(error_msg, requeue=False)
 
     try:
@@ -171,30 +172,30 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_dir_path = pathlib.Path(temp_dir)
             temp_file_path_obj = temp_dir_path / normalized_filename
-            log.info(f"Downloading MinIO object: {object_name} -> {str(temp_file_path_obj)}")
+            log.info(f"Downloading GCS object: {object_name} -> {str(temp_file_path_obj)}")
 
-            max_minio_retries = 3 # Adjusted retries for download
-            minio_delay = 2
-            for attempt_num in range(1, max_minio_retries + 1):
+            max_gcs_retries = 3 # Adjusted retries for download
+            gcs_delay = 2
+            for attempt_num in range(1, max_gcs_retries + 1):
                 try:
-                    minio_client.download_file_sync(object_name, str(temp_file_path_obj))
-                    log.info("File downloaded successfully from MinIO.")
+                    gcs_client.download_file_sync(object_name, str(temp_file_path_obj))
+                    log.info("File downloaded successfully from GCS.")
                     # Read file into bytes immediately after download
                     log.debug(f"Reading downloaded file into bytes: {str(temp_file_path_obj)}")
                     file_bytes = temp_file_path_obj.read_bytes()
                     log.info(f"File content read into memory ({len(file_bytes)} bytes).")
                     break # Exit retry loop on success
-                except MinioError as me:
-                    if "NoSuchKey" in str(me) or "Object not found" in str(me):
-                        log.warning(f"MinIO NoSuchKey on download attempt {attempt_num}/{max_minio_retries}. Retrying in {minio_delay}s...", error=str(me))
-                        if attempt_num == max_minio_retries:
-                            log.error(f"File still not found in MinIO after {max_minio_retries} attempts. Aborting.")
-                            raise # Re-raise the final MinioError
-                        time.sleep(minio_delay)
-                        minio_delay *= 2
+                except GCSClientError as gce:
+                    if "Object not found" in str(gce):
+                        log.warning(f"GCS object not found on download attempt {attempt_num}/{max_gcs_retries}. Retrying in {gcs_delay}s...", error=str(gce))
+                        if attempt_num == max_gcs_retries:
+                            log.error(f"File still not found in GCS after {max_gcs_retries} attempts. Aborting.")
+                            raise # Re-raise the final GCSClientError
+                        time.sleep(gcs_delay)
+                        gcs_delay *= 2
                     else:
-                        log.error("Non-retriable MinIO error during download", error=str(me))
-                        raise # Re-raise other Minio errors
+                        log.error("Non-retriable GCS error during download", error=str(gce))
+                        raise # Re-raise other GCS errors
                 except Exception as read_err:
                     log.error("Failed to read downloaded file into bytes", error=str(read_err), exc_info=True)
                     raise RuntimeError(f"Failed to read temp file: {read_err}") from read_err
@@ -231,15 +232,15 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
         return {"status": DocumentStatus.PROCESSED.value, "chunks_inserted": inserted_chunk_count, "document_id": document_id_str}
 
     # --- Error Handling ---
-    except MinioError as me:
-        log.error(f"MinIO Error during processing", error=str(me), exc_info=True)
-        error_msg = f"MinIO Error: {str(me)[:400]}"
+    except GCSClientError as gce:
+        log.error(f"GCS Error during processing", error=str(gce), exc_info=True)
+        error_msg = f"GCS Error: {str(gce)[:400]}"
         try: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg)
-        except Exception as db_err: log.critical("Failed to update status after MinIO failure!", error=str(db_err))
-        if "Object not found" in str(me):
-            raise Reject(f"MinIO Error: Object not found: {object_name}", requeue=False) from me
+        except Exception as db_err: log.critical("Failed to update status after GCS failure!", error=str(db_err))
+        if "Object not found" in str(gce):
+            raise Reject(f"GCS Error: Object not found: {object_name}", requeue=False) from gce
         else:
-            raise me # Allow retry for other potential MinIO errors
+            raise gce # Allow retry for other potential GCS errors
 
     except (*EXTRACTION_ERRORS, ValueError, RuntimeError, TypeError) as pipeline_err:
          # Catches extraction errors, embedding errors, chunking errors, Milvus errors, etc.

@@ -34,9 +34,7 @@ class StatusResponse(BaseModel):
     company_id: Optional[uuid.UUID] = None
     file_name: str
     file_type: str
-    # --- RENAMED FIELD: file_path ---
-    file_path: Optional[str] = None
-    # --------------------------------
+    file_path: Optional[str] = Field(None, description="Path to the original file in GCS.")
     metadata: Optional[Dict[str, Any]] = None
     status: str
     chunk_count: Optional[int] = 0
@@ -44,8 +42,11 @@ class StatusResponse(BaseModel):
     uploaded_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
-    minio_exists: Optional[bool] = None
-    milvus_chunk_count: Optional[int] = None
+    # --- RENAMED FIELD: gcs_exists ---
+    gcs_exists: Optional[bool] = Field(None, description="Indicates if the original file currently exists in GCS.")
+    # --- REMOVED minio_exists ---
+    # minio_exists: Optional[bool] = None
+    milvus_chunk_count: Optional[int] = Field(None, description="Live count of chunks found in Milvus for this document (-1 if check failed).")
     message: Optional[str] = None
 
     @field_validator('metadata', mode='before')
@@ -62,7 +63,7 @@ class StatusResponse(BaseModel):
     class Config:
         validate_assignment = True
         populate_by_name = True
-        # --- UPDATED EXAMPLE: Use file_path ---
+        # --- UPDATED EXAMPLE: Use file_path and gcs_exists ---
         json_schema_extra = {
              "example": {
                 "id": "52ad2ba8-cab9-4108-a504-b9822fe99bdc",
@@ -76,7 +77,7 @@ class StatusResponse(BaseModel):
                 "error_message": "Processing timed out after 600 seconds.",
                 "uploaded_at": "2025-04-19T19:42:38.671016Z",
                 "updated_at": "2025-04-19T19:42:42.337854Z",
-                "minio_exists": True,
+                "gcs_exists": True, # Updated field name
                 "milvus_chunk_count": 0,
                 "message": "El procesamiento falló: Timeout."
             }
@@ -99,16 +100,14 @@ class PaginatedStatusResponse(BaseModel):
                         "company_id": "51a66c8f-f6b1-43bd-8038-8768471a8b09",
                         "file_name": "Anexo-00-Modificaciones-de-la-Guia-5.1.0.pdf",
                         "file_type": "application/pdf",
-                        # --- UPDATED EXAMPLE ---
                         "file_path": "51a66c8f-f6b1-43bd-8038-8768471a8b09/52ad2ba8-cab9-4108-a504-b9822fe99bdc/Anexo-00-Modificaciones-de-la-Guia-5.1.0.pdf",
-                        # -----------------------
                         "metadata": {"source": "manual upload", "version": "1.1"},
                         "status": DocumentStatus.ERROR.value,
                         "chunk_count": 0,
                         "error_message": "Processing timed out after 600 seconds.",
                         "uploaded_at": "2025-04-19T19:42:38.671016Z",
                         "updated_at": "2025-04-19T19:42:42.337854Z",
-                        "minio_exists": True,
+                        "gcs_exists": True, # Updated field name
                         "milvus_chunk_count": 0,
                         "message": "El procesamiento falló: Timeout."
                     }

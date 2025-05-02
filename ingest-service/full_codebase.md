@@ -33,8 +33,8 @@ app/
 │   │   ├── md_extractor.py
 │   │   ├── pdf_extractor.py
 │   │   └── txt_extractor.py
+│   ├── gcs_client.py
 │   ├── ingest_pipeline.py
-│   ├── minio_client.py
 │   └── text_splitter.py
 └── tasks
     ├── __init__.py
@@ -66,6 +66,7 @@ app/
 
 ## File: `app\api\v1\endpoints\ingest.py`
 ```py
+# ingest-service/app/api/v1/endpoints/ingest.py
 def normalize_filename(filename: str) -> str:
     """Normaliza el nombre de archivo eliminando espacios al inicio/final y espacios duplicados."""
     return " ".join(filename.strip().split())
@@ -94,10 +95,9 @@ from app.core.config import settings
 from app.db import postgres_client as db_client
 from app.models.domain import DocumentStatus
 from app.api.v1.schemas import IngestResponse, StatusResponse, PaginatedStatusResponse, ErrorDetail
-from app.services.minio_client import MinioClient, MinioError
+from app.services.gcs_client import GCSClient, GCSClientError
 from app.tasks.celery_app import celery_app
 # Import the specific task instance registered in process_document.py
-# Note: The task name might change if you renamed the function in process_document.py
 from app.tasks.process_document import process_document_standalone as process_document_task # Use the new name
 # Import Milvus field name constants for consistency
 from app.services.ingest_pipeline import (
@@ -112,14 +112,17 @@ router = APIRouter()
 
 # --- Helper Functions ---
 
-# LLM_FLAG: NO_CHANGE - Minio Client Dependency
-def get_minio_client():
-    """Dependency to get Minio client instance."""
+# LLM_FLAG: NO_CHANGE - Minio Client Dependency removed
+
+# GCS Client Dependency
+def get_gcs_client():
+    """Dependency to get GCS client instance."""
     try:
-        client = MinioClient()
+        # No specific config needed here if GOOGLE_APPLICATION_CREDENTIALS is set
+        client = GCSClient()
         return client
     except Exception as e:
-        log.exception("Failed to initialize MinioClient dependency", error=str(e))
+        log.exception("Failed to initialize GCSClient dependency", error=str(e))
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Storage service configuration error."
@@ -151,89 +154,63 @@ async def get_db_conn():
 
 
 # --- Milvus Synchronous Helper Functions (Refactored to use pymilvus) ---
-
+# LLM_FLAG: NO_CHANGE - Milvus Sync Helper Functions (Already Correct)
 def _get_milvus_collection_sync() -> Collection:
     """Synchronously connects to Milvus and returns the Collection object."""
-    alias = "api_sync_helper" # Use a different alias for API helpers if desired
+    alias = "api_sync_helper"
     sync_milvus_log = log.bind(component="MilvusHelperSync", alias=alias)
-
-    # Check if connection exists for this alias
     if alias not in connections.list_connections():
         sync_milvus_log.info("Connecting to Milvus for sync helper...")
         try:
-            connections.connect(
-                alias=alias,
-                uri=settings.MILVUS_URI,
-                timeout=settings.MILVUS_GRPC_TIMEOUT
-            )
+            connections.connect(alias=alias, uri=settings.MILVUS_URI, timeout=settings.MILVUS_GRPC_TIMEOUT)
             sync_milvus_log.info("Milvus connection established for sync helper.")
         except MilvusException as e:
             sync_milvus_log.error("Failed to connect to Milvus for sync helper", error=str(e))
             raise RuntimeError(f"Milvus connection failed for API helper: {e}") from e
     else:
         sync_milvus_log.debug("Reusing existing Milvus connection for sync helper.")
-
-    # Get the collection object
     try:
         collection = Collection(name=MILVUS_COLLECTION_NAME, using=alias)
-        # Optional: Check if collection exists if creation isn't guaranteed by worker
-        # if not utility.has_collection(MILVUS_COLLECTION_NAME, using=alias):
-        #     log.error("Milvus collection not found by API helper", collection_name=MILVUS_COLLECTION_NAME)
-        #     raise RuntimeError(f"Collection '{MILVUS_COLLECTION_NAME}' not found.")
-
-        # Always load collection into memory (necessary for sync queries)
         sync_milvus_log.info("Loading Milvus collection for sync helper...")
         collection.load()
         sync_milvus_log.info("Milvus collection loaded for sync helper.")
-
         return collection
     except MilvusException as e:
         sync_milvus_log.error("Failed to get or load Milvus collection for sync helper", error=str(e))
         raise RuntimeError(f"Milvus collection access error for API helper: {e}") from e
-
 
 def _get_milvus_chunk_count_sync(document_id: str, company_id: str) -> int:
     """Synchronously counts chunks in Milvus for a specific document using pymilvus query."""
     count_log = log.bind(document_id=document_id, company_id=company_id, component="MilvusHelperSync")
     try:
         collection = _get_milvus_collection_sync()
-        # Construct the filter expression using imported constants
         expr = f'{MILVUS_COMPANY_ID_FIELD} == "{company_id}" and {MILVUS_DOCUMENT_ID_FIELD} == "{document_id}"'
         count_log.debug("Attempting to query Milvus chunk count", filter_expr=expr)
-
-        # Query for PK field and count results (workaround for unsupported count(*))
-        query_res = collection.query(
-            expr=expr,
-            output_fields=["pk_id"]
-        )
+        query_res = collection.query(expr=expr, output_fields=[MILVUS_PK_FIELD]) # Corrected field name
         count = len(query_res) if query_res else 0
         count_log.info("Milvus chunk count successful (pymilvus)", count=count)
         return count
-    except RuntimeError as re: # Catch collection/connection error
+    except RuntimeError as re:
         count_log.error("Failed to get Milvus count due to connection/collection error", error=str(re))
         return -1
     except MilvusException as e:
         count_log.error("Milvus query error during count", error=str(e), exc_info=True)
-        return -1 # Indicate error
+        return -1
     except Exception as e:
         count_log.exception("Unexpected error during Milvus count", error=str(e))
         return -1
-
 
 def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
     """Synchronously deletes chunks from Milvus using pymilvus delete."""
     delete_log = log.bind(document_id=document_id, company_id=company_id, component="MilvusHelperSync")
     try:
         collection = _get_milvus_collection_sync()
-        # Construct the filter expression
         expr = f'{MILVUS_COMPANY_ID_FIELD} == "{company_id}" and {MILVUS_DOCUMENT_ID_FIELD} == "{document_id}"'
         delete_log.info("Attempting to delete chunks from Milvus (pymilvus)", filter_expr=expr)
-
         delete_result = collection.delete(expr=expr)
         delete_log.info("Milvus delete operation executed (pymilvus)", deleted_count=delete_result.delete_count)
-        # Consider success even if delete_count is 0 (nothing to delete)
         return True
-    except RuntimeError as re: # Catch collection/connection error
+    except RuntimeError as re:
         delete_log.error("Failed to delete Milvus chunks due to connection/collection error", error=str(re))
         return False
     except MilvusException as e:
@@ -244,7 +221,7 @@ def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
         return False
 
 
-# --- API Endpoints (Logic remains largely the same, but task name might change) ---
+# --- API Endpoints ---
 
 @router.post(
     "/upload",
@@ -257,7 +234,7 @@ def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
         409: {"model": ErrorDetail, "description": "Conflict (Duplicate file)"},
         422: {"model": ErrorDetail, "description": "Validation Error (Missing Headers)"},
         500: {"model": ErrorDetail, "description": "Internal Server Error"},
-        503: {"model": ErrorDetail, "description": "Service Unavailable (DB or MinIO)"},
+        503: {"model": ErrorDetail, "description": "Service Unavailable (DB or GCS)"}, # Updated description
     }
 )
 @router.post(
@@ -271,10 +248,10 @@ async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     metadata_json: Optional[str] = Form(None),
-    minio_client: MinioClient = Depends(get_minio_client),
+    gcs_client: GCSClient = Depends(get_gcs_client), # Uses GCS client
 ):
     """
-    Receives a document file and optional metadata, saves it to MinIO,
+    Receives a document file and optional metadata, saves it to GCS,
     creates a record in PostgreSQL, and queues a Celery task for processing.
     """
     company_id = request.headers.get("X-Company-ID")
@@ -292,7 +269,6 @@ async def upload_document(
         endpoint_log.warning("Missing X-User-ID header")
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing required header: X-User-ID")
 
-    # Normalizar el nombre del archivo
     normalized_filename = normalize_filename(file.filename)
     endpoint_log = endpoint_log.bind(company_id=company_id, user_id=user_id,
                                      filename=normalized_filename, content_type=file.content_type)
@@ -336,6 +312,7 @@ async def upload_document(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error checking for duplicates.")
 
     document_id = uuid.uuid4()
+    # GCS object name format
     file_path_in_storage = f"{company_id}/{document_id}/{normalized_filename}"
 
     try:
@@ -351,49 +328,51 @@ async def upload_document(
         endpoint_log.exception("Failed to create document record in PostgreSQL", error=str(e))
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error creating record.")
 
+    # Use GCS Client
     try:
         file_content = await file.read()
-        endpoint_log.info("[INGEST] Preparando subida a MinIO", object_name=file_path_in_storage, filename=normalized_filename, size=len(file_content), content_type=file.content_type)
+        endpoint_log.info("Preparing upload to GCS", object_name=file_path_in_storage, filename=normalized_filename, size=len(file_content), content_type=file.content_type)
         try:
-            await minio_client.upload_file_async(
+            await gcs_client.upload_file_async(
                 object_name=file_path_in_storage, data=file_content, content_type=file.content_type
             )
-            endpoint_log.info("[INGEST] File uploaded successfully to MinIO", object_name=file_path_in_storage)
+            endpoint_log.info("File uploaded successfully to GCS", object_name=file_path_in_storage)
         except Exception as upload_exc:
-            endpoint_log.error("[INGEST] Exception during MinIO upload", object_name=file_path_in_storage, error=str(upload_exc))
-            raise
+            endpoint_log.error("Exception during GCS upload", object_name=file_path_in_storage, error=str(upload_exc))
+            raise # Re-raise to be caught below
 
-        # --- Validación extra: verificar que el archivo existe en MinIO ---
+        # --- Validation: check file exists in GCS ---
         try:
-            file_exists = await minio_client.check_file_exists_async(file_path_in_storage)
-            endpoint_log.info("[INGEST] MinIO existence check after upload", object_name=file_path_in_storage, exists=file_exists)
+            file_exists = await gcs_client.check_file_exists_async(file_path_in_storage)
+            endpoint_log.info("GCS existence check after upload", object_name=file_path_in_storage, exists=file_exists)
         except Exception as check_exc:
-            endpoint_log.error("[INGEST] Exception during MinIO existence check", object_name=file_path_in_storage, error=str(check_exc))
-            file_exists = False
+            endpoint_log.error("Exception during GCS existence check", object_name=file_path_in_storage, error=str(check_exc))
+            file_exists = False # Assume not exists on error
 
         if not file_exists:
-            endpoint_log.error("[INGEST] File not found in MinIO after upload", object_name=file_path_in_storage, filename=normalized_filename)
+            endpoint_log.error("File not found in GCS after upload attempt", object_name=file_path_in_storage, filename=normalized_filename)
             async with get_db_conn() as conn:
                 await api_db_retry_strategy(db_client.update_document_status)(
-                    document_id=document_id, status=DocumentStatus.ERROR, error_message="File not found in MinIO after upload", conn=conn
+                    document_id=document_id, status=DocumentStatus.ERROR, error_message="File not found in GCS after upload", conn=conn
                 )
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="File not found in MinIO after upload.")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="File verification in GCS failed after upload.")
 
         async with get_db_conn() as conn:
             await api_db_retry_strategy(db_client.update_document_status)(
-                document_id=document_id, status=DocumentStatus.UPLOADED, conn=conn # Use keyword arg for conn
+                document_id=document_id, status=DocumentStatus.UPLOADED, conn=conn
             )
-        endpoint_log.info("[INGEST] Document status updated to 'uploaded'", document_id=str(document_id))
-    except MinioError as me:
-        endpoint_log.error("Failed to upload file to MinIO", object_name=file_path_in_storage, error=str(me))
+        endpoint_log.info("Document status updated to 'uploaded'", document_id=str(document_id))
+
+    except GCSClientError as gce: # Catch GCS specific errors
+        endpoint_log.error("Failed to upload file to GCS", object_name=file_path_in_storage, error=str(gce))
         try:
             async with get_db_conn() as conn:
                 await api_db_retry_strategy(db_client.update_document_status)(
-                    document_id=document_id, status=DocumentStatus.ERROR, error_message=f"MinIO upload failed: {me}", conn=conn
+                    document_id=document_id, status=DocumentStatus.ERROR, error_message=f"GCS upload failed: {str(gce)[:200]}", conn=conn
                 )
         except Exception as db_err:
-            endpoint_log.exception("Failed to update status to ERROR after MinIO failure", error=str(db_err))
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Storage service error: {me}")
+            endpoint_log.exception("Failed to update status to ERROR after GCS failure", error=str(db_err))
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Storage service error: {gce}")
     except Exception as e:
          endpoint_log.exception("Unexpected error during file upload or DB update", error=str(e))
          try:
@@ -407,12 +386,12 @@ async def upload_document(
     finally:
         await file.close()
 
+    # Enqueue Celery task (No change needed here)
     try:
         task_payload = {
             "document_id": str(document_id), "company_id": company_id,
             "filename": normalized_filename, "content_type": file.content_type
         }
-        # Use the imported task instance (now points to process_document_standalone)
         task = process_document_task.delay(**task_payload)
         endpoint_log.info("Document ingestion task queued successfully", task_id=task.id, task_name=process_document_task.name)
     except Exception as e:
@@ -441,7 +420,7 @@ async def upload_document(
         404: {"model": ErrorDetail, "description": "Document not found"},
         422: {"model": ErrorDetail, "description": "Validation Error (Missing Headers or Invalid ID)"},
         500: {"model": ErrorDetail, "description": "Internal Server Error"},
-        503: {"model": ErrorDetail, "description": "Service Unavailable (DB, MinIO, Milvus)"},
+        503: {"model": ErrorDetail, "description": "Service Unavailable (DB, GCS, Milvus)"}, # Updated description
     }
 )
 @router.get(
@@ -452,10 +431,10 @@ async def upload_document(
 async def get_document_status(
     request: Request,
     document_id: uuid.UUID = Path(..., description="The UUID of the document"),
-    minio_client: MinioClient = Depends(get_minio_client),
+    gcs_client: GCSClient = Depends(get_gcs_client), # Uses GCS Client
 ):
     """
-    Retrieves document status from PostgreSQL and performs live MinIO/Milvus checks.
+    Retrieves document status from PostgreSQL and performs live GCS/Milvus checks.
     Uses refactored pymilvus helpers for counting.
     """
     company_id = request.headers.get("X-Company-ID")
@@ -484,6 +463,8 @@ async def get_document_status(
         status_log.exception("Error fetching document status from DB", error=str(e))
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error fetching status.")
 
+    # Live checks and status correction logic
+    from datetime import datetime, timedelta, timezone
     needs_update = False
     current_status_enum = DocumentStatus(doc_data['status'])
     current_chunk_count = doc_data.get('chunk_count')
@@ -492,40 +473,62 @@ async def get_document_status(
     updated_chunk_count = current_chunk_count
     updated_error_message = current_error_message
 
-    minio_path = doc_data.get('file_path')
-    minio_exists = False
-    if not minio_path:
-         status_log.warning("MinIO file path missing in DB record", db_id=doc_data['id'])
-         if updated_status_enum not in [DocumentStatus.ERROR, DocumentStatus.PENDING]:
-             needs_update = True
-             updated_status_enum = DocumentStatus.ERROR
-             updated_error_message = (updated_error_message or "") + " File path missing."
-    else:
-        status_log.debug("Checking MinIO for file existence", object_name=minio_path)
-        try:
-            minio_exists = await minio_client.check_file_exists_async(minio_path)
-            status_log.info("MinIO existence check complete", exists=minio_exists)
-            if not minio_exists and updated_status_enum not in [DocumentStatus.ERROR, DocumentStatus.PENDING]:
-                 status_log.warning("File missing in MinIO but DB status suggests otherwise.", current_db_status=updated_status_enum.value)
-                 if updated_status_enum != DocumentStatus.ERROR:
-                     needs_update = True
-                     updated_status_enum = DocumentStatus.ERROR
-                     updated_error_message = "File missing from storage."
-                     updated_chunk_count = 0
-        except Exception as minio_e:
-            status_log.error("MinIO check failed", error=str(minio_e))
-            minio_exists = False
-            if updated_status_enum != DocumentStatus.ERROR:
-                 needs_update = True
-                 updated_status_enum = DocumentStatus.ERROR
-                 updated_error_message = (updated_error_message or "") + f" MinIO check error ({type(minio_e).__name__})."
-                 updated_chunk_count = 0
+    updated_at = doc_data.get('updated_at')
+    now_utc = datetime.now(timezone.utc)
+    updated_at_dt = None
+    if updated_at:
+        if isinstance(updated_at, datetime): updated_at_dt = updated_at.astimezone(timezone.utc)
+        else:
+            try: updated_at_dt = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
+            except Exception: updated_at_dt = None
 
+    GRACE_PERIOD_SECONDS = 120 # Grace period to avoid flapping
+
+    gcs_path = doc_data.get('file_path')
+    # --- RENAMED VARIABLE: gcs_exists ---
+    gcs_exists = False
+    if not gcs_path:
+        status_log.warning("GCS file path missing in DB record", db_id=doc_data['id'])
+        if updated_status_enum not in [DocumentStatus.ERROR, DocumentStatus.PENDING]:
+            if not (updated_status_enum == DocumentStatus.PROCESSED and updated_at_dt and (now_utc - updated_at_dt).total_seconds() < GRACE_PERIOD_SECONDS):
+                needs_update = True
+                updated_status_enum = DocumentStatus.ERROR
+                updated_error_message = (updated_error_message or "") + " File path missing."
+            else:
+                status_log.warning("Grace period: no status change for missing file_path (recent processed)")
+    else:
+        status_log.debug("Checking GCS for file existence", object_name=gcs_path)
+        try:
+            # Use GCS client and renamed variable
+            gcs_exists = await gcs_client.check_file_exists_async(gcs_path)
+            status_log.info("GCS existence check complete", exists=gcs_exists)
+            if not gcs_exists and updated_status_enum not in [DocumentStatus.ERROR, DocumentStatus.PENDING]:
+                status_log.warning("File missing in GCS but DB status suggests otherwise.", current_db_status=updated_status_enum.value)
+                if updated_status_enum != DocumentStatus.ERROR:
+                    if not (updated_status_enum == DocumentStatus.PROCESSED and updated_at_dt and (now_utc - updated_at_dt).total_seconds() < GRACE_PERIOD_SECONDS):
+                        needs_update = True
+                        updated_status_enum = DocumentStatus.ERROR
+                        updated_error_message = "File missing from storage."
+                        updated_chunk_count = 0
+                    else:
+                        status_log.warning("Grace period: no status change for missing GCS file (recent processed)")
+        except Exception as gcs_e:
+            status_log.error("GCS check failed", error=str(gcs_e))
+            gcs_exists = False # Assume not exists on error
+            if updated_status_enum != DocumentStatus.ERROR:
+                if not (updated_status_enum == DocumentStatus.PROCESSED and updated_at_dt and (now_utc - updated_at_dt).total_seconds() < GRACE_PERIOD_SECONDS):
+                    needs_update = True
+                    updated_status_enum = DocumentStatus.ERROR
+                    updated_error_message = (updated_error_message or "") + f" GCS check error ({type(gcs_e).__name__})."
+                    updated_chunk_count = 0
+                else:
+                     status_log.warning("Grace period: no status change for GCS exception (recent processed)")
+
+    # Milvus Check (No changes needed here)
     status_log.debug("Checking Milvus for chunk count using pymilvus helper...")
     loop = asyncio.get_running_loop()
     milvus_chunk_count = -1
     try:
-        # Use the refactored pymilvus helper ran in executor
         milvus_chunk_count = await loop.run_in_executor(
             None, _get_milvus_chunk_count_sync, str(document_id), company_id
         )
@@ -534,13 +537,16 @@ async def get_document_status(
         if milvus_chunk_count == -1:
             status_log.error("Milvus count check failed (returned -1).")
             if updated_status_enum != DocumentStatus.ERROR:
-                needs_update = True
-                updated_status_enum = DocumentStatus.ERROR
-                updated_error_message = (updated_error_message or "") + " Failed Milvus count check."
+                if not (updated_status_enum == DocumentStatus.PROCESSED and updated_at_dt and (now_utc - updated_at_dt).total_seconds() < GRACE_PERIOD_SECONDS):
+                    needs_update = True
+                    updated_status_enum = DocumentStatus.ERROR
+                    updated_error_message = (updated_error_message or "") + " Failed Milvus count check."
+                else:
+                    status_log.warning("Grace period: no status change for Milvus count failure (recent processed)")
         elif milvus_chunk_count > 0:
-            # Si hay chunks y el archivo existe, y el estado es error o uploaded, corregir a PROCESSED
-            if minio_exists and updated_status_enum in [DocumentStatus.ERROR, DocumentStatus.UPLOADED]:
-                status_log.warning("Inconsistency: Chunks found and file exists but DB status is not 'processed'. Corrigiendo.")
+             # --- Use gcs_exists ---
+            if gcs_exists and updated_status_enum in [DocumentStatus.ERROR, DocumentStatus.UPLOADED]:
+                status_log.warning("Inconsistency: Chunks found and file exists but DB status is not 'processed'. Correcting.")
                 needs_update = True
                 updated_status_enum = DocumentStatus.PROCESSED
                 updated_chunk_count = milvus_chunk_count
@@ -553,10 +559,13 @@ async def get_document_status(
         elif milvus_chunk_count == 0:
             if updated_status_enum == DocumentStatus.PROCESSED:
                 status_log.warning("Inconsistency: DB status 'processed' but no chunks found. Correcting.")
-                needs_update = True
-                updated_status_enum = DocumentStatus.ERROR
-                updated_chunk_count = 0
-                updated_error_message = (updated_error_message or "") + " Processed data missing."
+                if not (updated_status_enum == DocumentStatus.PROCESSED and updated_at_dt and (now_utc - updated_at_dt).total_seconds() < GRACE_PERIOD_SECONDS):
+                    needs_update = True
+                    updated_status_enum = DocumentStatus.ERROR
+                    updated_chunk_count = 0
+                    updated_error_message = (updated_error_message or "") + " Processed data missing."
+                else:
+                     status_log.warning("Grace period: no status change for zero Milvus chunks (recent processed)")
             elif updated_status_enum == DocumentStatus.ERROR and updated_chunk_count != 0:
                 needs_update = True
                 updated_chunk_count = 0
@@ -565,9 +574,12 @@ async def get_document_status(
         status_log.exception("Unexpected error during Milvus count check execution", error=str(e))
         milvus_chunk_count = -1
         if updated_status_enum != DocumentStatus.ERROR:
-            needs_update = True
-            updated_status_enum = DocumentStatus.ERROR
-            updated_error_message = (updated_error_message or "") + f" Error checking Milvus ({type(e).__name__})."
+            if not (updated_status_enum == DocumentStatus.PROCESSED and updated_at_dt and (now_utc - updated_at_dt).total_seconds() < GRACE_PERIOD_SECONDS):
+                needs_update = True
+                updated_status_enum = DocumentStatus.ERROR
+                updated_error_message = (updated_error_message or "") + f" Error checking Milvus ({type(e).__name__})."
+            else:
+                status_log.warning("Grace period: no status change for Milvus exception (recent processed)")
 
     if needs_update:
         status_log.warning("Inconsistency detected, updating document status in DB",
@@ -590,11 +602,13 @@ async def get_document_status(
     final_chunk_count_val = doc_data.get('chunk_count', 0)
     final_error_message_val = doc_data.get('error_message')
 
+    # Return StatusResponse using renamed field
     return StatusResponse(
         document_id=str(doc_data['id']), company_id=str(doc_data['company_id']),
         status=final_status_val, file_name=doc_data.get('file_name'),
         file_type=doc_data.get('file_type'), file_path=doc_data.get('file_path'),
-        chunk_count=final_chunk_count_val, minio_exists=minio_exists,
+        chunk_count=final_chunk_count_val,
+        gcs_exists=gcs_exists,  # Use renamed field
         milvus_chunk_count=milvus_chunk_count, last_updated=doc_data.get('updated_at'),
         uploaded_at=doc_data.get('uploaded_at'), error_message=final_error_message_val,
         metadata=doc_data.get('metadata')
@@ -608,7 +622,7 @@ async def get_document_status(
     responses={
         422: {"model": ErrorDetail, "description": "Validation Error (Missing Headers)"},
         500: {"model": ErrorDetail, "description": "Internal Server Error"},
-        503: {"model": ErrorDetail, "description": "Service Unavailable (DB, MinIO, Milvus)"},
+        503: {"model": ErrorDetail, "description": "Service Unavailable (DB, GCS, Milvus)"}, # Updated description
     }
 )
 @router.get(
@@ -620,10 +634,10 @@ async def list_document_statuses(
     request: Request,
     limit: int = Query(30, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    minio_client: MinioClient = Depends(get_minio_client),
+    gcs_client: GCSClient = Depends(get_gcs_client), # Uses GCS Client
 ):
     """
-    Lists documents for the company with pagination. Performs live MinIO/Milvus checks.
+    Lists documents for the company with pagination. Performs live GCS/Milvus checks.
     Uses refactored pymilvus helpers.
     """
     company_id = request.headers.get("X-Company-ID")
@@ -651,6 +665,7 @@ async def list_document_statuses(
 
     if not documents_db: return []
 
+    # --- Inner function for concurrent checks ---
     async def check_single_document(doc_db_data: Dict[str, Any]) -> Dict[str, Any]:
         check_log = log.bind(request_id=req_id, document_id=str(doc_db_data['id']), company_id=company_id)
         doc_id_str = str(doc_db_data['id'])
@@ -662,28 +677,30 @@ async def list_document_statuses(
         doc_updated_chunk_count = doc_current_chunk_count
         doc_updated_error_msg = doc_current_error_msg
 
-        minio_path_db = doc_db_data.get('file_path')
-        live_minio_exists = False
-        if minio_path_db:
+        # --- RENAMED VARIABLE: live_gcs_exists ---
+        gcs_path_db = doc_db_data.get('file_path')
+        live_gcs_exists = False
+        if gcs_path_db:
             try:
-                live_minio_exists = await minio_client.check_file_exists_async(minio_path_db)
-                if not live_minio_exists and doc_updated_status_enum not in [DocumentStatus.ERROR, DocumentStatus.PENDING]:
+                live_gcs_exists = await gcs_client.check_file_exists_async(gcs_path_db)
+                if not live_gcs_exists and doc_updated_status_enum not in [DocumentStatus.ERROR, DocumentStatus.PENDING]:
                     if doc_updated_status_enum != DocumentStatus.ERROR:
                         doc_needs_update = True
                         doc_updated_status_enum = DocumentStatus.ERROR
                         doc_updated_error_msg = "File missing from storage."
                         doc_updated_chunk_count = 0
             except Exception as e:
-                check_log.error("MinIO check failed for list item", error=str(e))
-                live_minio_exists = False
+                check_log.error("GCS check failed for list item", error=str(e))
+                live_gcs_exists = False # Assume not exists on error
                 if doc_updated_status_enum != DocumentStatus.ERROR:
                     doc_needs_update = True
                     doc_updated_status_enum = DocumentStatus.ERROR
-                    doc_updated_error_msg = (doc_updated_error_msg or "") + f" MinIO check error."
+                    doc_updated_error_msg = (doc_updated_error_msg or "") + f" GCS check error."
                     doc_updated_chunk_count = 0
         else:
-            live_minio_exists = False
+            live_gcs_exists = False # If path is missing, it doesn't exist
 
+        # Milvus Check (No changes needed)
         live_milvus_chunk_count = -1
         loop = asyncio.get_running_loop()
         try:
@@ -694,9 +711,9 @@ async def list_document_statuses(
                     doc_updated_status_enum = DocumentStatus.ERROR
                     doc_updated_error_msg = (doc_updated_error_msg or "") + " Failed Milvus count."
             elif live_milvus_chunk_count > 0:
-                # Si hay chunks y el archivo existe, y el estado es error o uploaded, corregir a PROCESSED
-                if live_minio_exists and doc_updated_status_enum in [DocumentStatus.ERROR, DocumentStatus.UPLOADED]:
-                    check_log.warning("Inconsistency: Chunks found and file exists but DB status is not 'processed'. Corrigiendo.")
+                 # --- Use live_gcs_exists ---
+                if live_gcs_exists and doc_updated_status_enum in [DocumentStatus.ERROR, DocumentStatus.UPLOADED]:
+                    check_log.warning("Inconsistency: Chunks found and file exists but DB status is not 'processed'. Correcting.")
                     doc_needs_update = True
                     doc_updated_status_enum = DocumentStatus.PROCESSED
                     doc_updated_chunk_count = live_milvus_chunk_count
@@ -727,15 +744,17 @@ async def list_document_statuses(
             "updated_status_enum": doc_updated_status_enum,
             "updated_chunk_count": doc_updated_chunk_count,
             "final_error_message": doc_updated_error_msg,
-            "live_minio_exists": live_minio_exists,
+            "live_gcs_exists": live_gcs_exists, # Renamed field
             "live_milvus_chunk_count": live_milvus_chunk_count
         }
+    # --- End inner function ---
 
     list_log.info(f"Performing live checks for {len(documents_db)} documents concurrently...")
     check_tasks = [check_single_document(doc) for doc in documents_db]
     check_results = await asyncio.gather(*check_tasks)
     list_log.info("Live checks completed.")
 
+    # Update DB if needed (No changes needed here)
     updated_doc_data_map = {}
     docs_to_update_in_db = []
     for result in check_results:
@@ -769,15 +788,18 @@ async def list_document_statuses(
         except Exception as bulk_db_conn_err:
             list_log.exception("Error acquiring DB connection for sequential updates", error=str(bulk_db_conn_err))
 
+    # Build final response
     final_response_items = []
     for result in check_results:
          doc_id_str = str(result["db_data"]["id"])
          current_data = updated_doc_data_map.get(doc_id_str, result["db_data"])
+         # Use renamed field in response
          final_response_items.append(StatusResponse(
             document_id=doc_id_str, company_id=str(current_data['company_id']),
             status=current_data['status'], file_name=current_data.get('file_name'),
             file_type=current_data.get('file_type'), file_path=current_data.get('file_path'),
-            chunk_count=current_data.get('chunk_count', 0), minio_exists=result["live_minio_exists"],
+            chunk_count=current_data.get('chunk_count', 0),
+            gcs_exists=result["live_gcs_exists"], # Use renamed field
             milvus_chunk_count=result["live_milvus_chunk_count"], last_updated=current_data.get('updated_at'),
             uploaded_at=current_data.get('uploaded_at'), error_message=current_data.get('error_message'),
             metadata=current_data.get('metadata')
@@ -850,13 +872,14 @@ async def retry_ingestion(
         async with get_db_conn() as conn:
             await api_db_retry_strategy(db_client.update_document_status)(
                 conn=conn, document_id=document_id, status=DocumentStatus.PROCESSING,
-                chunk_count=None, error_message=None
+                chunk_count=None, error_message=None # Clear error message on retry
             )
         retry_log.info("Document status updated to 'processing' for retry.")
     except Exception as e:
         retry_log.exception("Failed to update document status for retry", error=str(e))
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error updating status for retry.")
 
+    # Re-queue Celery task (No change needed)
     try:
         file_name_from_db = doc_data.get('file_name')
         content_type_from_db = doc_data.get('file_type')
@@ -868,7 +891,6 @@ async def retry_ingestion(
             "document_id": str(document_id), "company_id": company_id,
             "filename": file_name_from_db, "content_type": content_type_from_db
         }
-        # Use the correct task instance variable
         task = process_document_task.delay(**task_payload)
         retry_log.info("Document reprocessing task queued successfully", task_id=task.id, task_name=process_document_task.name)
     except Exception as e:
@@ -890,7 +912,7 @@ async def retry_ingestion(
         404: {"model": ErrorDetail, "description": "Document not found"},
         422: {"model": ErrorDetail, "description": "Validation Error (Missing Headers or Invalid ID)"},
         500: {"model": ErrorDetail, "description": "Internal Server Error"},
-        503: {"model": ErrorDetail, "description": "Service Unavailable (DB, MinIO, Milvus)"},
+        503: {"model": ErrorDetail, "description": "Service Unavailable (DB, GCS, Milvus)"}, # Updated description
     }
 )
 @router.delete(
@@ -901,10 +923,10 @@ async def retry_ingestion(
 async def delete_document_endpoint(
     request: Request,
     document_id: uuid.UUID = Path(..., description="The UUID of the document to delete"),
-    minio_client: MinioClient = Depends(get_minio_client),
+    gcs_client: GCSClient = Depends(get_gcs_client), # Uses GCS Client
 ):
     """
-    Deletes a document: removes from Milvus (using pymilvus helper), MinIO, and PostgreSQL.
+    Deletes a document: removes from Milvus (using pymilvus helper), GCS, and PostgreSQL.
     """
     company_id = request.headers.get("X-Company-ID")
     req_id = getattr(request.state, 'request_id', 'N/A')
@@ -934,11 +956,10 @@ async def delete_document_endpoint(
 
     errors = []
 
-    # --- 1. Delete from Milvus (using refactored pymilvus helper) ---
+    # 1. Delete from Milvus (No change needed)
     delete_log.info("Attempting to delete chunks from Milvus (pymilvus)...")
     loop = asyncio.get_running_loop()
     try:
-        # Run the refactored synchronous pymilvus delete helper in executor
         milvus_deleted = await loop.run_in_executor(None, _delete_milvus_sync, str(document_id), company_id)
         if milvus_deleted: delete_log.info("Milvus delete command executed successfully (pymilvus).")
         else:
@@ -948,24 +969,24 @@ async def delete_document_endpoint(
         delete_log.exception("Unexpected error during Milvus delete execution", error=str(e))
         errors.append(f"Milvus delete exception: {type(e).__name__}")
 
-    # --- 2. Delete from MinIO ---
-    minio_path = doc_data.get('file_path')
-    if minio_path:
-        delete_log.info("Attempting to delete file from MinIO...", object_name=minio_path)
+    # 2. Delete from GCS
+    gcs_path = doc_data.get('file_path')
+    if gcs_path:
+        delete_log.info("Attempting to delete file from GCS...", object_name=gcs_path)
         try:
-            await minio_client.delete_file_async(minio_path)
-            delete_log.info("Successfully deleted file from MinIO.")
-        except MinioError as me:
-            delete_log.error("Failed to delete file from MinIO", object_name=minio_path, error=str(me))
-            errors.append(f"MinIO delete failed: {me}")
+            await gcs_client.delete_file_async(gcs_path)
+            delete_log.info("Successfully deleted file from GCS.")
+        except GCSClientError as gce:
+            delete_log.error("Failed to delete file from GCS", object_name=gcs_path, error=str(gce))
+            errors.append(f"GCS delete failed: {gce}")
         except Exception as e:
-            delete_log.exception("Unexpected error during MinIO delete", error=str(e))
-            errors.append(f"MinIO delete exception: {type(e).__name__}")
+            delete_log.exception("Unexpected error during GCS delete", error=str(e))
+            errors.append(f"GCS delete exception: {type(e).__name__}")
     else:
-        delete_log.warning("Skipping MinIO delete: file path not found in DB record.")
-        errors.append("MinIO path unknown in DB.")
+        delete_log.warning("Skipping GCS delete: file path not found in DB record.")
+        errors.append("GCS path unknown in DB.")
 
-    # --- 3. Delete from PostgreSQL ---
+    # 3. Delete from PostgreSQL (No change needed)
     delete_log.info("Attempting to delete record from PostgreSQL...")
     try:
          async with get_db_conn() as conn:
@@ -1023,9 +1044,7 @@ class StatusResponse(BaseModel):
     company_id: Optional[uuid.UUID] = None
     file_name: str
     file_type: str
-    # --- RENAMED FIELD: file_path ---
-    file_path: Optional[str] = None
-    # --------------------------------
+    file_path: Optional[str] = Field(None, description="Path to the original file in GCS.")
     metadata: Optional[Dict[str, Any]] = None
     status: str
     chunk_count: Optional[int] = 0
@@ -1033,8 +1052,11 @@ class StatusResponse(BaseModel):
     uploaded_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
-    minio_exists: Optional[bool] = None
-    milvus_chunk_count: Optional[int] = None
+    # --- RENAMED FIELD: gcs_exists ---
+    gcs_exists: Optional[bool] = Field(None, description="Indicates if the original file currently exists in GCS.")
+    # --- REMOVED minio_exists ---
+    # minio_exists: Optional[bool] = None
+    milvus_chunk_count: Optional[int] = Field(None, description="Live count of chunks found in Milvus for this document (-1 if check failed).")
     message: Optional[str] = None
 
     @field_validator('metadata', mode='before')
@@ -1051,7 +1073,7 @@ class StatusResponse(BaseModel):
     class Config:
         validate_assignment = True
         populate_by_name = True
-        # --- UPDATED EXAMPLE: Use file_path ---
+        # --- UPDATED EXAMPLE: Use file_path and gcs_exists ---
         json_schema_extra = {
              "example": {
                 "id": "52ad2ba8-cab9-4108-a504-b9822fe99bdc",
@@ -1065,7 +1087,7 @@ class StatusResponse(BaseModel):
                 "error_message": "Processing timed out after 600 seconds.",
                 "uploaded_at": "2025-04-19T19:42:38.671016Z",
                 "updated_at": "2025-04-19T19:42:42.337854Z",
-                "minio_exists": True,
+                "gcs_exists": True, # Updated field name
                 "milvus_chunk_count": 0,
                 "message": "El procesamiento falló: Timeout."
             }
@@ -1088,16 +1110,14 @@ class PaginatedStatusResponse(BaseModel):
                         "company_id": "51a66c8f-f6b1-43bd-8038-8768471a8b09",
                         "file_name": "Anexo-00-Modificaciones-de-la-Guia-5.1.0.pdf",
                         "file_type": "application/pdf",
-                        # --- UPDATED EXAMPLE ---
                         "file_path": "51a66c8f-f6b1-43bd-8038-8768471a8b09/52ad2ba8-cab9-4108-a504-b9822fe99bdc/Anexo-00-Modificaciones-de-la-Guia-5.1.0.pdf",
-                        # -----------------------
                         "metadata": {"source": "manual upload", "version": "1.1"},
                         "status": DocumentStatus.ERROR.value,
                         "chunk_count": 0,
                         "error_message": "Processing timed out after 600 seconds.",
                         "uploaded_at": "2025-04-19T19:42:38.671016Z",
                         "updated_at": "2025-04-19T19:42:42.337854Z",
-                        "minio_exists": True,
+                        "gcs_exists": True, # Updated field name
                         "milvus_chunk_count": 0,
                         "message": "El procesamiento falló: Timeout."
                     }
@@ -1130,7 +1150,7 @@ import json
 
 # --- Service Names en K8s ---
 POSTGRES_K8S_SVC = "postgresql-service.nyro-develop.svc.cluster.local"
-MINIO_K8S_SVC = "minio-service.nyro-develop.svc.cluster.local"
+# MINIO_K8S_SVC = "minio-service.nyro-develop.svc.cluster.local" # REMOVED
 MILVUS_K8S_SVC = "milvus-standalone.nyro-develop.svc.cluster.local"
 REDIS_K8S_SVC = "redis-service-master.nyro-develop.svc.cluster.local"
 
@@ -1138,14 +1158,14 @@ REDIS_K8S_SVC = "redis-service-master.nyro-develop.svc.cluster.local"
 POSTGRES_K8S_PORT_DEFAULT = 5432
 POSTGRES_K8S_DB_DEFAULT = "atenex"
 POSTGRES_K8S_USER_DEFAULT = "postgres"
-MINIO_K8S_PORT_DEFAULT = 9000
-MINIO_BUCKET_DEFAULT = "ingested-documents"
+# MINIO_K8S_PORT_DEFAULT = 9000 # REMOVED
+# MINIO_BUCKET_DEFAULT = "ingested-documents" # REMOVED
 MILVUS_K8S_PORT_DEFAULT = 19530
-MILVUS_DEFAULT_COLLECTION = "document_chunks_minilm" # Cambiado nombre default
+MILVUS_DEFAULT_COLLECTION = "document_chunks_minilm"
 MILVUS_DEFAULT_INDEX_PARAMS = '{"metric_type": "IP", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}}'
 MILVUS_DEFAULT_SEARCH_PARAMS = '{"metric_type": "IP", "params": {"ef": 128}}'
 DEFAULT_EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
-DEFAULT_EMBEDDING_DIM = 384 # <- Actualizado para MiniLM
+DEFAULT_EMBEDDING_DIM = 384
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -1180,21 +1200,20 @@ class Settings(BaseSettings):
     MILVUS_INDEX_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_INDEX_PARAMS))
     MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_SEARCH_PARAMS))
 
-    # --- MinIO ---
-    MINIO_ENDPOINT: str = Field(default=f"{MINIO_K8S_SVC}:{MINIO_K8S_PORT_DEFAULT}")
-    MINIO_ACCESS_KEY: SecretStr
-    MINIO_SECRET_KEY: SecretStr
-    MINIO_BUCKET_NAME: str = MINIO_BUCKET_DEFAULT
-    MINIO_USE_SECURE: bool = False
+    # --- MinIO (REMOVED) ---
+    # MINIO_ENDPOINT: str = Field(default=f"{MINIO_K8S_SVC}:{MINIO_K8S_PORT_DEFAULT}")
+    # MINIO_ACCESS_KEY: SecretStr
+    # MINIO_SECRET_KEY: SecretStr
+    # MINIO_BUCKET_NAME: str = MINIO_BUCKET_DEFAULT
+    # MINIO_USE_SECURE: bool = False
+
+    # --- Google Cloud Storage (GCS) ---
+    GCS_BUCKET_NAME: str = Field(default="atenex", description="Name of the Google Cloud Storage bucket for storing original files.")
+    # GOOGLE_APPLICATION_CREDENTIALS environment variable should be set in the deployment environment
 
     # --- Embeddings (ACTUALIZADO) ---
     EMBEDDING_MODEL_ID: str = Field(default=DEFAULT_EMBEDDING_MODEL_ID)
     EMBEDDING_DIMENSION: int = Field(default=DEFAULT_EMBEDDING_DIM)
-    # OPENAI_API_KEY: Optional[SecretStr] = None # Opcional, no usado en ingesta
-
-    # --- ELIMINADO ---
-    # FASTEMBED_MODEL: str = ...
-    # USE_GPU: bool = False
 
     # --- Clients ---
     HTTP_CLIENT_TIMEOUT: int = 60
@@ -1212,7 +1231,6 @@ class Settings(BaseSettings):
     ])
     SPLITTER_CHUNK_SIZE: int = Field(default=1000)
     SPLITTER_CHUNK_OVERLAP: int = Field(default=200)
-    # SPLITTER_SPLIT_BY: str = "word" # No relevante para el splitter actual
 
     # --- Validators ---
     @field_validator("LOG_LEVEL")
@@ -1235,7 +1253,8 @@ class Settings(BaseSettings):
         logging.debug(f"Using EMBEDDING_DIMENSION: {v}")
         return v
 
-    @field_validator('POSTGRES_PASSWORD', 'MINIO_ACCESS_KEY', 'MINIO_SECRET_KEY', mode='before')
+    # @field_validator('POSTGRES_PASSWORD', 'MINIO_ACCESS_KEY', 'MINIO_SECRET_KEY', mode='before') # MODIFIED VALIDATOR
+    @field_validator('POSTGRES_PASSWORD', mode='before')
     @classmethod
     def check_required_secret_value_present(cls, v: Any, info: ValidationInfo) -> Any:
         if v is None or v == "":
@@ -1247,7 +1266,7 @@ class Settings(BaseSettings):
     @classmethod
     def validate_milvus_uri(cls, v: str) -> str:
         if not v.startswith("http://") and not v.startswith("https://"):
-             if "." not in v:
+             if "." not in v: # Assume k8s service name
                  return f"http://{v}"
              raise ValueError(f"Invalid MILVUS_URI format: '{v}'. Must start with 'http://' or 'https://' or be a valid service name.")
         return v
@@ -1277,10 +1296,14 @@ try:
     temp_log.info(f"  MILVUS_URI:               {settings.MILVUS_URI}")
     temp_log.info(f"  MILVUS_COLLECTION_NAME:   {settings.MILVUS_COLLECTION_NAME}")
     temp_log.info(f"  MILVUS_GRPC_TIMEOUT:      {settings.MILVUS_GRPC_TIMEOUT}s")
-    temp_log.info(f"  MINIO_ENDPOINT:           {settings.MINIO_ENDPOINT}")
-    temp_log.info(f"  MINIO_BUCKET_NAME:        {settings.MINIO_BUCKET_NAME}")
-    temp_log.info(f"  MINIO_ACCESS_KEY:         {'*** SET ***' if settings.MINIO_ACCESS_KEY else '!!! NOT SET !!!'}")
-    temp_log.info(f"  MINIO_SECRET_KEY:         {'*** SET ***' if settings.MINIO_SECRET_KEY else '!!! NOT SET !!!'}")
+    # --- REMOVED MINIO LOGS ---
+    # temp_log.info(f"  MINIO_ENDPOINT:           {settings.MINIO_ENDPOINT}")
+    # temp_log.info(f"  MINIO_BUCKET_NAME:        {settings.MINIO_BUCKET_NAME}")
+    # temp_log.info(f"  MINIO_ACCESS_KEY:         {'*** SET ***' if settings.MINIO_ACCESS_KEY else '!!! NOT SET !!!'}")
+    # temp_log.info(f"  MINIO_SECRET_KEY:         {'*** SET ***' if settings.MINIO_SECRET_KEY else '!!! NOT SET !!!'}")
+    # temp_log.info(f"  MINIO_USE_SECURE:         {settings.MINIO_USE_SECURE}")
+    # --- ADDED GCS LOG ---
+    temp_log.info(f"  GCS_BUCKET_NAME:          {settings.GCS_BUCKET_NAME}")
     temp_log.info(f"  EMBEDDING_MODEL_ID:       {settings.EMBEDDING_MODEL_ID}")
     temp_log.info(f"  EMBEDDING_DIMENSION:      {settings.EMBEDDING_DIMENSION}")
     temp_log.info(f"  SUPPORTED_CONTENT_TYPES:  {settings.SUPPORTED_CONTENT_TYPES}")
@@ -2300,6 +2323,151 @@ def extract_text_from_txt(file_bytes: bytes, filename: str = "unknown.txt", enco
 
 ```
 
+## File: `app\services\gcs_client.py`
+```py
+import structlog
+import asyncio
+from typing import Optional
+from google.cloud import storage
+from google.api_core.exceptions import NotFound, GoogleAPIError
+from app.core.config import settings
+
+log = structlog.get_logger(__name__)
+
+class GCSClientError(Exception):
+    """Custom exception for GCS related errors."""
+    def __init__(self, message: str, original_exception: Optional[Exception] = None):
+        self.message = message
+        self.original_exception = original_exception
+        super().__init__(message)
+
+    def __str__(self):
+        if self.original_exception:
+            return f"{self.message}: {type(self.original_exception).__name__} - {str(self.original_exception)}"
+        return self.message
+
+class GCSClient:
+    """Client to interact with Google Cloud Storage using configured settings."""
+    def __init__(self, bucket_name: Optional[str] = None):
+        self.bucket_name = bucket_name or settings.GCS_BUCKET_NAME
+        self._client = storage.Client()
+        self._bucket = self._client.bucket(self.bucket_name)
+        self.log = log.bind(gcs_bucket=self.bucket_name)
+
+    async def upload_file_async(self, object_name: str, data: bytes, content_type: str) -> str:
+        self.log.info("Uploading file to GCS...", object_name=object_name, content_type=content_type, length=len(data))
+        loop = asyncio.get_running_loop()
+        def _upload():
+            blob = self._bucket.blob(object_name)
+            blob.upload_from_string(data, content_type=content_type)
+            return object_name
+        try:
+            uploaded_object_name = await loop.run_in_executor(None, _upload)
+            self.log.info("File uploaded successfully to GCS", object_name=object_name)
+            return uploaded_object_name
+        except GoogleAPIError as e:
+            self.log.error("GCS upload failed", error=str(e))
+            raise GCSClientError(f"GCS error uploading {object_name}", e) from e
+        except Exception as e:
+            self.log.exception("Unexpected error during GCS upload", error=str(e))
+            raise GCSClientError(f"Unexpected error uploading {object_name}", e) from e
+
+    async def download_file_async(self, object_name: str, file_path: str):
+        self.log.info("Downloading file from GCS...", object_name=object_name, target_path=file_path)
+        loop = asyncio.get_running_loop()
+        def _download():
+            blob = self._bucket.blob(object_name)
+            blob.download_to_filename(file_path)
+        try:
+            await loop.run_in_executor(None, _download)
+            self.log.info("File downloaded successfully from GCS", object_name=object_name)
+        except NotFound as e:
+            self.log.error("Object not found in GCS", object_name=object_name)
+            raise GCSClientError(f"Object not found in GCS: {object_name}", e) from e
+        except GoogleAPIError as e:
+            self.log.error("GCS download failed", error=str(e))
+            raise GCSClientError(f"GCS error downloading {object_name}", e) from e
+        except Exception as e:
+            self.log.exception("Unexpected error during GCS download", error=str(e))
+            raise GCSClientError(f"Unexpected error downloading {object_name}", e) from e
+
+    async def check_file_exists_async(self, object_name: str) -> bool:
+        self.log.debug("Checking file existence in GCS", object_name=object_name)
+        loop = asyncio.get_running_loop()
+        def _exists():
+            blob = self._bucket.blob(object_name)
+            return blob.exists()
+        try:
+            exists = await loop.run_in_executor(None, _exists)
+            self.log.debug("File existence check completed in GCS", object_name=object_name, exists=exists)
+            return exists
+        except Exception as e:
+            self.log.exception("Unexpected error during GCS existence check", error=str(e))
+            return False
+
+    async def delete_file_async(self, object_name: str):
+        self.log.info("Deleting file from GCS...", object_name=object_name)
+        loop = asyncio.get_running_loop()
+        def _delete():
+            blob = self._bucket.blob(object_name)
+            blob.delete()
+        try:
+            await loop.run_in_executor(None, _delete)
+            self.log.info("File deleted successfully from GCS", object_name=object_name)
+        except NotFound:
+            self.log.info("Object already deleted or not found in GCS", object_name=object_name)
+        except GoogleAPIError as e:
+            self.log.error("GCS delete failed", error=str(e))
+            raise GCSClientError(f"GCS error deleting {object_name}", e) from e
+        except Exception as e:
+            self.log.exception("Unexpected error during GCS delete", error=str(e))
+            raise GCSClientError(f"Unexpected error deleting {object_name}", e) from e
+
+    # Synchronous methods for worker compatibility
+    def download_file_sync(self, object_name: str, file_path: str):
+        self.log.info("Downloading file from GCS (sync)...", object_name=object_name, target_path=file_path)
+        try:
+            blob = self._bucket.blob(object_name)
+            blob.download_to_filename(file_path)
+            self.log.info("File downloaded successfully from GCS (sync)", object_name=object_name)
+        except NotFound as e:
+            self.log.error("Object not found in GCS (sync)", object_name=object_name)
+            raise GCSClientError(f"Object not found in GCS: {object_name}", e) from e
+        except GoogleAPIError as e:
+            self.log.error("GCS download failed (sync)", error=str(e))
+            raise GCSClientError(f"GCS error downloading {object_name}", e) from e
+        except Exception as e:
+            self.log.exception("Unexpected error during GCS download (sync)", error=str(e))
+            raise GCSClientError(f"Unexpected error downloading {object_name}", e) from e
+
+    def check_file_exists_sync(self, object_name: str) -> bool:
+        self.log.debug("Checking file existence in GCS (sync)", object_name=object_name)
+        try:
+            blob = self._bucket.blob(object_name)
+            exists = blob.exists()
+            self.log.debug("File existence check completed in GCS (sync)", object_name=object_name, exists=exists)
+            return exists
+        except Exception as e:
+            self.log.exception("Unexpected error during GCS existence check (sync)", error=str(e))
+            return False
+
+    def delete_file_sync(self, object_name: str):
+        self.log.info("Deleting file from GCS (sync)...", object_name=object_name)
+        try:
+            blob = self._bucket.blob(object_name)
+            blob.delete()
+            self.log.info("File deleted successfully from GCS (sync)", object_name=object_name)
+        except NotFound:
+            self.log.info("Object already deleted or not found in GCS (sync)", object_name=object_name)
+        except GoogleAPIError as e:
+            self.log.error("GCS delete failed (sync)", error=str(e))
+            raise GCSClientError(f"GCS error deleting {object_name}", e) from e
+        except Exception as e:
+            self.log.exception("Unexpected error during GCS delete (sync)", error=str(e))
+            raise GCSClientError(f"Unexpected error deleting {object_name}", e) from e
+
+```
+
 ## File: `app\services\ingest_pipeline.py`
 ```py
 # ingest-service/app/services/ingest_pipeline.py
@@ -2603,239 +2771,6 @@ def ingest_document_pipeline(
         raise RuntimeError(f"Unexpected Milvus insertion error: {e}") from e
 ```
 
-## File: `app\services\minio_client.py`
-```py
-# ingest-service/app/services/minio_client.py
-import io
-import uuid
-from typing import IO, BinaryIO, Optional
-from minio import Minio
-from minio.error import S3Error
-import structlog
-import asyncio
-
-from app.core.config import settings
-
-log = structlog.get_logger(__name__)
-
-class MinioError(Exception):
-    """Custom exception for MinIO related errors."""
-    def __init__(self, message: str, original_exception: Optional[Exception] = None):
-        self.message = message
-        self.original_exception = original_exception
-        super().__init__(message)
-
-    def __str__(self):
-        if self.original_exception:
-            return f"{self.message}: {type(self.original_exception).__name__} - {str(self.original_exception)}"
-        return self.message
-
-class MinioClient:
-    """Client to interact with MinIO using configured settings."""
-
-    def __init__(
-        self,
-        endpoint: Optional[str] = None,
-        access_key: Optional[str] = None,
-        secret_key: Optional[str] = None,
-        bucket_name: Optional[str] = None,
-        secure: Optional[bool] = None
-    ):
-        self._endpoint = endpoint or settings.MINIO_ENDPOINT
-        self._access_key = access_key or settings.MINIO_ACCESS_KEY.get_secret_value()
-        self._secret_key = secret_key or settings.MINIO_SECRET_KEY.get_secret_value()
-        self.bucket_name = bucket_name or settings.MINIO_BUCKET_NAME
-        self._secure = secure if secure is not None else settings.MINIO_USE_SECURE
-
-        self._client: Optional[Minio] = None
-        self.log = log.bind(minio_endpoint=self._endpoint, bucket_name=self.bucket_name)
-        self._initialize_client()
-
-    def _initialize_client(self):
-        """Initializes the internal MinIO client and ensures bucket exists."""
-        self.log.debug("Initializing MinIO client...")
-        try:
-            self._client = Minio(
-                self._endpoint,
-                access_key=self._access_key,
-                secret_key=self._secret_key,
-                secure=self._secure
-            )
-            self._ensure_bucket_exists_sync()
-            self.log.info("MinIO client initialized successfully.")
-        except (S3Error, TypeError, ValueError) as e:
-            self.log.critical("CRITICAL: Failed to initialize MinIO client", error=str(e), exc_info=True)
-            raise RuntimeError(f"MinIO client initialization failed: {e}") from e
-
-    def _get_client(self) -> Minio:
-        """Returns the initialized MinIO client, raising error if not available."""
-        if self._client is None:
-            self.log.error("Minio client accessed before initialization.")
-            raise RuntimeError("Minio client is not initialized.")
-        return self._client
-
-    def _ensure_bucket_exists_sync(self):
-        """Synchronously creates the bucket if it doesn't exist."""
-        client = self._get_client()
-        try:
-            found = client.bucket_exists(self.bucket_name)
-            if not found:
-                client.make_bucket(self.bucket_name)
-                self.log.info(f"MinIO bucket '{self.bucket_name}' created.")
-            else:
-                self.log.debug(f"MinIO bucket '{self.bucket_name}' already exists.")
-        except S3Error as e:
-            self.log.error(f"S3Error checking/creating MinIO bucket", bucket=self.bucket_name, error_code=getattr(e, 'code', 'Unknown'), error_details=str(e))
-            raise MinioError(f"Error checking/creating bucket '{self.bucket_name}'", e) from e
-        except Exception as e:
-            self.log.error(f"Unexpected error checking/creating MinIO bucket", bucket=self.bucket_name, error=str(e), exc_info=True)
-            raise MinioError(f"Unexpected error with bucket '{self.bucket_name}'", e) from e
-
-    # --- Asynchronous Methods (Used by API) ---
-
-    async def upload_file_async(
-        self,
-        object_name: str,
-        data: bytes,
-        content_type: str
-    ) -> str:
-        """Uploads file content to MinIO asynchronously using run_in_executor."""
-        upload_log = self.log.bind(bucket=self.bucket_name, object_name=object_name, content_type=content_type, length=len(data))
-        upload_log.info("Queueing file upload to MinIO executor")
-        loop = asyncio.get_running_loop()
-        client = self._get_client()
-
-        def _upload_sync():
-            data_stream = io.BytesIO(data)
-            try:
-                 result = client.put_object(
-                    bucket_name=self.bucket_name, object_name=object_name,
-                    data=data_stream, length=len(data), content_type=content_type
-                )
-                 upload_log.debug("MinIO put_object successful (sync part)", etag=getattr(result, 'etag', 'N/A'), version_id=getattr(result, 'version_id', 'N/A'))
-                 return object_name
-            except S3Error as e:
-                 upload_log.error("S3Error during MinIO upload (sync part)", error_code=getattr(e, 'code', 'Unknown'), error_details=str(e))
-                 raise MinioError(f"S3 error uploading {object_name}", e) from e
-            except Exception as e:
-                 upload_log.exception("Unexpected error during MinIO upload (sync part)", error=str(e))
-                 raise MinioError(f"Unexpected error uploading {object_name}", e) from e
-        try:
-            uploaded_object_name = await loop.run_in_executor(None, _upload_sync)
-            upload_log.info("File uploaded successfully to MinIO via executor")
-            return uploaded_object_name
-        except MinioError as me:
-            upload_log.error("Upload failed via executor", error=str(me))
-            raise me
-        except Exception as e:
-             upload_log.exception("Unexpected executor error during upload", error=str(e))
-             raise MinioError("Unexpected executor error during upload", e) from e
-
-    async def download_file(self, object_name: str, file_path: str):
-        """Downloads a file from MinIO to a local path asynchronously."""
-        download_log = self.log.bind(bucket=self.bucket_name, object_name=object_name, target_path=file_path)
-        download_log.info("Queueing file download from MinIO executor")
-        loop = asyncio.get_running_loop()
-        try:
-            # Note: Uses the synchronous download method internally via executor
-            await loop.run_in_executor(None, self.download_file_sync, object_name, file_path)
-            download_log.info("File download successful via executor")
-        except MinioError as me:
-            download_log.error("Download failed via executor", error=str(me))
-            raise me
-        except Exception as e:
-            download_log.exception("Unexpected executor error during download", error=str(e))
-            raise MinioError("Unexpected executor error during download", e) from e
-
-    async def check_file_exists_async(self, object_name: str) -> bool:
-        """Checks if a file exists in MinIO asynchronously."""
-        check_log = self.log.bind(bucket=self.bucket_name, object_name=object_name)
-        check_log.debug("Queueing file existence check in executor")
-        loop = asyncio.get_running_loop()
-        try:
-             # Note: Uses the synchronous check method internally via executor
-            exists = await loop.run_in_executor(None, self.check_file_exists_sync, object_name)
-            check_log.debug("File existence check completed via executor", exists=exists)
-            return exists
-        except MinioError as me:
-            if "Object not found" in str(me): return False
-            check_log.error("Existence check failed via executor", error=str(me))
-            return False
-        except Exception as e:
-            check_log.exception("Unexpected executor error during existence check", error=str(e))
-            return False
-
-    async def delete_file_async(self, object_name: str) -> None:
-        """Deletes a file from MinIO asynchronously."""
-        delete_log = self.log.bind(bucket=self.bucket_name, object_name=object_name)
-        delete_log.info("Queueing file deletion from MinIO executor")
-        loop = asyncio.get_running_loop()
-        try:
-            # Note: Uses the synchronous delete method internally via executor
-            await loop.run_in_executor(None, self.delete_file_sync, object_name)
-            delete_log.info("File deletion successful via executor")
-        except Exception as e:
-            delete_log.exception("Unexpected executor error during deletion", error=str(e))
-            # Log but don't raise to allow main delete flow to continue
-
-    # --- Synchronous Methods (Used by Worker) ---
-
-    def download_file_sync(self, object_name: str, file_path: str):
-        """Synchronously downloads a file from MinIO to a local path."""
-        download_log = self.log.bind(bucket=self.bucket_name, object_name=object_name, target_path=file_path)
-        download_log.info("Downloading file from MinIO (sync operation)...")
-        client = self._get_client()
-        try:
-            client.fget_object(self.bucket_name, object_name, file_path)
-            download_log.info(f"File downloaded successfully from MinIO to {file_path} (sync)")
-        except S3Error as e:
-            download_log.error("S3Error downloading file (sync)", error_code=getattr(e, 'code', 'Unknown'), error_details=str(e))
-            if getattr(e, 'code', None) == 'NoSuchKey':
-                raise MinioError(f"Object not found in MinIO: {object_name}", e) from e
-            else:
-                raise MinioError(f"S3 error downloading {object_name}: {e.code}", e) from e
-        except Exception as e:
-            download_log.exception("Unexpected error during sync file download", error=str(e))
-            raise MinioError(f"Unexpected error downloading {object_name}", e) from e
-
-    def check_file_exists_sync(self, object_name: str) -> bool:
-        """Synchronously checks if a file exists in MinIO. Strips bucket prefix if present."""
-        # Defensive: Remove bucket name prefix if present
-        if object_name.startswith(self.bucket_name + "/"):
-            self.log.warning("Object name included bucket prefix, stripping it for MinIO API.", original_object_name=object_name)
-            object_name = object_name[len(self.bucket_name) + 1:]
-        check_log = self.log.bind(bucket=self.bucket_name, object_name=object_name)
-        client = self._get_client()
-        try:
-            client.stat_object(self.bucket_name, object_name)
-            check_log.debug("Object exists in MinIO (sync check).")
-            return True
-        except S3Error as e:
-            if getattr(e, 'code', None) in ('NoSuchKey', 'NoSuchBucket'):
-                check_log.debug("Object not found in MinIO (sync check)", code=e.code)
-                return False
-            check_log.error("S3Error checking object existence (sync)", error_code=getattr(e, 'code', 'Unknown'), error_details=str(e))
-            raise MinioError(f"S3 error checking existence for {object_name}", e) from e
-        except Exception as e:
-            check_log.exception("Unexpected error checking object existence (sync)", error=str(e))
-            raise MinioError(f"Unexpected error checking existence for {object_name}", e) from e
-
-    def delete_file_sync(self, object_name: str):
-        """Synchronously deletes a file from MinIO."""
-        delete_log = self.log.bind(bucket=self.bucket_name, object_name=object_name)
-        delete_log.info("Deleting file from MinIO (sync operation)...")
-        client = self._get_client()
-        try:
-            client.remove_object(self.bucket_name, object_name)
-            delete_log.info("File deleted successfully from MinIO (sync)")
-        except S3Error as e:
-            delete_log.error("S3Error deleting file (sync)", error_code=getattr(e, 'code', 'Unknown'), error_details=str(e))
-            # Allow process to continue for partial deletion scenarios
-        except Exception as e:
-            delete_log.exception("Unexpected error during sync file deletion", error=str(e))
-            # Allow process to continue
-```
-
 ## File: `app\services\text_splitter.py`
 ```py
 import re
@@ -2933,7 +2868,7 @@ from app.services.embedder import get_embedding_model # Function to load/cache m
 from app.core.config import settings
 from app.db.postgres_client import get_sync_engine, set_status_sync
 from app.models.domain import DocumentStatus
-from app.services.minio_client import MinioClient, MinioError
+from app.services.gcs_client import GCSClient, GCSClientError
 # LLM_FLAG: Import REFACTORIZADO pipeline and EXTRACTORS map
 from app.services.ingest_pipeline import ingest_document_pipeline, EXTRACTORS, EXTRACTION_ERRORS
 from app.tasks.celery_app import celery_app
@@ -2943,14 +2878,14 @@ IS_WORKER = "worker" in sys.argv
 
 # --- Global Resources for Worker Process ---
 sync_engine: Optional[Engine] = None
-minio_client: Optional[MinioClient] = None
+gcs_client: Optional[GCSClient] = None
 # LLM_FLAG: Variable to hold the loaded embedding model per worker process
 worker_embedding_model: Optional[SentenceTransformer] = None
 
 # LLM_FLAG: Initialize resources at worker startup
 @worker_process_init.connect(weak=False)
 def init_worker_resources(**kwargs):
-    global sync_engine, minio_client, worker_embedding_model
+    global sync_engine, gcs_client, worker_embedding_model
     log = task_struct_log.bind(signal="worker_process_init")
     log.info("Worker process initializing resources...")
     try:
@@ -2960,11 +2895,12 @@ def init_worker_resources(**kwargs):
         else:
              log.info("Synchronous DB engine already initialized.")
 
-        if minio_client is None:
-            minio_client = MinioClient()
-            log.info("MinIO client initialized.")
+
+        if gcs_client is None:
+            gcs_client = GCSClient()
+            log.info("GCS client initialized.")
         else:
-            log.info("MinIO client already initialized.")
+            log.info("GCS client already initialized.")
 
         if worker_embedding_model is None:
             log.info("Preloading embedding model...")
@@ -2977,7 +2913,7 @@ def init_worker_resources(**kwargs):
         log.critical("CRITICAL FAILURE during worker resource initialization!", error=str(e), exc_info=True)
         # Set to None so pre-checks in task will fail cleanly
         sync_engine = None
-        minio_client = None
+        gcs_client = None
         worker_embedding_model = None
 
 # --------------------------------------------------------------------------
@@ -3036,15 +2972,15 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
              try: set_status_sync(engine=sync_engine, document_id=doc_uuid_err, status=DocumentStatus.ERROR, error_message=error_msg)
              except Exception as db_err: log.critical("Failed to update status after embedding model check failure!", error=str(db_err))
          raise Reject(error_msg, requeue=False)
-    if not minio_client:
-         log.critical("Worker MinIO Client is not initialized. Task cannot proceed.")
-         error_msg = "Worker MinIO client init failed."
+    if not gcs_client:
+         log.critical("Worker GCS Client is not initialized. Task cannot proceed.")
+         error_msg = "Worker GCS client init failed."
          doc_uuid_err = None
          try: doc_uuid_err = uuid.UUID(document_id_str)
          except ValueError: pass
          if doc_uuid_err:
               try: set_status_sync(engine=sync_engine, document_id=doc_uuid_err, status=DocumentStatus.ERROR, error_message=error_msg)
-              except Exception as db_err: log.critical("Failed to update status after MinIO client check failure!", error=str(db_err))
+              except Exception as db_err: log.critical("Failed to update status after GCS client check failure!", error=str(db_err))
          raise Reject(error_msg, requeue=False)
 
     try:
@@ -3081,30 +3017,30 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_dir_path = pathlib.Path(temp_dir)
             temp_file_path_obj = temp_dir_path / normalized_filename
-            log.info(f"Downloading MinIO object: {object_name} -> {str(temp_file_path_obj)}")
+            log.info(f"Downloading GCS object: {object_name} -> {str(temp_file_path_obj)}")
 
-            max_minio_retries = 3 # Adjusted retries for download
-            minio_delay = 2
-            for attempt_num in range(1, max_minio_retries + 1):
+            max_gcs_retries = 3 # Adjusted retries for download
+            gcs_delay = 2
+            for attempt_num in range(1, max_gcs_retries + 1):
                 try:
-                    minio_client.download_file_sync(object_name, str(temp_file_path_obj))
-                    log.info("File downloaded successfully from MinIO.")
+                    gcs_client.download_file_sync(object_name, str(temp_file_path_obj))
+                    log.info("File downloaded successfully from GCS.")
                     # Read file into bytes immediately after download
                     log.debug(f"Reading downloaded file into bytes: {str(temp_file_path_obj)}")
                     file_bytes = temp_file_path_obj.read_bytes()
                     log.info(f"File content read into memory ({len(file_bytes)} bytes).")
                     break # Exit retry loop on success
-                except MinioError as me:
-                    if "NoSuchKey" in str(me) or "Object not found" in str(me):
-                        log.warning(f"MinIO NoSuchKey on download attempt {attempt_num}/{max_minio_retries}. Retrying in {minio_delay}s...", error=str(me))
-                        if attempt_num == max_minio_retries:
-                            log.error(f"File still not found in MinIO after {max_minio_retries} attempts. Aborting.")
-                            raise # Re-raise the final MinioError
-                        time.sleep(minio_delay)
-                        minio_delay *= 2
+                except GCSClientError as gce:
+                    if "Object not found" in str(gce):
+                        log.warning(f"GCS object not found on download attempt {attempt_num}/{max_gcs_retries}. Retrying in {gcs_delay}s...", error=str(gce))
+                        if attempt_num == max_gcs_retries:
+                            log.error(f"File still not found in GCS after {max_gcs_retries} attempts. Aborting.")
+                            raise # Re-raise the final GCSClientError
+                        time.sleep(gcs_delay)
+                        gcs_delay *= 2
                     else:
-                        log.error("Non-retriable MinIO error during download", error=str(me))
-                        raise # Re-raise other Minio errors
+                        log.error("Non-retriable GCS error during download", error=str(gce))
+                        raise # Re-raise other GCS errors
                 except Exception as read_err:
                     log.error("Failed to read downloaded file into bytes", error=str(read_err), exc_info=True)
                     raise RuntimeError(f"Failed to read temp file: {read_err}") from read_err
@@ -3141,15 +3077,15 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
         return {"status": DocumentStatus.PROCESSED.value, "chunks_inserted": inserted_chunk_count, "document_id": document_id_str}
 
     # --- Error Handling ---
-    except MinioError as me:
-        log.error(f"MinIO Error during processing", error=str(me), exc_info=True)
-        error_msg = f"MinIO Error: {str(me)[:400]}"
+    except GCSClientError as gce:
+        log.error(f"GCS Error during processing", error=str(gce), exc_info=True)
+        error_msg = f"GCS Error: {str(gce)[:400]}"
         try: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg)
-        except Exception as db_err: log.critical("Failed to update status after MinIO failure!", error=str(db_err))
-        if "Object not found" in str(me):
-            raise Reject(f"MinIO Error: Object not found: {object_name}", requeue=False) from me
+        except Exception as db_err: log.critical("Failed to update status after GCS failure!", error=str(db_err))
+        if "Object not found" in str(gce):
+            raise Reject(f"GCS Error: Object not found: {object_name}", requeue=False) from gce
         else:
-            raise me # Allow retry for other potential MinIO errors
+            raise gce # Allow retry for other potential GCS errors
 
     except (*EXTRACTION_ERRORS, ValueError, RuntimeError, TypeError) as pipeline_err:
          # Catches extraction errors, embedding errors, chunking errors, Milvus errors, etc.
@@ -3196,7 +3132,7 @@ process_document_haystack_task = process_document_standalone
 [tool.poetry]
 name = "ingest-service"
 version = "0.3.0" # Incrementamos versión por refactorización MiniLM/PyMuPDF
-description = "Ingest service for Atenex B2B SaaS (Postgres/Minio/Milvus/SentenceTransformers - CPU - Prefork)"
+description = "Ingest service for Atenex B2B SaaS (Postgres/GCS/Milvus/SentenceTransformers - CPU - Prefork)"
 authors = ["Atenex Team <dev@atenex.com>"]
 readme = "README.md"
 
@@ -3213,7 +3149,8 @@ asyncpg = "^0.29.0" # Keep for API
 tenacity = "^8.2.3"
 python-multipart = "^0.0.9"
 structlog = "^24.1.0"
-minio = "^7.1.17"
+
+google-cloud-storage = "^2.16.0"
 
 # --- ONNX Runtime ---
 onnxruntime = "^1.18.0"

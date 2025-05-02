@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "ingest-service"
 version = "0.3.0" # Incrementamos versión por refactorización MiniLM/PyMuPDF
-description = "Ingest service for Atenex B2B SaaS (Postgres/Minio/Milvus/SentenceTransformers - CPU - Prefork)"
+description = "Ingest service for Atenex B2B SaaS (Postgres/GCS/Milvus/SentenceTransformers - CPU - Prefork)"
 authors = ["Atenex Team <dev@atenex.com>"]
 readme = "README.md"
 
@@ -18,7 +18,8 @@ asyncpg = "^0.29.0" # Keep for API
 tenacity = "^8.2.3"
 python-multipart = "^0.0.9"
 structlog = "^24.1.0"
-minio = "^7.1.17"
+
+google-cloud-storage = "^2.16.0"
 
 # --- ONNX Runtime ---
 onnxruntime = "^1.18.0"
