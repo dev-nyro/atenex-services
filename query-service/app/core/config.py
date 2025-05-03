@@ -59,6 +59,8 @@ DEFAULT_EMBEDDING_DIMENSION = 384 # Match ingest (MiniLM dimension)
 # ------------------------------------------------------------------
 
 class Settings(BaseSettings):
+    # --- Milvus gRPC Timeout ---
+    MILVUS_GRPC_TIMEOUT: int = 10  # Seconds (match ingest-service default)
     model_config = SettingsConfigDict(
         env_file='.env',
         env_prefix='QUERY_',
