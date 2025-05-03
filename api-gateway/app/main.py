@@ -80,7 +80,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.PROJECT_NAME,
     description="Atenex API Gateway: Single entry point, JWT auth, routing via explicit HTTP calls, Admin API.",
-    version="1.1.1", # Version bump para reflejar corrección de ruta
+    version="1.1.2", # Nueva versión para reflejar corrección final de ruta
     lifespan=lifespan,
 )
 
@@ -93,10 +93,10 @@ if settings.VERCEL_FRONTEND_URL:
     escaped_base = re.escape(base_vercel_url).replace(r"\.vercel\.app", "")
     vercel_pattern = rf"(https://{escaped_base}(-[a-z0-9-]+)*\.vercel\.app)"
 else: log.warning("VERCEL_FRONTEND_URL not set for CORS.")
-localhost_pattern = r"(http://localhost:300[0-9]|http://127.0.0.1:300[0-9])" # Añadido 127.0.0.1
+localhost_pattern = r"(http://localhost:300[0-9]|http://127.0.0.1:300[0-9])"
 allowed_origin_patterns = [localhost_pattern];
 if vercel_pattern: allowed_origin_patterns.append(vercel_pattern)
-final_regex = rf"^{ '|'.join(allowed_origin_patterns) }$" if allowed_origin_patterns else "" # Manejar caso sin patrones
+final_regex = rf"^{ '|'.join(allowed_origin_patterns) }$" if allowed_origin_patterns else ""
 if final_regex:
     log.info("Configuring CORS middleware", allow_origin_regex=final_regex)
     app.add_middleware(CORSMiddleware, allow_origin_regex=final_regex, allow_credentials=True,
@@ -145,14 +145,11 @@ async def add_request_context_timing_logging(request: Request, call_next):
 
 # --- Include Routers ---
 log.info("Including application routers...")
-# --- CORRECCIÓN: Cambiar el prefijo para user_router ---
-# User router (prefix /api/v1/users)
+# --- CORRECCIÓN DEFINITIVA: Usar el prefijo correcto /api/v1/users ---
 app.include_router(user_router_instance, prefix="/api/v1/users", tags=["Users & Authentication"])
-# --- FIN CORRECCIÓN ---
-# Admin router (prefix /api/v1/admin)
+# -------------------------------------------------------------------
 app.include_router(admin_router_instance, prefix="/api/v1/admin", tags=["Admin"])
-# Gateway router (prefix /api/v1) - Proxy general, va después de los específicos
-app.include_router(gateway_router_instance, prefix="/api/v1")
+app.include_router(gateway_router_instance, prefix="/api/v1") # Proxy general va último
 log.info("Routers included successfully.")
 
 # --- Root & Health Endpoints (Sin cambios) ---
