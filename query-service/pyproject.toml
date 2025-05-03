@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "query-service"
-version = "0.1.1" # LLM_COMMENT: Increment version after fixing build and embedder refactor
-description = "Query service for SaaS B2B using Haystack RAG with FastEmbed" # LLM_COMMENT: Updated description
+version = "0.1.2" # Incremented version number
+description = "Query service for SaaS B2B using PyMilvus & Haystack RAG with FastEmbed" # Updated description
 authors = ["Nyro <dev@nyro.com>"]
 readme = "README.md"
 
@@ -19,10 +19,10 @@ tenacity = "^8.2.3"
 structlog = "^24.1.0"
 
 # --- Haystack Dependencies ---
-haystack-ai = "^2.0.1" # Core Haystack
-pymilvus = "^2.4.1"    # Cliente Milvus explícito
-milvus-haystack = "^0.0.6" # Integración Milvus para Haystack 2.x
-# FastEmbed integration for Haystack (PyPI package name and available version)
+haystack-ai = "^2.0.1" # Core Haystack (still used for PromptBuilder, Document class)
+pymilvus = "^2.4.1"    # Cliente Milvus explícito (Now used directly for retrieval)
+# milvus-haystack = "^0.0.6" # REMOVED - Replaced by direct pymilvus usage
+# FastEmbed integration for Haystack (still used for embedding)
 fastembed-haystack = "^1.4.1"
 
 # --- Gemini Dependency  ---

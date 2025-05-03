@@ -1283,43 +1283,38 @@ log = structlog.get_logger(__name__)
 
 # --- Component Initialization Functions ---
 
-# --- CORRECTION: Explicitly pass field names to MilvusDocumentStore ---
+# --- CORRECTION: REMOVE unexpected keyword arguments from __init__ ---
 def get_milvus_document_store() -> MilvusDocumentStore:
     """Initializes and returns a MilvusDocumentStore instance."""
     connection_uri = str(settings.MILVUS_URI)
+    # Log the fields defined in config for context, even if not passed to init
     store_log = log.bind(
         component="MilvusDocumentStore",
         uri=connection_uri,
         collection=settings.MILVUS_COLLECTION_NAME,
-        embedding_field=settings.MILVUS_EMBEDDING_FIELD, # Log field name
-        content_field=settings.MILVUS_CONTENT_FIELD      # Log field name
+        expected_embedding_field=settings.MILVUS_EMBEDDING_FIELD,
+        expected_content_field=settings.MILVUS_CONTENT_FIELD
     )
-    store_log.debug("Initializing...")
+    store_log.debug("Initializing (relying on default field names 'content' and 'embedding')...")
     try:
         store = MilvusDocumentStore(
             connection_args={"uri": connection_uri},
             collection_name=settings.MILVUS_COLLECTION_NAME,
-            # --- Pass explicit field names ---
-            embedding_field=settings.MILVUS_EMBEDDING_FIELD,
-            content_field=settings.MILVUS_CONTENT_FIELD,
-            # ---------------------------------
-            # --- Optional: Map metadata fields if they differ from Haystack defaults ---
-            # field_map={
-            #     "content": settings.MILVUS_CONTENT_FIELD,
-            #     "embedding": settings.MILVUS_EMBEDDING_FIELD,
-            #     # Map other metadata fields if their names differ significantly
-            #     # "meta.company_id": settings.MILVUS_COMPANY_ID_FIELD, # Example if names differed
-            # },
-            # -----------------------------------------------------------------------
+            # embedding_field=settings.MILVUS_EMBEDDING_FIELD, # REMOVED ARGUMENT
+            # content_field=settings.MILVUS_CONTENT_FIELD,     # REMOVED ARGUMENT
             index_params=settings.MILVUS_INDEX_PARAMS,
             search_params=settings.MILVUS_SEARCH_PARAMS,
             consistency_level="Strong",
         )
-        store_log.info("Initialization successful.")
+        # Log successful init, implying default fields are expected to match
+        store_log.info("Initialization successful using default field names.")
         return store
     except Exception as e:
         store_log.error("Initialization failed", error=str(e), exc_info=True)
-        raise RuntimeError(f"Milvus initialization error: {e}")
+        # Propagate a clearer error if it's a TypeError related to arguments
+        if isinstance(e, TypeError) and "__init__" in str(e):
+             raise TypeError(f"Failed to initialize MilvusDocumentStore. Check constructor arguments for the installed 'milvus-haystack' version. Error: {e}") from e
+        raise RuntimeError(f"Milvus initialization error: {e}") from e
 # -----------------------------------------------------------------------
 
 def get_fastembed_text_embedder() -> FastembedTextEmbedder:
@@ -1344,7 +1339,7 @@ def get_prompt_builder(template: str) -> PromptBuilder:
     return PromptBuilder(template=template)
 
 # --- Pipeline Execution Logic ---
-# (No changes needed in the execution flow itself, only in component init)
+# (No changes needed below this point for this specific error)
 
 async def embed_query(query: str) -> List[float]:
     """Embeds the user query using FastEmbed."""
@@ -1356,14 +1351,12 @@ async def embed_query(query: str) -> List[float]:
         embedding = result.get("embedding")
         if not embedding:
             raise ValueError("Embedding process returned no embedding vector.")
-        # --- CORRECTION: Validate embedding dimension ---
         if len(embedding) != settings.EMBEDDING_DIMENSION:
             embed_log.error("Embedding dimension mismatch!",
                             expected=settings.EMBEDDING_DIMENSION,
                             actual=len(embedding),
                             model=settings.FASTEMBED_MODEL_NAME)
             raise ValueError(f"Embedding dimension mismatch: expected {settings.EMBEDDING_DIMENSION}, got {len(embedding)}")
-        # ----------------------------------------------
         embed_log.info("Query embedded successfully", vector_dim=len(embedding))
         return embedding
     except Exception as e:
@@ -1375,15 +1368,12 @@ async def retrieve_documents(embedding: List[float], company_id: str, top_k: int
     retrieve_log = log.bind(action="retrieve_documents", company_id=company_id, top_k=top_k)
     try:
         document_store = get_milvus_document_store()
-        # --- Construct filter using the field name from settings ---
         filters = {settings.MILVUS_COMPANY_ID_FIELD: company_id}
         retrieve_log.debug("Using filter for retrieval", filter_dict=filters)
-        # --------------------------------------------------------
         retriever = MilvusEmbeddingRetriever(
             document_store=document_store,
             filters=filters,
             top_k=top_k
-            # embedding_field is inferred from document_store if set correctly
         )
         result = await asyncio.to_thread(retriever.run, query_embedding=embedding)
         documents = result.get("documents", [])
@@ -1391,9 +1381,7 @@ async def retrieve_documents(embedding: List[float], company_id: str, top_k: int
         return documents
     except MilvusException as me:
          retrieve_log.error("Milvus retrieval failed", error_code=me.code, error_message=me.message, exc_info=False)
-         # --- Provide more context in the error ---
          raise ConnectionError(f"Vector DB retrieval error (Collection: {settings.MILVUS_COLLECTION_NAME}, Milvus code: {me.code})") from me
-         # -------------------------------------------
     except Exception as e:
         retrieve_log.error("Retrieval failed", error=str(e), exc_info=True)
         raise ConnectionError(f"Retrieval service error: {e}") from e
@@ -1497,7 +1485,7 @@ async def check_pipeline_dependencies() -> Dict[str, str]:
 
     # Check Milvus
     try:
-        store = get_milvus_document_store()
+        store = get_milvus_document_store() # This now uses default field names
         # Check connection and collection existence using pymilvus directly for reliability
         if store.conn.has_collection(store.collection_name):
             results["milvus_connection"] = "ok"

@@ -4,13 +4,17 @@ import asyncio
 import uuid
 from typing import Dict, Any, List, Tuple, Optional
 
-from pymilvus.exceptions import MilvusException, ErrorCode
+# --- Direct pymilvus Imports ---
+from pymilvus import Collection, connections, utility, MilvusException, DataType # Added DataType
+# -----------------------------
 from fastapi import HTTPException, status
 from haystack import Document # Keep Haystack Document import
 # Import FastEmbed Text Embedder for Haystack
 from haystack_integrations.components.embedders.fastembed import FastembedTextEmbedder
 from haystack.components.builders.prompt_builder import PromptBuilder
-from milvus_haystack import MilvusDocumentStore, MilvusEmbeddingRetriever # Keep Milvus imports
+# --- REMOVED Milvus Haystack Imports ---
+# from milvus_haystack import MilvusDocumentStore, MilvusEmbeddingRetriever
+# ------------------------------------
 from haystack.utils import Secret
 
 from app.core.config import settings
@@ -20,41 +24,62 @@ from app.api.v1.schemas import RetrievedDocument # Import schema for logging
 
 log = structlog.get_logger(__name__)
 
-# --- Component Initialization Functions ---
+# --- Milvus Connection Management (using pymilvus) ---
+_milvus_collection: Optional[Collection] = None
+_milvus_connected = False
 
-# --- CORRECTION: REMOVE unexpected keyword arguments from __init__ ---
-def get_milvus_document_store() -> MilvusDocumentStore:
-    """Initializes and returns a MilvusDocumentStore instance."""
-    connection_uri = str(settings.MILVUS_URI)
-    # Log the fields defined in config for context, even if not passed to init
-    store_log = log.bind(
-        component="MilvusDocumentStore",
-        uri=connection_uri,
-        collection=settings.MILVUS_COLLECTION_NAME,
-        expected_embedding_field=settings.MILVUS_EMBEDDING_FIELD,
-        expected_content_field=settings.MILVUS_CONTENT_FIELD
-    )
-    store_log.debug("Initializing (relying on default field names 'content' and 'embedding')...")
-    try:
-        store = MilvusDocumentStore(
-            connection_args={"uri": connection_uri},
-            collection_name=settings.MILVUS_COLLECTION_NAME,
-            # embedding_field=settings.MILVUS_EMBEDDING_FIELD, # REMOVED ARGUMENT
-            # content_field=settings.MILVUS_CONTENT_FIELD,     # REMOVED ARGUMENT
-            index_params=settings.MILVUS_INDEX_PARAMS,
-            search_params=settings.MILVUS_SEARCH_PARAMS,
-            consistency_level="Strong",
-        )
-        # Log successful init, implying default fields are expected to match
-        store_log.info("Initialization successful using default field names.")
-        return store
-    except Exception as e:
-        store_log.error("Initialization failed", error=str(e), exc_info=True)
-        # Propagate a clearer error if it's a TypeError related to arguments
-        if isinstance(e, TypeError) and "__init__" in str(e):
-             raise TypeError(f"Failed to initialize MilvusDocumentStore. Check constructor arguments for the installed 'milvus-haystack' version. Error: {e}") from e
-        raise RuntimeError(f"Milvus initialization error: {e}") from e
-# -----------------------------------------------------------------------
+def _ensure_milvus_connection_and_collection() -> Collection:
+    """Ensures connection to Milvus and returns the Collection object using pymilvus."""
+    global _milvus_collection, _milvus_connected
+    alias = "query_service_pymilvus" # Unique alias for this service
+    if not _milvus_connected or alias not in connections.list_connections():
+        uri = str(settings.MILVUS_URI)
+        connect_log = log.bind(component="PymilvusConnection", uri=uri, alias=alias)
+        connect_log.info("Connecting to Milvus...")
+        try:
+            connections.connect(alias=alias, uri=uri, timeout=settings.MILVUS_GRPC_TIMEOUT) # Use timeout from config
+            _milvus_connected = True
+            connect_log.info("Connected to Milvus successfully.")
+        except MilvusException as e:
+            connect_log.error("Failed to connect to Milvus.", error=str(e))
+            _milvus_connected = False
+            raise ConnectionError(f"Milvus connection failed: {e}") from e
+        except Exception as e:
+            connect_log.error("Unexpected error connecting to Milvus.", error=str(e))
+            _milvus_connected = False
+            raise ConnectionError(f"Unexpected Milvus connection error: {e}") from e
+
+    if _milvus_collection is None:
+        collection_name = settings.MILVUS_COLLECTION_NAME
+        collection_log = log.bind(component="PymilvusCollection", collection=collection_name, alias=alias)
+        try:
+            if not utility.has_collection(collection_name, using=alias):
+                 collection_log.error("Milvus collection does not exist. It should be created by the ingest service.")
+                 # Raise an error because query service shouldn't create the collection
+                 raise RuntimeError(f"Milvus collection '{collection_name}' not found.")
+
+            collection = Collection(name=collection_name, using=alias)
+            # Load the collection into memory for searching
+            collection_log.info("Loading Milvus collection into memory...")
+            collection.load()
+            collection_log.info("Milvus collection loaded successfully.")
+            _milvus_collection = collection
+
+        except MilvusException as e:
+            collection_log.error("Failed to get or load Milvus collection", error=str(e))
+            raise RuntimeError(f"Milvus collection access error: {e}") from e
+        except Exception as e:
+             collection_log.exception("Unexpected error accessing Milvus collection")
+             raise RuntimeError(f"Unexpected error accessing Milvus collection: {e}") from e
+
+
+    if not isinstance(_milvus_collection, Collection):
+        log.critical("Milvus collection object is unexpectedly None or invalid type after initialization attempt.")
+        raise RuntimeError("Failed to obtain a valid Milvus collection object.")
+
+    return _milvus_collection
+
+# --- Component Initialization Functions (Embedder, PromptBuilder - No Change) ---
 
 def get_fastembed_text_embedder() -> FastembedTextEmbedder:
     """Initializes and returns a FastembedTextEmbedder instance."""
@@ -62,7 +87,7 @@ def get_fastembed_text_embedder() -> FastembedTextEmbedder:
         component="FastembedTextEmbedder",
         model=settings.FASTEMBED_MODEL_NAME,
         prefix=settings.FASTEMBED_QUERY_PREFIX,
-        dimension=settings.EMBEDDING_DIMENSION # Log dimension
+        dimension=settings.EMBEDDING_DIMENSION
     )
     embedder_log.debug("Initializing...")
     embedder = FastembedTextEmbedder(
@@ -78,7 +103,6 @@ def get_prompt_builder(template: str) -> PromptBuilder:
     return PromptBuilder(template=template)
 
 # --- Pipeline Execution Logic ---
-# (No changes needed below this point for this specific error)
 
 async def embed_query(query: str) -> List[float]:
     """Embeds the user query using FastEmbed."""
@@ -102,28 +126,87 @@ async def embed_query(query: str) -> List[float]:
         embed_log.error("Embedding failed", error=str(e), exc_info=True)
         raise ConnectionError(f"Embedding service error: {e}") from e
 
-async def retrieve_documents(embedding: List[float], company_id: str, top_k: int) -> List[Document]:
-    """Retrieves relevant documents from Milvus based on the query embedding and company_id."""
-    retrieve_log = log.bind(action="retrieve_documents", company_id=company_id, top_k=top_k)
+# --- REFACTORED: Retrieve documents using pymilvus ---
+async def search_milvus_directly(embedding: List[float], company_id: str, top_k: int) -> List[Document]:
+    """
+    Retrieves relevant documents directly from Milvus using pymilvus search.
+    Converts results to Haystack Document objects.
+    """
+    search_log = log.bind(action="search_milvus_directly", company_id=company_id, top_k=top_k)
     try:
-        document_store = get_milvus_document_store()
-        filters = {settings.MILVUS_COMPANY_ID_FIELD: company_id}
-        retrieve_log.debug("Using filter for retrieval", filter_dict=filters)
-        retriever = MilvusEmbeddingRetriever(
-            document_store=document_store,
-            filters=filters,
-            top_k=top_k
+        collection = _ensure_milvus_connection_and_collection()
+
+        # Define search parameters
+        search_params = settings.MILVUS_SEARCH_PARAMS
+
+        # Define the filter expression
+        filter_expr = f'{settings.MILVUS_COMPANY_ID_FIELD} == "{company_id}"'
+        search_log.debug("Using filter expression", expr=filter_expr)
+
+        # Define output fields
+        output_fields = [
+            settings.MILVUS_CONTENT_FIELD,
+            settings.MILVUS_COMPANY_ID_FIELD, # Keep for potential verification
+            settings.MILVUS_DOCUMENT_ID_FIELD,
+            settings.MILVUS_FILENAME_FIELD,
+            # Add other metadata fields from MILVUS_METADATA_FIELDS if needed
+        ]
+        # Ensure PK field is not requested if auto_id=True (it comes in hit.id)
+        # If PK is not auto_id and needed, add it here.
+
+        search_log.info("Performing Milvus vector search...", vector_field=settings.MILVUS_EMBEDDING_FIELD)
+
+        # Execute search asynchronously using run_in_executor
+        loop = asyncio.get_running_loop()
+        search_results = await loop.run_in_executor(
+            None, # Use default executor
+            lambda: collection.search(
+                data=[embedding], # Search data expects a list of vectors
+                anns_field=settings.MILVUS_EMBEDDING_FIELD,
+                param=search_params,
+                limit=top_k,
+                expr=filter_expr,
+                output_fields=output_fields,
+                consistency_level="Strong" # Or match consistency level used in ingest
+            )
         )
-        result = await asyncio.to_thread(retriever.run, query_embedding=embedding)
-        documents = result.get("documents", [])
-        retrieve_log.info("Documents retrieved successfully", count=len(documents))
-        return documents
+
+        search_log.info(f"Milvus search completed. Found hits: {len(search_results[0]) if search_results else 0}")
+
+        # Convert Milvus results to Haystack Documents
+        haystack_documents: List[Document] = []
+        if search_results and search_results[0]:
+            for hit in search_results[0]:
+                entity = hit.entity # Contains the output fields
+                content = entity.get(settings.MILVUS_CONTENT_FIELD, "")
+                metadata = {
+                    # Include all retrieved output fields (except content/embedding) as metadata
+                    field: entity.get(field) for field in output_fields if field != settings.MILVUS_CONTENT_FIELD
+                }
+                # Add standard fields if not already present
+                metadata.setdefault("company_id", entity.get(settings.MILVUS_COMPANY_ID_FIELD))
+                metadata.setdefault("document_id", entity.get(settings.MILVUS_DOCUMENT_ID_FIELD))
+                metadata.setdefault("file_name", entity.get(settings.MILVUS_FILENAME_FIELD))
+
+                doc = Document(
+                    id=str(hit.id), # Use Milvus primary key as Haystack ID
+                    content=content,
+                    meta=metadata,
+                    score=hit.score # Or hit.distance depending on metric
+                )
+                haystack_documents.append(doc)
+
+        search_log.info(f"Converted {len(haystack_documents)} Milvus hits to Haystack Documents.")
+        return haystack_documents
+
     except MilvusException as me:
-         retrieve_log.error("Milvus retrieval failed", error_code=me.code, error_message=me.message, exc_info=False)
-         raise ConnectionError(f"Vector DB retrieval error (Collection: {settings.MILVUS_COLLECTION_NAME}, Milvus code: {me.code})") from me
+         search_log.error("Milvus search failed", error_code=me.code, error_message=me.message, exc_info=False)
+         raise ConnectionError(f"Vector DB search error (Collection: {settings.MILVUS_COLLECTION_NAME}, Milvus code: {me.code})") from me
     except Exception as e:
-        retrieve_log.error("Retrieval failed", error=str(e), exc_info=True)
-        raise ConnectionError(f"Retrieval service error: {e}") from e
+        search_log.exception("Direct Milvus search failed")
+        raise ConnectionError(f"Milvus search service error: {e}") from e
+# --- End Refactored Search ---
+
 
 async def build_prompt(query: str, documents: List[Document]) -> str:
     """Builds the final prompt for the LLM, selecting template based on retrieved documents."""
@@ -167,10 +250,10 @@ async def run_rag_pipeline(
     chat_id: Optional[uuid.UUID] = None
 ) -> Tuple[str, List[Document], Optional[uuid.UUID]]:
     """
-    Orchestrates the RAG pipeline steps: embed, retrieve, build prompt, generate answer, log interaction.
+    Orchestrates the RAG pipeline steps: embed, retrieve (using pymilvus), build prompt, generate answer, log interaction.
     """
     run_log = log.bind(company_id=company_id, user_id=user_id or "N/A", chat_id=str(chat_id) if chat_id else "N/A", query=query[:50]+"...")
-    run_log.info("Executing RAG pipeline")
+    run_log.info("Executing RAG pipeline (using direct pymilvus search)")
     retriever_k = top_k or settings.RETRIEVER_TOP_K
     log_id: Optional[uuid.UUID] = None
 
@@ -178,8 +261,10 @@ async def run_rag_pipeline(
         # 1. Embed Query
         query_embedding = await embed_query(query)
 
-        # 2. Retrieve Documents
-        retrieved_docs = await retrieve_documents(query_embedding, company_id, retriever_k)
+        # --- REPLACED Haystack Retriever with direct pymilvus search ---
+        # 2. Retrieve Documents using pymilvus
+        retrieved_docs = await search_milvus_directly(query_embedding, company_id, retriever_k)
+        # ------------------------------------------------------------
 
         # 3. Build Prompt
         final_prompt = await build_prompt(query, retrieved_docs)
@@ -218,27 +303,25 @@ async def run_rag_pipeline(
 
 # --- Dependency Check Function ---
 async def check_pipeline_dependencies() -> Dict[str, str]:
-    """Checks the status of pipeline dependencies (Milvus, Gemini)."""
+    """Checks the status of pipeline dependencies (Milvus via pymilvus, Gemini)."""
     results = {"milvus_connection": "pending", "gemini_api": "pending", "fastembed_model": "pending"}
     check_log = log.bind(action="check_dependencies")
 
-    # Check Milvus
+    # Check Milvus (using direct pymilvus connection)
     try:
-        store = get_milvus_document_store() # This now uses default field names
-        # Check connection and collection existence using pymilvus directly for reliability
-        if store.conn.has_collection(store.collection_name):
-            results["milvus_connection"] = "ok"
-            check_log.debug("Milvus dependency check: Connection ok, collection exists.")
-        else:
-            # It's okay if the collection doesn't exist at startup for query service
-            results["milvus_connection"] = "ok (collection not found yet)"
-            check_log.info("Milvus dependency check: Connection ok, collection does not exist (needs data from ingest).")
+        # Attempt to get collection - this implicitly checks connection
+        _ = _ensure_milvus_connection_and_collection()
+        results["milvus_connection"] = "ok"
+        check_log.debug("Milvus dependency check via pymilvus: Connection ok, collection loaded.")
     except MilvusException as me:
         results["milvus_connection"] = f"error: MilvusException (code={me.code}, msg={me.message})"
-        check_log.warning("Milvus dependency check failed", error_code=me.code, error_message=me.message, exc_info=False)
+        check_log.warning("Milvus dependency check via pymilvus failed", error_code=me.code, error_message=me.message, exc_info=False)
+    except RuntimeError as re: # Catch errors from _ensure_milvus...
+         results["milvus_connection"] = f"error: RuntimeError during connection/load ({re})"
+         check_log.warning("Milvus dependency check via pymilvus failed", error=str(re), exc_info=False)
     except Exception as e:
         results["milvus_connection"] = f"error: Unexpected {type(e).__name__}"
-        check_log.warning("Milvus dependency check failed", error=str(e), exc_info=True)
+        check_log.warning("Milvus dependency check via pymilvus failed", error=str(e), exc_info=True)
 
     # Check Gemini (API Key Presence)
     if settings.GEMINI_API_KEY.get_secret_value():
