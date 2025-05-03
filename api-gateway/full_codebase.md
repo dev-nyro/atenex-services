@@ -1050,7 +1050,7 @@ import uvicorn
 import time
 import uuid
 import logging
-import re
+import re # Mantenemos re por si se usa en otro lado, pero no para CORS aquí
 
 # --- Configuración de Logging PRIMERO ---
 from app.core.logging_config import setup_logging
@@ -1118,30 +1118,45 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.PROJECT_NAME,
     description="Atenex API Gateway: Single entry point, JWT auth, routing via explicit HTTP calls, Admin API.",
-    version="1.1.2", # Nueva versión para reflejar corrección final de ruta
+    version="1.1.3", # Nueva versión para reflejar corrección CORS
     lifespan=lifespan,
 )
 
 # --- Middlewares ---
-# CORS (Configuración sin cambios)
-vercel_pattern = ""
+
+# --- CORRECCIÓN CORS: Usar allow_origins en lugar de regex ---
+allowed_origins = [
+    "http://localhost:3000", # Puerto común de React/Next.js dev
+    "http://localhost:3001", # Otro puerto posible
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
+]
+
+# Añadir la URL base de Vercel si está configurada
 if settings.VERCEL_FRONTEND_URL:
-    base_vercel_url = settings.VERCEL_FRONTEND_URL.split("://")[1]
-    base_vercel_url = re.sub(r"(-git-[a-z0-9-]+)?(-[a-z0-9]+)?\.vercel\.app", ".vercel.app", base_vercel_url)
-    escaped_base = re.escape(base_vercel_url).replace(r"\.vercel\.app", "")
-    vercel_pattern = rf"(https://{escaped_base}(-[a-z0-9-]+)*\.vercel\.app)"
-else: log.warning("VERCEL_FRONTEND_URL not set for CORS.")
-localhost_pattern = r"(http://localhost:300[0-9]|http://127.0.0.1:300[0-9])"
-allowed_origin_patterns = [localhost_pattern];
-if vercel_pattern: allowed_origin_patterns.append(vercel_pattern)
-final_regex = rf"^{ '|'.join(allowed_origin_patterns) }$" if allowed_origin_patterns else ""
-if final_regex:
-    log.info("Configuring CORS middleware", allow_origin_regex=final_regex)
-    app.add_middleware(CORSMiddleware, allow_origin_regex=final_regex, allow_credentials=True,
-                       allow_methods=["*"], allow_headers=["*"],
-                       expose_headers=["X-Request-ID", "X-Process-Time"], max_age=600)
-else:
-    log.warning("No CORS origins configured. CORS middleware not added.")
+    allowed_origins.append(settings.VERCEL_FRONTEND_URL)
+    # ¡IMPORTANTE! Para que las PREVIEWS de Vercel funcionen, necesitas permitir
+    # sus URLs específicas o usar un patrón regex más permisivo (que puede ser
+    # menos seguro). Otra opción es añadir URLs de preview específicas aquí
+    # temporalmente durante el desarrollo o usar una variable de entorno separada.
+    # Ejemplo añadiendo la URL específica del log (NO RECOMENDADO para producción):
+    allowed_origins.append("https://atenex-frontend-git-main-devnyro-gmailcoms-projects.vercel.app")
+
+# Añadir la URL de Ngrok del log (considera hacerla configurable vía env var)
+# ¡CAMBIA ESTO SI TU URL DE NGROK CAMBIA!
+NGROK_URL_FROM_LOG = "https://2646-2001-1388-53a1-bd93-5941-79e3-d98a-2e11.ngrok-free.app"
+allowed_origins.append(NGROK_URL_FROM_LOG)
+
+log.info("Configuring CORS middleware", allowed_origins=allowed_origins)
+app.add_middleware(CORSMiddleware,
+                   allow_origins=allowed_origins, # Usar la lista de orígenes
+                   allow_credentials=True,
+                   allow_methods=["*"], # Permite GET, POST, OPTIONS, etc.
+                   allow_headers=["*"], # Permite todos los headers comunes
+                   expose_headers=["X-Request-ID", "X-Process-Time"],
+                   max_age=600)
+# --- FIN CORRECCIÓN CORS ---
+
 
 # Request Context/Timing/Logging Middleware (Sin cambios)
 @app.middleware("http")
@@ -1153,39 +1168,49 @@ async def add_request_context_timing_logging(request: Request, call_next):
     if hasattr(request.state, 'user') and isinstance(request.state.user, dict):
         user_context['user_id'] = request.state.user.get('sub')
         user_context['company_id'] = request.state.user.get('company_id')
+    # Incluir origin en el log inicial
+    origin = request.headers.get("origin", "N/A")
     request_log = log.bind(request_id=request_id, method=request.method, path=request.url.path,
                            client_ip=request.client.host if request.client else "unknown",
-                           origin=request.headers.get("origin", "N/A"), **user_context)
-    if request.method == "OPTIONS": request_log.debug("OPTIONS preflight request received")
-    else: request_log.info("Request received")
-    response = None; status_code = 500
+                           origin=origin, **user_context)
+
+    # Loguear la recepción de OPTIONS de forma diferente para depurar CORS
+    if request.method == "OPTIONS":
+        request_log.info("OPTIONS preflight request received") # Cambiado a INFO para visibilidad
+    else:
+        request_log.info("Request received")
+
+    response = None
+    status_code = 500
     try:
         response = await call_next(request); status_code = response.status_code
+        # Loguear headers de respuesta si es OPTIONS para depurar CORS
+        if request.method == "OPTIONS" and response:
+            request_log.info("OPTIONS preflight response sent", status_code=response.status_code, headers=dict(response.headers))
     except Exception as e:
         proc_time = (time.perf_counter() - start_time) * 1000
         request_log.exception("Unhandled exception", status_code=500, error=str(e), proc_time=round(proc_time,2))
+        # ¡Importante! Asegurar que las respuestas de error también incluyan cabeceras CORS
         response = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
-        origin = request.headers.get("Origin");
-        if final_regex and origin and re.match(final_regex, origin):
+        response.headers["X-Request-ID"] = request_id
+        # Re-aplicar CORS a respuestas de error (el middleware puede no hacerlo si la excepción ocurre antes)
+        if origin in allowed_origins: # Comprobar si el origen está permitido
              response.headers["Access-Control-Allow-Origin"] = origin
              response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["X-Request-ID"] = request_id
         return response
     finally:
-        if response:
+        if response and request.method != "OPTIONS": # No loguear completion de OPTIONS si ya se logueó la respuesta
             proc_time = (time.perf_counter() - start_time) * 1000
             response.headers["X-Request-ID"] = request_id
             response.headers["X-Process-Time"] = f"{proc_time:.2f}ms"
             log_level = "debug" if request.url.path == "/health" else "info"
             log_func = getattr(request_log.bind(status_code=status_code), log_level)
-            if request.method != "OPTIONS": log_func("Request completed", proc_time=round(proc_time, 2))
+            log_func("Request completed", proc_time=round(proc_time, 2))
     return response
 
 # --- Include Routers ---
 log.info("Including application routers...")
-# --- CORRECCIÓN DEFINITIVA: Usar el prefijo correcto /api/v1/users ---
 app.include_router(user_router_instance, prefix="/api/v1/users", tags=["Users & Authentication"])
-# -------------------------------------------------------------------
 app.include_router(admin_router_instance, prefix="/api/v1/admin", tags=["Admin"])
 app.include_router(gateway_router_instance, prefix="/api/v1") # Proxy general va último
 log.info("Routers included successfully.")
