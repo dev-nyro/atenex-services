@@ -25,13 +25,11 @@ from app.db import postgres_client
 # --- Importar Routers ---
 from app.routers.gateway_router import router as gateway_router_instance
 from app.routers.user_router import router as user_router_instance
-# --- AÑADIDO: Importar el nuevo router de admin ---
 from app.routers.admin_router import router as admin_router_instance
-# from app.routers.auth_router import router as auth_router_instance # Probablemente no necesario
 
 log = structlog.get_logger("atenex_api_gateway.main")
 
-# --- Lifespan Manager (Sin cambios respecto a la versión anterior) ---
+# --- Lifespan Manager (Sin cambios) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Application startup sequence initiated...")
@@ -77,16 +75,17 @@ async def lifespan(app: FastAPI):
         log.exception("Error closing PostgreSQL pool.", error=str(e))
     log.info("Application shutdown complete.")
 
+
 # --- Create FastAPI App Instance ---
 app = FastAPI(
     title=settings.PROJECT_NAME,
     description="Atenex API Gateway: Single entry point, JWT auth, routing via explicit HTTP calls, Admin API.",
-    version="1.1.0", # Version bump para reflejar cambios admin
+    version="1.1.1", # Version bump para reflejar corrección de ruta
     lifespan=lifespan,
 )
 
 # --- Middlewares ---
-# CORS (Configuración sin cambios, asumiendo que 'final_regex' está definido correctamente antes)
+# CORS (Configuración sin cambios)
 vercel_pattern = ""
 if settings.VERCEL_FRONTEND_URL:
     base_vercel_url = settings.VERCEL_FRONTEND_URL.split("://")[1]
@@ -112,7 +111,6 @@ async def add_request_context_timing_logging(request: Request, call_next):
     start_time = time.perf_counter()
     request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
     request.state.request_id = request_id
-    # Añadir user_id/company_id al log si están en el estado (puestos por auth middleware)
     user_context = {}
     if hasattr(request.state, 'user') and isinstance(request.state.user, dict):
         user_context['user_id'] = request.state.user.get('sub')
@@ -147,11 +145,13 @@ async def add_request_context_timing_logging(request: Request, call_next):
 
 # --- Include Routers ---
 log.info("Including application routers...")
+# --- CORRECCIÓN: Cambiar el prefijo para user_router ---
 # User router (prefix /api/v1/users)
-app.include_router(user_router_instance, prefix="/api/v1", tags=["Users & Authentication"]) # Mantenemos prefix /api/v1 aquí para que coincida con paths internos
+app.include_router(user_router_instance, prefix="/api/v1/users", tags=["Users & Authentication"])
+# --- FIN CORRECCIÓN ---
 # Admin router (prefix /api/v1/admin)
-app.include_router(admin_router_instance, prefix="/api/v1/admin", tags=["Admin"]) # Añadir el router admin
-# Gateway router (prefix /api/v1) - Debe ir DESPUÉS de los más específicos si hay solapamiento
+app.include_router(admin_router_instance, prefix="/api/v1/admin", tags=["Admin"])
+# Gateway router (prefix /api/v1) - Proxy general, va después de los específicos
 app.include_router(gateway_router_instance, prefix="/api/v1")
 log.info("Routers included successfully.")
 

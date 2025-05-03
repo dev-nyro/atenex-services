@@ -725,16 +725,17 @@ async def get_db_pool() -> asyncpg.Pool:
                       schema='pg_catalog',
                       format='text' # Asegurar formato texto para JSON
                   )
-                 # Codec para TEXT[] (arrays de texto) - asyncpg suele manejarlo bien,
-                 # pero registrar explícitamente puede ayudar en algunos casos.
-                 # Aquí simplemente definimos cómo tratar el array en Python (como list).
-                 await conn.set_type_codec(
-                     'text[]',
-                     encoder=lambda x: x, # Lo envía como lista, pg lo convierte
-                     decoder=lambda x: x, # Lo recibe como lista
-                     schema='pg_catalog',
-                     format='text'
-                 )
+                 # --- CORRECCIÓN: ELIMINADO EL BLOQUE PARA text[] ---
+                 # asyncpg maneja text[] automáticamente. No es necesario (y causa error)
+                 # registrar un codec explícito para él.
+                 # await conn.set_type_codec(
+                 #     'text[]',
+                 #     encoder=lambda x: x,
+                 #     decoder=lambda x: x,
+                 #     schema='pg_catalog',
+                 #     format='text'
+                 # )
+                 # --- FIN CORRECCIÓN ---
 
 
             _pool = await asyncpg.create_pool(
@@ -796,7 +797,7 @@ async def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
     Alineado con el esquema USERS (con 'roles').
     """
     pool = await get_db_pool()
-    # --- MODIFICADO: Selecciona 'roles' en lugar de 'role' ---
+    # Selecciona 'roles' en lugar de 'role'
     query = """
         SELECT id, company_id, email, hashed_password, full_name, roles,
                created_at, last_login, is_active
@@ -809,14 +810,14 @@ async def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
             row = await conn.fetchrow(query, email)
         if row:
             log.debug("User found by email", user_id=str(row['id']))
-            # asyncpg debería devolver 'roles' como una lista de Python si el codec está bien
+            # asyncpg devuelve 'roles' como una lista de Python automáticamente
             return dict(row)
         else:
             log.debug("User not found by email", email=email)
             return None
     except Exception as e:
         log.error("Error getting user by email", error=str(e), email=email, exc_info=True)
-        raise # Relanzar para manejo de errores superior
+        raise
 
 async def get_user_by_id(user_id: uuid.UUID) -> Optional[Dict[str, Any]]:
     """
@@ -825,7 +826,7 @@ async def get_user_by_id(user_id: uuid.UUID) -> Optional[Dict[str, Any]]:
     Alineado con el esquema USERS (con 'roles'). Excluye la contraseña hash por seguridad.
     """
     pool = await get_db_pool()
-    # --- MODIFICADO: Selecciona 'roles' en lugar de 'role' ---
+    # Selecciona 'roles' en lugar de 'role'
     query = """
         SELECT id, company_id, email, full_name, roles,
                created_at, last_login, is_active
@@ -838,7 +839,7 @@ async def get_user_by_id(user_id: uuid.UUID) -> Optional[Dict[str, Any]]:
             row = await conn.fetchrow(query, user_id)
         if row:
             log.debug("User found by ID", user_id=str(user_id))
-            # asyncpg debería devolver 'roles' como una lista de Python
+            # asyncpg devuelve 'roles' como una lista de Python automáticamente
             return dict(row)
         else:
             log.debug("User not found by ID", user_id=str(user_id))
@@ -849,27 +850,26 @@ async def get_user_by_id(user_id: uuid.UUID) -> Optional[Dict[str, Any]]:
 
 async def update_user_company(user_id: uuid.UUID, company_id: uuid.UUID) -> bool:
     """
-    Actualiza el company_id para un usuario específico y actualiza updated_at.
-    Devuelve True si la actualización fue exitosa (al menos una fila afectada), False en caso contrario.
-    Alineado con el esquema USERS.
+    Actualiza el company_id para un usuario específico y actualiza updated_at (si existiera).
+    NOTA: La tabla users según el esquema no tiene updated_at.
+    Devuelve True si la actualización fue exitosa, False en caso contrario.
     """
     pool = await get_db_pool()
+    # Quitamos updated_at = NOW() porque la columna no existe
     query = """
         UPDATE users
-        SET company_id = $2, updated_at = NOW()
+        SET company_id = $2 -- , updated_at = NOW() -- Columna no existe
         WHERE id = $1
         RETURNING id -- Devolvemos el ID para confirmar la actualización
     """
     log.debug("Executing update_user_company query", user_id=str(user_id), company_id=str(company_id))
     try:
         async with pool.acquire() as conn:
-            # Usar fetchval para obtener el ID devuelto o None
             result = await conn.fetchval(query, user_id, company_id)
         if result is not None:
             log.info("User company updated successfully", user_id=str(user_id), new_company_id=str(company_id))
             return True
         else:
-            # Esto podría suceder si el user_id no existe
             log.warning("Update user company command executed but no rows were affected.", user_id=str(user_id))
             return False
     except Exception as e:
@@ -877,6 +877,7 @@ async def update_user_company(user_id: uuid.UUID, company_id: uuid.UUID) -> bool
         raise
 
 # --- NUEVAS FUNCIONES PARA ADMIN ---
+# (Las nuevas funciones no se modifican, ya eran correctas respecto a 'roles')
 
 async def create_company(name: str) -> Dict[str, Any]:
     """Crea una nueva compañía."""
@@ -889,19 +890,16 @@ async def create_company(name: str) -> Dict[str, Any]:
     log.debug("Executing create_company query", name=name)
     try:
         async with pool.acquire() as conn:
-            # Usamos fetchrow porque esperamos una sola fila de vuelta
             new_company = await conn.fetchrow(query, name)
             if new_company:
                  log.info("Company created successfully", company_id=str(new_company['id']), name=new_company['name'])
                  return dict(new_company)
             else:
-                 # Esto no debería ocurrir si la inserción fue exitosa sin error, pero es una salvaguarda
                  log.error("Company creation query executed but no data returned.")
                  raise Exception("Failed to retrieve created company data.")
     except asyncpg.UniqueViolationError:
-        # Si hubiera una constraint UNIQUE en el nombre, por ejemplo
         log.warning("Failed to create company: Name might already exist.", name=name)
-        raise # Relanzar para que el router maneje como 409 Conflict
+        raise
     except Exception as e:
         log.error("Error creating company", error=str(e), name=name, exc_info=True)
         raise
@@ -920,7 +918,7 @@ async def get_active_companies_select() -> List[Dict[str, Any]]:
         async with pool.acquire() as conn:
             rows = await conn.fetch(query)
         log.info(f"Retrieved {len(rows)} active companies for select.")
-        return [dict(row) for row in rows] # Convertir cada Record a dict
+        return [dict(row) for row in rows]
     except Exception as e:
         log.error("Error getting active companies for select", error=str(e), exc_info=True)
         raise
@@ -934,12 +932,12 @@ async def create_user(
 ) -> Dict[str, Any]:
     """Crea un nuevo usuario asociado a una compañía."""
     pool = await get_db_pool()
+    # Query corregido sin updated_at
     query = """
-        INSERT INTO users (email, hashed_password, full_name, company_id, roles, is_active)
-        VALUES ($1, $2, $3, $4, $5, TRUE)
+        INSERT INTO users (email, hashed_password, full_name, company_id, roles, is_active, created_at)
+        VALUES ($1, $2, $3, $4, $5, TRUE, NOW())
         RETURNING id, email, full_name, company_id, roles, is_active, created_at;
     """
-    # Asegurarse de que roles es una lista, aunque Pydantic debería garantizarlo
     db_roles = roles if isinstance(roles, list) else [roles]
     log.debug("Executing create_user query", email=email, company_id=str(company_id), roles=db_roles)
     try:
@@ -947,21 +945,18 @@ async def create_user(
             new_user = await conn.fetchrow(query, email, hashed_password, name, company_id, db_roles)
             if new_user:
                 log.info("User created successfully", user_id=str(new_user['id']), email=new_user['email'])
-                # Excluir hashed_password antes de devolver
                 user_data = dict(new_user)
-                user_data.pop('hashed_password', None) # Asegurar que no se devuelve
+                # hashed_password no está en el RETURNING, así que no hace falta pop
                 return user_data
             else:
                 log.error("User creation query executed but no data returned.")
                 raise Exception("Failed to retrieve created user data.")
     except asyncpg.UniqueViolationError as e:
-         # Probablemente debido a que el email ya existe
          log.warning("Failed to create user: Email likely already exists.", email=email, pg_error=str(e))
-         raise # Relanzar para que el router maneje como 409 Conflict
+         raise
     except asyncpg.ForeignKeyViolationError as e:
-         # Probablemente debido a que company_id no existe
          log.warning("Failed to create user: Company ID likely does not exist.", company_id=str(company_id), pg_error=str(e))
-         raise # Relanzar para que el router maneje como 400/404 Bad Request
+         raise
     except Exception as e:
         log.error("Error creating user", error=str(e), email=email, exc_info=True)
         raise
@@ -975,7 +970,7 @@ async def count_active_companies() -> int:
         async with pool.acquire() as conn:
             count = await conn.fetchval(query)
         log.info(f"Found {count} active companies.")
-        return count or 0 # fetchval puede devolver None si no hay filas
+        return count or 0
     except Exception as e:
         log.error("Error counting active companies", error=str(e), exc_info=True)
         raise
@@ -991,7 +986,6 @@ async def count_active_users_per_active_company() -> List[Dict[str, Any]]:
         GROUP BY c.id, c.name
         ORDER BY c.name;
     """
-    # Nota: LEFT JOIN y filtrado en JOIN (u.is_active) asegura que contamos 0 para compañías sin usuarios activos.
     log.debug("Executing count_active_users_per_active_company query")
     try:
         async with pool.acquire() as conn:
@@ -1005,6 +999,7 @@ async def count_active_users_per_active_company() -> List[Dict[str, Any]]:
 async def get_company_by_id(company_id: uuid.UUID) -> Optional[Dict[str, Any]]:
     """Obtiene datos de una compañía por su ID."""
     pool = await get_db_pool()
+    # Query corregido para incluir updated_at de la tabla companies
     query = """
         SELECT id, name, email, created_at, updated_at, is_active
         FROM companies
