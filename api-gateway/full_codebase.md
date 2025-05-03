@@ -14,8 +14,11 @@ app/
 ├── db
 │   └── postgres_client.py
 ├── main.py
+├── models
+│   └── admin_models.py
 ├── routers
 │   ├── __init__.py
+│   ├── admin_router.py
 │   ├── auth_router.py
 │   ├── gateway_router.py
 │   └── user_router.py
@@ -41,183 +44,138 @@ app/
 # api-gateway/app/auth/auth_middleware.py
 from fastapi import Request, HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from typing import Optional, Annotated, Dict, Any
+from typing import Optional, Annotated, Dict, Any, List # Añadido List
 import structlog
 import httpx
 
-# Importar verify_token del nuevo servicio de autenticación
-from app.auth.auth_service import verify_token # <-- Asegúrate que la importación es correcta
+from app.auth.auth_service import verify_token
 
 log = structlog.get_logger(__name__)
 
-# Instancia del scheme HTTPBearer. auto_error=False para manejar manualmente la ausencia de token.
 bearer_scheme = HTTPBearer(bearerFormat="JWT", auto_error=False)
 
 async def _get_user_payload_internal(
     request: Request,
-    # Usar Annotated para combinar Depends y el tipo
     authorization: Annotated[Optional[HTTPAuthorizationCredentials], Depends(bearer_scheme)],
-    require_company_id: bool # Parámetro interno para controlar la verificación
+    require_company_id: bool
 ) -> Optional[Dict[str, Any]]:
-    """
-    Función interna para obtener y validar el payload JWT.
-    Controla si se requiere company_id según el parámetro.
-    Devuelve el payload si el token es válido y cumple el requisito de company_id.
-    Devuelve None si no se proporciona token (cabecera Authorization ausente).
-    Lanza HTTPException si el token existe pero es inválido (firma, exp, usuario no existe)
-    o si falta company_id cuando es requerido (403).
-    """
-    # Limpiar estado previo si existiera para evitar contaminación entre requests
     if hasattr(request.state, 'user'):
         del request.state.user
-
     if authorization is None:
-        # No hay cabecera Authorization: Bearer
         log.debug("No Authorization Bearer header found.")
-        # No es un error aún, la dependencia que lo use decidirá si lo requiere
         return None
-
     token = authorization.credentials
     try:
-        # Llamar a la función de verificación centralizada
-        # Esta función ya maneja las excepciones 401 y 403 internamente
+        # verify_token ahora puede incluir 'roles' actualizados desde la DB
         payload = await verify_token(token, require_company_id=require_company_id)
-
-        # Guardar payload en el estado de la request para posible uso posterior (ej. logging middleware)
         request.state.user = payload
-
-        # Log de éxito más descriptivo
         log_msg = "Token verified successfully via internal getter"
         if require_company_id:
             log_msg += " (company_id required and present)"
         else:
             log_msg += " (company_id check passed or not required)"
-        log.debug(log_msg, subject=payload.get('sub'), company_id=payload.get('company_id'))
-
+        log.debug(log_msg, subject=payload.get('sub'), company_id=payload.get('company_id'), roles=payload.get('roles'))
         return payload
     except HTTPException as e:
-        # verify_token lanza 401 (inválido) o 403 (falta company_id requerido)
-        # Loguear el error específico antes de relanzar
         log_detail = getattr(e, 'detail', 'No detail provided')
+        # Extraer user_id del payload si está disponible en la excepción
+        user_id_from_exception = getattr(e, 'user_id', None)
         log.info(f"Token verification failed in dependency: {log_detail}",
                  status_code=e.status_code,
-                 user_id=getattr(e, 'user_id', None)) # Loguear user_id si está disponible
-        # Re-lanzar la excepción para que FastAPI la maneje y devuelva la respuesta HTTP correcta
+                 user_id=user_id_from_exception)
         raise e
     except Exception as e:
-        # Capturar errores inesperados *dentro* de verify_token que no sean HTTPException
         log.exception("Unexpected error during internal payload retrieval", error=str(e))
-        # Devolver un error 500 genérico para no exponer detalles internos
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal error during authentication check."
         )
 
-# --- Dependencia Estándar (Intenta obtener payload, REQUIERE company_id) ---
 async def get_current_user_payload(
     request: Request,
     authorization: Annotated[Optional[HTTPAuthorizationCredentials], Depends(bearer_scheme)]
 ) -> Optional[Dict[str, Any]]:
-    """
-    Dependencia FastAPI para intentar validar el token JWT requiriendo company_id.
-    - Devuelve el payload si el token es válido Y tiene company_id.
-    - Devuelve None si no se proporciona token.
-    - Lanza 401 si el token es inválido (firma, exp, usuario no existe).
-    - Lanza 403 si el token es válido pero falta company_id.
-    """
     try:
-        # Llama a la función interna requiriendo company_id
         return await _get_user_payload_internal(request, authorization, require_company_id=True)
     except HTTPException as e:
-        # Si _get_user_payload_internal lanza 401 o 403, simplemente relanzamos
         raise e
     except Exception as e:
-         # Manejar cualquier otro error inesperado aquí también
          log.exception("Unexpected error in get_current_user_payload wrapper", error=str(e))
          raise HTTPException(status_code=500, detail="Internal Server Error in auth wrapper")
 
-# --- Dependencia para la Asociación Inicial (NO requiere company_id) ---
 async def get_initial_user_payload(
     request: Request,
     authorization: Annotated[Optional[HTTPAuthorizationCredentials], Depends(bearer_scheme)]
 ) -> Optional[Dict[str, Any]]:
-    """
-    Dependencia FastAPI para validar el token JWT sin requerir company_id.
-    Útil para la ruta de asociación inicial de company_id.
-    - Devuelve el payload si el token es válido (firma, exp, usuario existe), incluso sin company_id.
-    - Devuelve None si no se proporciona token.
-    - Lanza 401 si el token es inválido (firma, exp, usuario no existe).
-    """
     try:
-        # Llama a la función interna sin requerir company_id
+        # No requiere company_id, pero sí valida firma, exp, usuario existe y activo
         return await _get_user_payload_internal(request, authorization, require_company_id=False)
     except HTTPException as e:
-        # Si _get_user_payload_internal lanza 401 (o 403, aunque no debería aquí), lo relanzamos
         raise e
     except Exception as e:
-         # Manejar cualquier otro error inesperado aquí también
          log.exception("Unexpected error in get_initial_user_payload wrapper", error=str(e))
          raise HTTPException(status_code=500, detail="Internal Server Error in auth wrapper")
 
-# --- Dependencia que Requiere Usuario Estricto (Falla si no hay token válido CON company_id) ---
 async def require_user(
-    # Depende de la función anterior (get_current_user_payload).
-    # Si esa función devuelve None (sin token) o lanza una excepción (401/403),
-    # esta dependencia manejará el caso o no se ejecutará.
     user_payload: Annotated[Optional[Dict[str, Any]], Depends(get_current_user_payload)]
 ) -> Dict[str, Any]:
-    """
-    Dependencia FastAPI que *asegura* que una ruta requiere un usuario autenticado
-    con un token válido Y con company_id asociado.
-    - Lanza 401 si no hay token o es inválido (lo hace la dependencia `get_current_user_payload`).
-    - Lanza 403 si el token es válido pero falta company_id (lo hace la dependencia `get_current_user_payload`).
-    - Si `get_current_user_payload` devuelve `None` (porque no se envió token), esta función lanzará 401.
-    """
     if user_payload is None:
-        # Esto ocurre si get_current_user_payload devolvió None (sin cabecera Authorization)
         log.info("Access denied by require_user: Authentication required but no token was provided.")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated",
-            headers={"WWW-Authenticate": "Bearer"}, # Indica al cliente cómo autenticarse
+            headers={"WWW-Authenticate": "Bearer"},
         )
-    # Si user_payload no es None, significa que get_current_user_payload tuvo éxito
-    # (el token era válido y tenía company_id), así que simplemente lo devolvemos.
-    # Las excepciones 401/403 ya habrían sido lanzadas por la dependencia anterior.
+    # Las excepciones 401 (inválido) o 403 (sin company_id) ya fueron lanzadas por get_current_user_payload
     return user_payload
 
-# --- Dependencia que Requiere Usuario Inicial (Falla si no hay token válido, pero NO requiere company_id) ---
 async def require_initial_user(
-    # Depende de get_initial_user_payload.
-    # Si esa función devuelve None (sin token) o lanza una excepción (401),
-    # esta dependencia manejará el caso o no se ejecutará.
     user_payload: Annotated[Optional[Dict[str, Any]], Depends(get_initial_user_payload)]
 ) -> Dict[str, Any]:
-    """
-    Dependencia FastAPI que *asegura* que una ruta requiere un usuario autenticado
-    con un token válido (firma, exp, usuario existe), pero NO requiere company_id.
-    Útil para la ruta de asociación inicial de company_id.
-    - Lanza 401 si no hay token o es inválido (lo hace la dependencia `get_initial_user_payload`).
-    - Si `get_initial_user_payload` devuelve `None` (sin token), esta función lanzará 401.
-    """
     if user_payload is None:
-        # Esto ocurre si get_initial_user_payload devolvió None (sin cabecera Authorization)
         log.info("Access denied by require_initial_user: Authentication required but no token was provided.")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    # Si user_payload no es None, significa que get_initial_user_payload tuvo éxito
-    # (el token era válido), así que simplemente lo devolvemos.
+    # La excepción 401 (inválido, no existe, inactivo) ya fue lanzada por get_initial_user_payload
     return user_payload
 
-# --- Tipos anotados para usar en las rutas y mejorar la legibilidad ---
-# StrictAuth: Requiere token válido con company_id
-StrictAuth = Annotated[Dict[str, Any], Depends(require_user)]
+# --- NUEVA DEPENDENCIA: Require Admin User ---
+async def require_admin_user(
+    # Depende de require_initial_user para la validación base del token
+    # (firma, exp, usuario existe y activo). No requiere company_id en este punto.
+    user_payload: Annotated[Dict[str, Any], Depends(require_initial_user)]
+) -> Dict[str, Any]:
+    """
+    Dependencia FastAPI que asegura que el usuario autenticado tiene el rol 'admin'.
+    Relanza 401 si el token base es inválido (gestionado por require_initial_user).
+    Lanza 403 si el token es válido pero el usuario no tiene el rol 'admin'.
+    """
+    # user_payload ya está validado como perteneciente a un usuario existente y activo.
+    # Ahora verificamos el rol específico de admin.
+    # Usamos los roles del payload, que verify_token actualizó desde la DB.
+    roles: Optional[List[str]] = user_payload.get("roles")
 
-# InitialAuth: Requiere token válido, pero company_id no es obligatorio
+    if not roles or "admin" not in roles:
+        log.warning("Admin access denied: User does not have 'admin' role.",
+                   user_id=user_payload.get("sub"),
+                   roles=roles)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Insufficient permissions. Administrator role required.",
+        )
+
+    # Si llegamos aquí, el usuario es admin
+    log.info("Admin access granted.", user_id=user_payload.get("sub"), roles=roles)
+    return user_payload # Devuelve el payload con toda la info del admin
+
+
+# --- Tipos anotados para usar en las rutas ---
+StrictAuth = Annotated[Dict[str, Any], Depends(require_user)]
 InitialAuth = Annotated[Dict[str, Any], Depends(require_initial_user)]
+AdminAuth = Annotated[Dict[str, Any], Depends(require_admin_user)] # <-- NUEVO: Tipo para Admin
 ```
 
 ## File: `app\auth\auth_service.py`
@@ -226,7 +184,7 @@ InitialAuth = Annotated[Dict[str, Any], Depends(require_initial_user)]
 # api-gateway/app/auth/auth_service.py
 import uuid
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List # Añadido List
 from datetime import datetime, timezone, timedelta
 from jose import jwt, JWTError, ExpiredSignatureError, JOSEError
 import structlog
@@ -262,8 +220,10 @@ async def authenticate_user(email: str, password: str) -> Optional[Dict[str, Any
     """
     Autentica un usuario por email y contraseña contra la base de datos.
     Retorna el diccionario del usuario si es válido y activo, None en caso contrario.
+    Incluye 'roles' si existe.
     """
     log.debug("Attempting to authenticate user", email=email)
+    # postgres_client.get_user_by_email ya fue modificado para devolver 'roles'
     user_data = await postgres_client.get_user_by_email(email)
 
     if not user_data:
@@ -280,7 +240,7 @@ async def authenticate_user(email: str, password: str) -> Optional[Dict[str, Any
         return None
 
     # Autenticación exitosa
-    log.info("User authenticated successfully", email=email, user_id=str(user_data.get('id')))
+    log.info("User authenticated successfully", email=email, user_id=str(user_data.get('id')), roles=user_data.get('roles'))
     # Eliminar hash de contraseña antes de devolver los datos
     user_data.pop('hashed_password', None)
     return user_data
@@ -291,16 +251,15 @@ def create_access_token(
     user_id: uuid.UUID,
     email: str,
     company_id: Optional[uuid.UUID] = None,
-    # full_name: Optional[str] = None, # Podrías añadir más claims si los necesitas
-    # role: Optional[str] = None,
+    roles: Optional[List[str]] = None, # <-- AÑADIDO: Parámetro roles
+    # full_name: Optional[str] = None,
     expires_delta: timedelta = timedelta(days=1) # Tiempo de expiración configurable
 ) -> str:
     """
     Crea un token JWT para el usuario autenticado.
-    Incluye 'sub' (user_id), 'exp', 'iat', 'email' y opcionalmente 'company_id'.
+    Incluye 'sub', 'exp', 'iat', 'email', opcionalmente 'company_id' y 'roles'.
     """
     expire = datetime.now(timezone.utc) + expires_delta
-    # Usar datetime.now(timezone.utc) para iat también
     issued_at = datetime.now(timezone.utc)
 
     to_encode: Dict[str, Any] = {
@@ -308,13 +267,18 @@ def create_access_token(
         "exp": expire,               # Expiration Time
         "iat": issued_at,            # Issued At
         "email": email,              # Email del usuario
-        # "aud": "authenticated",    # Audiencia (opcional, si tus servicios la verifican)
-        # "iss": "AtenexAuth",       # Emisor (opcional)
+        # "aud": "authenticated",
+        # "iss": "AtenexAuth",
     }
 
     # Añadir company_id si está presente
     if company_id:
         to_encode["company_id"] = str(company_id)
+
+    # --- AÑADIDO: Añadir roles si están presentes ---
+    if roles:
+        # Asegurarse de que es una lista, aunque la llamada debería pasarla así
+        to_encode["roles"] = roles if isinstance(roles, list) else [roles]
 
     # Codificar el token usando el secreto y algoritmo de la configuración
     try:
@@ -323,11 +287,10 @@ def create_access_token(
             settings.JWT_SECRET.get_secret_value(), # Obtener valor del SecretStr
             algorithm=settings.JWT_ALGORITHM
         )
-        log.debug("Access token created", user_id=str(user_id), expires_at=expire.isoformat())
+        log.debug("Access token created", user_id=str(user_id), expires_at=expire.isoformat(), claims_keys=list(to_encode.keys()))
         return encoded_jwt
     except JOSEError as e:
         log.exception("Failed to encode JWT", error=str(e), user_id=str(user_id))
-        # En un caso real, esto es un error interno grave
         raise HTTPException(status_code=500, detail="Could not create access token")
 
 
@@ -337,13 +300,14 @@ async def verify_token(token: str, require_company_id: bool = True) -> Dict[str,
     """
     Verifica la validez de un token JWT (firma, expiración, claims básicos).
     Opcionalmente requiere la presencia de un 'company_id' válido en el payload.
-    Verifica que el usuario ('sub') exista en la base de datos.
+    Verifica que el usuario ('sub') exista y esté activo en la base de datos.
+    Devuelve el payload completo, incluyendo 'roles' si existen en el token.
 
     Returns:
         El payload decodificado si el token es válido.
 
     Raises:
-        HTTPException(401): Si el token es inválido (firma, exp, formato) o el usuario no existe.
+        HTTPException(401): Si el token es inválido (firma, exp, formato) o el usuario no existe/inactivo.
         HTTPException(403): Si 'require_company_id' es True y falta un 'company_id' válido.
         HTTPException(500): Error interno.
     """
@@ -357,18 +321,22 @@ async def verify_token(token: str, require_company_id: bool = True) -> Dict[str,
         detail="User authenticated, but required company association is missing or invalid in token.",
         headers={"WWW-Authenticate": "Bearer error=\"insufficient_scope\""}, # Indica falta de permisos/scope
     )
+    user_inactive_exception = HTTPException( # Excepción específica para inactivos
+        status_code=status.HTTP_401_UNAUTHORIZED, # Sigue siendo 401
+        detail="User associated with token is inactive.",
+        headers={"WWW-Authenticate": "Bearer error=\"invalid_token\", error_description=\"User inactive\""},
+    )
     internal_error_exception = HTTPException(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail="An internal error occurred during token verification.",
     )
 
-    # Verificación de seguridad del secreto (ya hecha en config, pero doble check no daña)
     if not settings.JWT_SECRET or settings.JWT_SECRET.get_secret_value() == "YOUR_DEFAULT_JWT_SECRET_KEY_CHANGE_ME_IN_ENV_OR_SECRET":
          log.critical("FATAL: Attempting JWT verification with default or missing GATEWAY_JWT_SECRET!")
          raise internal_error_exception
 
+    payload = {} # Inicializar payload
     try:
-        # Decodificar el token (valida firma, exp)
         payload = jwt.decode(
             token,
             settings.JWT_SECRET.get_secret_value(),
@@ -376,14 +344,12 @@ async def verify_token(token: str, require_company_id: bool = True) -> Dict[str,
             options={
                 "verify_signature": True,
                 "verify_exp": True,
-                "verify_iat": True,
-                "verify_nbf": True, # Si usas 'not before'
-                # "verify_aud": False # No verificamos audiencia específica por defecto
+                "verify_iat": True, # Verificar Issued At si está presente
+                "verify_nbf": True, # Verificar Not Before si está presente
             }
         )
         log.debug("Token decoded successfully", payload_keys=list(payload.keys()))
 
-        # Validar 'sub' (user_id)
         user_id_str = payload.get("sub")
         if not user_id_str:
             log.warning("Token verification failed: 'sub' claim missing.")
@@ -397,8 +363,7 @@ async def verify_token(token: str, require_company_id: bool = True) -> Dict[str,
             credentials_exception.detail = "Invalid user ID format in token."
             raise credentials_exception
 
-        # Verificar que el usuario existe y está activo en la DB
-        # Esto previene usar tokens de usuarios eliminados o desactivados
+        # Verificar existencia y estado del usuario en DB
         user_db_data = await postgres_client.get_user_by_id(user_id)
         if not user_db_data:
             log.warning("Token verification failed: User specified in 'sub' not found in DB.", user_id=user_id_str)
@@ -406,8 +371,21 @@ async def verify_token(token: str, require_company_id: bool = True) -> Dict[str,
             raise credentials_exception
         if not user_db_data.get('is_active', False):
             log.warning("Token verification failed: User specified in 'sub' is inactive.", user_id=user_id_str)
-            credentials_exception.detail = "User associated with token is inactive."
-            raise credentials_exception
+            # Usar la excepción específica para inactivos
+            raise user_inactive_exception
+
+        # Actualizar payload con roles de la DB (más seguro que confiar sólo en el token)
+        # Esto asegura que los roles están actualizados incluso si el token es viejo.
+        db_roles = user_db_data.get('roles')
+        if db_roles:
+             payload['roles'] = db_roles # Sobreescribir/añadir roles desde la DB
+             log.debug("Updated payload with roles from database", user_id=user_id_str, db_roles=db_roles)
+        elif 'roles' in payload:
+             # Si la DB no tiene roles pero el token sí, podría ser un estado inconsistente.
+             # Por seguridad, eliminamos los roles del token si no están en DB.
+             log.warning("Roles found in token but not in DB, removing from payload for consistency.", user_id=user_id_str, token_roles=payload.get('roles'))
+             payload.pop('roles', None)
+
 
         # Validar 'company_id' si es requerido
         company_id_str: Optional[str] = payload.get("company_id")
@@ -419,18 +397,17 @@ async def verify_token(token: str, require_company_id: bool = True) -> Dict[str,
             except ValueError:
                 log.warning("Token verification: 'company_id' claim present but not a valid UUID.",
                            company_id_value=company_id_str, user_id=user_id_str)
-                # Considerar si un company_id inválido debe ser 401 o 403
-                # Vamos a tratarlo como inválido (401), ya que el token está malformado en ese aspecto
                 credentials_exception.detail = "Invalid company ID format in token."
                 raise credentials_exception
 
         if require_company_id and not valid_company_id_present:
             log.info("Token verification failed: Required 'company_id' is missing.", user_id=user_id_str)
+            # Pasar el user_id a la excepción para posible logging en la dependencia
+            forbidden_exception.user_id = user_id_str # type: ignore
             raise forbidden_exception # Falla porque se requiere y no está
 
-        # Si pasa todas las verificaciones, el token es válido
-        log.info("Token verified successfully", user_id=user_id_str, company_id=company_id_str or "N/A")
-        return payload # Devolver el payload completo
+        log.info("Token verified successfully", user_id=user_id_str, company_id=company_id_str or "N/A", roles=payload.get('roles', 'N/A'))
+        return payload # Devolver el payload completo y actualizado
 
     except ExpiredSignatureError:
         log.info("Token verification failed: Token has expired.")
@@ -438,16 +415,16 @@ async def verify_token(token: str, require_company_id: bool = True) -> Dict[str,
         credentials_exception.headers["WWW-Authenticate"] = 'Bearer error="invalid_token", error_description="The token has expired"'
         raise credentials_exception
     except JWTError as e:
-        # Otros errores de JWT (firma inválida, formato incorrecto, etc.)
         log.warning(f"JWT Verification Error: {e}", token_provided=True)
         credentials_exception.detail = f"Token validation failed: {e}"
         raise credentials_exception
     except HTTPException as e:
-        # Re-lanzar excepciones HTTP ya manejadas (como 403 por company_id)
+        # Re-lanzar excepciones HTTP ya manejadas (como 403 por company_id o 401 por inactivo)
         raise e
     except Exception as e:
-        # Capturar cualquier otro error inesperado (ej. error de DB en get_user_by_id)
-        log.exception(f"Unexpected error during token verification: {e}", user_id=payload.get('sub') if 'payload' in locals() else 'unknown')
+        # Capturar cualquier otro error inesperado
+        user_id_from_payload = payload.get('sub', 'unknown') if payload else 'unknown'
+        log.exception(f"Unexpected error during token verification: {e}", user_id=user_id_from_payload)
         raise internal_error_exception
 ```
 
@@ -469,8 +446,8 @@ import logging
 from typing import Optional, List
 import uuid # Para validar UUID
 
-# URLs por defecto si no se especifican en el entorno (usando el namespace 'atenex-develop')
-K8S_INGEST_SVC_URL_DEFAULT = "http://ingest-api-service.atenex-develop.svc.cluster.local:80"
+# URLs por defecto si no se especifican en el entorno (usando el namespace 'nyro-develop')
+K8S_INGEST_SVC_URL_DEFAULT = "http://ingest-api-service.nyro-develop.svc.cluster.local:80"
 K8S_QUERY_SVC_URL_DEFAULT = "http://query-service.atenex-develop.svc.cluster.local:80"
 K8S_AUTH_SVC_URL_DEFAULT = None # No hay auth service por defecto
 
@@ -704,6 +681,7 @@ from typing import Any, Optional, Dict, List
 import asyncpg
 import structlog
 import json
+from datetime import datetime # Añadido para tipos
 
 from app.core.config import settings
 
@@ -731,18 +709,33 @@ async def get_db_pool() -> asyncpg.Pool:
                 return json.loads(value)
 
             async def init_connection(conn):
+                 # Codec para JSONB
                  await conn.set_type_codec(
                      'jsonb',
                      encoder=_json_encoder,
                      decoder=_json_decoder,
-                     schema='pg_catalog'
+                     schema='pg_catalog',
+                     format='text' # Asegurar formato texto para JSONB
                  )
+                 # Codec para JSON estándar
                  await conn.set_type_codec(
                       'json',
                       encoder=_json_encoder,
                       decoder=_json_decoder,
-                      schema='pg_catalog'
+                      schema='pg_catalog',
+                      format='text' # Asegurar formato texto para JSON
                   )
+                 # Codec para TEXT[] (arrays de texto) - asyncpg suele manejarlo bien,
+                 # pero registrar explícitamente puede ayudar en algunos casos.
+                 # Aquí simplemente definimos cómo tratar el array en Python (como list).
+                 await conn.set_type_codec(
+                     'text[]',
+                     encoder=lambda x: x, # Lo envía como lista, pg lo convierte
+                     decoder=lambda x: x, # Lo recibe como lista
+                     schema='pg_catalog',
+                     format='text'
+                 )
+
 
             _pool = await asyncpg.create_pool(
                 user=settings.POSTGRES_USER,
@@ -753,7 +746,7 @@ async def get_db_pool() -> asyncpg.Pool:
                 min_size=5,   # Ajusta según necesidad
                 max_size=20,  # Ajusta según necesidad
                 statement_cache_size=0, # Deshabilitar caché para evitar problemas con tipos dinámicos
-                init=init_connection # Añadir inicializador para codecs JSON/JSONB
+                init=init_connection # Añadir inicializador para codecs
             )
             log.info("PostgreSQL connection pool created successfully.")
         except Exception as e:
@@ -800,23 +793,24 @@ async def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
     """
     Recupera un usuario por su email.
     Devuelve un diccionario con los datos del usuario o None si no se encuentra.
-    Alineado con el esquema USERS.
+    Alineado con el esquema USERS (con 'roles').
     """
     pool = await get_db_pool()
+    # --- MODIFICADO: Selecciona 'roles' en lugar de 'role' ---
     query = """
-        SELECT id, company_id, email, hashed_password, full_name, role,
+        SELECT id, company_id, email, hashed_password, full_name, roles,
                created_at, last_login, is_active
         FROM users
         WHERE lower(email) = lower($1)
     """
-    # No filtramos por is_active aquí, la lógica de autenticación puede decidir
     log.debug("Executing get_user_by_email query", email=email)
     try:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(query, email)
         if row:
             log.debug("User found by email", user_id=str(row['id']))
-            return dict(row) # Convertir asyncpg.Record a dict
+            # asyncpg debería devolver 'roles' como una lista de Python si el codec está bien
+            return dict(row)
         else:
             log.debug("User not found by email", email=email)
             return None
@@ -828,11 +822,12 @@ async def get_user_by_id(user_id: uuid.UUID) -> Optional[Dict[str, Any]]:
     """
     Recupera un usuario por su ID (UUID).
     Devuelve un diccionario con los datos del usuario o None si no se encuentra.
-    Alineado con el esquema USERS. Excluye la contraseña hash por seguridad.
+    Alineado con el esquema USERS (con 'roles'). Excluye la contraseña hash por seguridad.
     """
     pool = await get_db_pool()
+    # --- MODIFICADO: Selecciona 'roles' en lugar de 'role' ---
     query = """
-        SELECT id, company_id, email, full_name, role,
+        SELECT id, company_id, email, full_name, roles,
                created_at, last_login, is_active
         FROM users
         WHERE id = $1
@@ -843,6 +838,7 @@ async def get_user_by_id(user_id: uuid.UUID) -> Optional[Dict[str, Any]]:
             row = await conn.fetchrow(query, user_id)
         if row:
             log.debug("User found by ID", user_id=str(user_id))
+            # asyncpg debería devolver 'roles' como una lista de Python
             return dict(row)
         else:
             log.debug("User not found by ID", user_id=str(user_id))
@@ -853,7 +849,7 @@ async def get_user_by_id(user_id: uuid.UUID) -> Optional[Dict[str, Any]]:
 
 async def update_user_company(user_id: uuid.UUID, company_id: uuid.UUID) -> bool:
     """
-    Actualiza el company_id para un usuario específico y actualiza last_login.
+    Actualiza el company_id para un usuario específico y actualiza updated_at.
     Devuelve True si la actualización fue exitosa (al menos una fila afectada), False en caso contrario.
     Alineado con el esquema USERS.
     """
@@ -880,6 +876,167 @@ async def update_user_company(user_id: uuid.UUID, company_id: uuid.UUID) -> bool
         log.error("Error updating user company", error=str(e), user_id=str(user_id), company_id=str(company_id), exc_info=True)
         raise
 
+# --- NUEVAS FUNCIONES PARA ADMIN ---
+
+async def create_company(name: str) -> Dict[str, Any]:
+    """Crea una nueva compañía."""
+    pool = await get_db_pool()
+    query = """
+        INSERT INTO companies (name)
+        VALUES ($1)
+        RETURNING id, name, created_at, is_active;
+    """
+    log.debug("Executing create_company query", name=name)
+    try:
+        async with pool.acquire() as conn:
+            # Usamos fetchrow porque esperamos una sola fila de vuelta
+            new_company = await conn.fetchrow(query, name)
+            if new_company:
+                 log.info("Company created successfully", company_id=str(new_company['id']), name=new_company['name'])
+                 return dict(new_company)
+            else:
+                 # Esto no debería ocurrir si la inserción fue exitosa sin error, pero es una salvaguarda
+                 log.error("Company creation query executed but no data returned.")
+                 raise Exception("Failed to retrieve created company data.")
+    except asyncpg.UniqueViolationError:
+        # Si hubiera una constraint UNIQUE en el nombre, por ejemplo
+        log.warning("Failed to create company: Name might already exist.", name=name)
+        raise # Relanzar para que el router maneje como 409 Conflict
+    except Exception as e:
+        log.error("Error creating company", error=str(e), name=name, exc_info=True)
+        raise
+
+async def get_active_companies_select() -> List[Dict[str, Any]]:
+    """Obtiene una lista de IDs y nombres de compañías activas para selectores."""
+    pool = await get_db_pool()
+    query = """
+        SELECT id, name
+        FROM companies
+        WHERE is_active = TRUE
+        ORDER BY name;
+    """
+    log.debug("Executing get_active_companies_select query")
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(query)
+        log.info(f"Retrieved {len(rows)} active companies for select.")
+        return [dict(row) for row in rows] # Convertir cada Record a dict
+    except Exception as e:
+        log.error("Error getting active companies for select", error=str(e), exc_info=True)
+        raise
+
+async def create_user(
+    email: str,
+    hashed_password: str,
+    name: Optional[str],
+    company_id: uuid.UUID,
+    roles: List[str]
+) -> Dict[str, Any]:
+    """Crea un nuevo usuario asociado a una compañía."""
+    pool = await get_db_pool()
+    query = """
+        INSERT INTO users (email, hashed_password, full_name, company_id, roles, is_active)
+        VALUES ($1, $2, $3, $4, $5, TRUE)
+        RETURNING id, email, full_name, company_id, roles, is_active, created_at;
+    """
+    # Asegurarse de que roles es una lista, aunque Pydantic debería garantizarlo
+    db_roles = roles if isinstance(roles, list) else [roles]
+    log.debug("Executing create_user query", email=email, company_id=str(company_id), roles=db_roles)
+    try:
+        async with pool.acquire() as conn:
+            new_user = await conn.fetchrow(query, email, hashed_password, name, company_id, db_roles)
+            if new_user:
+                log.info("User created successfully", user_id=str(new_user['id']), email=new_user['email'])
+                # Excluir hashed_password antes de devolver
+                user_data = dict(new_user)
+                user_data.pop('hashed_password', None) # Asegurar que no se devuelve
+                return user_data
+            else:
+                log.error("User creation query executed but no data returned.")
+                raise Exception("Failed to retrieve created user data.")
+    except asyncpg.UniqueViolationError as e:
+         # Probablemente debido a que el email ya existe
+         log.warning("Failed to create user: Email likely already exists.", email=email, pg_error=str(e))
+         raise # Relanzar para que el router maneje como 409 Conflict
+    except asyncpg.ForeignKeyViolationError as e:
+         # Probablemente debido a que company_id no existe
+         log.warning("Failed to create user: Company ID likely does not exist.", company_id=str(company_id), pg_error=str(e))
+         raise # Relanzar para que el router maneje como 400/404 Bad Request
+    except Exception as e:
+        log.error("Error creating user", error=str(e), email=email, exc_info=True)
+        raise
+
+async def count_active_companies() -> int:
+    """Cuenta el número total de compañías activas."""
+    pool = await get_db_pool()
+    query = "SELECT COUNT(*) FROM companies WHERE is_active = TRUE;"
+    log.debug("Executing count_active_companies query")
+    try:
+        async with pool.acquire() as conn:
+            count = await conn.fetchval(query)
+        log.info(f"Found {count} active companies.")
+        return count or 0 # fetchval puede devolver None si no hay filas
+    except Exception as e:
+        log.error("Error counting active companies", error=str(e), exc_info=True)
+        raise
+
+async def count_active_users_per_active_company() -> List[Dict[str, Any]]:
+    """Cuenta usuarios activos por cada compañía activa."""
+    pool = await get_db_pool()
+    query = """
+        SELECT c.id as company_id, c.name, COUNT(u.id) AS user_count
+        FROM companies c
+        LEFT JOIN users u ON c.id = u.company_id AND u.is_active = TRUE
+        WHERE c.is_active = TRUE
+        GROUP BY c.id, c.name
+        ORDER BY c.name;
+    """
+    # Nota: LEFT JOIN y filtrado en JOIN (u.is_active) asegura que contamos 0 para compañías sin usuarios activos.
+    log.debug("Executing count_active_users_per_active_company query")
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(query)
+        log.info(f"Retrieved user counts for {len(rows)} active companies.")
+        return [dict(row) for row in rows]
+    except Exception as e:
+        log.error("Error counting users per company", error=str(e), exc_info=True)
+        raise
+
+async def get_company_by_id(company_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+    """Obtiene datos de una compañía por su ID."""
+    pool = await get_db_pool()
+    query = """
+        SELECT id, name, email, created_at, updated_at, is_active
+        FROM companies
+        WHERE id = $1;
+    """
+    log.debug("Executing get_company_by_id query", company_id=str(company_id))
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(query, company_id)
+        if row:
+            log.debug("Company found by ID", company_id=str(company_id))
+            return dict(row)
+        else:
+            log.debug("Company not found by ID", company_id=str(company_id))
+            return None
+    except Exception as e:
+        log.error("Error getting company by ID", error=str(e), company_id=str(company_id), exc_info=True)
+        raise
+
+async def check_email_exists(email: str) -> bool:
+    """Verifica si un email ya existe en la tabla users."""
+    pool = await get_db_pool()
+    query = "SELECT EXISTS (SELECT 1 FROM users WHERE lower(email) = lower($1));"
+    log.debug("Executing check_email_exists query", email=email)
+    try:
+        async with pool.acquire() as conn:
+            exists = await conn.fetchval(query, email)
+        log.debug(f"Email '{email}' exists check result: {exists}")
+        return exists or False
+    except Exception as e:
+        log.error("Error checking email existence", error=str(e), email=email, exc_info=True)
+        raise
 ```
 
 ## File: `app\main.py`
@@ -909,123 +1066,104 @@ from app.core.config import settings
 from app.db import postgres_client
 
 # --- Importar Routers ---
-# Import specific router instances
 from app.routers.gateway_router import router as gateway_router_instance
 from app.routers.user_router import router as user_router_instance
-# You might not need to import auth_router if it's empty or deleted
-# from app.routers.auth_router import router as auth_router_instance
+# --- AÑADIDO: Importar el nuevo router de admin ---
+from app.routers.admin_router import router as admin_router_instance
+# from app.routers.auth_router import router as auth_router_instance # Probablemente no necesario
 
 log = structlog.get_logger("atenex_api_gateway.main")
 
-# --- Lifespan Manager (Uses app.state) ---
+# --- Lifespan Manager (Sin cambios respecto a la versión anterior) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Application startup sequence initiated...")
     http_client_instance: Optional[httpx.AsyncClient] = None
     db_pool_ok = False
-
-    # 1. Initialize HTTP Client
     try:
         log.info("Initializing HTTPX client for application state...")
-        limits = httpx.Limits(
-            max_keepalive_connections=settings.HTTP_CLIENT_MAX_KEEPALIVE_CONNECTIONS,
-            max_connections=settings.HTTP_CLIENT_MAX_CONNECTIONS
-        )
-        # Increased default timeout slightly
+        limits = httpx.Limits(max_keepalive_connections=settings.HTTP_CLIENT_MAX_KEEPALIVE_CONNECTIONS, max_connections=settings.HTTP_CLIENT_MAX_CONNECTIONS)
         timeout = httpx.Timeout(settings.HTTP_CLIENT_TIMEOUT, connect=15.0)
-        http_client_instance = httpx.AsyncClient(
-            limits=limits,
-            timeout=timeout,
-            follow_redirects=False,
-            http2=True
-        )
-        app.state.http_client = http_client_instance # Attach to app.state
+        http_client_instance = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=False, http2=True)
+        app.state.http_client = http_client_instance
         log.info("HTTPX client initialized and attached to app.state successfully.")
     except Exception as e:
         log.exception("CRITICAL: Failed to initialize HTTPX client during startup!", error=str(e))
         app.state.http_client = None
-
-    # 2. Initialize and Verify PostgreSQL Connection
     log.info("Initializing and verifying PostgreSQL connection pool...")
     try:
         pool = await postgres_client.get_db_pool()
         if pool:
             db_pool_ok = await postgres_client.check_db_connection()
-            if db_pool_ok:
-                log.info("PostgreSQL connection pool initialized and connection verified.")
-            else:
-                log.critical("PostgreSQL pool initialized BUT connection check failed!")
-                await postgres_client.close_db_pool()
-        else:
-            log.critical("PostgreSQL connection pool initialization returned None!")
-    except Exception as e:
-        log.exception("CRITICAL: Failed to initialize or verify PostgreSQL connection!", error=str(e))
-        db_pool_ok = False
-
-    # Log final readiness check
-    if getattr(app.state, 'http_client', None) and db_pool_ok:
-        log.info("Application startup sequence complete. Dependencies ready.")
-    else:
-        log.error("Application startup sequence FAILED. Check HTTP Client or DB init.",
-                  http_client_ready=bool(getattr(app.state, 'http_client', None)),
-                  db_ready=db_pool_ok)
-        # Consider raising an error to prevent startup if critical dependencies failed
-        # raise RuntimeError("Critical dependencies failed to initialize during startup.")
-
-    yield # Application runs here
-
+            if db_pool_ok: log.info("PostgreSQL connection pool initialized and connection verified.")
+            else: log.critical("PostgreSQL pool initialized BUT connection check failed!"); await postgres_client.close_db_pool()
+        else: log.critical("PostgreSQL connection pool initialization returned None!")
+    except Exception as e: log.exception("CRITICAL: Failed to initialize or verify PostgreSQL connection!", error=str(e)); db_pool_ok = False
+    if getattr(app.state, 'http_client', None) and db_pool_ok: log.info("Application startup sequence complete. Dependencies ready.")
+    else: log.error("Application startup sequence FAILED.", http_client_ready=bool(getattr(app.state, 'http_client', None)), db_ready=db_pool_ok)
+    yield
     log.info("Application shutdown sequence initiated...")
-    # Close HTTP Client
     client_to_close = getattr(app.state, 'http_client', None)
     if client_to_close and not client_to_close.is_closed:
         log.info("Closing HTTPX client from app.state...")
-        try: await client_to_close.aclose(); log.info("HTTPX client closed.")
-        except Exception as e: log.exception("Error closing HTTPX client.", error=str(e))
-    else: log.info("HTTPX client was not initialized or already closed.")
-    # Close DB Pool
+        try:
+            await client_to_close.aclose()
+            log.info("HTTPX client closed.")
+        except Exception as e:
+            log.exception("Error closing HTTPX client.", error=str(e))
+    else:
+        log.info("HTTPX client was not initialized or already closed.")
     log.info("Closing PostgreSQL connection pool...")
-    try: await postgres_client.close_db_pool()
-    except Exception as e: log.exception("Error closing PostgreSQL pool.", error=str(e))
+    try:
+        await postgres_client.close_db_pool()
+    except Exception as e:
+        log.exception("Error closing PostgreSQL pool.", error=str(e))
     log.info("Application shutdown complete.")
-
 
 # --- Create FastAPI App Instance ---
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    description="Atenex API Gateway: Single entry point, JWT auth, routing via explicit HTTP calls.",
-    version="1.0.4", # Version bump
+    description="Atenex API Gateway: Single entry point, JWT auth, routing via explicit HTTP calls, Admin API.",
+    version="1.1.0", # Version bump para reflejar cambios admin
     lifespan=lifespan,
 )
 
 # --- Middlewares ---
-# CORS
+# CORS (Configuración sin cambios, asumiendo que 'final_regex' está definido correctamente antes)
 vercel_pattern = ""
 if settings.VERCEL_FRONTEND_URL:
-    # (Regex logic kept same as previous version)
     base_vercel_url = settings.VERCEL_FRONTEND_URL.split("://")[1]
     base_vercel_url = re.sub(r"(-git-[a-z0-9-]+)?(-[a-z0-9]+)?\.vercel\.app", ".vercel.app", base_vercel_url)
     escaped_base = re.escape(base_vercel_url).replace(r"\.vercel\.app", "")
     vercel_pattern = rf"(https://{escaped_base}(-[a-z0-9-]+)*\.vercel\.app)"
 else: log.warning("VERCEL_FRONTEND_URL not set for CORS.")
-localhost_pattern = r"(http://localhost:300[0-9])"
+localhost_pattern = r"(http://localhost:300[0-9]|http://127.0.0.1:300[0-9])" # Añadido 127.0.0.1
 allowed_origin_patterns = [localhost_pattern];
 if vercel_pattern: allowed_origin_patterns.append(vercel_pattern)
-final_regex = rf"^{ '|'.join(allowed_origin_patterns) }$"
-log.info("Configuring CORS middleware", allow_origin_regex=final_regex)
-app.add_middleware(CORSMiddleware, allow_origin_regex=final_regex, allow_credentials=True,
-                   allow_methods=["*"], allow_headers=["*"],
-                   expose_headers=["X-Request-ID", "X-Process-Time"], max_age=600)
+final_regex = rf"^{ '|'.join(allowed_origin_patterns) }$" if allowed_origin_patterns else "" # Manejar caso sin patrones
+if final_regex:
+    log.info("Configuring CORS middleware", allow_origin_regex=final_regex)
+    app.add_middleware(CORSMiddleware, allow_origin_regex=final_regex, allow_credentials=True,
+                       allow_methods=["*"], allow_headers=["*"],
+                       expose_headers=["X-Request-ID", "X-Process-Time"], max_age=600)
+else:
+    log.warning("No CORS origins configured. CORS middleware not added.")
 
-# Request Context/Timing/Logging Middleware
+# Request Context/Timing/Logging Middleware (Sin cambios)
 @app.middleware("http")
 async def add_request_context_timing_logging(request: Request, call_next):
     start_time = time.perf_counter()
     request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
     request.state.request_id = request_id
+    # Añadir user_id/company_id al log si están en el estado (puestos por auth middleware)
+    user_context = {}
+    if hasattr(request.state, 'user') and isinstance(request.state.user, dict):
+        user_context['user_id'] = request.state.user.get('sub')
+        user_context['company_id'] = request.state.user.get('company_id')
     request_log = log.bind(request_id=request_id, method=request.method, path=request.url.path,
                            client_ip=request.client.host if request.client else "unknown",
-                           origin=request.headers.get("origin", "N/A"))
-    if request.method == "OPTIONS": request_log.debug("OPTIONS preflight request received") # Downgraded log level
+                           origin=request.headers.get("origin", "N/A"), **user_context)
+    if request.method == "OPTIONS": request_log.debug("OPTIONS preflight request received")
     else: request_log.info("Request received")
     response = None; status_code = 500
     try:
@@ -1035,7 +1173,7 @@ async def add_request_context_timing_logging(request: Request, call_next):
         request_log.exception("Unhandled exception", status_code=500, error=str(e), proc_time=round(proc_time,2))
         response = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
         origin = request.headers.get("Origin");
-        if origin and re.match(final_regex, origin):
+        if final_regex and origin and re.match(final_regex, origin):
              response.headers["Access-Control-Allow-Origin"] = origin
              response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["X-Request-ID"] = request_id
@@ -1047,20 +1185,21 @@ async def add_request_context_timing_logging(request: Request, call_next):
             response.headers["X-Process-Time"] = f"{proc_time:.2f}ms"
             log_level = "debug" if request.url.path == "/health" else "info"
             log_func = getattr(request_log.bind(status_code=status_code), log_level)
-            # Avoid logging OPTIONS completion if already logged received
             if request.method != "OPTIONS": log_func("Request completed", proc_time=round(proc_time, 2))
     return response
 
 # --- Include Routers ---
 log.info("Including application routers...")
-# User router: ahora con prefijo correcto
-app.include_router(user_router_instance, prefix="/api/v1/users", tags=["users"])
-# Gateway router
+# User router (prefix /api/v1/users)
+app.include_router(user_router_instance, prefix="/api/v1", tags=["Users & Authentication"]) # Mantenemos prefix /api/v1 aquí para que coincida con paths internos
+# Admin router (prefix /api/v1/admin)
+app.include_router(admin_router_instance, prefix="/api/v1/admin", tags=["Admin"]) # Añadir el router admin
+# Gateway router (prefix /api/v1) - Debe ir DESPUÉS de los más específicos si hay solapamiento
 app.include_router(gateway_router_instance, prefix="/api/v1")
 log.info("Routers included successfully.")
 
-# --- Root & Health Endpoints ---
-@app.get("/", tags=["General"], summary="Root endpoint")
+# --- Root & Health Endpoints (Sin cambios) ---
+@app.get("/", tags=["General"], summary="Root endpoint", include_in_schema=False)
 async def read_root():
     return {"message": f"{settings.PROJECT_NAME} is running!"}
 
@@ -1079,16 +1218,294 @@ async def health_check(request: Request):
     log.debug("Health check successful", checks=health_status["checks"])
     return health_status
 
-# --- Main Execution ---
+# --- Main Execution (Sin cambios) ---
 if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8080))
+    host = os.getenv("HOST", "0.0.0.0")
+    reload_flag = os.getenv("UVICORN_RELOAD", "false").lower() == "true"
+    log_level_uvicorn = settings.LOG_LEVEL.lower()
+
     print(f"Starting {settings.PROJECT_NAME} using Uvicorn...")
-    uvicorn.run("app.main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8080)),
-                reload=True, log_level=settings.LOG_LEVEL.lower())
+    print(f" Host: {host}")
+    print(f" Port: {port}")
+    print(f" Reload: {reload_flag}")
+    print(f" Log Level: {log_level_uvicorn}")
+
+    uvicorn.run(
+        "app.main:app",
+        host=host,
+        port=port,
+        reload=reload_flag,
+        log_level=log_level_uvicorn
+    )
+```
+
+## File: `app\models\admin_models.py`
+```py
+# File: app/models/admin_models.py
+# api-gateway/app/models/admin_models.py
+import uuid
+from pydantic import BaseModel, EmailStr, Field, validator
+from typing import List, Optional
+from datetime import datetime
+
+# --- Modelos para Compañías ---
+
+class CompanyCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, description="Nombre de la nueva compañía.")
+
+class CompanyResponse(BaseModel):
+    id: uuid.UUID
+    name: str
+    created_at: datetime
+    # Podríamos añadir is_active si fuera relevante en la respuesta
+    # is_active: bool
+
+    model_config = { # Anteriormente Config
+        "from_attributes": True # Anteriormente orm_mode
+    }
+
+class CompanySelectItem(BaseModel):
+    id: uuid.UUID
+    name: str
+
+    model_config = {
+        "from_attributes": True
+    }
+
+# No necesitamos un modelo wrapper CompanyListSelectResponse, FastAPI puede devolver List[CompanySelectItem] directamente.
+
+# --- Modelos para Usuarios ---
+
+class UserCreateRequest(BaseModel):
+    email: EmailStr = Field(..., description="Correo electrónico único del nuevo usuario.")
+    password: str = Field(..., min_length=8, description="Contraseña del nuevo usuario (mínimo 8 caracteres).")
+    name: Optional[str] = Field(None, description="Nombre completo del usuario (opcional).")
+    company_id: uuid.UUID = Field(..., description="ID de la compañía a la que pertenece el usuario.")
+    roles: List[str] = Field(default=['user'], description="Lista de roles asignados al usuario (ej. ['user', 'admin']).")
+
+    @validator('roles', each_item=True)
+    def check_role_values(cls, v):
+        # Opcional: Validar que los roles sean de un conjunto permitido si es necesario
+        allowed_roles = {'user', 'admin'} # Ejemplo
+        if v not in allowed_roles:
+             raise ValueError(f"Rol inválido: '{v}'. Roles permitidos: {allowed_roles}")
+        return v
+
+class UserResponse(BaseModel):
+    id: uuid.UUID
+    email: EmailStr
+    name: Optional[str] = None
+    company_id: uuid.UUID
+    roles: List[str]
+    is_active: bool
+    created_at: datetime
+
+    model_config = {
+        "from_attributes": True
+    }
+
+
+# --- Modelos para Estadísticas ---
+
+class UsersPerCompanyStat(BaseModel):
+    company_id: uuid.UUID
+    name: str
+    user_count: int
+
+    model_config = {
+        "from_attributes": True
+    }
+
+class AdminStatsResponse(BaseModel):
+    company_count: int = Field(..., description="Número total de compañías activas.")
+    users_per_company: List[UsersPerCompanyStat] = Field(..., description="Lista de compañías activas con su conteo de usuarios activos.")
 ```
 
 ## File: `app\routers\__init__.py`
 ```py
 
+```
+
+## File: `app\routers\admin_router.py`
+```py
+# File: app/routers/admin_router.py
+# api-gateway/app/routers/admin_router.py
+from fastapi import APIRouter, Depends, HTTPException, status, Request
+from typing import List, Dict, Any
+import structlog
+import uuid
+import asyncpg # Para capturar errores específicos de DB
+
+# --- Dependencias y Servicios ---
+from app.auth.auth_middleware import AdminAuth # Usar la dependencia AdminAuth
+from app.db import postgres_client
+from app.auth.auth_service import get_password_hash
+
+# --- Modelos Pydantic ---
+from app.models.admin_models import (
+    CompanyCreateRequest, CompanyResponse, CompanySelectItem,
+    UserCreateRequest, UserResponse,
+    UsersPerCompanyStat, AdminStatsResponse
+)
+
+log = structlog.get_logger(__name__)
+router = APIRouter() # No añadir prefijo aquí, se añade en main.py
+
+# --- Endpoints de Administración ---
+
+@router.get(
+    "/stats",
+    response_model=AdminStatsResponse,
+    summary="Obtener estadísticas generales",
+    description="Devuelve el número total de compañías activas y el número de usuarios activos por compañía activa."
+)
+async def get_admin_stats(
+    request: Request,
+    admin_user: AdminAuth # Protegido: Solo admins pueden acceder
+):
+    admin_id = admin_user.get("sub")
+    req_id = getattr(request.state, 'request_id', 'N/A')
+    stats_log = log.bind(request_id=req_id, admin_user_id=admin_id)
+    stats_log.info("Admin requested platform statistics.")
+
+    try:
+        company_count = await postgres_client.count_active_companies()
+        users_per_company = await postgres_client.count_active_users_per_active_company()
+
+        stats_log.info("Statistics retrieved successfully.", company_count=company_count, companies_with_users=len(users_per_company))
+        return AdminStatsResponse(
+            company_count=company_count,
+            users_per_company=users_per_company
+        )
+    except Exception as e:
+        stats_log.exception("Error retrieving admin statistics", error=str(e))
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve statistics.")
+
+
+@router.post(
+    "/companies",
+    response_model=CompanyResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Crear una nueva compañía",
+    description="Crea un nuevo registro de compañía en la base de datos."
+)
+async def create_new_company(
+    request: Request,
+    company_data: CompanyCreateRequest,
+    admin_user: AdminAuth # Protegido
+):
+    admin_id = admin_user.get("sub")
+    req_id = getattr(request.state, 'request_id', 'N/A')
+    company_log = log.bind(request_id=req_id, admin_user_id=admin_id, company_name=company_data.name)
+    company_log.info("Admin attempting to create a new company.")
+
+    # Validación del nombre ya la hace Pydantic (min_length=1)
+    try:
+        new_company = await postgres_client.create_company(name=company_data.name)
+        company_log.info("Company created successfully", new_company_id=str(new_company['id']))
+        # Convertir a CompanyResponse (Pydantic v2 usa model_validate)
+        return CompanyResponse.model_validate(new_company)
+    except asyncpg.UniqueViolationError:
+         company_log.warning("Failed to create company: Name likely already exists.")
+         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Company name '{company_data.name}' may already exist.")
+    except Exception as e:
+        company_log.exception("Error creating company", error=str(e))
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create company.")
+
+
+@router.get(
+    "/companies/select",
+    response_model=List[CompanySelectItem],
+    summary="Listar compañías para selector",
+    description="Devuelve una lista simplificada (ID, Nombre) de compañías activas, ordenadas por nombre."
+)
+async def list_companies_for_select(
+    request: Request,
+    admin_user: AdminAuth # Protegido
+):
+    admin_id = admin_user.get("sub")
+    req_id = getattr(request.state, 'request_id', 'N/A')
+    list_log = log.bind(request_id=req_id, admin_user_id=admin_id)
+    list_log.info("Admin requested list of active companies for select.")
+
+    try:
+        companies = await postgres_client.get_active_companies_select()
+        list_log.info(f"Retrieved {len(companies)} companies for select.")
+        # FastAPI maneja la conversión a List[CompanySelectItem] si los dicts coinciden
+        return companies
+    except Exception as e:
+        list_log.exception("Error retrieving companies for select", error=str(e))
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve company list.")
+
+
+@router.post(
+    "/users",
+    response_model=UserResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Crear un nuevo usuario",
+    description="Crea un nuevo usuario, lo asocia a una compañía y le asigna roles."
+)
+async def create_new_user(
+    request: Request,
+    user_data: UserCreateRequest,
+    admin_user: AdminAuth # Protegido
+):
+    admin_id = admin_user.get("sub")
+    req_id = getattr(request.state, 'request_id', 'N/A')
+    user_log = log.bind(request_id=req_id, admin_user_id=admin_id, new_user_email=user_data.email, target_company_id=str(user_data.company_id))
+    user_log.info("Admin attempting to create a new user.")
+
+    # --- Validaciones Adicionales ---
+    # 1. Verificar si el email ya existe
+    try:
+        email_exists = await postgres_client.check_email_exists(user_data.email)
+        if email_exists:
+            user_log.warning("User creation failed: Email already exists.")
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Email '{user_data.email}' already registered.")
+    except Exception as e:
+        user_log.exception("Error checking email existence during user creation", error=str(e))
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error checking email availability.")
+
+    # 2. Verificar si la compañía existe
+    try:
+        company = await postgres_client.get_company_by_id(user_data.company_id)
+        if not company:
+            user_log.warning("User creation failed: Target company not found.", company_id=str(user_data.company_id))
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Company with ID '{user_data.company_id}' not found.")
+        if not company.get('is_active', False):
+             user_log.warning("User creation failed: Target company is inactive.", company_id=str(user_data.company_id))
+             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Cannot assign user to inactive company '{user_data.company_id}'.")
+    except Exception as e:
+        user_log.exception("Error checking company existence during user creation", error=str(e))
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error verifying target company.")
+
+    # --- Creación del Usuario ---
+    try:
+        # Hashear contraseña
+        hashed_password = get_password_hash(user_data.password)
+
+        # Crear usuario en DB
+        new_user = await postgres_client.create_user(
+            email=user_data.email,
+            hashed_password=hashed_password,
+            name=user_data.name,
+            company_id=user_data.company_id,
+            roles=user_data.roles # Pasa la lista de roles
+        )
+        user_log.info("User created successfully", new_user_id=str(new_user['id']))
+        # Convertir a UserResponse (Pydantic v2 usa model_validate)
+        return UserResponse.model_validate(new_user)
+
+    except asyncpg.UniqueViolationError: # Ya controlado arriba, pero por si acaso
+         user_log.warning("User creation conflict (likely email).")
+         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Email '{user_data.email}' already registered.")
+    except asyncpg.ForeignKeyViolationError: # Ya controlado arriba, pero por si acaso
+         user_log.warning("User creation failed due to non-existent company ID.")
+         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Company with ID '{user_data.company_id}' not found.")
+    except Exception as e:
+        user_log.exception("Error creating user in database", error=str(e))
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create user.")
 ```
 
 ## File: `app\routers\auth_router.py`
@@ -1392,7 +1809,7 @@ else:
 # File: app/routers/user_router.py
 # api-gateway/app/routers/user_router.py
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Body
-from typing import Dict, Any, Optional, Annotated
+from typing import Dict, Any, Optional, Annotated, List # Añadido List
 import structlog
 import uuid
 
@@ -1404,12 +1821,24 @@ from pydantic import BaseModel, EmailStr, Field, validator
 
 log = structlog.get_logger(__name__)
 
-# --- REMOVE prefix from router definition ---
-router = APIRouter(tags=["Users & Authentication"]) # No prefix here
+# El prefijo /api/v1/users se define en main.py al incluir el router
+router = APIRouter()
 
-# --- Modelos Pydantic (Sin cambios) ---
-class LoginRequest(BaseModel): email: EmailStr; password: str = Field(..., min_length=6)
-class LoginResponse(BaseModel): access_token: str; token_type: str = "bearer"; user_id: str; email: EmailStr; full_name: Optional[str] = None; role: Optional[str] = "user"; company_id: Optional[str] = None
+# --- Modelos Pydantic ---
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=6)
+
+# --- MODIFICADO: Añadir roles a LoginResponse ---
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user_id: str
+    email: EmailStr
+    full_name: Optional[str] = None
+    roles: Optional[List[str]] = None # Añadido campo roles
+    company_id: Optional[str] = None
+
 class EnsureCompanyRequest(BaseModel):
     company_id: Optional[str] = None
     @validator('company_id')
@@ -1418,52 +1847,169 @@ class EnsureCompanyRequest(BaseModel):
             try: uuid.UUID(v)
             except ValueError: raise ValueError("Provided company_id is not a valid UUID")
         return v
-class EnsureCompanyResponse(BaseModel): user_id: str; company_id: str; message: str; new_access_token: str; token_type: str = "bearer"
 
-# --- Endpoints (Relative paths within this router) ---
-# Paths should be relative to the /api/v1/users prefix added in main.py
-@router.post("/login", response_model=LoginResponse) # Path corrected relative to main prefix
+class EnsureCompanyResponse(BaseModel):
+    user_id: str
+    company_id: str
+    message: str
+    new_access_token: str
+    token_type: str = "bearer"
+    # Añadir también roles aquí si el frontend lo necesita tras asegurar compañía
+    roles: Optional[List[str]] = None
+
+# --- Endpoints ---
+# El path "/login" se resuelve como "/api/v1/users/login" debido al prefijo en main.py
+@router.post("/login", response_model=LoginResponse, tags=["Users & Authentication"])
 async def login_for_access_token(login_data: LoginRequest):
     log.info("Login attempt initiated", email=login_data.email)
     user = await authenticate_user(login_data.email, login_data.password)
     if not user:
         log.warning("Login failed", email=login_data.email)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Incorrect email or password", headers={"WWW-Authenticate": "Bearer"})
-    user_id = user.get("id"); company_id = user.get("company_id"); email = user.get("email"); full_name = user.get("full_name"); role = user.get("role", "user")
-    if not user_id or not email: log.error("Auth user data missing fields", keys=user.keys()); raise HTTPException(500, "Internal login error")
-    access_token = create_access_token(user_id=user_id, email=email, company_id=company_id)
-    log.info("Login successful", user_id=str(user_id), company_id=str(company_id) if company_id else "None")
-    return LoginResponse(access_token=access_token, user_id=str(user_id), email=email, full_name=full_name, role=role, company_id=str(company_id) if company_id else None)
 
-@router.post("/users/me/ensure-company", response_model=EnsureCompanyResponse) # Path corrected relative to main prefix
-async def ensure_company_association(request: Request, user_payload: InitialAuth, ensure_request: Optional[EnsureCompanyRequest] = Body(None)):
-    user_id_str = user_payload.get("sub"); req_id = getattr(request.state, 'request_id', 'N/A'); log_ctx = log.bind(request_id=req_id, user_id=user_id_str)
+    user_id = user.get("id")
+    company_id = user.get("company_id")
+    email = user.get("email")
+    full_name = user.get("full_name")
+    roles = user.get("roles") # Obtener roles de la DB
+
+    if not user_id or not email:
+        log.error("Authenticated user data missing critical fields (id or email)", keys=list(user.keys()) if user else None)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal login error: Missing user data.")
+
+    # --- MODIFICADO: Pasar roles a create_access_token ---
+    access_token = create_access_token(
+        user_id=user_id,
+        email=email,
+        company_id=company_id,
+        roles=roles # Pasar la lista de roles
+    )
+
+    log.info("Login successful", user_id=str(user_id), company_id=str(company_id) if company_id else "None", roles=roles)
+
+    # --- MODIFICADO: Incluir roles en la respuesta ---
+    return LoginResponse(
+        access_token=access_token,
+        user_id=str(user_id),
+        email=email,
+        full_name=full_name,
+        roles=roles, # Devolver roles al frontend
+        company_id=str(company_id) if company_id else None
+    )
+
+# El path "/me/ensure-company" se resuelve como "/api/v1/users/me/ensure-company"
+@router.post("/me/ensure-company", response_model=EnsureCompanyResponse, tags=["Users & Authentication"])
+async def ensure_company_association(
+    request: Request,
+    user_payload: InitialAuth, # Requiere token válido (firma, exp, user activo), no company_id
+    ensure_request: Optional[EnsureCompanyRequest] = Body(None)
+):
+    user_id_str = user_payload.get("sub")
+    req_id = getattr(request.state, 'request_id', 'N/A')
+    log_ctx = log.bind(request_id=req_id, user_id=user_id_str)
     log_ctx.info("Ensure company association requested.")
-    if not user_id_str: log_ctx.error("Ensure fail: User ID missing"); raise HTTPException(400, "User ID not found in token.")
-    try: user_id = uuid.UUID(user_id_str)
-    except ValueError: log_ctx.error("Ensure fail: Invalid User ID", sub=user_id_str); raise HTTPException(400, "Invalid user ID format.")
+
+    if not user_id_str:
+        log_ctx.error("Ensure company failed: User ID ('sub') missing from token payload.");
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User ID not found in token.")
+    try:
+        user_id = uuid.UUID(user_id_str)
+    except ValueError:
+        log_ctx.error("Ensure company failed: Invalid User ID format in token.", sub_value=user_id_str)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid user ID format.")
+
+    # Obtener datos actuales del usuario (incluyendo roles actuales)
     current_user_data = await postgres_client.get_user_by_id(user_id)
-    if not current_user_data: log_ctx.error("Ensure fail: User not in DB"); raise HTTPException(404, "User not found in database.")
-    current_company_id = current_user_data.get("company_id"); target_company_id_str: Optional[str] = None; action_taken = "none"
-    if ensure_request and ensure_request.company_id: target_company_id_str = ensure_request.company_id; log_ctx.info("Using company_id from body", target=target_company_id_str)
-    elif not current_company_id and settings.DEFAULT_COMPANY_ID: target_company_id_str = settings.DEFAULT_COMPANY_ID; log_ctx.info("Using default company_id", default=target_company_id_str)
-    elif current_company_id: target_company_id_str = str(current_company_id); log_ctx.info("Using current company_id", current=target_company_id_str)
-    else: log_ctx.error("Ensure fail: No target company"); raise HTTPException(400,"Cannot associate company: No ID provided and no default configured.")
-    try: target_company_id = uuid.UUID(target_company_id_str)
-    except ValueError: log_ctx.error("Ensure fail: Invalid target UUID", target=target_company_id_str); raise HTTPException(400, "Invalid target company ID format.")
+    if not current_user_data:
+        log_ctx.error("Ensure company failed: User from token not found in database.");
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.") # 404 es más apropiado
+
+    current_company_id = current_user_data.get("company_id")
+    current_roles = current_user_data.get("roles") # Obtener roles actuales
+    user_email = current_user_data.get("email") # Obtener email para el nuevo token
+
+    if not user_email:
+        log_ctx.error("Ensure company failed: Email missing for user, cannot generate new token.", user_id=user_id_str)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal error: Missing user email.")
+
+    target_company_id_str: Optional[str] = None
+    action_taken = "none" # 'updated', 'confirmed', 'failed'
+
+    # Determinar target company ID
+    if ensure_request and ensure_request.company_id:
+        target_company_id_str = ensure_request.company_id
+        log_ctx.info("Attempting to use company_id from request body.", target_id=target_company_id_str)
+    elif current_company_id:
+        target_company_id_str = str(current_company_id)
+        log_ctx.info("Using user's current company_id.", current_id=target_company_id_str)
+    elif settings.DEFAULT_COMPANY_ID:
+        target_company_id_str = settings.DEFAULT_COMPANY_ID
+        log_ctx.info("Using default company_id from settings.", default_id=target_company_id_str)
+    else:
+        log_ctx.error("Ensure company failed: Cannot determine target company ID. None provided, user has no current ID, and no default is set.")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot associate company: No specific ID provided and no default available for this user."
+        )
+
+    # Validar formato del target company ID
+    try:
+        target_company_id = uuid.UUID(target_company_id_str)
+    except (ValueError, TypeError):
+        log_ctx.error("Ensure company failed: Invalid target company ID format.", target_value=target_company_id_str)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid target company ID format.")
+
+    # Verificar si la compañía objetivo existe (opcional pero recomendado)
+    # try:
+    #     target_company = await postgres_client.get_company_by_id(target_company_id)
+    #     if not target_company:
+    #          log_ctx.warning("Ensure company failed: Target company ID does not exist in DB.", target_id=str(target_company_id))
+    #          raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Target company {target_company_id} not found.")
+    # except Exception as e:
+    #      log_ctx.exception("Ensure company failed: Error verifying target company existence.", error=str(e))
+    #      raise HTTPException(status_code=500, detail="Error verifying target company.")
+
+
+    # Actualizar DB si es necesario
     if target_company_id != current_company_id:
-        log_ctx.info("Updating user company in DB", new_id=str(target_company_id))
-        updated = await postgres_client.update_user_company(user_id, target_company_id)
-        if not updated: log_ctx.error("DB update failed"); raise HTTPException(500, "Failed to update user company.")
-        action_taken = "updated"; log_ctx.info("DB update successful")
-    else: action_taken = "confirmed"; log_ctx.info("Company association confirmed, no DB update")
-    user_email = current_user_data.get("email")
-    if not user_email: log_ctx.error("Cannot generate token, missing email"); raise HTTPException(500, "Internal error generating token.")
-    new_access_token = create_access_token(user_id=user_id, email=user_email, company_id=target_company_id)
-    log_ctx.info("New token generated", company_id=str(target_company_id))
-    if action_taken == "updated": message = f"Company association updated to {target_company_id}."
-    else: message = f"Company association confirmed as {target_company_id}."
-    return EnsureCompanyResponse(user_id=str(user_id), company_id=str(target_company_id), message=message, new_access_token=new_access_token)
+        log_ctx.info("Target company differs from current. Attempting database update.",
+                     current_id=str(current_company_id), new_id=str(target_company_id))
+        try:
+            updated = await postgres_client.update_user_company(user_id, target_company_id)
+            if not updated:
+                # Esto podría ocurrir si el user_id ya no existe, aunque get_user_by_id lo verificó antes.
+                log_ctx.error("Ensure company failed: Database update command affected 0 rows.", target_company_id=str(target_company_id))
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to update user company association.")
+            action_taken = "updated"
+            log_ctx.info("User company association updated in database successfully.")
+        except Exception as e:
+            log_ctx.exception("Ensure company failed: Error during database update.", error=str(e))
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error during company update.")
+    else:
+        action_taken = "confirmed"
+        log_ctx.info("Target company matches current. No database update needed.", company_id=str(target_company_id))
+
+    # Generar nuevo token con la compañía final y los roles actuales
+    new_access_token = create_access_token(
+        user_id=user_id,
+        email=user_email,
+        company_id=target_company_id, # Usar la compañía final
+        roles=current_roles # Incluir los roles actuales en el nuevo token
+    )
+    log_ctx.info("New access token generated successfully.", final_company_id=str(target_company_id), roles=current_roles)
+
+    if action_taken == "updated":
+        message = f"Company association successfully updated to {target_company_id}."
+    else: # action_taken == "confirmed"
+        message = f"Company association confirmed as {target_company_id}."
+
+    return EnsureCompanyResponse(
+        user_id=str(user_id),
+        company_id=str(target_company_id),
+        message=message,
+        new_access_token=new_access_token,
+        roles=current_roles # Devolver roles en la respuesta
+    )
 ```
 
 ## File: `pyproject.toml`
