@@ -25,8 +25,8 @@ MILVUS_DEFAULT_DOCUMENT_ID_FIELD = "document_id"
 MILVUS_DEFAULT_FILENAME_FIELD = "file_name"
 # ----------------------------------
 MILVUS_DEFAULT_GRPC_TIMEOUT = 10
-MILVUS_DEFAULT_INDEX_PARAMS = '{"metric_type": "COSINE", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}}'
-MILVUS_DEFAULT_SEARCH_PARAMS = '{"metric_type": "COSINE", "params": {"ef": 128}}'
+MILVUS_DEFAULT_INDEX_PARAMS = '{"metric_type": "IP", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}}'
+MILVUS_DEFAULT_SEARCH_PARAMS = '{"metric_type": "IP", "params": {"ef": 128}}'
 
 # --- RAG Defaults ---
 DEFAULT_RAG_PROMPT_TEMPLATE = """
