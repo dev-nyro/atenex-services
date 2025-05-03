@@ -9,20 +9,22 @@ import sys
 import json # LLM_COMMENT: Added json import for default factories
 
 # --- PostgreSQL Kubernetes Defaults ---
-POSTGRES_K8S_HOST_DEFAULT = "postgresql-service.nyro-develop.svc.cluster.local" # Corrected service name
+POSTGRES_K8S_HOST_DEFAULT = "postgresql-service.nyro-develop.svc.cluster.local"
 POSTGRES_K8S_PORT_DEFAULT = 5432
 POSTGRES_K8S_DB_DEFAULT = "atenex"
 POSTGRES_K8S_USER_DEFAULT = "postgres"
 
 # --- Milvus Kubernetes Defaults ---
-MILVUS_K8S_DEFAULT_URI = "http://milvus-standalone.nyro-develop.svc.cluster.local:19530" # Corrected service name
-# --- CORRECTION: Align collection name with ingest ---
-MILVUS_DEFAULT_COLLECTION = "document_chunks_haystack" # Match ingest config
-# --- CORRECTION: Align field names with ingest ---
+MILVUS_K8S_DEFAULT_URI = "http://milvus-standalone.nyro-develop.svc.cluster.local:19530"
+MILVUS_DEFAULT_COLLECTION = "document_chunks_haystack"
 MILVUS_DEFAULT_EMBEDDING_FIELD = "embedding"
 MILVUS_DEFAULT_CONTENT_FIELD = "content"
 MILVUS_DEFAULT_COMPANY_ID_FIELD = "company_id"
-# ---------------------------------------------------
+# --- Added Missing Field Defaults ---
+MILVUS_DEFAULT_DOCUMENT_ID_FIELD = "document_id"
+MILVUS_DEFAULT_FILENAME_FIELD = "file_name"
+# ----------------------------------
+MILVUS_DEFAULT_GRPC_TIMEOUT = 10
 MILVUS_DEFAULT_INDEX_PARAMS = '{"metric_type": "COSINE", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}}'
 MILVUS_DEFAULT_SEARCH_PARAMS = '{"metric_type": "COSINE", "params": {"ef": 128}}'
 
@@ -52,15 +54,15 @@ Pregunta: {{ query }}
 Respuesta:
 """
 
-# --- CORRECTION: Align Embedding Model and Dimension with ingest ---
-DEFAULT_FASTEMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2" # Match ingest
+# --- Embedding Model and Dimension (Aligned with ingest) ---
+DEFAULT_FASTEMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_FASTEMBED_QUERY_PREFIX = "query: "
-DEFAULT_EMBEDDING_DIMENSION = 384 # Match ingest (MiniLM dimension)
+DEFAULT_EMBEDDING_DIMENSION = 384
 # ------------------------------------------------------------------
 
 class Settings(BaseSettings):
     # --- Milvus gRPC Timeout ---
-    MILVUS_GRPC_TIMEOUT: int = 10  # Seconds (match ingest-service default)
+    MILVUS_GRPC_TIMEOUT: int = Field(default=MILVUS_DEFAULT_GRPC_TIMEOUT, description="Timeout in seconds for Milvus gRPC calls.") # Moved up for consistency
     model_config = SettingsConfigDict(
         env_file='.env',
         env_prefix='QUERY_',
@@ -84,23 +86,21 @@ class Settings(BaseSettings):
     # --- Vector Store (Milvus) ---
     MILVUS_URI: AnyHttpUrl = Field(default=AnyHttpUrl(MILVUS_K8S_DEFAULT_URI))
     MILVUS_COLLECTION_NAME: str = MILVUS_DEFAULT_COLLECTION
-    # --- CORRECTION: Use defaults aligned with ingest ---
-    MILVUS_EMBEDDING_FIELD: str = Field(default=MILVUS_DEFAULT_EMBEDDING_FIELD) # Field name for vectors in Milvus
-    MILVUS_CONTENT_FIELD: str = Field(default=MILVUS_DEFAULT_CONTENT_FIELD) # Field name for text content in Milvus
-    MILVUS_COMPANY_ID_FIELD: str = Field(default=MILVUS_DEFAULT_COMPANY_ID_FIELD) # Field used for tenant filtering in Milvus
-    # --------------------------------------------------
-    # LLM_COMMENT: Define metadata fields expected in Milvus, MUST include 'company_id' for filtering
-    MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name", "file_type"]) # Keep others if needed
-    # LLM_COMMENT: Use json.loads with default_factory for complex dict defaults
+    MILVUS_EMBEDDING_FIELD: str = Field(default=MILVUS_DEFAULT_EMBEDDING_FIELD)
+    MILVUS_CONTENT_FIELD: str = Field(default=MILVUS_DEFAULT_CONTENT_FIELD)
+    MILVUS_COMPANY_ID_FIELD: str = Field(default=MILVUS_DEFAULT_COMPANY_ID_FIELD)
+    # --- Added Missing Field Settings ---
+    MILVUS_DOCUMENT_ID_FIELD: str = Field(default=MILVUS_DEFAULT_DOCUMENT_ID_FIELD, description="Field name for the original document UUID in Milvus.")
+    MILVUS_FILENAME_FIELD: str = Field(default=MILVUS_DEFAULT_FILENAME_FIELD, description="Field name for the original filename in Milvus.")
+    # ------------------------------------
+    MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name", "file_type"]) # Keep fields used in metadata
     MILVUS_INDEX_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_INDEX_PARAMS))
     MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_SEARCH_PARAMS))
 
     # --- Embedding Model (FastEmbed) ---
-    # --- CORRECTION: Use aligned defaults ---
     FASTEMBED_MODEL_NAME: str = Field(default=DEFAULT_FASTEMBED_MODEL)
-    EMBEDDING_DIMENSION: int = Field(default=DEFAULT_EMBEDDING_DIMENSION) # Dimension matching the FastEmbed model
-    FASTEMBED_QUERY_PREFIX: str = Field(default=DEFAULT_FASTEMBED_QUERY_PREFIX) # Prefix for query embedding
-    # --------------------------------------
+    EMBEDDING_DIMENSION: int = Field(default=DEFAULT_EMBEDDING_DIMENSION)
+    FASTEMBED_QUERY_PREFIX: str = Field(default=DEFAULT_FASTEMBED_QUERY_PREFIX)
 
     # --- LLM (Google Gemini) ---
     GEMINI_API_KEY: SecretStr
@@ -135,38 +135,23 @@ class Settings(BaseSettings):
             raise ValueError(f"Required secret field '{field_name}' cannot be empty.")
         return v
 
-    # --- CORRECTION: Add validator for embedding dimension vs model ---
     @field_validator('EMBEDDING_DIMENSION')
     @classmethod
     def check_embedding_dimension(cls, v: int, info: ValidationInfo) -> int:
         if v <= 0:
             raise ValueError("EMBEDDING_DIMENSION must be a positive integer.")
-        # Check against the actual model being used (from defaults or env var)
         model_name = info.data.get('FASTEMBED_MODEL_NAME', DEFAULT_FASTEMBED_MODEL)
         expected_dim = -1
-        if 'all-MiniLM-L6-v2' in model_name:
-            expected_dim = 384
-        elif 'bge-small-en-v1.5' in model_name:
-            expected_dim = 384
-        elif 'bge-large-en-v1.5' in model_name:
-            expected_dim = 1024
-        # Add other known models here
+        if 'all-MiniLM-L6-v2' in model_name: expected_dim = 384
+        elif 'bge-small-en-v1.5' in model_name: expected_dim = 384
+        elif 'bge-large-en-v1.5' in model_name: expected_dim = 1024
 
         if expected_dim != -1 and v != expected_dim:
-            logging.warning(
-                f"Configured EMBEDDING_DIMENSION ({v}) differs from standard dimension ({expected_dim}) "
-                f"for model '{model_name}'. Ensure this is intentional."
-            )
+            logging.warning(f"Configured EMBEDDING_DIMENSION ({v}) differs from standard dimension ({expected_dim}) for model '{model_name}'. Ensure this is intentional.")
         elif expected_dim == -1:
-            logging.warning(
-                 f"Unknown embedding dimension for model '{model_name}'. Using configured dimension {v}. "
-                 f"Verify this matches the actual model output."
-            )
-
+            logging.warning(f"Unknown embedding dimension for model '{model_name}'. Using configured dimension {v}. Verify this matches the actual model output.")
         logging.debug(f"Using EMBEDDING_DIMENSION: {v} for model: {model_name}")
         return v
-    # ------------------------------------------------------------------
-
 
 # --- Instancia Global ---
 temp_log = logging.getLogger("query_service.config.loader")
@@ -190,10 +175,13 @@ try:
     temp_log.info(f"  POSTGRES_PASSWORD: *** SET ***")
     temp_log.info(f"  MILVUS_URI: {settings.MILVUS_URI}")
     temp_log.info(f"  MILVUS_COLLECTION_NAME: {settings.MILVUS_COLLECTION_NAME}")
-    # --- Log corrected fields ---
+    temp_log.info(f"  MILVUS_GRPC_TIMEOUT: {settings.MILVUS_GRPC_TIMEOUT}s")
     temp_log.info(f"  MILVUS_EMBEDDING_FIELD: {settings.MILVUS_EMBEDDING_FIELD}")
     temp_log.info(f"  MILVUS_CONTENT_FIELD: {settings.MILVUS_CONTENT_FIELD}")
     temp_log.info(f"  MILVUS_COMPANY_ID_FIELD: {settings.MILVUS_COMPANY_ID_FIELD}")
+    # --- Log added settings ---
+    temp_log.info(f"  MILVUS_DOCUMENT_ID_FIELD: {settings.MILVUS_DOCUMENT_ID_FIELD}")
+    temp_log.info(f"  MILVUS_FILENAME_FIELD: {settings.MILVUS_FILENAME_FIELD}")
     # --------------------------
     temp_log.info(f"  FASTEMBED_MODEL_NAME: {settings.FASTEMBED_MODEL_NAME}")
     temp_log.info(f"  EMBEDDING_DIMENSION: {settings.EMBEDDING_DIMENSION}")
