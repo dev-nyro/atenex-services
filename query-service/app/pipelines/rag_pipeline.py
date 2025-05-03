@@ -29,27 +29,13 @@ def get_milvus_document_store() -> MilvusDocumentStore:
     store_log = log.bind(
         component="MilvusDocumentStore",
         uri=connection_uri,
-        collection=settings.MILVUS_COLLECTION_NAME,
-        embedding_field=settings.MILVUS_EMBEDDING_FIELD, # Log field name
-        content_field=settings.MILVUS_CONTENT_FIELD      # Log field name
+        collection=settings.MILVUS_COLLECTION_NAME
     )
     store_log.debug("Initializing...")
     try:
         store = MilvusDocumentStore(
             connection_args={"uri": connection_uri},
             collection_name=settings.MILVUS_COLLECTION_NAME,
-            # --- Pass explicit field names ---
-            embedding_field=settings.MILVUS_EMBEDDING_FIELD,
-            content_field=settings.MILVUS_CONTENT_FIELD,
-            # ---------------------------------
-            # --- Optional: Map metadata fields if they differ from Haystack defaults ---
-            # field_map={
-            #     "content": settings.MILVUS_CONTENT_FIELD,
-            #     "embedding": settings.MILVUS_EMBEDDING_FIELD,
-            #     # Map other metadata fields if their names differ significantly
-            #     # "meta.company_id": settings.MILVUS_COMPANY_ID_FIELD, # Example if names differed
-            # },
-            # -----------------------------------------------------------------------
             index_params=settings.MILVUS_INDEX_PARAMS,
             search_params=settings.MILVUS_SEARCH_PARAMS,
             consistency_level="Strong",

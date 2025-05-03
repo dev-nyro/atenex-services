@@ -433,7 +433,7 @@ class HealthCheckResponse(BaseModel):
 
 ## File: `app\core\config.py`
 ```py
-# ./app/core/config.py
+# query-service/app/core/config.py
 import logging
 import os
 from typing import Optional, List, Any, Dict
@@ -444,21 +444,24 @@ import sys
 import json # LLM_COMMENT: Added json import for default factories
 
 # --- PostgreSQL Kubernetes Defaults ---
-POSTGRES_K8S_HOST_DEFAULT = "postgresql.nyro-develop.svc.cluster.local"
+POSTGRES_K8S_HOST_DEFAULT = "postgresql-service.nyro-develop.svc.cluster.local" # Corrected service name
 POSTGRES_K8S_PORT_DEFAULT = 5432
-POSTGRES_K8S_DB_DEFAULT = "atenex" # LLM_COMMENT: Verified database name
+POSTGRES_K8S_DB_DEFAULT = "atenex"
 POSTGRES_K8S_USER_DEFAULT = "postgres"
 
 # --- Milvus Kubernetes Defaults ---
-MILVUS_K8S_DEFAULT_URI = "http://milvus-milvus.default.svc.cluster.local:19530" # LLM_COMMENT: Default Milvus URI in 'default' namespace
-# LLM_COMMENT: Default Milvus collection name, should match ingest-service
-MILVUS_DEFAULT_COLLECTION = "atenex_doc_chunks"
-# LLM_COMMENT: Default Milvus index/search parameters, can be overridden by env vars
+MILVUS_K8S_DEFAULT_URI = "http://milvus-standalone.nyro-develop.svc.cluster.local:19530" # Corrected service name
+# --- CORRECTION: Align collection name with ingest ---
+MILVUS_DEFAULT_COLLECTION = "document_chunks_haystack" # Match ingest config
+# --- CORRECTION: Align field names with ingest ---
+MILVUS_DEFAULT_EMBEDDING_FIELD = "embedding"
+MILVUS_DEFAULT_CONTENT_FIELD = "content"
+MILVUS_DEFAULT_COMPANY_ID_FIELD = "company_id"
+# ---------------------------------------------------
 MILVUS_DEFAULT_INDEX_PARAMS = '{"metric_type": "COSINE", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}}'
 MILVUS_DEFAULT_SEARCH_PARAMS = '{"metric_type": "COSINE", "params": {"ef": 128}}'
 
 # --- RAG Defaults ---
-# LLM_COMMENT: Prompt for RAG when documents are retrieved. Uses Jinja2 syntax.
 DEFAULT_RAG_PROMPT_TEMPLATE = """
 Basándote estrictamente en los siguientes documentos recuperados, responde a la pregunta del usuario.
 Si los documentos no contienen la respuesta, indica explícitamente que no puedes responder con la información proporcionada.
@@ -475,7 +478,6 @@ Pregunta: {{ query }}
 
 Respuesta concisa y directa:
 """
-# LLM_COMMENT: Prompt for general conversation when NO documents are relevant.
 DEFAULT_GENERAL_PROMPT_TEMPLATE = """
 Eres un asistente de IA llamado Atenex. Responde a la siguiente pregunta del usuario de forma útil y conversacional.
 Si no sabes la respuesta o la pregunta no está relacionada con tus capacidades, indícalo amablemente.
@@ -485,61 +487,63 @@ Pregunta: {{ query }}
 Respuesta:
 """
 
-# LLM_COMMENT: Define default FastEmbed model and query prefix
-DEFAULT_FASTEMBED_MODEL = "BAAI/bge-small-en-v1.5"
+# --- CORRECTION: Align Embedding Model and Dimension with ingest ---
+DEFAULT_FASTEMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2" # Match ingest
 DEFAULT_FASTEMBED_QUERY_PREFIX = "query: "
-# LLM_COMMENT: Embedding dimension for the default FastEmbed model
-DEFAULT_EMBEDDING_DIMENSION = 384
+DEFAULT_EMBEDDING_DIMENSION = 384 # Match ingest (MiniLM dimension)
+# ------------------------------------------------------------------
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file='.env',
-        env_prefix='QUERY_', # LLM_COMMENT: Keep prefix consistent
+        env_prefix='QUERY_',
         env_file_encoding='utf-8',
         case_sensitive=False,
         extra='ignore'
     )
 
     # --- General ---
-    PROJECT_NAME: str = "Atenex Query Service" # LLM_COMMENT: Standardized name
+    PROJECT_NAME: str = "Atenex Query Service"
     API_V1_STR: str = "/api/v1"
     LOG_LEVEL: str = "INFO"
 
     # --- Database (PostgreSQL) ---
     POSTGRES_USER: str = POSTGRES_K8S_USER_DEFAULT
-    POSTGRES_PASSWORD: SecretStr # LLM_COMMENT: Secret loaded from env/secret
+    POSTGRES_PASSWORD: SecretStr
     POSTGRES_SERVER: str = POSTGRES_K8S_HOST_DEFAULT
     POSTGRES_PORT: int = POSTGRES_K8S_PORT_DEFAULT
     POSTGRES_DB: str = POSTGRES_K8S_DB_DEFAULT
 
     # --- Vector Store (Milvus) ---
-    MILVUS_URI: AnyHttpUrl = Field(default=AnyHttpUrl(MILVUS_K8S_DEFAULT_URI)) # LLM_COMMENT: Use Field for default
+    MILVUS_URI: AnyHttpUrl = Field(default=AnyHttpUrl(MILVUS_K8S_DEFAULT_URI))
     MILVUS_COLLECTION_NAME: str = MILVUS_DEFAULT_COLLECTION
+    # --- CORRECTION: Use defaults aligned with ingest ---
+    MILVUS_EMBEDDING_FIELD: str = Field(default=MILVUS_DEFAULT_EMBEDDING_FIELD) # Field name for vectors in Milvus
+    MILVUS_CONTENT_FIELD: str = Field(default=MILVUS_DEFAULT_CONTENT_FIELD) # Field name for text content in Milvus
+    MILVUS_COMPANY_ID_FIELD: str = Field(default=MILVUS_DEFAULT_COMPANY_ID_FIELD) # Field used for tenant filtering in Milvus
+    # --------------------------------------------------
     # LLM_COMMENT: Define metadata fields expected in Milvus, MUST include 'company_id' for filtering
-    MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name", "file_type"])
-    MILVUS_EMBEDDING_FIELD: str = "embedding" # LLM_COMMENT: Field name for vectors in Milvus
-    MILVUS_CONTENT_FIELD: str = "content" # LLM_COMMENT: Field name for text content in Milvus
-    MILVUS_COMPANY_ID_FIELD: str = "company_id" # LLM_COMMENT: Field used for tenant filtering in Milvus
+    MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name", "file_type"]) # Keep others if needed
     # LLM_COMMENT: Use json.loads with default_factory for complex dict defaults
     MILVUS_INDEX_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_INDEX_PARAMS))
     MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_SEARCH_PARAMS))
 
     # --- Embedding Model (FastEmbed) ---
-    # LLM_COMMENT: Settings specific to FastEmbed replacing OpenAI embedding settings
-    FASTEMBED_MODEL_NAME: str = DEFAULT_FASTEMBED_MODEL
-    FASTEMBED_QUERY_PREFIX: str = DEFAULT_FASTEMBED_QUERY_PREFIX # LLM_COMMENT: Prefix for query embedding
-    EMBEDDING_DIMENSION: int = DEFAULT_EMBEDDING_DIMENSION # LLM_COMMENT: Dimension matching the FastEmbed model
+    # --- CORRECTION: Use aligned defaults ---
+    FASTEMBED_MODEL_NAME: str = Field(default=DEFAULT_FASTEMBED_MODEL)
+    EMBEDDING_DIMENSION: int = Field(default=DEFAULT_EMBEDDING_DIMENSION) # Dimension matching the FastEmbed model
+    FASTEMBED_QUERY_PREFIX: str = Field(default=DEFAULT_FASTEMBED_QUERY_PREFIX) # Prefix for query embedding
+    # --------------------------------------
 
     # --- LLM (Google Gemini) ---
-    GEMINI_API_KEY: SecretStr # LLM_COMMENT: Secret loaded from env/secret
+    GEMINI_API_KEY: SecretStr
     GEMINI_MODEL_NAME: str = "gemini-1.5-flash-latest"
 
     # --- RAG Pipeline Settings ---
     RETRIEVER_TOP_K: int = 5
     RAG_PROMPT_TEMPLATE: str = DEFAULT_RAG_PROMPT_TEMPLATE
-    # LLM_COMMENT: Added separate template for non-RAG scenarios
     GENERAL_PROMPT_TEMPLATE: str = DEFAULT_GENERAL_PROMPT_TEMPLATE
-    MAX_PROMPT_TOKENS: Optional[int] = 7000 # LLM_COMMENT: Optional token limit for prompts
+    MAX_PROMPT_TOKENS: Optional[int] = 7000
 
     # --- Service Client Config ---
     HTTP_CLIENT_TIMEOUT: int = 60
@@ -547,7 +551,6 @@ class Settings(BaseSettings):
     HTTP_CLIENT_BACKOFF_FACTOR: float = 1.0
 
     # --- Validators ---
-    # LLM_COMMENT: Validator for LOG_LEVEL (using Pydantic v2 syntax)
     @field_validator('LOG_LEVEL')
     @classmethod
     def check_log_level(cls, v: str) -> str:
@@ -557,7 +560,6 @@ class Settings(BaseSettings):
             raise ValueError(f"Invalid LOG_LEVEL '{v}'. Must be one of {valid_levels}")
         return normalized_v
 
-    # LLM_COMMENT: Validator to ensure required secrets are present (using Pydantic v2 syntax)
     @field_validator('POSTGRES_PASSWORD', 'GEMINI_API_KEY', mode='before')
     @classmethod
     def check_secret_value_present(cls, v: Any, info: ValidationInfo) -> Any:
@@ -566,21 +568,52 @@ class Settings(BaseSettings):
             raise ValueError(f"Required secret field '{field_name}' cannot be empty.")
         return v
 
+    # --- CORRECTION: Add validator for embedding dimension vs model ---
+    @field_validator('EMBEDDING_DIMENSION')
+    @classmethod
+    def check_embedding_dimension(cls, v: int, info: ValidationInfo) -> int:
+        if v <= 0:
+            raise ValueError("EMBEDDING_DIMENSION must be a positive integer.")
+        # Check against the actual model being used (from defaults or env var)
+        model_name = info.data.get('FASTEMBED_MODEL_NAME', DEFAULT_FASTEMBED_MODEL)
+        expected_dim = -1
+        if 'all-MiniLM-L6-v2' in model_name:
+            expected_dim = 384
+        elif 'bge-small-en-v1.5' in model_name:
+            expected_dim = 384
+        elif 'bge-large-en-v1.5' in model_name:
+            expected_dim = 1024
+        # Add other known models here
+
+        if expected_dim != -1 and v != expected_dim:
+            logging.warning(
+                f"Configured EMBEDDING_DIMENSION ({v}) differs from standard dimension ({expected_dim}) "
+                f"for model '{model_name}'. Ensure this is intentional."
+            )
+        elif expected_dim == -1:
+            logging.warning(
+                 f"Unknown embedding dimension for model '{model_name}'. Using configured dimension {v}. "
+                 f"Verify this matches the actual model output."
+            )
+
+        logging.debug(f"Using EMBEDDING_DIMENSION: {v} for model: {model_name}")
+        return v
+    # ------------------------------------------------------------------
+
+
 # --- Instancia Global ---
-# LLM_COMMENT: Keep global settings instance pattern
 temp_log = logging.getLogger("query_service.config.loader")
-if not temp_log.handlers: # Avoid adding handler multiple times during reloads
+if not temp_log.handlers:
     handler = logging.StreamHandler(sys.stdout)
     formatter = logging.Formatter('%(levelname)s: [%(name)s] %(message)s')
     handler.setFormatter(formatter)
     temp_log.addHandler(handler)
-    temp_log.setLevel(logging.INFO) # Use INFO level for startup logs
+    temp_log.setLevel(logging.INFO)
 
 try:
     temp_log.info("Loading Query Service settings...")
     settings = Settings()
     temp_log.info("Query Service Settings Loaded Successfully:")
-    # LLM_COMMENT: Log key settings for verification (secrets are masked)
     temp_log.info(f"  PROJECT_NAME: {settings.PROJECT_NAME}")
     temp_log.info(f"  LOG_LEVEL: {settings.LOG_LEVEL}")
     temp_log.info(f"  API_V1_STR: {settings.API_V1_STR}")
@@ -590,6 +623,11 @@ try:
     temp_log.info(f"  POSTGRES_PASSWORD: *** SET ***")
     temp_log.info(f"  MILVUS_URI: {settings.MILVUS_URI}")
     temp_log.info(f"  MILVUS_COLLECTION_NAME: {settings.MILVUS_COLLECTION_NAME}")
+    # --- Log corrected fields ---
+    temp_log.info(f"  MILVUS_EMBEDDING_FIELD: {settings.MILVUS_EMBEDDING_FIELD}")
+    temp_log.info(f"  MILVUS_CONTENT_FIELD: {settings.MILVUS_CONTENT_FIELD}")
+    temp_log.info(f"  MILVUS_COMPANY_ID_FIELD: {settings.MILVUS_COMPANY_ID_FIELD}")
+    # --------------------------
     temp_log.info(f"  FASTEMBED_MODEL_NAME: {settings.FASTEMBED_MODEL_NAME}")
     temp_log.info(f"  EMBEDDING_DIMENSION: {settings.EMBEDDING_DIMENSION}")
     temp_log.info(f"  GEMINI_API_KEY: *** SET ***")
@@ -1229,32 +1267,50 @@ from typing import Dict, Any, List, Tuple, Optional
 
 from pymilvus.exceptions import MilvusException, ErrorCode
 from fastapi import HTTPException, status
-from haystack import Document # LLM_COMMENT: Keep Haystack Document import
-# LLM_COMMENT: Import FastEmbed Text Embedder for Haystack
+from haystack import Document # Keep Haystack Document import
+# Import FastEmbed Text Embedder for Haystack
 from haystack_integrations.components.embedders.fastembed import FastembedTextEmbedder
 from haystack.components.builders.prompt_builder import PromptBuilder
-from milvus_haystack import MilvusDocumentStore, MilvusEmbeddingRetriever # LLM_COMMENT: Keep Milvus imports
+from milvus_haystack import MilvusDocumentStore, MilvusEmbeddingRetriever # Keep Milvus imports
 from haystack.utils import Secret
 
 from app.core.config import settings
 from app.db import postgres_client
-from app.services.gemini_client import gemini_client # LLM_COMMENT: Keep Gemini client import
-from app.api.v1.schemas import RetrievedDocument # LLM_COMMENT: Import schema for logging
+from app.services.gemini_client import gemini_client # Keep Gemini client import
+from app.api.v1.schemas import RetrievedDocument # Import schema for logging
 
 log = structlog.get_logger(__name__)
 
 # --- Component Initialization Functions ---
-# LLM_COMMENT: Encapsulate component initialization for clarity and potential reuse/caching
 
+# --- CORRECTION: Explicitly pass field names to MilvusDocumentStore ---
 def get_milvus_document_store() -> MilvusDocumentStore:
     """Initializes and returns a MilvusDocumentStore instance."""
     connection_uri = str(settings.MILVUS_URI)
-    store_log = log.bind(component="MilvusDocumentStore", uri=connection_uri, collection=settings.MILVUS_COLLECTION_NAME)
+    store_log = log.bind(
+        component="MilvusDocumentStore",
+        uri=connection_uri,
+        collection=settings.MILVUS_COLLECTION_NAME,
+        embedding_field=settings.MILVUS_EMBEDDING_FIELD, # Log field name
+        content_field=settings.MILVUS_CONTENT_FIELD      # Log field name
+    )
     store_log.debug("Initializing...")
     try:
         store = MilvusDocumentStore(
             connection_args={"uri": connection_uri},
             collection_name=settings.MILVUS_COLLECTION_NAME,
+            # --- Pass explicit field names ---
+            embedding_field=settings.MILVUS_EMBEDDING_FIELD,
+            content_field=settings.MILVUS_CONTENT_FIELD,
+            # ---------------------------------
+            # --- Optional: Map metadata fields if they differ from Haystack defaults ---
+            # field_map={
+            #     "content": settings.MILVUS_CONTENT_FIELD,
+            #     "embedding": settings.MILVUS_EMBEDDING_FIELD,
+            #     # Map other metadata fields if their names differ significantly
+            #     # "meta.company_id": settings.MILVUS_COMPANY_ID_FIELD, # Example if names differed
+            # },
+            # -----------------------------------------------------------------------
             index_params=settings.MILVUS_INDEX_PARAMS,
             search_params=settings.MILVUS_SEARCH_PARAMS,
             consistency_level="Strong",
@@ -1264,77 +1320,88 @@ def get_milvus_document_store() -> MilvusDocumentStore:
     except Exception as e:
         store_log.error("Initialization failed", error=str(e), exc_info=True)
         raise RuntimeError(f"Milvus initialization error: {e}")
+# -----------------------------------------------------------------------
 
 def get_fastembed_text_embedder() -> FastembedTextEmbedder:
     """Initializes and returns a FastembedTextEmbedder instance."""
-    embedder_log = log.bind(component="FastembedTextEmbedder", model=settings.FASTEMBED_MODEL_NAME, prefix=settings.FASTEMBED_QUERY_PREFIX)
+    embedder_log = log.bind(
+        component="FastembedTextEmbedder",
+        model=settings.FASTEMBED_MODEL_NAME,
+        prefix=settings.FASTEMBED_QUERY_PREFIX,
+        dimension=settings.EMBEDDING_DIMENSION # Log dimension
+    )
     embedder_log.debug("Initializing...")
-    # LLM_COMMENT: No API key needed for FastEmbed, uses local model.
     embedder = FastembedTextEmbedder(
         model=settings.FASTEMBED_MODEL_NAME,
-        prefix=settings.FASTEMBED_QUERY_PREFIX # LLM_COMMENT: Apply query prefix if defined
-        # meta_fields_to_embed=[] # LLM_COMMENT: Usually not needed for query embedding
+        prefix=settings.FASTEMBED_QUERY_PREFIX
     )
     embedder_log.info("Initialization successful.")
     return embedder
 
-# LLM_COMMENT: PromptBuilder initialization remains the same logic but uses templates from config
 def get_prompt_builder(template: str) -> PromptBuilder:
     """Initializes PromptBuilder with a given template."""
     log.debug("Initializing PromptBuilder...")
     return PromptBuilder(template=template)
 
 # --- Pipeline Execution Logic ---
-# LLM_COMMENT: Refactored RAG pipeline execution into distinct async steps for clarity
-# LLM_COMMENT: Added conditional prompt logic based on document retrieval
+# (No changes needed in the execution flow itself, only in component init)
 
 async def embed_query(query: str) -> List[float]:
     """Embeds the user query using FastEmbed."""
     embed_log = log.bind(action="embed_query")
     try:
         embedder = get_fastembed_text_embedder()
-        # Inicializar el modelo si es necesario
         await asyncio.to_thread(embedder.warm_up)
-        # FastEmbed components might be synchronous internally, run in thread
         result = await asyncio.to_thread(embedder.run, text=query)
         embedding = result.get("embedding")
         if not embedding:
             raise ValueError("Embedding process returned no embedding vector.")
+        # --- CORRECTION: Validate embedding dimension ---
+        if len(embedding) != settings.EMBEDDING_DIMENSION:
+            embed_log.error("Embedding dimension mismatch!",
+                            expected=settings.EMBEDDING_DIMENSION,
+                            actual=len(embedding),
+                            model=settings.FASTEMBED_MODEL_NAME)
+            raise ValueError(f"Embedding dimension mismatch: expected {settings.EMBEDDING_DIMENSION}, got {len(embedding)}")
+        # ----------------------------------------------
         embed_log.info("Query embedded successfully", vector_dim=len(embedding))
         return embedding
     except Exception as e:
         embed_log.error("Embedding failed", error=str(e), exc_info=True)
-        raise ConnectionError(f"Embedding service error: {e}") from e # LLM_COMMENT: Raise specific error type
+        raise ConnectionError(f"Embedding service error: {e}") from e
 
 async def retrieve_documents(embedding: List[float], company_id: str, top_k: int) -> List[Document]:
     """Retrieves relevant documents from Milvus based on the query embedding and company_id."""
     retrieve_log = log.bind(action="retrieve_documents", company_id=company_id, top_k=top_k)
     try:
         document_store = get_milvus_document_store()
-        # LLM_COMMENT: Construct filters for multi-tenancy
-        filters = {"company_id": company_id}
+        # --- Construct filter using the field name from settings ---
+        filters = {settings.MILVUS_COMPANY_ID_FIELD: company_id}
+        retrieve_log.debug("Using filter for retrieval", filter_dict=filters)
+        # --------------------------------------------------------
         retriever = MilvusEmbeddingRetriever(
             document_store=document_store,
             filters=filters,
             top_k=top_k
+            # embedding_field is inferred from document_store if set correctly
         )
-        # LLM_COMMENT: Milvus retrieval might be synchronous, run in thread
         result = await asyncio.to_thread(retriever.run, query_embedding=embedding)
         documents = result.get("documents", [])
         retrieve_log.info("Documents retrieved successfully", count=len(documents))
         return documents
     except MilvusException as me:
          retrieve_log.error("Milvus retrieval failed", error_code=me.code, error_message=me.message, exc_info=False)
-         raise ConnectionError(f"Vector DB retrieval error (Milvus code: {me.code})") from me
+         # --- Provide more context in the error ---
+         raise ConnectionError(f"Vector DB retrieval error (Collection: {settings.MILVUS_COLLECTION_NAME}, Milvus code: {me.code})") from me
+         # -------------------------------------------
     except Exception as e:
         retrieve_log.error("Retrieval failed", error=str(e), exc_info=True)
-        raise ConnectionError(f"Retrieval service error: {e}") from e # LLM_COMMENT: Raise specific error type
+        raise ConnectionError(f"Retrieval service error: {e}") from e
 
 async def build_prompt(query: str, documents: List[Document]) -> str:
     """Builds the final prompt for the LLM, selecting template based on retrieved documents."""
     build_log = log.bind(action="build_prompt", num_docs=len(documents))
     try:
-        # LLM_COMMENT: Conditional prompt template selection
         if documents:
             template = settings.RAG_PROMPT_TEMPLATE
             prompt_builder = get_prompt_builder(template)
@@ -1343,7 +1410,6 @@ async def build_prompt(query: str, documents: List[Document]) -> str:
         else:
             template = settings.GENERAL_PROMPT_TEMPLATE
             prompt_builder = get_prompt_builder(template)
-            # LLM_COMMENT: Only pass query when no documents are used
             result = await asyncio.to_thread(prompt_builder.run, query=query)
             build_log.info("General prompt built (no documents retrieved)")
 
@@ -1353,7 +1419,7 @@ async def build_prompt(query: str, documents: List[Document]) -> str:
         return prompt
     except Exception as e:
         build_log.error("Prompt building failed", error=str(e), exc_info=True)
-        raise ValueError(f"Prompt building error: {e}") from e # LLM_COMMENT: Raise specific error type
+        raise ValueError(f"Prompt building error: {e}") from e
 
 async def generate_llm_answer(prompt: str) -> str:
     """Generates the final answer using the Gemini client."""
@@ -1364,14 +1430,14 @@ async def generate_llm_answer(prompt: str) -> str:
         return answer
     except Exception as e:
         llm_log.error("LLM generation failed", error=str(e), exc_info=True)
-        raise ConnectionError(f"LLM service error: {e}") from e # LLM_COMMENT: Raise specific error type
+        raise ConnectionError(f"LLM service error: {e}") from e
 
 async def run_rag_pipeline(
     query: str,
     company_id: str,
-    user_id: Optional[str], # LLM_COMMENT: user_id can be optional for logging
+    user_id: Optional[str],
     top_k: Optional[int] = None,
-    chat_id: Optional[uuid.UUID] = None # LLM_COMMENT: Pass chat_id for logging context
+    chat_id: Optional[uuid.UUID] = None
 ) -> Tuple[str, List[Document], Optional[uuid.UUID]]:
     """
     Orchestrates the RAG pipeline steps: embed, retrieve, build prompt, generate answer, log interaction.
@@ -1379,7 +1445,7 @@ async def run_rag_pipeline(
     run_log = log.bind(company_id=company_id, user_id=user_id or "N/A", chat_id=str(chat_id) if chat_id else "N/A", query=query[:50]+"...")
     run_log.info("Executing RAG pipeline")
     retriever_k = top_k or settings.RETRIEVER_TOP_K
-    log_id: Optional[uuid.UUID] = None # LLM_COMMENT: Initialize log_id as None
+    log_id: Optional[uuid.UUID] = None
 
     try:
         # 1. Embed Query
@@ -1388,7 +1454,7 @@ async def run_rag_pipeline(
         # 2. Retrieve Documents
         retrieved_docs = await retrieve_documents(query_embedding, company_id, retriever_k)
 
-        # 3. Build Prompt (Conditional based on retrieved docs)
+        # 3. Build Prompt
         final_prompt = await build_prompt(query, retrieved_docs)
 
         # 4. Generate Answer
@@ -1396,54 +1462,50 @@ async def run_rag_pipeline(
 
         # 5. Log Interaction (Best effort)
         try:
-            # LLM_COMMENT: Format retrieved docs for logging
             docs_for_log = [RetrievedDocument.from_haystack_doc(d).model_dump(exclude_none=True)
                             for d in retrieved_docs]
             log_id = await postgres_client.log_query_interaction(
-                company_id=uuid.UUID(company_id), # LLM_COMMENT: Ensure UUID type
-                user_id=uuid.UUID(user_id) if user_id else None, # LLM_COMMENT: Ensure UUID type or None
+                company_id=uuid.UUID(company_id),
+                user_id=uuid.UUID(user_id) if user_id else None,
                 query=query, answer=answer,
                 retrieved_documents_data=docs_for_log,
                 chat_id=chat_id,
-                # LLM_COMMENT: Added metadata for context in logs
                 metadata={"top_k": retriever_k, "llm_model": settings.GEMINI_MODEL_NAME, "embedder_model": settings.FASTEMBED_MODEL_NAME, "num_retrieved": len(retrieved_docs)}
             )
             run_log.info("Interaction logged successfully", db_log_id=str(log_id))
         except Exception as log_err:
-            run_log.error("Failed to log RAG interaction to DB", error=str(log_err), exc_info=False) # LLM_COMMENT: Log error but don't fail the request
+            run_log.error("Failed to log RAG interaction to DB", error=str(log_err), exc_info=False)
 
         run_log.info("RAG pipeline completed successfully")
         return answer, retrieved_docs, log_id
 
-    # LLM_COMMENT: Catch specific errors from pipeline steps and map to HTTP exceptions
-    except ConnectionError as ce: # Errors connecting to Milvus, Embedder, LLM
+    except ConnectionError as ce:
         run_log.error("Connection error during RAG pipeline", error=str(ce), exc_info=True)
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"A dependency is unavailable: {ce}")
-    except ValueError as ve: # Errors during embedding or prompt building
+    except ValueError as ve:
         run_log.error("Value error during RAG pipeline", error=str(ve), exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Data processing error: {ve}")
-    except Exception as e: # Catch-all for unexpected errors
+    except Exception as e:
         run_log.exception("Unexpected error during RAG pipeline execution")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An internal error occurred.")
 
 # --- Dependency Check Function ---
 async def check_pipeline_dependencies() -> Dict[str, str]:
     """Checks the status of pipeline dependencies (Milvus, Gemini)."""
-    # LLM_COMMENT: Keep dependency check logic, adapted for FastEmbed/Gemini
     results = {"milvus_connection": "pending", "gemini_api": "pending", "fastembed_model": "pending"}
     check_log = log.bind(action="check_dependencies")
 
     # Check Milvus
     try:
         store = get_milvus_document_store()
-        # LLM_COMMENT: Use a potentially lighter check like has_collection if available, or count_documents
-        collection_exists = await asyncio.to_thread(store.conn.has_collection, store.collection_name)
-        if collection_exists:
+        # Check connection and collection existence using pymilvus directly for reliability
+        if store.conn.has_collection(store.collection_name):
             results["milvus_connection"] = "ok"
             check_log.debug("Milvus dependency check: Connection ok, collection exists.")
         else:
-             results["milvus_connection"] = "ok (collection not found yet)"
-             check_log.info("Milvus dependency check: Connection ok, collection does not exist (will be created on write).")
+            # It's okay if the collection doesn't exist at startup for query service
+            results["milvus_connection"] = "ok (collection not found yet)"
+            check_log.info("Milvus dependency check: Connection ok, collection does not exist (needs data from ingest).")
     except MilvusException as me:
         results["milvus_connection"] = f"error: MilvusException (code={me.code}, msg={me.message})"
         check_log.warning("Milvus dependency check failed", error_code=me.code, error_message=me.message, exc_info=False)
@@ -1460,12 +1522,12 @@ async def check_pipeline_dependencies() -> Dict[str, str]:
         check_log.warning("Gemini dependency check: API Key is MISSING.")
 
     # Check FastEmbed (Model loading is lazy, just check config)
-    if settings.FASTEMBED_MODEL_NAME:
-         results["fastembed_model"] = f"configured ({settings.FASTEMBED_MODEL_NAME})"
-         check_log.debug("FastEmbed dependency check: Model configured.", model=settings.FASTEMBED_MODEL_NAME)
+    if settings.FASTEMBED_MODEL_NAME and settings.EMBEDDING_DIMENSION:
+         results["fastembed_model"] = f"configured ({settings.FASTEMBED_MODEL_NAME}, dim={settings.EMBEDDING_DIMENSION})"
+         check_log.debug("FastEmbed dependency check: Model configured.", model=settings.FASTEMBED_MODEL_NAME, dim=settings.EMBEDDING_DIMENSION)
     else:
          results["fastembed_model"] = "config_missing"
-         check_log.error("FastEmbed dependency check: Model name MISSING in configuration.")
+         check_log.error("FastEmbed dependency check: Model name or dimension MISSING in configuration.")
 
     return results
 ```
