@@ -65,16 +65,15 @@ class MilvusAdapter(VectorStorePort):
 
                 collection = Collection(name=collection_name, using=self._alias)
 
-                # Check if loaded, load if necessary
-                # This check can be expensive, consider loading strategy (e.g., always load on startup/first use)
-                # For simplicity here, we check and load if needed.
                 if not collection.has_index():
                      collection_log.warning("Collection exists but has no index. Retrieval quality may be affected.")
-                     # Decide if loading is still useful without an index, or raise error?
                      # Let's try loading anyway for now.
 
                 collection_log.debug("Loading Milvus collection into memory...")
-                collection.load() # Load data into memory for search
+                # Specify partition names if applicable and needed for loading specific data
+                # partition_names = ["_default"] # Example if partitions are used
+                # collection.load(partition_names=partition_names)
+                collection.load() # Load default partition or all partitions if not specified
                 collection_log.info("Milvus collection loaded successfully.")
                 self._collection = collection
 
@@ -85,7 +84,6 @@ class MilvusAdapter(VectorStorePort):
                  collection_log.exception("Unexpected error accessing Milvus collection")
                  raise RuntimeError(f"Unexpected error accessing Milvus collection: {e}") from e
 
-        # Double check if collection is valid after potential errors
         if not isinstance(self._collection, Collection):
             log.critical("Milvus collection object is unexpectedly None or invalid after initialization attempt.")
             raise RuntimeError("Failed to obtain a valid Milvus collection object.")
@@ -98,21 +96,26 @@ class MilvusAdapter(VectorStorePort):
         try:
             collection = await self._get_collection()
 
-            search_params = settings.MILVUS_SEARCH_PARAMS
+            # --- CORRECTION: Added Default Milvus Search Params ---
+            # Use reasonable defaults if not explicitly set in config
+            search_params = getattr(settings, "MILVUS_SEARCH_PARAMS", {"metric_type": "L2", "params": {"nprobe": 10}})
+            # ------------------------------------------------------
+
             filter_expr = f'{settings.MILVUS_COMPANY_ID_FIELD} == "{company_id}"'
             search_log.debug("Using filter expression", expr=filter_expr)
 
-            # Define output fields based on config, ensuring content and necessary meta are included
+            # --- CORRECTION: Ensure embedding field is requested ---
             output_fields = list(set([
                 settings.MILVUS_CONTENT_FIELD, # Ensure content is requested
+                settings.MILVUS_EMBEDDING_FIELD, # Ensure embedding is requested
                 settings.MILVUS_COMPANY_ID_FIELD,
                 settings.MILVUS_DOCUMENT_ID_FIELD,
                 settings.MILVUS_FILENAME_FIELD,
             ] + settings.MILVUS_METADATA_FIELDS)) # Add other configured metadata fields
+            # --------------------------------------------------------
 
             search_log.debug("Performing Milvus vector search...", vector_field=settings.MILVUS_EMBEDDING_FIELD, output_fields=output_fields)
 
-            # Execute search asynchronously (run_in_executor as Milvus client might be blocking)
             loop = asyncio.get_running_loop()
             search_results = await loop.run_in_executor(
                 None,
@@ -123,28 +126,30 @@ class MilvusAdapter(VectorStorePort):
                     limit=top_k,
                     expr=filter_expr,
                     output_fields=output_fields,
-                    consistency_level="Strong" # Or match ingest consistency
+                    consistency_level="Strong"
                 )
             )
 
             search_log.debug(f"Milvus search completed. Hits: {len(search_results[0]) if search_results else 0}")
 
-            # Convert Milvus results to Domain RetrievedChunk objects
             domain_chunks: List[RetrievedChunk] = []
             if search_results and search_results[0]:
                 for hit in search_results[0]:
-                    entity_data = hit.entity.to_dict() # Convert entity to dict
+                    entity_data = hit.entity.to_dict()
                     content = entity_data.get(settings.MILVUS_CONTENT_FIELD, "")
+                    # --- CORRECTION: Extract embedding vector ---
+                    embedding_vector = entity_data.get(settings.MILVUS_EMBEDDING_FIELD)
+                    # ---------------------------------------------
 
                     # Prepare metadata, excluding the embedding field itself
                     metadata = {k: v for k, v in entity_data.items() if k != settings.MILVUS_EMBEDDING_FIELD}
 
                     chunk = RetrievedChunk(
-                        id=str(hit.id), # Use Milvus primary key as ID
+                        id=str(hit.id),
                         content=content,
-                        score=hit.score, # Or hit.distance
+                        score=hit.score,
                         metadata=metadata,
-                        # Populate top-level fields from metadata for convenience
+                        embedding=embedding_vector, # <-- Store the embedding
                         document_id=str(metadata.get(settings.MILVUS_DOCUMENT_ID_FIELD)) if metadata.get(settings.MILVUS_DOCUMENT_ID_FIELD) else None,
                         file_name=metadata.get(settings.MILVUS_FILENAME_FIELD),
                         company_id=str(metadata.get(settings.MILVUS_COMPANY_ID_FIELD)) if metadata.get(settings.MILVUS_COMPANY_ID_FIELD) else None
@@ -156,22 +161,18 @@ class MilvusAdapter(VectorStorePort):
 
         except MilvusException as me:
              search_log.error("Milvus search failed", error_code=me.code, error_message=me.message)
-             # Raise ConnectionError for infrastructure issues
              raise ConnectionError(f"Vector DB search error (Code: {me.code}): {me.message}") from me
         except Exception as e:
             search_log.exception("Unexpected error during Milvus search")
             raise ConnectionError(f"Vector DB search service error: {e}") from e
 
-    # Optional: Add a method for explicit connection/disconnection if needed outside lifespan
     async def connect(self):
-        """Explicitly establishes the connection."""
         await self._ensure_connection()
 
     async def disconnect(self):
-        """Disconnects from Milvus."""
         if self._connected and self._alias in connections.list_connections():
             log.info("Disconnecting from Milvus...", adapter="MilvusAdapter", alias=self._alias)
             connections.disconnect(self._alias)
             self._connected = False
-            self._collection = None # Reset collection object on disconnect
+            self._collection = None
             log.info("Disconnected from Milvus.", adapter="MilvusAdapter")

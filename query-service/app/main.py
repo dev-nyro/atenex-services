@@ -10,7 +10,7 @@ import asyncio
 import json
 import uuid
 from contextlib import asynccontextmanager
-from typing import Annotated # For explicit dependency injection hints
+from typing import Annotated, Optional # Explicit type hint for Optionals
 
 # Configurar logging primero
 from app.core.config import settings
@@ -34,7 +34,9 @@ from app.infrastructure.vectorstores.milvus_adapter import MilvusAdapter
 from app.infrastructure.llms.gemini_adapter import GeminiAdapter
 from app.infrastructure.retrievers.bm25_retriever import BM25sRetriever
 from app.infrastructure.rerankers.bge_reranker import BGEReranker
-from app.infrastructure.filters.diversity_filter import StubDiversityFilter # Use Stub for now
+# --- CORRECTION: Import both MMR and Stub Filters ---
+from app.infrastructure.filters.diversity_filter import MMRDiversityFilter, StubDiversityFilter
+# --- END CORRECTION ---
 
 # Import Use Case
 from app.application.use_cases.ask_query_use_case import AskQueryUseCase
@@ -45,7 +47,6 @@ from app.infrastructure.persistence import postgres_connector
 # Global state
 SERVICE_READY = False
 # Global instances for simplified DI (replace with proper container if needed)
-# LLM_REFACTOR_FINAL: Instantiate adapters globally or within lifespan for reuse
 chat_repo_instance: Optional[ChatRepositoryPort] = None
 log_repo_instance: Optional[LogRepositoryPort] = None
 chunk_content_repo_instance: Optional[ChunkContentRepositoryPort] = None
@@ -53,7 +54,7 @@ vector_store_instance: Optional[VectorStorePort] = None
 llm_instance: Optional[LLMPort] = None
 sparse_retriever_instance: Optional[SparseRetrieverPort] = None
 reranker_instance: Optional[RerankerPort] = None
-diversity_filter_instance: Optional[DiversityFilterPort] = None
+diversity_filter_instance: Optional[DiversityFilterPort] = None # Will hold either MMR or Stub
 ask_query_use_case_instance: Optional[AskQueryUseCase] = None
 
 
@@ -75,7 +76,6 @@ async def lifespan(app: FastAPI):
         if db_ready:
             log.info("PostgreSQL connection pool initialized and verified.")
             db_pool_initialized = True
-            # Instantiate DB-dependent repositories
             chat_repo_instance = PostgresChatRepository()
             log_repo_instance = PostgresLogRepository()
             chunk_content_repo_instance = PostgresChunkContentRepository()
@@ -86,12 +86,11 @@ async def lifespan(app: FastAPI):
         log.critical("CRITICAL: Failed PostgreSQL pool initialization.", error=str(e), exc_info=True)
         dependencies_ok = False
 
-    # 2. Initialize other adapters (conditionally based on config where applicable)
+    # 2. Initialize other adapters
     if dependencies_ok:
         try:
             vector_store_instance = MilvusAdapter()
-            # Attempt initial connection/collection load for readiness check
-            await vector_store_instance._get_collection() # Use internal method to force load/check
+            await vector_store_instance._get_collection()
             log.info("Milvus Adapter initialized and collection checked/loaded.")
         except Exception as e:
             log.critical("CRITICAL: Failed to initialize Milvus Adapter or load collection.", error=str(e), exc_info=True)
@@ -100,10 +99,8 @@ async def lifespan(app: FastAPI):
     if dependencies_ok:
         try:
             llm_instance = GeminiAdapter()
-            if not llm_instance.model: # Check if model loaded successfully (API key validity)
+            if not llm_instance.model:
                  log.critical("CRITICAL: Gemini Adapter initialized but model failed to load (check API key).")
-                 # Decide if this is fatal - for now, let's allow startup but warn heavily
-                 # dependencies_ok = False
                  log.warning("Continuing startup despite Gemini model load failure.")
             else:
                  log.info("Gemini Adapter initialized successfully.")
@@ -111,7 +108,7 @@ async def lifespan(app: FastAPI):
             log.critical("CRITICAL: Failed to initialize Gemini Adapter.", error=str(e), exc_info=True)
             dependencies_ok = False
 
-    # Initialize optional components if enabled
+    # Initialize optional components
     if dependencies_ok and settings.BM25_ENABLED:
         try:
             if chunk_content_repo_instance:
@@ -122,33 +119,43 @@ async def lifespan(app: FastAPI):
                  sparse_retriever_instance = None
         except ImportError:
             log.error("BM25sRetriever dependency (bm2s) not installed. BM25 disabled.")
+            sparse_retriever_instance = None
         except Exception as e:
             log.error("Failed to initialize BM25s Retriever.", error=str(e), exc_info=True)
             sparse_retriever_instance = None
 
     if dependencies_ok and settings.RERANKER_ENABLED:
         try:
-            reranker_instance = BGEReranker() # Add device='cpu' if needed
-            if not reranker_instance.model: # Check if underlying model loaded
+            reranker_instance = BGEReranker()
+            if not reranker_instance.model:
                 log.warning("BGE Reranker initialized but model loading failed. Reranking might not work.")
             else:
                  log.info("BGE Reranker initialized.")
         except ImportError:
             log.error("BGEReranker dependency (sentence-transformers) not installed. Reranker disabled.")
+            reranker_instance = None
         except Exception as e:
             log.error("Failed to initialize BGE Reranker.", error=str(e), exc_info=True)
             reranker_instance = None
 
+    # --- CORRECTION: Initialize Diversity Filter based on setting ---
     if dependencies_ok and settings.DIVERSITY_FILTER_ENABLED:
         try:
-            # For now, always use the Stub. Replace if MMR/Dartboard is implemented.
-            diversity_filter_instance = StubDiversityFilter()
-            log.info("Stub Diversity Filter initialized.")
+            diversity_filter_instance = MMRDiversityFilter(lambda_mult=settings.QUERY_DIVERSITY_LAMBDA)
+            log.info("MMR Diversity Filter initialized.")
         except Exception as e:
-            log.error("Failed to initialize Diversity Filter.", error=str(e), exc_info=True)
-            diversity_filter_instance = None
+            log.error("Failed to initialize MMR Diversity Filter. Falling back to Stub.", error=str(e), exc_info=True)
+            # Fallback to Stub if MMR fails
+            diversity_filter_instance = StubDiversityFilter()
+    else:
+        # If disabled, explicitly set to None or Stub (depending on desired behavior if accidentally called)
+        # Using Stub makes the AskQueryUseCase logic simpler as it doesn't need to check for None
+        log.info("Diversity filter disabled, using StubDiversityFilter as placeholder.")
+        diversity_filter_instance = StubDiversityFilter()
+    # --- END CORRECTION ---
 
-    # 3. Instantiate Use Case if all required dependencies are OK
+
+    # 3. Instantiate Use Case
     if dependencies_ok and chat_repo_instance and log_repo_instance and vector_store_instance and llm_instance:
          try:
              ask_query_use_case_instance = AskQueryUseCase(
@@ -156,13 +163,13 @@ async def lifespan(app: FastAPI):
                  log_repo=log_repo_instance,
                  vector_store=vector_store_instance,
                  llm=llm_instance,
-                 sparse_retriever=sparse_retriever_instance, # Will be None if not enabled/failed
-                 chunk_content_repo=chunk_content_repo_instance, # Required for BM25
-                 reranker=reranker_instance,               # Will be None if not enabled/failed
-                 diversity_filter=diversity_filter_instance # Will be None if not enabled/failed
+                 sparse_retriever=sparse_retriever_instance,
+                 chunk_content_repo=chunk_content_repo_instance,
+                 reranker=reranker_instance,
+                 diversity_filter=diversity_filter_instance # Pass the initialized filter (MMR or Stub)
              )
              log.info("AskQueryUseCase instantiated successfully.")
-             SERVICE_READY = True # Service is ready only if UseCase could be created
+             SERVICE_READY = True
              log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY.")
          except Exception as e:
               log.critical("CRITICAL: Failed to instantiate AskQueryUseCase.", error=str(e), exc_info=True)
@@ -178,7 +185,7 @@ async def lifespan(app: FastAPI):
     log.info(f"Shutting down {settings.PROJECT_NAME}...")
     await postgres_connector.close_db_pool()
     if vector_store_instance and hasattr(vector_store_instance, 'disconnect'):
-        await vector_store_instance.disconnect() # Disconnect Milvus if adapter supports it
+        await vector_store_instance.disconnect()
     log.info("Shutdown complete.")
 
 # --- FastAPI App Initialization ---
@@ -218,7 +225,6 @@ async def add_request_id_timing_logging(request: Request, call_next):
     return response
 
 # --- Exception Handlers ---
-# ... (Handlers remain the same as previous step) ...
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     log_level = log.warning if exc.status_code < 500 else log.error
@@ -245,8 +251,6 @@ async def generic_exception_handler(request: Request, exc: Exception):
 
 
 # --- Simplified Dependency Injection Functions ---
-# These functions provide the globally instantiated adapters/repos to the endpoints
-
 def get_chat_repository() -> ChatRepositoryPort:
     if not chat_repo_instance: raise HTTPException(status_code=503, detail="Chat Repository not available")
     return chat_repo_instance
@@ -254,10 +258,6 @@ def get_chat_repository() -> ChatRepositoryPort:
 def get_ask_query_use_case() -> AskQueryUseCase:
     if not ask_query_use_case_instance: raise HTTPException(status_code=503, detail="Ask Query Use Case not available")
     return ask_query_use_case_instance
-
-# Update endpoint dependencies to use the new provider functions
-# (The existing Depends(get_ask_query_use_case) and Depends(get_chat_repository) in endpoints are now correct)
-
 
 # --- Routers ---
 app.include_router(query_router_module.router, prefix=settings.API_V1_STR, tags=["Query Interaction"])
@@ -270,15 +270,7 @@ async def read_root():
     health_log = log.bind(check="liveness_readiness")
     if not SERVICE_READY:
         health_log.warning("Health check failed: Service not ready.")
-        # Return 503 directly without checking DB if SERVICE_READY is False
         raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service Not Ready")
-
-    # If SERVICE_READY is True, we assume DB was OK during startup.
-    # A deeper readiness probe could re-check dependencies here if needed.
-    # db_ok = await postgres_connector.check_db_connection()
-    # if not db_ok:
-    #      health_log.error("Readiness check failed: DB check FAILED.")
-    #      raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service Unavailable (DB Check Failed)")
 
     health_log.debug("Health check passed.")
     return PlainTextResponse("OK", status_code=fastapi_status.HTTP_200_OK)

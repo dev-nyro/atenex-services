@@ -34,6 +34,9 @@ class RetrievedChunk(BaseModel):
     content: Optional[str] = None # Contenido textual del chunk
     score: Optional[float] = None # Puntuación de relevancia
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    # --- Añadir campo para embedding ---
+    embedding: Optional[List[float]] = None # Embedding vectorial del chunk
+    # --- Fin adición ---
     # Campos comunes esperados en metadata
     document_id: Optional[str] = Field(None, alias="document_id") # Alias para mapeo desde meta
     file_name: Optional[str] = Field(None, alias="file_name")
@@ -51,11 +54,15 @@ class RetrievedChunk(BaseModel):
         doc_id_str = str(doc_meta.get("document_id")) if doc_meta.get("document_id") else None
         company_id_str = str(doc_meta.get("company_id")) if doc_meta.get("company_id") else None
 
+        # Extraer embedding si existe en el documento Haystack
+        embedding_vector = getattr(doc, 'embedding', None)
+
         return cls(
             id=str(doc.id),
             content=doc.content,
             score=doc.score,
             metadata=doc_meta,
+            embedding=embedding_vector, # Añadir embedding
             document_id=doc_id_str,
             file_name=doc_meta.get("file_name"),
             company_id=company_id_str
