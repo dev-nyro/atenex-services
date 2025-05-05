@@ -1,0 +1,1 @@
+# query-service/app/infrastructure/persistence/__init__.py

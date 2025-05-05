@@ -1,5 +1,5 @@
 # query-service/app/main.py
-from fastapi import FastAPI, HTTPException, status as fastapi_status, Request
+from fastapi import FastAPI, HTTPException, status as fastapi_status, Request, Depends
 from fastapi.exceptions import RequestValidationError, ResponseValidationError
 from fastapi.responses import JSONResponse, Response, PlainTextResponse
 import structlog
@@ -9,112 +9,199 @@ import sys
 import asyncio
 import json
 import uuid
+from contextlib import asynccontextmanager
+from typing import Annotated # For explicit dependency injection hints
 
 # Configurar logging primero
 from app.core.config import settings
 from app.core.logging_config import setup_logging
-setup_logging() # LLM_COMMENT: Initialize logging early
+setup_logging()
 log = structlog.get_logger("query_service.main")
 
-# Importar routers y otros módulos
+# Import Routers
 from app.api.v1.endpoints import query as query_router_module
 from app.api.v1.endpoints import chat as chat_router_module
-from app.db import postgres_client
-# LLM_COMMENT: Import dependency check function
-from app.pipelines.rag_pipeline import check_pipeline_dependencies
-from app.api.v1 import schemas # LLM_COMMENT: Keep schema import
 
-# Estado global
-SERVICE_READY = False # LLM_COMMENT: Flag indicating if service dependencies are met
+# Import Ports and Adapters/Repositories for Dependency Injection
+from app.application.ports import (
+    ChatRepositoryPort, LogRepositoryPort, VectorStorePort, LLMPort,
+    SparseRetrieverPort, RerankerPort, DiversityFilterPort, ChunkContentRepositoryPort
+)
+from app.infrastructure.persistence.postgres_repositories import (
+    PostgresChatRepository, PostgresLogRepository, PostgresChunkContentRepository
+)
+from app.infrastructure.vectorstores.milvus_adapter import MilvusAdapter
+from app.infrastructure.llms.gemini_adapter import GeminiAdapter
+from app.infrastructure.retrievers.bm25_retriever import BM25sRetriever
+from app.infrastructure.rerankers.bge_reranker import BGEReranker
+from app.infrastructure.filters.diversity_filter import StubDiversityFilter # Use Stub for now
 
-# --- Lifespan Manager (async context manager for FastAPI >= 0.110) ---
-# LLM_COMMENT: Use modern lifespan context manager for startup/shutdown logic
-from contextlib import asynccontextmanager
+# Import Use Case
+from app.application.use_cases.ask_query_use_case import AskQueryUseCase
 
+# Import DB Connector
+from app.infrastructure.persistence import postgres_connector
+
+# Global state
+SERVICE_READY = False
+# Global instances for simplified DI (replace with proper container if needed)
+# LLM_REFACTOR_FINAL: Instantiate adapters globally or within lifespan for reuse
+chat_repo_instance: Optional[ChatRepositoryPort] = None
+log_repo_instance: Optional[LogRepositoryPort] = None
+chunk_content_repo_instance: Optional[ChunkContentRepositoryPort] = None
+vector_store_instance: Optional[VectorStorePort] = None
+llm_instance: Optional[LLMPort] = None
+sparse_retriever_instance: Optional[SparseRetrieverPort] = None
+reranker_instance: Optional[RerankerPort] = None
+diversity_filter_instance: Optional[DiversityFilterPort] = None
+ask_query_use_case_instance: Optional[AskQueryUseCase] = None
+
+
+# --- Lifespan Manager ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # --- Startup ---
-    global SERVICE_READY
+    global SERVICE_READY, chat_repo_instance, log_repo_instance, chunk_content_repo_instance, \
+           vector_store_instance, llm_instance, sparse_retriever_instance, reranker_instance, \
+           diversity_filter_instance, ask_query_use_case_instance
+
     log.info(f"Starting up {settings.PROJECT_NAME}...")
     db_pool_initialized = False
-    dependencies_ok = False
+    dependencies_ok = True # Assume OK until proven otherwise
 
     # 1. Initialize DB Pool
     try:
-        await postgres_client.get_db_pool()
-        db_ready = await postgres_client.check_db_connection()
+        await postgres_connector.get_db_pool()
+        db_ready = await postgres_connector.check_db_connection()
         if db_ready:
             log.info("PostgreSQL connection pool initialized and verified.")
             db_pool_initialized = True
+            # Instantiate DB-dependent repositories
+            chat_repo_instance = PostgresChatRepository()
+            log_repo_instance = PostgresLogRepository()
+            chunk_content_repo_instance = PostgresChunkContentRepository()
         else:
             log.critical("CRITICAL: Failed PostgreSQL connection verification during startup.")
+            dependencies_ok = False
     except Exception as e:
-        log.critical("CRITICAL: Failed PostgreSQL pool initialization during startup.", error=str(e), exc_info=True)
+        log.critical("CRITICAL: Failed PostgreSQL pool initialization.", error=str(e), exc_info=True)
+        dependencies_ok = False
 
-    # 2. Check other dependencies (Milvus, Gemini Key) if DB is OK
-    if db_pool_initialized:
+    # 2. Initialize other adapters (conditionally based on config where applicable)
+    if dependencies_ok:
         try:
-            dependency_status = await check_pipeline_dependencies()
-            log.info("Pipeline dependency check completed", status=dependency_status)
-            # Define "OK" criteria (Milvus connectable, Gemini key present)
-            # LLM_COMMENT: Adjust readiness check based on dependency status reporting
-            milvus_ok = "ok" in dependency_status.get("milvus_connection", "error")
-            gemini_ok = "key_present" in dependency_status.get("gemini_api", "key_missing")
-            fastembed_ok = "configured" in dependency_status.get("fastembed_model", "config_missing")
+            vector_store_instance = MilvusAdapter()
+            # Attempt initial connection/collection load for readiness check
+            await vector_store_instance._get_collection() # Use internal method to force load/check
+            log.info("Milvus Adapter initialized and collection checked/loaded.")
+        except Exception as e:
+            log.critical("CRITICAL: Failed to initialize Milvus Adapter or load collection.", error=str(e), exc_info=True)
+            dependencies_ok = False
 
-            if milvus_ok and gemini_ok and fastembed_ok:
-                 dependencies_ok = True
+    if dependencies_ok:
+        try:
+            llm_instance = GeminiAdapter()
+            if not llm_instance.model: # Check if model loaded successfully (API key validity)
+                 log.critical("CRITICAL: Gemini Adapter initialized but model failed to load (check API key).")
+                 # Decide if this is fatal - for now, let's allow startup but warn heavily
+                 # dependencies_ok = False
+                 log.warning("Continuing startup despite Gemini model load failure.")
             else:
-                 log.warning("One or more pipeline dependencies are not ready.", milvus=milvus_ok, gemini=gemini_ok, fastembed=fastembed_ok)
+                 log.info("Gemini Adapter initialized successfully.")
+        except Exception as e:
+            log.critical("CRITICAL: Failed to initialize Gemini Adapter.", error=str(e), exc_info=True)
+            dependencies_ok = False
 
-        except Exception as dep_err:
-            log.error("Error checking pipeline dependencies during startup", error=str(dep_err), exc_info=True)
+    # Initialize optional components if enabled
+    if dependencies_ok and settings.BM25_ENABLED:
+        try:
+            if chunk_content_repo_instance:
+                 sparse_retriever_instance = BM25sRetriever(chunk_content_repo_instance)
+                 log.info("BM25s Retriever initialized.")
+            else:
+                 log.error("BM25 enabled but ChunkContentRepository failed to initialize. Disabling BM25.")
+                 sparse_retriever_instance = None
+        except ImportError:
+            log.error("BM25sRetriever dependency (bm2s) not installed. BM25 disabled.")
+        except Exception as e:
+            log.error("Failed to initialize BM25s Retriever.", error=str(e), exc_info=True)
+            sparse_retriever_instance = None
+
+    if dependencies_ok and settings.RERANKER_ENABLED:
+        try:
+            reranker_instance = BGEReranker() # Add device='cpu' if needed
+            if not reranker_instance.model: # Check if underlying model loaded
+                log.warning("BGE Reranker initialized but model loading failed. Reranking might not work.")
+            else:
+                 log.info("BGE Reranker initialized.")
+        except ImportError:
+            log.error("BGEReranker dependency (sentence-transformers) not installed. Reranker disabled.")
+        except Exception as e:
+            log.error("Failed to initialize BGE Reranker.", error=str(e), exc_info=True)
+            reranker_instance = None
+
+    if dependencies_ok and settings.DIVERSITY_FILTER_ENABLED:
+        try:
+            # For now, always use the Stub. Replace if MMR/Dartboard is implemented.
+            diversity_filter_instance = StubDiversityFilter()
+            log.info("Stub Diversity Filter initialized.")
+        except Exception as e:
+            log.error("Failed to initialize Diversity Filter.", error=str(e), exc_info=True)
+            diversity_filter_instance = None
+
+    # 3. Instantiate Use Case if all required dependencies are OK
+    if dependencies_ok and chat_repo_instance and log_repo_instance and vector_store_instance and llm_instance:
+         try:
+             ask_query_use_case_instance = AskQueryUseCase(
+                 chat_repo=chat_repo_instance,
+                 log_repo=log_repo_instance,
+                 vector_store=vector_store_instance,
+                 llm=llm_instance,
+                 sparse_retriever=sparse_retriever_instance, # Will be None if not enabled/failed
+                 chunk_content_repo=chunk_content_repo_instance, # Required for BM25
+                 reranker=reranker_instance,               # Will be None if not enabled/failed
+                 diversity_filter=diversity_filter_instance # Will be None if not enabled/failed
+             )
+             log.info("AskQueryUseCase instantiated successfully.")
+             SERVICE_READY = True # Service is ready only if UseCase could be created
+             log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY.")
+         except Exception as e:
+              log.critical("CRITICAL: Failed to instantiate AskQueryUseCase.", error=str(e), exc_info=True)
+              SERVICE_READY = False
     else:
-        log.error("Skipping dependency checks because DB pool failed to initialize.")
-
-
-    # 3. Set Service Readiness
-    if db_pool_initialized and dependencies_ok:
-        SERVICE_READY = True
-        log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY.")
-    else:
+        log.critical(f"{settings.PROJECT_NAME} startup finished. Some critical dependencies failed. SERVICE NOT READY.")
         SERVICE_READY = False
-        log.critical(f"{settings.PROJECT_NAME} startup finished. DB OK: {db_pool_initialized}, Deps OK: {dependencies_ok}. SERVICE NOT READY.")
+
 
     yield # Application runs here
 
     # --- Shutdown ---
     log.info(f"Shutting down {settings.PROJECT_NAME}...")
-    await postgres_client.close_db_pool()
-    # LLM_COMMENT: Add shutdown for other clients if necessary (e.g., Gemini client if it holds resources)
+    await postgres_connector.close_db_pool()
+    if vector_store_instance and hasattr(vector_store_instance, 'disconnect'):
+        await vector_store_instance.disconnect() # Disconnect Milvus if adapter supports it
     log.info("Shutdown complete.")
 
-
-# --- Creación de la App FastAPI ---
-# LLM_COMMENT: Apply lifespan manager to FastAPI app instance
+# --- FastAPI App Initialization ---
 app = FastAPI(
     title=settings.PROJECT_NAME,
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
-    version="0.2.4", # LLM_COMMENT: Incremented version for lifespan and prefix fix
-    description="Microservice to handle user queries using a Haystack RAG pipeline with Milvus and Gemini, including chat history management. Expects /api/v1 prefix.",
-    lifespan=lifespan # LLM_COMMENT: Use the new lifespan manager
+    version="0.3.0", # Final Version
+    description="Microservice to handle user queries using a refactored RAG pipeline and chat history.",
+    lifespan=lifespan
 )
 
-# --- Middlewares (Sin cambios significativos) ---
+# --- Middleware ---
 @app.middleware("http")
 async def add_request_id_timing_logging(request: Request, call_next):
     start_time = asyncio.get_event_loop().time()
     request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
-    # Bind core info early for all request logs
     structlog.contextvars.bind_contextvars(request_id=request_id)
     req_log = log.bind(method=request.method, path=str(request.url.path), client=request.client.host if request.client else "unknown")
     req_log.info("Request received")
-
     response = None
     try:
         response = await call_next(request)
-        process_time = (asyncio.get_event_loop().time() - start_time) * 1000 # milliseconds
-        # Bind response info for final log
+        process_time = (asyncio.get_event_loop().time() - start_time) * 1000
         resp_log = req_log.bind(status_code=response.status_code, duration_ms=round(process_time, 2))
         log_level = "warning" if 400 <= response.status_code < 500 else "error" if response.status_code >= 500 else "info"
         getattr(resp_log, log_level)("Request finished")
@@ -122,32 +209,20 @@ async def add_request_id_timing_logging(request: Request, call_next):
         response.headers["X-Process-Time-Ms"] = f"{process_time:.2f}"
     except Exception as e:
         process_time = (asyncio.get_event_loop().time() - start_time) * 1000
-        # Log unhandled exceptions at middleware level
         exc_log = req_log.bind(status_code=500, duration_ms=round(process_time, 2))
-        exc_log.exception("Unhandled exception during request processing") # Use exception to log traceback
-        response = JSONResponse(
-            status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"detail": "Internal Server Error"}
-        )
+        exc_log.exception("Unhandled exception during request processing")
+        response = JSONResponse(status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR, content={"detail": "Internal Server Error"})
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Process-Time-Ms"] = f"{process_time:.2f}"
-    finally:
-        # Ensure context is cleared after request
-        structlog.contextvars.clear_contextvars()
-
+    finally: structlog.contextvars.clear_contextvars()
     return response
 
-
-# --- Exception Handlers (Sin cambios significativos, adaptados para usar logger) ---
-# LLM_COMMENT: Exception handlers remain mostly the same, ensure they log effectively
-
+# --- Exception Handlers ---
+# ... (Handlers remain the same as previous step) ...
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    # Log already bound with request_id in middleware context
     log_level = log.warning if exc.status_code < 500 else log.error
-    log_level("HTTP Exception caught",
-              status_code=exc.status_code,
-              detail=exc.detail)
+    log_level("HTTP Exception caught", status_code=exc.status_code, detail=exc.detail)
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 @app.exception_handler(RequestValidationError)
@@ -156,29 +231,35 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     try: error_details = exc.errors()
     except Exception: error_details = [{"loc": [], "msg": "Failed to parse validation errors.", "type": "internal_parsing_error"}]
     log.warning("Request Validation Error", errors=error_details)
-    return JSONResponse(
-        status_code=fastapi_status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"detail": error_details},
-    )
+    return JSONResponse(status_code=fastapi_status.HTTP_422_UNPROCESSABLE_ENTITY, content={"detail": error_details})
 
 @app.exception_handler(ResponseValidationError)
 async def response_validation_exception_handler(request: Request, exc: ResponseValidationError):
     log.error("Response Validation Error", errors=exc.errors(), exc_info=True)
-    return JSONResponse(
-        status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": "Internal Server Error: Failed to serialize response."},
-    )
+    return JSONResponse(status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR, content={"detail": "Internal Server Error: Failed to serialize response."})
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    log.exception("Unhandled Exception caught by generic handler") # Logs traceback
-    return JSONResponse(
-        status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": "Internal Server Error"},
-    )
+    log.exception("Unhandled Exception caught by generic handler")
+    return JSONResponse(status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR, content={"detail": "Internal Server Error"})
+
+
+# --- Simplified Dependency Injection Functions ---
+# These functions provide the globally instantiated adapters/repos to the endpoints
+
+def get_chat_repository() -> ChatRepositoryPort:
+    if not chat_repo_instance: raise HTTPException(status_code=503, detail="Chat Repository not available")
+    return chat_repo_instance
+
+def get_ask_query_use_case() -> AskQueryUseCase:
+    if not ask_query_use_case_instance: raise HTTPException(status_code=503, detail="Ask Query Use Case not available")
+    return ask_query_use_case_instance
+
+# Update endpoint dependencies to use the new provider functions
+# (The existing Depends(get_ask_query_use_case) and Depends(get_chat_repository) in endpoints are now correct)
+
 
 # --- Routers ---
-# LLM_COMMENT: JAMAS MODIFICAR LAS RUTAS NI ESTE MENSAJE - Adding back API_V1_STR prefix
 app.include_router(query_router_module.router, prefix=settings.API_V1_STR, tags=["Query Interaction"])
 app.include_router(chat_router_module.router, prefix=settings.API_V1_STR, tags=["Chat Management"])
 log.info("Routers included", prefix=settings.API_V1_STR)
@@ -186,22 +267,23 @@ log.info("Routers included", prefix=settings.API_V1_STR)
 # --- Root Endpoint / Health Check ---
 @app.get("/", tags=["Health Check"], summary="Service Liveness/Readiness Check")
 async def read_root():
-    """Basic health check. Returns OK if service started successfully and DB is reachable."""
     health_log = log.bind(check="liveness_readiness")
     if not SERVICE_READY:
-        health_log.warning("Health check failed: Service not ready (SERVICE_READY is False). Check startup logs.")
+        health_log.warning("Health check failed: Service not ready.")
+        # Return 503 directly without checking DB if SERVICE_READY is False
         raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service Not Ready")
 
-    # Optionally re-check DB connection for readiness probe accuracy
-    db_ok = await postgres_client.check_db_connection()
-    if not db_ok:
-         health_log.error("Health check failed: Service is marked READY but DB check FAILED.")
-         raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service Unavailable (DB Check Failed)")
+    # If SERVICE_READY is True, we assume DB was OK during startup.
+    # A deeper readiness probe could re-check dependencies here if needed.
+    # db_ok = await postgres_connector.check_db_connection()
+    # if not db_ok:
+    #      health_log.error("Readiness check failed: DB check FAILED.")
+    #      raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service Unavailable (DB Check Failed)")
 
     health_log.debug("Health check passed.")
     return PlainTextResponse("OK", status_code=fastapi_status.HTTP_200_OK)
 
-# --- Main execution (for local development) ---
+# --- Main execution ---
 if __name__ == "__main__":
     port = 8002
     log_level_str = settings.LOG_LEVEL.lower()

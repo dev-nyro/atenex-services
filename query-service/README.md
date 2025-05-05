@@ -1,256 +1,199 @@
-# Atenex Query Service (Microservicio de Consulta)
+# Atenex Query Service (Microservicio de Consulta) v0.3.0
 
 ## 1. Visión General
 
-El **Query Service** es el microservicio responsable de manejar las consultas en lenguaje natural de los usuarios y gestionar el historial de conversaciones dentro de la plataforma Atenex. Su función principal es:
+El **Query Service** es el microservicio responsable de manejar las consultas en lenguaje natural de los usuarios y gestionar el historial de conversaciones dentro de la plataforma Atenex. Esta versión ha sido refactorizada para adoptar **Clean Architecture** y un pipeline **Retrieval-Augmented Generation (RAG)** más avanzado y configurable.
 
-1.  Recibir una consulta del usuario (`query`) y opcionalmente un `chat_id` a través de la API (`POST /api/v1/query/ask`). Requiere headers `X-User-ID` y `X-Company-ID` inyectados por el API Gateway.
-2.  Gestionar el estado de la conversación: crear un nuevo chat si no se proporciona `chat_id`, o continuar uno existente (verificando la propiedad del usuario).
-3.  Detectar si la consulta es un saludo simple. Si lo es, generar una respuesta predefinida y omitir el pipeline RAG.
-4.  Guardar el mensaje del usuario en la tabla `messages` de **PostgreSQL**.
-5.  Si no es un saludo, ejecutar un pipeline de **Retrieval-Augmented Generation (RAG)**:
-    *   Generar un embedding para la consulta usando **FastEmbed** (modelo local/open-source, ej. `BAAI/bge-small-en-v1.5`).
-    *   Recuperar chunks de documentos relevantes desde **Milvus** (namespace `default`), **filtrando estrictamente por el `company_id`** del usuario.
-    *   Construir un prompt para el LLM:
-        *   Si se recuperaron documentos, usar una plantilla RAG que instruya al LLM a basarse en ellos (`RAG_PROMPT_TEMPLATE`).
-        *   Si *no* se recuperaron documentos, usar una plantilla de conversación general (`GENERAL_PROMPT_TEMPLATE`).
-6.  Generar una respuesta utilizando un Large Language Model (LLM) externo, actualmente **Google Gemini** (`gemini-1.5-flash-latest`).
-7.  Guardar el mensaje del asistente (respuesta y fuentes si aplica) en la tabla `messages` de **PostgreSQL**.
-8.  Registrar la interacción completa (pregunta, respuesta, metadatos, `chat_id`) en la tabla `query_logs` de **PostgreSQL**.
-9.  Proporcionar endpoints adicionales (`GET /chats`, `GET /chats/{id}/messages`, `DELETE /chats/{id}`) para que el frontend gestione el historial de chats del usuario. **La eliminación de chat ahora incluye la eliminación de mensajes y logs asociados.**
+Sus funciones principales son:
 
-Este servicio requiere autenticación (gestionada por el API Gateway) para identificar al usuario y la empresa, asegurando el aislamiento de datos y la correcta asociación del historial de chat.
+1.  Recibir una consulta (`query`) y opcionalmente un `chat_id` vía API (`POST /api/v1/query/ask`), requiriendo headers `X-User-ID` y `X-Company-ID`.
+2.  Gestionar el estado de la conversación (crear/continuar chat) usando `ChatRepositoryPort` (implementado por `PostgresChatRepository`).
+3.  Detectar saludos simples y responder directamente, omitiendo el pipeline RAG.
+4.  Guardar el mensaje del usuario en la tabla `messages` de PostgreSQL.
+5.  Si no es un saludo, ejecutar el pipeline RAG orquestado por `AskQueryUseCase`:
+    *   **Embedding de Consulta:** Genera un vector para la consulta usando `FastEmbed` (modelo local, configurable vía `QUERY_FASTEMBED_MODEL_NAME`).
+    *   **Recuperación Híbrida (Configurable):**
+        *   **Búsqueda Densa:** Recupera chunks desde Milvus usando `MilvusAdapter` (`pymilvus`), filtrando por `company_id`.
+        *   **Búsqueda Dispersa (BM25):** *Opcional* (habilitado por `QUERY_BM25_ENABLED`). Recupera chunks desde PostgreSQL usando `BM25sRetriever`, que construye un índice en memoria del contenido textual de los chunks de la compañía.
+        *   **Fusión:** Combina resultados densos y dispersos usando Reciprocal Rank Fusion (RRF).
+    *   **Reranking (Opcional):** Habilitado por `QUERY_RERANKER_ENABLED`. Reordena los chunks fusionados usando un modelo Cross-Encoder (`BGEReranker` con `sentence-transformers`).
+    *   **Filtrado de Diversidad (Opcional/Stub):** Habilitado por `QUERY_DIVERSITY_FILTER_ENABLED`. Aplica un filtro a los chunks reordenados (actualmente un `StubDiversityFilter` que solo trunca la lista).
+    *   **Construcción del Prompt:** Crea el prompt para el LLM usando `PromptBuilder`, seleccionando una plantilla RAG (si hay chunks finales) o una general.
+    *   **Generación de Respuesta:** Llama al LLM (Google Gemini) a través de `GeminiAdapter`.
+6.  Guardar el mensaje del asistente (respuesta y fuentes de los chunks finales) en la tabla `messages`.
+7.  Registrar la interacción completa (pregunta, respuesta, metadatos del pipeline, `chat_id`) en la tabla `query_logs` usando `LogRepositoryPort`.
+8.  Proporcionar endpoints API (`GET /chats`, `GET /chats/{id}/messages`, `DELETE /chats/{id}`) para gestionar el historial, usando `ChatRepositoryPort`.
 
-## 2. Arquitectura General del Proyecto (sin cambios)
+La autenticación sigue siendo manejada por el API Gateway.
+
+## 2. Arquitectura General (Clean Architecture)
 
 ```mermaid
-flowchart LR
-    Frontend["Frontend (Vercel / Cliente)"] -->|HTTPS /api/v1/query/ask<br/>POST & /chats* GET/DELETE| Gateway["API Gateway"]
-    Gateway -->|/api/v1/query/*| QueryAPI["Query Service API<br/>(FastAPI)"]
+graph TD
+    A[API Layer (FastAPI Endpoints)] --> UC{Application Layer (Use Cases)}
+    UC -- Uses Ports --> I{Infrastructure Layer (Adapters)}
 
-    subgraph QueryService
-      direction LR
-      QueryAPI -->|Headers: X-Company-ID, X-User-ID| QueryLogic{Query/Chat Logic}
-      QueryLogic -->|Manage Chats & Msgs| PSQL[(PostgreSQL<br/>atenex.chats, atenex.messages)]
-      QueryLogic -->|Log Interaction| PSQLLogs[(PostgreSQL<br/>atenex.query_logs)]
-      QueryLogic -->|Invoke RAG| RAGPipeline[RAG Pipeline Steps]
-
-      subgraph RAGPipeline
-        direction TB
-        EmbedQuery[1. Embed Query (FastEmbed)] --> RetrieveDocs[2. Retrieve Docs (Milvus)]
-        RetrieveDocs --> BuildPrompt[3. Build Prompt (Conditional)]
-        BuildPrompt --> GenerateLLM[4. Generate Answer (Gemini)]
-      end
-
-      RAGPipeline -->|Vector Store (Filter by Company)| Milvus[(Milvus<br/>default.atenex_doc_chunks)]
-      RAGPipeline -->|LLM API Call| GeminiAPI[("Google Gemini API")]
-      # LLM_COMMENT: OpenAI no es necesario para embedding de query
+    subgraph I [Infrastructure Layer]
+        direction LR
+        P[(Persistence Adapters<br/>Postgres Repositories<br/>- ChatRepository<br/>- LogRepository<br/>- ChunkContentRepository)]
+        V[(Vector Store Adapter<br/>MilvusAdapter)]
+        S[(Sparse Retriever<br/>BM25sRetriever)]
+        R[(Reranker Adapter<br/>BGEReranker)]
+        F[(Diversity Filter<br/>StubDiversityFilter)]
+        L[(LLM Adapter<br/>GeminiAdapter)]
     end
+
+    subgraph UC [Application Layer]
+        direction TB
+        Ports[Ports (Interfaces)<br/>- ChatRepositoryPort<br/>- VectorStorePort<br/>- LLMPort<br/>- SparseRetrieverPort<br/>...]
+        UseCases[Use Cases<br/>- AskQueryUseCase]
+    end
+
+    subgraph D [Domain Layer]
+         Models[Domain Models<br/>- RetrievedChunk<br/>- Chat<br/>- ChatMessage<br/>...]
+    end
+
+
+    A -- Calls --> UseCases
+    UseCases -- Depends on --> Ports
+    I -- Implements --> Ports
+    UseCases -- Uses --> Models
+    I -- Uses --> Models # Adapters might return/use Domain Models
+
+    %% External Dependencies linked to Infrastructure %%
+    P --> DB[(PostgreSQL<br/>'atenex' DB)]
+    V --> Milvus[(Milvus<br/>Collection)]
+    L --> LLM_API[("Google Gemini API")]
+    S -- Reads content --> DB
+
+    %% Component Interactions within RAG Pipeline (Simplified) %%
+    style UC fill:#D1C4E9,stroke:#333,stroke-width:1px
+    style A fill:#C8E6C9,stroke:#333,stroke-width:1px
+    style I fill:#BBDEFB,stroke:#333,stroke-width:1px
+    style D fill:#FFECB3,stroke:#333,stroke-width:1px
 ```
+*Diagrama actualizado reflejando la arquitectura hexagonal/clean.*
 
-## 3. Características Clave (Actualizado)
+## 3. Características Clave (v0.3.0)
 
-*   **API RESTful:** Endpoints para consultas (`/ask`), listar chats (`/chats`), obtener mensajes (`/chats/{id}/messages`) y **eliminar chats completamente** (`/chats/{id}`).
-*   **Pipeline RAG Flexible:**
-    *   Embedding de consulta con **FastEmbed** (configurable, modelo local).
-    *   Retrieval de **Milvus** filtrado por `company_id`.
-    *   **Prompt Condicional:** Usa plantillas diferentes si se recuperan o no documentos relevantes.
-    *   Generación con **Google Gemini**.
-*   **Manejo de Saludos:** Detecta y responde a saludos simples sin ejecutar el pipeline RAG.
-*   **Gestión de Historial de Chat Persistente:** Almacena y recupera conversaciones en PostgreSQL. La eliminación de chat ahora limpia mensajes y logs asociados.
-*   **Multi-tenancy Estricto:** Aplicado en retrieval de Milvus y acceso a chats/mensajes en PostgreSQL.
-*   **Logging Detallado:** Persistencia de interacciones (`query_logs`) y mensajes (`messages`).
+*   **Arquitectura Limpia (Hexagonal):** Separación clara de responsabilidades (Dominio, Aplicación, Infraestructura).
+*   **API RESTful:** Endpoints para consultas (`/ask`) y gestión de chats (`/chats/...`).
+*   **Pipeline RAG Avanzado y Configurable:**
+    *   Embedding de consulta con `FastEmbed`.
+    *   Recuperación Híbrida opcional (Dense: `MilvusAdapter` + Sparse: `BM25sRetriever`).
+    *   Fusión Reciprocal Rank Fusion (RRF).
+    *   Reranking opcional (`BGEReranker`).
+    *   Filtrado de Diversidad opcional (Stub actual).
+    *   Generación con Google Gemini (`GeminiAdapter`).
+    *   Control de etapas del pipeline mediante variables de entorno.
+*   **Manejo de Saludos:** Optimización para evitar RAG en saludos simples.
+*   **Gestión de Historial de Chat:** Persistencia completa en PostgreSQL.
+*   **Multi-tenancy Estricto:** Aplicado en todos los accesos a datos.
+*   **Logging Estructurado y Detallado:** Incluye metadatos del pipeline en `query_logs`.
 *   **Configuración Centralizada:** Kubernetes ConfigMaps/Secrets.
-*   **Logging Estructurado (JSON).**
-*   **Health Check Robusto.**
-*   **Manejo de Errores y Reintentos (Tenacity).**
+*   **Health Check.**
 
-## 4. Pila Tecnológica Principal (Actualizado)
+## 4. Pila Tecnológica Principal (v0.3.0)
 
 *   **Lenguaje:** Python 3.10+
 *   **Framework API:** FastAPI
-*   **Orquestación RAG:** Lógica manual + Haystack Components (`PromptBuilder`, `MilvusEmbeddingRetriever`)
-*   **Base de Datos Relacional (Log/Chat):** PostgreSQL (via `asyncpg`)
-*   **Base de Datos Vectorial (Retrieval):** Milvus (via `milvus-haystack`, `pymilvus`)
-*   **Modelo de Embeddings (Query):** **FastEmbed** (Modelo configurable, ej. `BAAI/bge-small-en-v1.5`) via `fastembed-haystack`.
+*   **Arquitectura:** Clean Architecture / Hexagonal
+*   **Base de Datos Relacional (Cliente):** PostgreSQL (via `asyncpg`)
+*   **Base de Datos Vectorial (Cliente):** Milvus (via `pymilvus`)
+*   **Modelo Embeddings (Query):** `FastEmbed` (via `fastembed-haystack`)
+*   **Recuperación Dispersa:** `bm2s`
+*   **Modelo Reranker:** `sentence-transformers` (`BAAI/bge-reranker-base`)
 *   **Modelo LLM (Generación):** Google Gemini (via `google-generativeai`)
+*   **Componentes Haystack:** `haystack-ai` (para `Document`, `PromptBuilder`)
 *   **Despliegue:** Docker, Kubernetes
 
-## 5. Estructura de la Codebase (sin cambios estructurales mayores)
+## 5. Estructura de la Codebase (v0.3.0)
 
 ```
-query-service/
-├── app/
-│   ├── __init__.py
-│   ├── api/                  # Definiciones API
-│   │   ├── __init__.py
-│   │   └── v1/
-│   │       ├── __init__.py
-│   │       ├── endpoints/
-│   │       │   ├── __init__.py
-│   │       │   ├── chat.py   # Endpoints: /chats, /chats/{id}/messages, /chats/{id}
-│   │       │   └── query.py  # Endpoint: /ask (lógica RAG y saludos)
-│   │       └── schemas.py    # Schemas Pydantic
-│   ├── core/                 # Configuración, Logging
-│   │   ├── __init__.py
-│   │   ├── config.py
-│   │   └── logging_config.py
-│   ├── db/                   # Acceso a Base de Datos
-│   │   ├── __init__.py
-│   │   └── postgres_client.py # Funciones asyncpg (logs, chats, messages - delete_chat modificado)
-│   ├── main.py               # Entrypoint FastAPI (lifespan, middleware, health)
-│   ├── models/               # (Vacío)
-│   │   └── __init__.py
-│   ├── pipelines/            # Lógica Pipeline Haystack/RAG
-│   │   ├── __init__.py
-│   │   └── rag_pipeline.py   # Lógica RAG refactorizada (FastEmbed, prompt condicional)
-│   ├── services/             # Clientes APIs Externas
-│   │   ├── __init__.py
-│   │   ├── base_client.py    # Cliente HTTP base
-│   │   └── gemini_client.py  # Cliente Google Gemini
-│   └── utils/
-│       ├── __init__.py
-│       └── helpers.py        # Funciones utilidad (ej. truncate_text)
-├── k8s/                      # Manifests K8s (Ejemplos)
-│   ├── query-configmap.yaml
-│   ├── query-deployment.yaml
-│   ├── query-secret.example.yaml
-│   └── query-service.yaml
-├── Dockerfile
-├── pyproject.toml
-├── poetry.lock
-└── README.md                 # Este archivo
+app/
+├── api                   # Capa API (FastAPI)
+│   └── v1
+│       ├── endpoints       # Controladores HTTP
+│       ├── mappers.py      # Mapeadores DTO <-> Dominio (si es necesario)
+│       └── schemas.py      # DTOs (Pydantic)
+├── application           # Capa Aplicación
+│   ├── ports             # Interfaces (Puertos)
+│   └── use_cases         # Lógica de orquestación (Casos de Uso)
+├── core                  # Configuración central, logging
+│   ├── config.py
+│   └── logging_config.py
+├── domain                # Capa Dominio
+│   └── models.py         # Entidades y Value Objects
+├── infrastructure        # Capa Infraestructura
+│   ├── filters           # Implementaciones DiversityFilterPort
+│   ├── llms              # Implementaciones LLMPort (Gemini)
+│   ├── persistence       # Implementaciones RepositoryPorts (Postgres)
+│   ├── rerankers         # Implementaciones RerankerPort (BGE)
+│   ├── retrievers        # Implementaciones SparseRetrieverPort (BM25)
+│   └── vectorstores      # Implementaciones VectorStorePort (Milvus)
+├── main.py               # Entrypoint FastAPI, Lifespan, Middleware
+├── models                # (Vacío, mantenido por si acaso)
+└── utils                 # Funciones de utilidad
+    └── helpers.py
 ```
+*(Los directorios `db`, `pipelines`, `services` han sido eliminados).*
 
-## 6. Configuración (Kubernetes - Actualizado)
+## 6. Configuración (Kubernetes - v0.3.0)
 
-Gestionada mediante ConfigMap `query-service-config` y Secret `query-service-secrets` en el namespace `nyro-develop`.
+Gestionada mediante ConfigMap `query-service-config` y Secret `query-service-secrets` en `nyro-develop`.
 
-### ConfigMap (`query-service-config` en `nyro-develop`)
+### ConfigMap (`query-service-config`) - Claves Añadidas/Importantes
 
-| Clave                           | Descripción                                        | Ejemplo (Valor Esperado en K8s)                       |
-| :------------------------------ | :------------------------------------------------- | :---------------------------------------------------- |
-| `QUERY_LOG_LEVEL`               | Nivel de logging.                                  | `INFO`                                                |
-| `QUERY_POSTGRES_SERVER`         | Host/Service PostgreSQL (en `nyro-develop`).       | `postgresql.nyro-develop.svc.cluster.local`         |
-| `QUERY_POSTGRES_PORT`           | Puerto PostgreSQL.                                 | `5432`                                                |
-| `QUERY_POSTGRES_USER`           | Usuario PostgreSQL.                                | `postgres`                                            |
-| `QUERY_POSTGRES_DB`             | Base de datos PostgreSQL (`atenex`).               | `atenex`                                              |
-| `QUERY_MILVUS_URI`              | URI Milvus (en `default` namespace).               | `http://milvus-milvus.default.svc.cluster.local:19530`|
-| `QUERY_MILVUS_COLLECTION_NAME`  | Nombre colección Milvus (`atenex_doc_chunks`).   | `atenex_doc_chunks`                                   |
-| `QUERY_MILVUS_EMBEDDING_FIELD`  | Campo vectorial Milvus.                            | `embedding`                                           |
-| `QUERY_MILVUS_CONTENT_FIELD`    | Campo contenido Milvus.                            | `content`                                             |
-| `QUERY_MILVUS_COMPANY_ID_FIELD` | Campo metadatos para filtrar Cia.                 | `company_id`                                          |
-| **`QUERY_FASTEMBED_MODEL_NAME`** | **Modelo FastEmbed para consulta.**                | `BAAI/bge-small-en-v1.5`                              |
-| **`QUERY_FASTEMBED_QUERY_PREFIX`**| **(Opcional) Prefijo para embedding de consulta.** | `query: `                                              |
-| `QUERY_EMBEDDING_DIMENSION`     | Dimensión embedding (**DEBE coincidir con modelo FastEmbed**). | `384` (para bge-small)                        |
-| `QUERY_RETRIEVER_TOP_K`         | Nº docs. por defecto a recuperar.                  | `5`                                                   |
-| `QUERY_GEMINI_MODEL_NAME`       | Modelo Gemini para generación.                     | `gemini-1.5-flash-latest`                             |
-| `QUERY_RAG_PROMPT_TEMPLATE`     | (Opcional) Plantilla prompt RAG (con documentos).  | *(Ver default en `config.py`)*                        |
-| **`QUERY_GENERAL_PROMPT_TEMPLATE`** | **(Opcional) Plantilla prompt sin documentos.** | *(Ver default en `config.py`)*                        |
-| `QUERY_HTTP_CLIENT_TIMEOUT`     | Timeout clientes HTTP (s).                         | `60`                                                  |
-| `QUERY_HTTP_CLIENT_MAX_RETRIES` | Reintentos clientes HTTP.                          | `2`                                                   |
-| `QUERY_HTTP_CLIENT_BACKOFF_FACTOR`| Factor backoff reintentos.                     | `1.0`                                                 |
+| Clave                            | Descripción                                        | Ejemplo (Valor Esperado)            |
+| :------------------------------- | :------------------------------------------------- | :---------------------------------- |
+| `QUERY_BM25_ENABLED`             | Habilita/deshabilita retrieval BM25.               | `"true"` / `"false"`                |
+| `QUERY_RERANKER_ENABLED`         | Habilita/deshabilita reranking.                    | `"true"` / `"false"`                |
+| `QUERY_RERANKER_MODEL_NAME`      | Modelo sentence-transformer para reranker.         | `"BAAI/bge-reranker-base"`          |
+| `QUERY_DIVERSITY_FILTER_ENABLED` | Habilita/deshabilita filtro diversidad (stub).   | `"true"` / `"false"`                |
+| `QUERY_DIVERSITY_K_FINAL`        | Nº chunks tras filtro diversidad.                | `"10"`                              |
+| `QUERY_HYBRID_FUSION_ALPHA`      | Peso para fusión (no usado por RRF actualmente).   | `"0.5"`                             |
+| `QUERY_RETRIEVER_TOP_K`          | Nº inicial de chunks por retriever (denso/sparse).| `"5"`                               |
+| ... (otras claves existentes)    | ...                                                | ...                                 |
 
-### Secret (`query-service-secrets` en `nyro-develop`)
+### Secret (`query-service-secrets`)
 
 | Clave del Secreto     | Variable de Entorno Correspondiente | Descripción             |
 | :-------------------- | :---------------------------------- | :---------------------- |
 | `POSTGRES_PASSWORD`   | `QUERY_POSTGRES_PASSWORD`           | Contraseña PostgreSQL.  |
 | `GEMINI_API_KEY`      | `QUERY_GEMINI_API_KEY`              | Clave API Google Gemini.|
-| **`OPENAI_API_KEY`**  | **`QUERY_OPENAI_API_KEY`**          | **(Ya no es necesaria aquí)** |
 
-## 7. API Endpoints (Actualizado)
+## 7. API Endpoints (Sin cambios funcionales externos)
 
-Prefijo base: `/api/v1/query`
+El prefijo base sigue siendo `/api/v1/query`. Los endpoints `/ask`, `/chats`, `/chats/{id}/messages`, `/chats/{id}` mantienen su firma externa, pero ahora su lógica interna es manejada por el `AskQueryUseCase` o los repositorios correspondientes.
 
----
+## 8. Dependencias Externas Clave (v0.3.0)
 
-### Health Check
-
-*   **Endpoint:** `GET /` (Raíz del servicio)
-*   **Descripción:** Chequeo Liveness/Readiness. Verifica inicio y conexión DB/dependencias.
-*   **Respuesta OK (`200 OK`):** `OK` (Texto plano)
-*   **Respuesta Error (`503 Service Unavailable`):** Si no está listo o falla conexión/dependencia crítica.
-
----
-
-### Realizar Consulta / Continuar Chat
-
-*   **Endpoint:** `POST /ask` (**Ruta Cambiada internamente**)
-*   **Descripción:** Procesa consulta (RAG o saludo), gestiona chat, loguea y devuelve respuesta.
-*   **Headers:** `X-Company-ID` (UUID), `X-User-ID` (UUID) **requeridos** (inyectados por Gateway).
-*   **Body:** `schemas.QueryRequest` (`{"query": "...", "chat_id": "uuid|null", "retriever_top_k": int|null}`)
-*   **Respuesta OK (`200 OK`):** `schemas.QueryResponse` (`{"answer": "...", "retrieved_documents": [...], "query_log_id": "uuid|null", "chat_id": "uuid"}`)
-*   **Errores:** 400, 403 (chat no pertenece), 422, 500, 503.
-
----
-
-### Listar Chats
-
-*   **Endpoint:** `GET /chats`
-*   **Descripción:** Lista chats del usuario/compañía (paginado).
-*   **Headers:** `X-Company-ID` (UUID), `X-User-ID` (UUID) **requeridos**.
-*   **Query Params:** `limit` (int, default 100), `offset` (int, default 0).
-*   **Respuesta OK (`200 OK`):** `List[schemas.ChatSummary]`
-*   **Errores:** 422, 500.
-
----
-
-### Obtener Mensajes de Chat
-
-*   **Endpoint:** `GET /chats/{chat_id}/messages`
-*   **Descripción:** Obtiene mensajes de un chat específico (paginado). Verifica propiedad.
-*   **Headers:** `X-Company-ID` (UUID), `X-User-ID` (UUID) **requeridos**.
-*   **Path Params:** `chat_id` (UUID).
-*   **Query Params:** `limit` (int, default 100), `offset` (int, default 0).
-*   **Respuesta OK (`200 OK`):** `List[schemas.ChatMessage]` (Puede ser vacía si no hay mensajes o no se tiene acceso).
-*   **Errores:** 403 (no propietario), 404 (no encontrado - aunque 403 es más preciso aquí), 422, 500.
-
----
-
-### Borrar Chat
-
-*   **Endpoint:** `DELETE /chats/{chat_id}`
-*   **Descripción:** Elimina un chat, sus mensajes y sus logs de consulta asociados. Verifica propiedad.
-*   **Headers:** `X-Company-ID` (UUID), `X-User-ID` (UUID) **requeridos**.
-*   **Path Params:** `chat_id` (UUID).
-*   **Respuesta OK (`204 No Content`):** Éxito (sin cuerpo).
-*   **Errores:** 403 (no propietario), 404 (no encontrado), 422, 500.
-
----
-
-## 8. Dependencias Externas Clave (Actualizado)
-
-*   **PostgreSQL:** (Namespace `nyro-develop`) Logs, Chats, Mensajes.
-*   **Milvus:** (Namespace `default`) Vectores para retrieval.
+*   **PostgreSQL:** Almacena logs, chats, mensajes y **contenido de chunks** (leído por BM25).
+*   **Milvus:** Almacena **vectores de chunks** y metadatos asociados (leído por MilvusAdapter).
 *   **Google Gemini API:** Generación de respuestas LLM.
-*   **API Gateway:** Orquestación, autenticación inicial.
-*   **(Implícito) Modelo FastEmbed:** Descargado/cacheado por el worker/pod que corre FastEmbed.
+*   **API Gateway:** Autenticación y enrutamiento.
+*   **(Implícito) Modelos ML:** `FastEmbed`, `sentence-transformers` (BGE Reranker) se descargan/cachean en el pod.
 
-## 9. Pipeline RAG (`app/pipelines/rag_pipeline.py` - Actualizado)
+## 9. Pipeline RAG (Ejecutado por `AskQueryUseCase` - v0.3.0)
 
-1.  **Embed Query:** `FastembedTextEmbedder` con `settings.FASTEMBED_QUERY_PREFIX`.
-2.  **Retrieve Docs:** `MilvusEmbeddingRetriever` filtrando por `company_id`.
-3.  **Build Prompt:**
-    *   Si `docs` existe: `PromptBuilder` con `settings.RAG_PROMPT_TEMPLATE`.
-    *   Si `docs` está vacío: `PromptBuilder` con `settings.GENERAL_PROMPT_TEMPLATE`.
-4.  **Generate Answer:** Llamada a `GeminiClient` con el prompt construido.
-5.  **Log Interaction:** Llamada a `postgres_client.log_query_interaction`.
+1.  **Embed Query:** `FastEmbed` (`_embed_query`).
+2.  **Coarse Retrieval:**
+    *   Llamada concurrente a `VectorStorePort.search` (Dense/Milvus) y (si `BM25_ENABLED`) `SparseRetrieverPort.search` (BM25/Postgres+BM25s).
+3.  **Fusion:** Combina resultados densos y dispersos con RRF (`_reciprocal_rank_fusion`).
+4.  **Content Fetch:** Obtiene contenido de chunks (si faltan) de `ChunkContentRepositoryPort`.
+5.  **Reranking (Opcional):** Si `RERANKER_ENABLED`, llama a `RerankerPort.rerank`.
+6.  **Diversity Filtering (Opcional):** Si `DIVERSITY_FILTER_ENABLED`, llama a `DiversityFilterPort.filter` (actualmente Stub).
+7.  **Build Prompt:** Construye el prompt con `PromptBuilder` usando los chunks finales.
+8.  **Generate Answer:** Llama a `LLMPort.generate`.
+9.  **Log Interaction:** Guarda detalles (incluyendo etapas usadas) en `query_logs` vía `LogRepositoryPort`.
 
-## 10. Consideraciones Adicionales (Actualizado)
+## 10. Próximos Pasos y Consideraciones
 
-*   **Manejo de Saludos:** Implementado con regex simple. Podría expandirse.
-*   **Contexto de Chat en Prompt:** Sigue sin incluirse historial previo en el prompt para Gemini. RAG sigue basándose solo en la última consulta.
-*   **Descarga Modelo FastEmbed:** El pod necesitará acceso a internet (o a un mirror interno) para descargar el modelo FastEmbed la primera vez.
-
-## 11. TODO / Mejoras Futuras
-
-*   **Contexto de Chat en Prompt:** Implementar inclusión de historial relevante en el prompt de Gemini.
-*   **Tests:** Unitarios y de integración (API, pipeline, DB, chat).
-*   **Observabilidad:** Tracing (OpenTelemetry), Métricas (API, latencias, uso de API externas).
-*   **Optimización:** Tuning de parámetros Milvus/Gemini/FastEmbed, caching.
-*   **Gestión Contexto Largo RAG.**
-*   **Generación/Edición Títulos Chat.**
-*   **Evaluación RAG / Feedback.**
-*   **Refinar Manejo Errores API.**
-*   **Intent Detection más robusto:** Ir más allá de saludos simples.
+*   **Acciones Manuales:**
+    *   Ejecutar `poetry lock && poetry install` en el entorno de despliegue/construcción.
+    *   Actualizar el `Dockerfile` para instalar las nuevas dependencias (`sentence-transformers`, `bm2s`, `numpy`).
+    *   Aplicar los manifiestos K8s actualizados (`ConfigMap`, `Deployment`).
+*   **Modificaciones `ingest-service`:** Priorizar la modificación de `ingest-service` para enriquecer los metadatos en `document_chunks` (Postgres) y sincronizarlos con Milvus para mejorar la calidad del RAG y la información mostrada.
+*   **Rendimiento BM25:** Monitorizar el rendimiento del `BM25sRetriever` en memoria. Si se convierte en un cuello de botella, explorar la indexación offline.
+*   **Filtro de Diversidad:** Reemplazar `StubDiversityFilter` por una implementación real (MMR o Dartboard) si se necesita mejorar la diversidad de los resultados.
+*   **Testing:** Añadir tests unitarios y de integración para la nueva arquitectura y componentes.

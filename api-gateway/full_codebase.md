@@ -1050,7 +1050,7 @@ import uvicorn
 import time
 import uuid
 import logging
-import re # Mantenemos re por si se usa en otro lado, pero no para CORS aquí
+import re # Mantenemos re por si se usa en otro lado
 
 # --- Configuración de Logging PRIMERO ---
 from app.core.logging_config import setup_logging
@@ -1067,7 +1067,7 @@ from app.routers.admin_router import router as admin_router_instance
 
 log = structlog.get_logger("atenex_api_gateway.main")
 
-# --- Lifespan Manager (Sin cambios) ---
+# --- Lifespan Manager (Sin cambios respecto a la versión actual) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Application startup sequence initiated...")
@@ -1118,16 +1118,16 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.PROJECT_NAME,
     description="Atenex API Gateway: Single entry point, JWT auth, routing via explicit HTTP calls, Admin API.",
-    version="1.1.3", # Nueva versión para reflejar corrección CORS
+    version="1.1.4", # Nueva versión para reflejar corrección CORS definitiva
     lifespan=lifespan,
 )
 
 # --- Middlewares ---
 
-# --- CORRECCIÓN CORS: Usar allow_origins en lugar de regex ---
+# --- CORRECCIÓN CORS DEFINITIVA: Usar allow_origins con lista explícita ---
 allowed_origins = [
-    "http://localhost:3000", # Puerto común de React/Next.js dev
-    "http://localhost:3001", # Otro puerto posible
+    "http://localhost:3000",
+    "http://localhost:3001",
     "http://127.0.0.1:3000",
     "http://127.0.0.1:3001",
 ]
@@ -1135,80 +1135,106 @@ allowed_origins = [
 # Añadir la URL base de Vercel si está configurada
 if settings.VERCEL_FRONTEND_URL:
     allowed_origins.append(settings.VERCEL_FRONTEND_URL)
-    # ¡IMPORTANTE! Para que las PREVIEWS de Vercel funcionen, necesitas permitir
-    # sus URLs específicas o usar un patrón regex más permisivo (que puede ser
-    # menos seguro). Otra opción es añadir URLs de preview específicas aquí
-    # temporalmente durante el desarrollo o usar una variable de entorno separada.
-    # Ejemplo añadiendo la URL específica del log (NO RECOMENDADO para producción):
+    # Añadir explícitamente la URL de preview de Vercel que causa el problema
     allowed_origins.append("https://atenex-frontend-git-main-devnyro-gmailcoms-projects.vercel.app")
 
-# Añadir la URL de Ngrok del log (considera hacerla configurable vía env var)
-# ¡CAMBIA ESTO SI TU URL DE NGROK CAMBIA!
+# Añadir la URL de Ngrok específica de los logs
+# Considera hacer esto configurable a través de variables de entorno si cambia frecuentemente
 NGROK_URL_FROM_LOG = "https://2646-2001-1388-53a1-bd93-5941-79e3-d98a-2e11.ngrok-free.app"
-allowed_origins.append(NGROK_URL_FROM_LOG)
+if NGROK_URL_FROM_LOG not in allowed_origins: # Evitar duplicados
+    allowed_origins.append(NGROK_URL_FROM_LOG)
+
+# También añadir la URL de NGROK directamente si está en settings (aunque no se usó en el log)
+# if settings.NGROK_URL and settings.NGROK_URL not in allowed_origins:
+#     allowed_origins.append(settings.NGROK_URL)
+
 
 log.info("Configuring CORS middleware", allowed_origins=allowed_origins)
 app.add_middleware(CORSMiddleware,
-                   allow_origins=allowed_origins, # Usar la lista de orígenes
+                   allow_origins=allowed_origins, # Usar la lista explícita de orígenes
                    allow_credentials=True,
                    allow_methods=["*"], # Permite GET, POST, OPTIONS, etc.
-                   allow_headers=["*"], # Permite todos los headers comunes
+                   allow_headers=["*"], # Permite todos los headers comunes (incluyendo Content-Type, Authorization, etc.)
                    expose_headers=["X-Request-ID", "X-Process-Time"],
                    max_age=600)
 # --- FIN CORRECCIÓN CORS ---
 
 
-# Request Context/Timing/Logging Middleware (Sin cambios)
+# Request Context/Timing/Logging Middleware (Con mejora en logging de OPTIONS)
 @app.middleware("http")
 async def add_request_context_timing_logging(request: Request, call_next):
     start_time = time.perf_counter()
     request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
     request.state.request_id = request_id
     user_context = {}
-    if hasattr(request.state, 'user') and isinstance(request.state.user, dict):
-        user_context['user_id'] = request.state.user.get('sub')
-        user_context['company_id'] = request.state.user.get('company_id')
-    # Incluir origin en el log inicial
-    origin = request.headers.get("origin", "N/A")
+    # No intentar extraer payload aquí, puede que aún no exista
+    origin = request.headers.get("origin", "N/A") # Capturar Origin para logs y errores
     request_log = log.bind(request_id=request_id, method=request.method, path=request.url.path,
                            client_ip=request.client.host if request.client else "unknown",
-                           origin=origin, **user_context)
+                           origin=origin) # Añadir origin al log inicial
 
-    # Loguear la recepción de OPTIONS de forma diferente para depurar CORS
+    # Loguear la recepción de OPTIONS a nivel INFO para visibilidad
     if request.method == "OPTIONS":
-        request_log.info("OPTIONS preflight request received") # Cambiado a INFO para visibilidad
+        request_log.info("OPTIONS preflight request received")
     else:
+        # Extraer contexto de usuario si ya está disponible (p.ej., de middleware anterior)
+        if hasattr(request.state, 'user') and isinstance(request.state.user, dict):
+            user_context['user_id'] = request.state.user.get('sub')
+            user_context['company_id'] = request.state.user.get('company_id')
+            request_log = request_log.bind(**user_context) # Vincular contexto de usuario
         request_log.info("Request received")
 
     response = None
     status_code = 500
     try:
-        response = await call_next(request); status_code = response.status_code
+        response = await call_next(request)
+        status_code = response.status_code
         # Loguear headers de respuesta si es OPTIONS para depurar CORS
         if request.method == "OPTIONS" and response:
-            request_log.info("OPTIONS preflight response sent", status_code=response.status_code, headers=dict(response.headers))
+            # Asegurar que el middleware CORS ya añadió las cabeceras correctas
+            request_log.info("OPTIONS preflight response sending", status_code=response.status_code, headers=dict(response.headers))
     except Exception as e:
         proc_time = (time.perf_counter() - start_time) * 1000
-        request_log.exception("Unhandled exception", status_code=500, error=str(e), proc_time=round(proc_time,2))
-        # ¡Importante! Asegurar que las respuestas de error también incluyan cabeceras CORS
-        response = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+        # En caso de error, añadir contexto de usuario si está disponible
+        if hasattr(request.state, 'user') and isinstance(request.state.user, dict):
+             user_context['user_id'] = request.state.user.get('sub')
+             user_context['company_id'] = request.state.user.get('company_id')
+             request_log = request_log.bind(**user_context)
+        request_log.exception("Unhandled exception processing request", status_code=500, error=str(e), proc_time=round(proc_time,2))
+
+        # Crear respuesta de error genérica
+        response = JSONResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content={"detail": "Internal Server Error"})
         response.headers["X-Request-ID"] = request_id
-        # Re-aplicar CORS a respuestas de error (el middleware puede no hacerlo si la excepción ocurre antes)
-        if origin in allowed_origins: # Comprobar si el origen está permitido
-             response.headers["Access-Control-Allow-Origin"] = origin
+
+        # ¡IMPORTANTE! Re-aplicar cabeceras CORS a respuestas de error
+        # El middleware CORSMiddleware podría no ejecutarse completamente si la excepción ocurre muy temprano.
+        req_origin = request.headers.get("Origin")
+        if req_origin in allowed_origins: # Comprobar si el origen de la petición está permitido
+             response.headers["Access-Control-Allow-Origin"] = req_origin
              response.headers["Access-Control-Allow-Credentials"] = "true"
-        return response
+             # Opcional: añadir otros headers CORS si son necesarios para errores
+             # response.headers["Access-Control-Allow-Methods"] = "*"
+             # response.headers["Access-Control-Allow-Headers"] = "*"
+        return response # Devolver la respuesta de error con cabeceras CORS
     finally:
-        if response and request.method != "OPTIONS": # No loguear completion de OPTIONS si ya se logueó la respuesta
+        # Loguear finalización solo para métodos que no sean OPTIONS (ya se logueó al enviar)
+        if response and request.method != "OPTIONS":
             proc_time = (time.perf_counter() - start_time) * 1000
             response.headers["X-Request-ID"] = request_id
             response.headers["X-Process-Time"] = f"{proc_time:.2f}ms"
+            # Añadir contexto de usuario al log final si existe
+            if hasattr(request.state, 'user') and isinstance(request.state.user, dict):
+                user_context['user_id'] = request.state.user.get('sub')
+                user_context['company_id'] = request.state.user.get('company_id')
+                request_log = request_log.bind(**user_context)
             log_level = "debug" if request.url.path == "/health" else "info"
             log_func = getattr(request_log.bind(status_code=status_code), log_level)
             log_func("Request completed", proc_time=round(proc_time, 2))
+
     return response
 
-# --- Include Routers ---
+
+# --- Include Routers (Sin cambios) ---
 log.info("Including application routers...")
 app.include_router(user_router_instance, prefix="/api/v1/users", tags=["Users & Authentication"])
 app.include_router(admin_router_instance, prefix="/api/v1/admin", tags=["Admin"])
@@ -2035,7 +2061,7 @@ async def ensure_company_association(
 # api-gateway/pyproject.toml
 [tool.poetry]
 name = "atenex-api-gateway"
-version = "1.0.1"
+version = "1.1.4" # Incrementar versión para reflejar correcciones
 description = "API Gateway for Atenex Microservices"
 authors = ["Atenex Team <dev@atenex.com>"]
 readme = "README.md"
@@ -2052,10 +2078,8 @@ gunicorn = "^21.2.0"
 pydantic = {extras = ["email"], version = "^2.6.4"}
 pydantic-settings = "^2.2.1"
 
-# --- CORRECCIÓN DEFINITIVA: Usar la versión con extras y eliminar la simple ---
-# Cliente HTTP asíncrono
-# httpx = "^0.27.0" # <-- ELIMINAR ESTA LÍNEA SIMPLE
-httpx = {extras = ["http2"], version = "^0.27.0"} # <-- MANTENER/AÑADIR ESTA CON EXTRAS
+# Cliente HTTP asíncrono (versión con extras es la correcta)
+httpx = {extras = ["http2"], version = "^0.27.0"}
 
 # Manejo de JWT
 python-jose = {extras = ["cryptography"], version = "^3.3.0"}
@@ -2070,7 +2094,7 @@ asyncpg = "^0.29.0"
 passlib = {extras = ["bcrypt"], version = "^1.7.4"}
 
 # Dependencia necesaria para httpx[http2]
-h2 = "^4.1.0" # <-- MANTENER (o añadir si faltaba)
+h2 = "^4.1.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"
