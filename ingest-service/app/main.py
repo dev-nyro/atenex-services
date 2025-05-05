@@ -157,7 +157,7 @@ async def health_check():
     """
     return PlainTextResponse("OK", status_code=fastapi_status.HTTP_200_OK)
 
-# --- Local execution ----
+# --- Local execution ---
 if __name__ == "__main__":
     port = 8001
     log_level_str = settings.LOG_LEVEL.lower()
