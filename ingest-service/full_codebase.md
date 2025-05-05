@@ -104,6 +104,7 @@ from app.services.ingest_pipeline import (
     MILVUS_COLLECTION_NAME,
     MILVUS_COMPANY_ID_FIELD,
     MILVUS_DOCUMENT_ID_FIELD,
+    MILVUS_PK_FIELD, # Added for query
 )
 
 log = structlog.get_logger(__name__)
@@ -186,7 +187,7 @@ def _get_milvus_chunk_count_sync(document_id: str, company_id: str) -> int:
         collection = _get_milvus_collection_sync()
         expr = f'{MILVUS_COMPANY_ID_FIELD} == "{company_id}" and {MILVUS_DOCUMENT_ID_FIELD} == "{document_id}"'
         count_log.debug("Attempting to query Milvus chunk count", filter_expr=expr)
-        query_res = collection.query(expr=expr, output_fields=[MILVUS_PK_FIELD]) # Corrected field name
+        query_res = collection.query(expr=expr, output_fields=[MILVUS_PK_FIELD]) # Use PK field for count
         count = len(query_res) if query_res else 0
         count_log.info("Milvus chunk count successful (pymilvus)", count=count)
         return count
@@ -1003,7 +1004,7 @@ async def delete_document_endpoint(
     if errors: delete_log.warning("Document deletion process completed with non-critical errors", errors=errors)
 
     delete_log.info("Document deletion process finished.")
-    return None # Return 204 No Content
+    return None # Return 204 No Content 
 ```
 
 ## File: `app\api\v1\schemas.py`

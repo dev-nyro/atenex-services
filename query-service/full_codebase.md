@@ -747,8 +747,7 @@ class AskQueryUseCase:
                  diversity_filter_enabled=bool(self.diversity_filter))
         if self.sparse_retriever and not self.chunk_content_repo:
             log.error("SparseRetriever is enabled but ChunkContentRepositoryPort is missing!")
-            # Consider raising an error during initialization if this is a critical config issue
-            # raise ValueError("ChunkContentRepositoryPort is required when BM25 is enabled")
+
 
     def _initialize_embedder(self) -> FastembedTextEmbedder:
         embedder_log = log.bind(component="FastembedTextEmbedder", model=settings.FASTEMBED_MODEL_NAME)
@@ -804,10 +803,16 @@ class AskQueryUseCase:
                                 dense_results: List[RetrievedChunk],
                                 sparse_results: List[Tuple[str, float]],
                                 k: int = RRF_K) -> Dict[str, float]:
+        """Combines dense and sparse results using Reciprocal Rank Fusion."""
         fused_scores: Dict[str, float] = {}
+        # Process dense results
         for rank, chunk in enumerate(dense_results):
+            # Use chunk.id directly, it's already a string from MilvusAdapter/DomainModel
             fused_scores[chunk.id] = fused_scores.get(chunk.id, 0.0) + 1.0 / (k + rank + 1)
+
+        # Process sparse results
         for rank, (chunk_id, _) in enumerate(sparse_results):
+             # chunk_id from BM25Retriever is already a string
              fused_scores[chunk_id] = fused_scores.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
         return fused_scores
 
@@ -817,7 +822,12 @@ class AskQueryUseCase:
         dense_map: Dict[str, RetrievedChunk],
         top_n: int
         ) -> List[RetrievedChunk]:
+        """
+        Gets the top_n chunks based on fused scores and fetches content
+        for chunks that were only found in sparse results.
+        """
         if not fused_scores: return []
+
         sorted_chunk_ids = sorted(fused_scores.items(), key=lambda item: item[1], reverse=True)
         top_ids = [cid for cid, score in sorted_chunk_ids[:top_n]]
         chunks_with_content: List[RetrievedChunk] = []
@@ -827,25 +837,28 @@ class AskQueryUseCase:
         for cid in top_ids:
             if cid in dense_map and dense_map[cid].content:
                 chunk = dense_map[cid]
-                chunk.score = final_scores[cid]
+                chunk.score = final_scores[cid] # Update with fused score
                 chunks_with_content.append(chunk)
             else:
                 ids_needing_content.append(cid)
 
         if ids_needing_content and self.chunk_content_repo:
-             log.debug("Fetching content for chunks found only via sparse/fused search", count=len(ids_needing_content))
+             log.debug("Fetching content for chunks found via sparse/fused search", count=len(ids_needing_content))
              try:
                  content_map = await self.chunk_content_repo.get_chunk_contents_by_ids(ids_needing_content)
                  for cid in ids_needing_content:
                      if cid in content_map:
+                         # Create chunk with fetched content and fused score
                          chunk = RetrievedChunk(id=cid, content=content_map[cid], score=final_scores[cid], metadata={"retrieval_source": "sparse/fused"})
                          chunks_with_content.append(chunk)
                      else: log.warning("Content not found for sparsely retrieved chunk after fetch", chunk_id=cid)
              except Exception: log.exception("Failed to fetch content for sparse/fused results")
         elif ids_needing_content: log.warning("Cannot fetch content for sparse/fused results, ChunkContentRepository not available.")
 
+        # Re-sort the final list by score, as fetching might change order
         chunks_with_content.sort(key=lambda c: c.score or 0.0, reverse=True)
         return chunks_with_content
+
 
     async def execute(
         self, query: str, company_id: uuid.UUID, user_id: uuid.UUID,
@@ -853,7 +866,6 @@ class AskQueryUseCase:
     ) -> Tuple[str, List[RetrievedChunk], Optional[uuid.UUID], uuid.UUID]:
         """ Orchestrates the full RAG pipeline """
         exec_log = log.bind(use_case="AskQueryUseCase", company_id=str(company_id), user_id=str(user_id), query=truncate_text(query, 50))
-        exec_log.info("Starting use case execution")
         retriever_k = top_k or settings.RETRIEVER_TOP_K
         pipeline_stages_used = ["dense_retrieval", "llm_generation"] # Base stages
         final_chat_id: uuid.UUID
@@ -889,45 +901,41 @@ class AskQueryUseCase:
 
             # 5. Coarse Retrieval (Dense + Sparse)
             dense_task = self.vector_store.search(query_embedding, str(company_id), retriever_k)
-            sparse_task = asyncio.create_task(asyncio.sleep(0)) # Dummy task
+            sparse_task = asyncio.create_task(asyncio.sleep(0)) # Dummy if disabled
+            sparse_results: List[Tuple[str, float]] = [] # Default empty
             if self.sparse_retriever:
                  pipeline_stages_used.append("sparse_retrieval (bm25s)")
                  sparse_task = self.sparse_retriever.search(query, str(company_id), retriever_k)
 
-            dense_chunks, sparse_results = await asyncio.gather(dense_task, sparse_task)
+            # Await retrievals
+            dense_chunks, sparse_results_maybe = await asyncio.gather(dense_task, sparse_task)
+            if self.sparse_retriever: # Ensure sparse_results list is populated if run
+                sparse_results = sparse_results_maybe if isinstance(sparse_results_maybe, list) else []
             exec_log.info("Retrieval phase completed", dense_count=len(dense_chunks), sparse_count=len(sparse_results))
 
             # 6. Fusion
             pipeline_stages_used.append("fusion (rrf)")
             dense_map = {c.id: c for c in dense_chunks}
             fused_scores = self._reciprocal_rank_fusion(dense_chunks, sparse_results)
-            # Fetch content for top fused results (adjust N as needed)
             fusion_fetch_k = retriever_k * 2
             combined_chunks = await self._fetch_content_for_fused_results(fused_scores, dense_map, fusion_fetch_k)
             exec_log.info("Fusion completed", initial_fused_count=len(fused_scores), chunks_with_content=len(combined_chunks))
-
 
             # Filter out chunks without content before next steps
             chunks_for_next_steps = [c for c in combined_chunks if c.content]
             if not chunks_for_next_steps:
                  exec_log.warning("No chunks with content available after fusion/fetch.")
-                 # Handle case with no documents: use general prompt
-                 final_prompt = await self._build_prompt(query, [])
+                 final_prompt = await self._build_prompt(query, []) # Use general prompt
                  answer = await self.llm.generate(final_prompt)
                  await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=None)
-                 # Log interaction without retrieved docs
-                 try:
-                    log_id = await self.log_repo.log_query_interaction(
-                         company_id=company_id, user_id=user_id, query=query, answer=answer,
-                         retrieved_documents_data=[], chat_id=final_chat_id, metadata={"pipeline_stages": pipeline_stages_used, "result": "no_docs_found"}
-                    )
+                 try: # Best effort logging
+                    log_id = await self.log_repo.log_query_interaction(company_id=company_id, user_id=user_id, query=query, answer=answer, retrieved_documents_data=[], chat_id=final_chat_id, metadata={"pipeline_stages": pipeline_stages_used, "result": "no_docs_found"})
                  except Exception: exec_log.error("Failed to log interaction for no_docs case")
-                 return answer, [], log_id, final_chat_id
-
+                 return answer, [], log_id, final_chat_id # Return empty list for retrieved docs
 
             # 7. Reranking (Conditional)
             reranked_chunks = chunks_for_next_steps
-            if self.reranker:
+            if self.reranker: # Check if reranker instance exists (implies enabled and loaded)
                 pipeline_stages_used.append("reranking (bge)")
                 exec_log.debug("Performing reranking...", count=len(chunks_for_next_steps))
                 reranked_chunks = await self.reranker.rerank(query, chunks_for_next_steps)
@@ -935,7 +943,7 @@ class AskQueryUseCase:
 
             # 8. Diversity Filtering (Conditional)
             final_chunks_for_llm = reranked_chunks
-            if self.diversity_filter:
+            if self.diversity_filter: # Check if filter instance exists
                 pipeline_stages_used.append("diversity_filter (stub)")
                 k_final = settings.DIVERSITY_K_FINAL
                 exec_log.debug(f"Applying diversity filter k={k_final}...", count=len(reranked_chunks))
@@ -948,7 +956,7 @@ class AskQueryUseCase:
                 for c in final_chunks_for_llm if c.content
             ]
             if not haystack_docs_for_prompt:
-                 exec_log.warning("No documents remaining after filtering to build RAG prompt, using general prompt.")
+                 exec_log.warning("No documents remaining after filtering for RAG prompt, using general prompt.")
             final_prompt = await self._build_prompt(query, haystack_docs_for_prompt)
 
             # 10. Generate Answer
@@ -964,13 +972,9 @@ class AskQueryUseCase:
 
             # 12. Log Interaction
             try:
-                docs_for_log = [
-                    RetrievedDocumentSchema(id=c.id, score=c.score, metadata=c.metadata, document_id=c.document_id, file_name=c.file_name)
-                    .model_dump(exclude_none=True) for c in final_chunks_for_llm
-                ]
-                log_metadata = { "pipeline_stages": pipeline_stages_used, # Include stages used
-                                 "retriever_k": retriever_k, "fusion_fetch_k": fusion_fetch_k,
-                                 "diversity_k_final": settings.DIVERSITY_K_FINAL if self.diversity_filter else None,
+                docs_for_log = [RetrievedDocumentSchema(**c.model_dump()).model_dump(exclude_none=True) for c in final_chunks_for_llm]
+                log_metadata = { "pipeline_stages": pipeline_stages_used, "retriever_k": retriever_k,
+                                 "fusion_fetch_k": fusion_fetch_k, "diversity_k_final": settings.DIVERSITY_K_FINAL if self.diversity_filter else None,
                                  "num_final_to_llm": len(final_chunks_for_llm) }
                 log_id = await self.log_repo.log_query_interaction(
                     company_id=company_id, user_id=user_id, query=query, answer=answer,
@@ -2719,9 +2723,9 @@ def truncate_text(text: str, max_length: int) -> str:
 ```toml
 [tool.poetry]
 name = "query-service"
-# LLM_REFACTOR_STEP_4: Update version reflecting Step 2/4 progress
-version = "0.3.0-alpha.1"
-description = "Query service for SaaS B2B using Clean Architecture, PyMilvus, Haystack & Advanced RAG" # Updated description
+# LLM_REFACTOR_FINAL: Set final version number
+version = "0.3.0"
+description = "Query service for SaaS B2B using Clean Architecture, PyMilvus, Haystack & Advanced RAG"
 authors = ["Nyro <dev@nyro.com>"]
 readme = "README.md"
 
@@ -2741,15 +2745,13 @@ structlog = "^24.1.0"
 # --- Haystack Dependencies ---
 haystack-ai = "^2.0.1" # Core Haystack (Document, PromptBuilder)
 pymilvus = "^2.4.1"    # Milvus client
-# LLM_REFACTOR_STEP_4: Remove haystack-milvus dependency (was already commented)
-# milvus-haystack = "^0.0.6" # REMOVED
 # FastEmbed integration for Haystack (still used for embedding)
 fastembed-haystack = "^1.4.1"
 
 # --- LLM Dependency ---
 google-generativeai = "^0.5.4" # Gemini client
 
-# --- RAG Component Dependencies (Step 4 additions) ---
+# --- RAG Component Dependencies ---
 sentence-transformers = "^2.7.0" # For BGE Reranker adapter
 bm2s = "^0.2.0"                # For BM25s sparse retriever adapter
 numpy = "^1.26.4"              # Often a dependency for ML/vector libraries

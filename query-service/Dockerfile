@@ -35,7 +35,8 @@ COPY pyproject.toml ./
 
 # Instalar dependencias del proyecto usando Poetry
 # *** CORRECCIÓN: Llamar a poetry usando la ruta absoluta ***
-RUN /opt/poetry/bin/poetry install --no-root --no-dev --no-interaction --no-ansi
+# *** CORRECTION: Replaced deprecated --no-dev with --only main ***
+RUN /opt/poetry/bin/poetry install --no-root --only main --no-interaction --no-ansi
 
 # Copiar el código de la aplicación al contenedor
 COPY app ./app
