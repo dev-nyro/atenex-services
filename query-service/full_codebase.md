@@ -2392,22 +2392,24 @@ class MilvusAdapter(VectorStorePort):
                     collection_log.error("Milvus collection does not exist.")
                     raise RuntimeError(f"Milvus collection '{collection_name}' not found. It must be created by the ingest service.")
 
+                # Instanciación directa. Errores de índice ambiguo pueden surgir aquí o en load().
                 collection = Collection(name=collection_name, using=self._alias)
 
-                if not collection.has_index():
-                     collection_log.warning("Collection exists but has no index. Retrieval quality may be affected.")
-                     # Let's try loading anyway for now.
+                # --- CORRECTION: Removed explicit has_index() check ---
+                # if not collection.has_index():
+                #      collection_log.warning("Collection exists but has no index. Retrieval quality may be affected.")
+                # -----------------------------------------------------
 
                 collection_log.debug("Loading Milvus collection into memory...")
-                # Specify partition names if applicable and needed for loading specific data
-                # partition_names = ["_default"] # Example if partitions are used
-                # collection.load(partition_names=partition_names)
-                collection.load() # Load default partition or all partitions if not specified
+                collection.load() # Load default partition or all partitions. Error puede surgir aquí.
                 collection_log.info("Milvus collection loaded successfully.")
                 self._collection = collection
 
             except MilvusException as e:
                 collection_log.error("Failed to get or load Milvus collection", error_code=e.code, error_message=e.message)
+                # Add specific handling for ambiguous index error message for clarity
+                if "multiple indexes" in e.message.lower():
+                    collection_log.critical("Potential 'Ambiguous Index' error encountered. Please check Milvus indices for this collection.")
                 raise RuntimeError(f"Milvus collection access error (Code: {e.code}): {e.message}") from e
             except Exception as e:
                  collection_log.exception("Unexpected error accessing Milvus collection")
@@ -2425,23 +2427,18 @@ class MilvusAdapter(VectorStorePort):
         try:
             collection = await self._get_collection()
 
-            # --- CORRECTION: Added Default Milvus Search Params ---
-            # Use reasonable defaults if not explicitly set in config
             search_params = getattr(settings, "MILVUS_SEARCH_PARAMS", {"metric_type": "L2", "params": {"nprobe": 10}})
-            # ------------------------------------------------------
 
             filter_expr = f'{settings.MILVUS_COMPANY_ID_FIELD} == "{company_id}"'
             search_log.debug("Using filter expression", expr=filter_expr)
 
-            # --- CORRECTION: Ensure embedding field is requested ---
             output_fields = list(set([
-                settings.MILVUS_CONTENT_FIELD, # Ensure content is requested
-                settings.MILVUS_EMBEDDING_FIELD, # Ensure embedding is requested
+                settings.MILVUS_CONTENT_FIELD,
+                settings.MILVUS_EMBEDDING_FIELD,
                 settings.MILVUS_COMPANY_ID_FIELD,
                 settings.MILVUS_DOCUMENT_ID_FIELD,
                 settings.MILVUS_FILENAME_FIELD,
-            ] + settings.MILVUS_METADATA_FIELDS)) # Add other configured metadata fields
-            # --------------------------------------------------------
+            ] + settings.MILVUS_METADATA_FIELDS))
 
             search_log.debug("Performing Milvus vector search...", vector_field=settings.MILVUS_EMBEDDING_FIELD, output_fields=output_fields)
 
@@ -2464,24 +2461,29 @@ class MilvusAdapter(VectorStorePort):
             domain_chunks: List[RetrievedChunk] = []
             if search_results and search_results[0]:
                 for hit in search_results[0]:
-                    entity_data = hit.entity.to_dict()
+                    # Use hit.entity.to_dict() for easier access if available and preferred
+                    # entity_data = hit.entity.to_dict()
+                    # Using direct access for robustness
+                    entity_data = hit.entity.to_dict() if hasattr(hit, 'entity') and hasattr(hit.entity, 'to_dict') else {}
                     content = entity_data.get(settings.MILVUS_CONTENT_FIELD, "")
-                    # --- CORRECTION: Extract embedding vector ---
                     embedding_vector = entity_data.get(settings.MILVUS_EMBEDDING_FIELD)
-                    # ---------------------------------------------
 
-                    # Prepare metadata, excluding the embedding field itself
+                    # Prepare metadata from entity_data, excluding sensitive or large fields if needed
                     metadata = {k: v for k, v in entity_data.items() if k != settings.MILVUS_EMBEDDING_FIELD}
+
+                    # Ensure required fields for domain model exist in metadata
+                    doc_id = metadata.get(settings.MILVUS_DOCUMENT_ID_FIELD)
+                    comp_id = metadata.get(settings.MILVUS_COMPANY_ID_FIELD)
 
                     chunk = RetrievedChunk(
                         id=str(hit.id),
                         content=content,
                         score=hit.score,
                         metadata=metadata,
-                        embedding=embedding_vector, # <-- Store the embedding
-                        document_id=str(metadata.get(settings.MILVUS_DOCUMENT_ID_FIELD)) if metadata.get(settings.MILVUS_DOCUMENT_ID_FIELD) else None,
+                        embedding=embedding_vector,
+                        document_id=str(doc_id) if doc_id else None,
                         file_name=metadata.get(settings.MILVUS_FILENAME_FIELD),
-                        company_id=str(metadata.get(settings.MILVUS_COMPANY_ID_FIELD)) if metadata.get(settings.MILVUS_COMPANY_ID_FIELD) else None
+                        company_id=str(comp_id) if comp_id else None
                     )
                     domain_chunks.append(chunk)
 
@@ -2545,9 +2547,7 @@ from app.infrastructure.vectorstores.milvus_adapter import MilvusAdapter
 from app.infrastructure.llms.gemini_adapter import GeminiAdapter
 from app.infrastructure.retrievers.bm25_retriever import BM25sRetriever
 from app.infrastructure.rerankers.bge_reranker import BGEReranker
-# --- CORRECTION: Import both MMR and Stub Filters ---
 from app.infrastructure.filters.diversity_filter import MMRDiversityFilter, StubDiversityFilter
-# --- END CORRECTION ---
 
 # Import Use Case
 from app.application.use_cases.ask_query_use_case import AskQueryUseCase
@@ -2601,18 +2601,27 @@ async def lifespan(app: FastAPI):
     if dependencies_ok:
         try:
             vector_store_instance = MilvusAdapter()
+            # Attempt to get collection, which includes connection and load
             await vector_store_instance._get_collection()
             log.info("Milvus Adapter initialized and collection checked/loaded.")
         except Exception as e:
-            log.critical("CRITICAL: Failed to initialize Milvus Adapter or load collection.", error=str(e), exc_info=True)
+            # Log the error clearly, including potential Milvus error details
+            log.critical(
+                "CRITICAL: Failed to initialize Milvus Adapter or load collection. Service may not function correctly.",
+                error=str(e), exc_info=True, adapter_error=getattr(e, 'message', 'N/A') # Log Milvus specific message if available
+            )
             dependencies_ok = False
+            # LLM_FLAG: Even if Milvus fails, continue startup to potentially serve other endpoints?
+            # Decision: For now, mark dependencies as failed, but let the service start partially
+            # log.warning("Continuing startup despite Milvus initialization failure.")
 
     if dependencies_ok:
         try:
             llm_instance = GeminiAdapter()
             if not llm_instance.model:
                  log.critical("CRITICAL: Gemini Adapter initialized but model failed to load (check API key).")
-                 log.warning("Continuing startup despite Gemini model load failure.")
+                 # Treat this as critical failure for query functionality
+                 dependencies_ok = False
             else:
                  log.info("Gemini Adapter initialized successfully.")
         except Exception as e:
@@ -2649,21 +2658,16 @@ async def lifespan(app: FastAPI):
             log.error("Failed to initialize BGE Reranker.", error=str(e), exc_info=True)
             reranker_instance = None
 
-    # --- CORRECTION: Initialize Diversity Filter based on setting ---
     if dependencies_ok and settings.DIVERSITY_FILTER_ENABLED:
         try:
             diversity_filter_instance = MMRDiversityFilter(lambda_mult=settings.QUERY_DIVERSITY_LAMBDA)
             log.info("MMR Diversity Filter initialized.")
         except Exception as e:
             log.error("Failed to initialize MMR Diversity Filter. Falling back to Stub.", error=str(e), exc_info=True)
-            # Fallback to Stub if MMR fails
             diversity_filter_instance = StubDiversityFilter()
     else:
-        # If disabled, explicitly set to None or Stub (depending on desired behavior if accidentally called)
-        # Using Stub makes the AskQueryUseCase logic simpler as it doesn't need to check for None
         log.info("Diversity filter disabled, using StubDiversityFilter as placeholder.")
         diversity_filter_instance = StubDiversityFilter()
-    # --- END CORRECTION ---
 
 
     # 3. Instantiate Use Case
@@ -2677,17 +2681,35 @@ async def lifespan(app: FastAPI):
                  sparse_retriever=sparse_retriever_instance,
                  chunk_content_repo=chunk_content_repo_instance,
                  reranker=reranker_instance,
-                 diversity_filter=diversity_filter_instance # Pass the initialized filter (MMR or Stub)
+                 diversity_filter=diversity_filter_instance
              )
              log.info("AskQueryUseCase instantiated successfully.")
-             SERVICE_READY = True
-             log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY.")
+
+             # --- CORRECTION: Warm up embedder after use case initialization ---
+             log.info("Warming up embedding model...")
+             try:
+                 # Access the internal embedder instance and warm it up
+                 await asyncio.to_thread(ask_query_use_case_instance._embedder.warm_up)
+                 log.info("Embedding model warmed up successfully.")
+                 SERVICE_READY = True # Service is only ready if embedder also warms up
+                 log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY.")
+             except Exception as embed_err:
+                 log.critical("CRITICAL: Failed to warm up embedding model.", error=str(embed_err), exc_info=True)
+                 SERVICE_READY = False # Mark as not ready if embedder fails
+                 dependencies_ok = False # Update overall status
+             # --- END CORRECTION ---
+
          except Exception as e:
               log.critical("CRITICAL: Failed to instantiate AskQueryUseCase.", error=str(e), exc_info=True)
               SERVICE_READY = False
+              dependencies_ok = False
     else:
-        log.critical(f"{settings.PROJECT_NAME} startup finished. Some critical dependencies failed. SERVICE NOT READY.")
+        log.critical(f"{settings.PROJECT_NAME} startup check failed. Some critical dependencies might be missing or failed.",
+                     db_ok=db_pool_initialized, milvus_ok=bool(vector_store_instance), llm_ok=bool(llm_instance and llm_instance.model))
         SERVICE_READY = False
+        # Update status if dependencies failed before use case instantiation
+        if not dependencies_ok:
+           log.critical(f"{settings.PROJECT_NAME} startup finished. Some critical dependencies failed. SERVICE NOT READY.")
 
 
     yield # Application runs here
@@ -2767,7 +2789,10 @@ def get_chat_repository() -> ChatRepositoryPort:
     return chat_repo_instance
 
 def get_ask_query_use_case() -> AskQueryUseCase:
-    if not ask_query_use_case_instance: raise HTTPException(status_code=503, detail="Ask Query Use Case not available")
+    # Check service readiness which includes successful use case initialization AND embedder warm-up
+    if not SERVICE_READY or not ask_query_use_case_instance:
+         log.error("Dependency Injection Failed: AskQueryUseCase requested but service is not ready.")
+         raise HTTPException(status_code=503, detail="Query processing service is not ready. Check logs for initialization errors.")
     return ask_query_use_case_instance
 
 # --- Routers ---

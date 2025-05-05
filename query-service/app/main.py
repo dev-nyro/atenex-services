@@ -63,102 +63,93 @@ async def lifespan(app: FastAPI):
            vector_store_instance, llm_instance, sparse_retriever_instance, reranker_instance, \
            diversity_filter_instance, ask_query_use_case_instance
 
+    SERVICE_READY = False # Ensure service starts as not ready
     log.info(f"Starting up {settings.PROJECT_NAME}...")
-    db_pool_initialized = False
-    dependencies_ok = True # Assume OK until proven otherwise
+    dependencies_ok = True
+    critical_failure_message = ""
 
     # 1. Initialize DB Pool
-    try:
-        await postgres_connector.get_db_pool()
-        db_ready = await postgres_connector.check_db_connection()
-        if db_ready:
-            log.info("PostgreSQL connection pool initialized and verified.")
-            db_pool_initialized = True
-            chat_repo_instance = PostgresChatRepository()
-            log_repo_instance = PostgresLogRepository()
-            chunk_content_repo_instance = PostgresChunkContentRepository()
-        else:
-            log.critical("CRITICAL: Failed PostgreSQL connection verification during startup.")
+    if dependencies_ok:
+        try:
+            await postgres_connector.get_db_pool()
+            db_ready = await postgres_connector.check_db_connection()
+            if db_ready:
+                log.info("PostgreSQL connection pool initialized and verified.")
+                chat_repo_instance = PostgresChatRepository()
+                log_repo_instance = PostgresLogRepository()
+                chunk_content_repo_instance = PostgresChunkContentRepository()
+            else:
+                critical_failure_message = "Failed PostgreSQL connection verification during startup."
+                log.critical(f"CRITICAL: {critical_failure_message}")
+                dependencies_ok = False
+        except Exception as e:
+            critical_failure_message = "Failed PostgreSQL pool initialization."
+            log.critical(f"CRITICAL: {critical_failure_message}", error=str(e), exc_info=True)
             dependencies_ok = False
-    except Exception as e:
-        log.critical("CRITICAL: Failed PostgreSQL pool initialization.", error=str(e), exc_info=True)
-        dependencies_ok = False
 
-    # 2. Initialize other adapters
+    # 2. Initialize Milvus Adapter
     if dependencies_ok:
         try:
             vector_store_instance = MilvusAdapter()
-            # Attempt to get collection, which includes connection and load
-            await vector_store_instance._get_collection()
+            await vector_store_instance._get_collection() # This tries connection + load
             log.info("Milvus Adapter initialized and collection checked/loaded.")
         except Exception as e:
-            # Log the error clearly, including potential Milvus error details
+            critical_failure_message = "Failed to initialize Milvus Adapter or load collection."
             log.critical(
-                "CRITICAL: Failed to initialize Milvus Adapter or load collection. Service may not function correctly.",
-                error=str(e), exc_info=True, adapter_error=getattr(e, 'message', 'N/A') # Log Milvus specific message if available
+                f"CRITICAL: {critical_failure_message} Ensure collection '{settings.MILVUS_COLLECTION_NAME}' exists and is accessible.",
+                error=str(e), exc_info=True, adapter_error=getattr(e, 'message', 'N/A')
             )
             dependencies_ok = False
-            # LLM_FLAG: Even if Milvus fails, continue startup to potentially serve other endpoints?
-            # Decision: For now, mark dependencies as failed, but let the service start partially
-            # log.warning("Continuing startup despite Milvus initialization failure.")
 
+    # 3. Initialize LLM Adapter
     if dependencies_ok:
         try:
             llm_instance = GeminiAdapter()
             if not llm_instance.model:
-                 log.critical("CRITICAL: Gemini Adapter initialized but model failed to load (check API key).")
-                 # Treat this as critical failure for query functionality
+                 critical_failure_message = "Gemini Adapter initialized but model failed to load (check API key)."
+                 log.critical(f"CRITICAL: {critical_failure_message}")
                  dependencies_ok = False
             else:
                  log.info("Gemini Adapter initialized successfully.")
         except Exception as e:
-            log.critical("CRITICAL: Failed to initialize Gemini Adapter.", error=str(e), exc_info=True)
+            critical_failure_message = "Failed to initialize Gemini Adapter."
+            log.critical(f"CRITICAL: {critical_failure_message}", error=str(e), exc_info=True)
             dependencies_ok = False
 
-    # Initialize optional components
-    if dependencies_ok and settings.BM25_ENABLED:
-        try:
-            if chunk_content_repo_instance:
-                 sparse_retriever_instance = BM25sRetriever(chunk_content_repo_instance)
-                 log.info("BM25s Retriever initialized.")
-            else:
-                 log.error("BM25 enabled but ChunkContentRepository failed to initialize. Disabling BM25.")
-                 sparse_retriever_instance = None
-        except ImportError:
-            log.error("BM25sRetriever dependency (bm2s) not installed. BM25 disabled.")
-            sparse_retriever_instance = None
-        except Exception as e:
-            log.error("Failed to initialize BM25s Retriever.", error=str(e), exc_info=True)
-            sparse_retriever_instance = None
+    # Initialize optional components only if core dependencies are okay
+    if dependencies_ok:
+        if settings.BM25_ENABLED:
+            try:
+                if chunk_content_repo_instance:
+                    sparse_retriever_instance = BM25sRetriever(chunk_content_repo_instance)
+                    log.info("BM25s Retriever initialized.")
+                else:
+                    log.error("BM25 enabled but ChunkContentRepository failed to initialize. Disabling BM25.")
+                    sparse_retriever_instance = None
+            except ImportError: log.error("BM25sRetriever dependency (bm2s) not installed. BM25 disabled.")
+            except Exception as e: log.error("Failed to initialize BM25s Retriever.", error=str(e), exc_info=True)
 
-    if dependencies_ok and settings.RERANKER_ENABLED:
-        try:
-            reranker_instance = BGEReranker()
-            if not reranker_instance.model:
-                log.warning("BGE Reranker initialized but model loading failed. Reranking might not work.")
-            else:
-                 log.info("BGE Reranker initialized.")
-        except ImportError:
-            log.error("BGEReranker dependency (sentence-transformers) not installed. Reranker disabled.")
-            reranker_instance = None
-        except Exception as e:
-            log.error("Failed to initialize BGE Reranker.", error=str(e), exc_info=True)
-            reranker_instance = None
+        if settings.RERANKER_ENABLED:
+            try:
+                reranker_instance = BGEReranker()
+                if not reranker_instance.model: log.warning("BGE Reranker initialized but model loading failed.")
+                else: log.info("BGE Reranker initialized.")
+            except ImportError: log.error("BGEReranker dependency (sentence-transformers) not installed. Reranker disabled.")
+            except Exception as e: log.error("Failed to initialize BGE Reranker.", error=str(e), exc_info=True)
 
-    if dependencies_ok and settings.DIVERSITY_FILTER_ENABLED:
-        try:
-            diversity_filter_instance = MMRDiversityFilter(lambda_mult=settings.QUERY_DIVERSITY_LAMBDA)
-            log.info("MMR Diversity Filter initialized.")
-        except Exception as e:
-            log.error("Failed to initialize MMR Diversity Filter. Falling back to Stub.", error=str(e), exc_info=True)
+        if settings.DIVERSITY_FILTER_ENABLED:
+            try:
+                diversity_filter_instance = MMRDiversityFilter(lambda_mult=settings.QUERY_DIVERSITY_LAMBDA)
+                log.info("MMR Diversity Filter initialized.")
+            except Exception as e:
+                log.error("Failed to initialize MMR Diversity Filter. Falling back to Stub.", error=str(e), exc_info=True)
+                diversity_filter_instance = StubDiversityFilter()
+        else:
+            log.info("Diversity filter disabled, using StubDiversityFilter as placeholder.")
             diversity_filter_instance = StubDiversityFilter()
-    else:
-        log.info("Diversity filter disabled, using StubDiversityFilter as placeholder.")
-        diversity_filter_instance = StubDiversityFilter()
 
-
-    # 3. Instantiate Use Case
-    if dependencies_ok and chat_repo_instance and log_repo_instance and vector_store_instance and llm_instance:
+    # 4. Instantiate Use Case only if core dependencies are okay
+    if dependencies_ok:
          try:
              ask_query_use_case_instance = AskQueryUseCase(
                  chat_repo=chat_repo_instance,
@@ -172,31 +163,33 @@ async def lifespan(app: FastAPI):
              )
              log.info("AskQueryUseCase instantiated successfully.")
 
-             # --- CORRECTION: Warm up embedder after use case initialization ---
+             # 5. Warm up embedder only if use case is ready
              log.info("Warming up embedding model...")
              try:
-                 # Access the internal embedder instance and warm it up
                  await asyncio.to_thread(ask_query_use_case_instance._embedder.warm_up)
                  log.info("Embedding model warmed up successfully.")
-                 SERVICE_READY = True # Service is only ready if embedder also warms up
+                 # Only set ready if ALL critical steps succeeded
+                 SERVICE_READY = True
                  log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY.")
              except Exception as embed_err:
-                 log.critical("CRITICAL: Failed to warm up embedding model.", error=str(embed_err), exc_info=True)
-                 SERVICE_READY = False # Mark as not ready if embedder fails
-                 dependencies_ok = False # Update overall status
-             # --- END CORRECTION ---
+                 critical_failure_message = "Failed to warm up embedding model."
+                 log.critical(f"CRITICAL: {critical_failure_message}", error=str(embed_err), exc_info=True)
+                 SERVICE_READY = False # Ensure service is not ready
 
          except Exception as e:
-              log.critical("CRITICAL: Failed to instantiate AskQueryUseCase.", error=str(e), exc_info=True)
+              critical_failure_message = "Failed to instantiate AskQueryUseCase."
+              log.critical(f"CRITICAL: {critical_failure_message}", error=str(e), exc_info=True)
               SERVICE_READY = False
-              dependencies_ok = False
     else:
-        log.critical(f"{settings.PROJECT_NAME} startup check failed. Some critical dependencies might be missing or failed.",
-                     db_ok=db_pool_initialized, milvus_ok=bool(vector_store_instance), llm_ok=bool(llm_instance and llm_instance.model))
+        # Log final status if dependencies failed earlier
+        log.critical(f"{settings.PROJECT_NAME} startup sequence aborted due to critical failure: {critical_failure_message}")
+        log.critical("SERVICE NOT READY.")
+
+    # Final check - ensure service ready is false if dependencies failed at any point
+    if not dependencies_ok:
         SERVICE_READY = False
-        # Update status if dependencies failed before use case instantiation
-        if not dependencies_ok:
-           log.critical(f"{settings.PROJECT_NAME} startup finished. Some critical dependencies failed. SERVICE NOT READY.")
+        if not critical_failure_message: critical_failure_message = "Unknown critical dependency failure."
+        log.critical(f"Startup finished. Critical failure detected: {critical_failure_message}. SERVICE NOT READY.")
 
 
     yield # Application runs here
@@ -205,7 +198,10 @@ async def lifespan(app: FastAPI):
     log.info(f"Shutting down {settings.PROJECT_NAME}...")
     await postgres_connector.close_db_pool()
     if vector_store_instance and hasattr(vector_store_instance, 'disconnect'):
-        await vector_store_instance.disconnect()
+        try:
+            await vector_store_instance.disconnect()
+        except Exception as e:
+            log.error("Error during Milvus disconnect", error=str(e), exc_info=True)
     log.info("Shutdown complete.")
 
 # --- FastAPI App Initialization ---
@@ -272,14 +268,17 @@ async def generic_exception_handler(request: Request, exc: Exception):
 
 # --- Simplified Dependency Injection Functions ---
 def get_chat_repository() -> ChatRepositoryPort:
-    if not chat_repo_instance: raise HTTPException(status_code=503, detail="Chat Repository not available")
+    # Check instance directly, rely on lifespan to initialize it
+    if not chat_repo_instance:
+        log.error("Dependency Injection Failed: ChatRepository requested but not initialized.")
+        raise HTTPException(status_code=503, detail="Chat service component not available.")
     return chat_repo_instance
 
 def get_ask_query_use_case() -> AskQueryUseCase:
-    # Check service readiness which includes successful use case initialization AND embedder warm-up
+    # More robust check: verify both the instance exists AND the service was marked as ready
     if not SERVICE_READY or not ask_query_use_case_instance:
-         log.error("Dependency Injection Failed: AskQueryUseCase requested but service is not ready.")
-         raise HTTPException(status_code=503, detail="Query processing service is not ready. Check logs for initialization errors.")
+         log.error("Dependency Injection Failed: AskQueryUseCase requested but service is not ready.", service_ready=SERVICE_READY, instance_exists=bool(ask_query_use_case_instance))
+         raise HTTPException(status_code=503, detail="Query processing service is not ready. Check startup logs.")
     return ask_query_use_case_instance
 
 # --- Routers ---
@@ -291,8 +290,9 @@ log.info("Routers included", prefix=settings.API_V1_STR)
 @app.get("/", tags=["Health Check"], summary="Service Liveness/Readiness Check")
 async def read_root():
     health_log = log.bind(check="liveness_readiness")
+    # Use the global SERVICE_READY flag set by the lifespan manager
     if not SERVICE_READY:
-        health_log.warning("Health check failed: Service not ready.")
+        health_log.warning("Health check failed: Service not ready.", service_ready_flag=SERVICE_READY)
         raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service Not Ready")
 
     health_log.debug("Health check passed.")
