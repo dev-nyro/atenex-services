@@ -13,18 +13,34 @@ POSTGRES_K8S_HOST_DEFAULT = "postgresql-service.nyro-develop.svc.cluster.local"
 POSTGRES_K8S_PORT_DEFAULT = 5432
 POSTGRES_K8S_DB_DEFAULT = "atenex"
 POSTGRES_K8S_USER_DEFAULT = "postgres"
-# Milvus
+
+# --- CORRECTION: Align Milvus Collection Name with Ingest Service ---
 MILVUS_K8S_DEFAULT_URI = "http://milvus-standalone.nyro-develop.svc.cluster.local:19530"
-MILVUS_DEFAULT_COLLECTION = "document_chunks_haystack" # LLM_FLAG: Consider aligning collection name if ingest changes
-MILVUS_DEFAULT_EMBEDDING_FIELD = "embedding"
-MILVUS_DEFAULT_CONTENT_FIELD = "content"
-MILVUS_DEFAULT_COMPANY_ID_FIELD = "company_id"
-MILVUS_DEFAULT_DOCUMENT_ID_FIELD = "document_id"
-MILVUS_DEFAULT_FILENAME_FIELD = "file_name"
-MILVUS_DEFAULT_GRPC_TIMEOUT = 15 # Increased default timeout slightly
-# --- Default Milvus Search Params ---
+# LLM_COMMENT: Default collection name MUST match the one used by ingest-service
+MILVUS_DEFAULT_COLLECTION = "document_chunks_minilm"
+# --- END CORRECTION ---
+
+MILVUS_DEFAULT_EMBEDDING_FIELD = "embedding" # Consistent with ingest schema
+MILVUS_DEFAULT_CONTENT_FIELD = "content"     # Consistent with ingest schema
+MILVUS_DEFAULT_COMPANY_ID_FIELD = "company_id" # Consistent with ingest schema
+MILVUS_DEFAULT_DOCUMENT_ID_FIELD = "document_id" # Consistent with ingest schema
+MILVUS_DEFAULT_FILENAME_FIELD = "file_name"   # Consistent with ingest schema
+MILVUS_DEFAULT_GRPC_TIMEOUT = 15
+
+# --- CORRECTION: Align Milvus Search Params - Use L2 based on previous logs, but comment on ingest (IP) ---
+# LLM_COMMENT: Search metric should ideally match index metric (ingest uses IP default).
+# Using L2 as per previous query-service logs, but verify consistency if issues arise.
 MILVUS_DEFAULT_SEARCH_PARAMS = {"metric_type": "L2", "params": {"nprobe": 10}}
-# RAG Prompts
+# --- END CORRECTION ---
+
+# --- CORRECTION: Define Default Metadata Fields based on Ingest Schema ---
+# LLM_COMMENT: These are scalar fields requested from Milvus *in addition* to mandatory fields (pk, vector, content).
+# Should align with fields defined in ingest-service Milvus schema. 'file_type' was removed. Added 'page'.
+MILVUS_DEFAULT_METADATA_FIELDS = ["company_id", "document_id", "file_name", "page", "title"]
+# --- END CORRECTION ---
+
+
+# RAG Prompts (No change needed)
 DEFAULT_RAG_PROMPT_TEMPLATE = """
 Basándote estrictamente en los siguientes documentos recuperados, responde a la pregunta del usuario.
 Si los documentos no contienen la respuesta, indica explícitamente que no puedes responder con la información proporcionada.
@@ -49,20 +65,19 @@ Pregunta: {{ query }}
 
 Respuesta:
 """
-# Models
+# Models (No change needed)
 DEFAULT_FASTEMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_FASTEMBED_QUERY_PREFIX = "query: "
 DEFAULT_EMBEDDING_DIMENSION = 384
 DEFAULT_GEMINI_MODEL = "gemini-1.5-flash-latest"
 DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-base"
-# RAG Pipeline Parameters
+# RAG Pipeline Parameters (No change needed)
 DEFAULT_RETRIEVER_TOP_K = 5
 DEFAULT_BM25_ENABLED: bool = True
 DEFAULT_RERANKER_ENABLED: bool = True
 DEFAULT_DIVERSITY_FILTER_ENABLED: bool = False
 DEFAULT_DIVERSITY_K_FINAL: int = 10
 DEFAULT_HYBRID_ALPHA: float = 0.5
-# --- Default Diversity Lambda ---
 DEFAULT_DIVERSITY_LAMBDA: float = 0.5
 
 class Settings(BaseSettings):
@@ -88,15 +103,17 @@ class Settings(BaseSettings):
 
     # --- Vector Store (Milvus) ---
     MILVUS_URI: AnyHttpUrl = Field(default=AnyHttpUrl(MILVUS_K8S_DEFAULT_URI))
+    # --- CORRECTION: Use corrected default ---
     MILVUS_COLLECTION_NAME: str = Field(default=MILVUS_DEFAULT_COLLECTION)
+    # LLM_COMMENT: Ensure these field names exactly match the ingest-service Milvus schema
     MILVUS_EMBEDDING_FIELD: str = Field(default=MILVUS_DEFAULT_EMBEDDING_FIELD)
     MILVUS_CONTENT_FIELD: str = Field(default=MILVUS_DEFAULT_CONTENT_FIELD)
     MILVUS_COMPANY_ID_FIELD: str = Field(default=MILVUS_DEFAULT_COMPANY_ID_FIELD)
     MILVUS_DOCUMENT_ID_FIELD: str = Field(default=MILVUS_DEFAULT_DOCUMENT_ID_FIELD)
     MILVUS_FILENAME_FIELD: str = Field(default=MILVUS_DEFAULT_FILENAME_FIELD)
-    MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name", "file_type"])
+    # --- CORRECTION: Use corrected default ---
+    MILVUS_METADATA_FIELDS: List[str] = Field(default=MILVUS_DEFAULT_METADATA_FIELDS)
     MILVUS_GRPC_TIMEOUT: int = Field(default=MILVUS_DEFAULT_GRPC_TIMEOUT)
-    # --- Added Milvus Search Params ---
     MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default=MILVUS_DEFAULT_SEARCH_PARAMS)
 
     # --- Embedding Model (FastEmbed) ---
@@ -118,7 +135,6 @@ class Settings(BaseSettings):
     # --- Diversity Filter ---
     DIVERSITY_FILTER_ENABLED: bool = Field(default=DEFAULT_DIVERSITY_FILTER_ENABLED)
     DIVERSITY_K_FINAL: int = Field(default=DEFAULT_DIVERSITY_K_FINAL, gt=0, description="Target number of documents after diversity filtering.")
-    # --- Added Diversity Lambda ---
     QUERY_DIVERSITY_LAMBDA: float = Field(default=DEFAULT_DIVERSITY_LAMBDA, ge=0.0, le=1.0, description="Lambda for MMR diversity (0=max diversity, 1=max relevance).")
 
 
@@ -134,7 +150,7 @@ class Settings(BaseSettings):
     HTTP_CLIENT_MAX_RETRIES: int = Field(default=2)
     HTTP_CLIENT_BACKOFF_FACTOR: float = Field(default=1.0)
 
-    # --- Validators ---
+    # --- Validators (No changes needed here) ---
     @field_validator('LOG_LEVEL')
     @classmethod
     def check_log_level(cls, v: str) -> str:
