@@ -1413,11 +1413,13 @@ import structlog
 import json
 from datetime import datetime, timezone
 
-# --- Synchronous Imports (Added for Step 4.3) ---
-from sqlalchemy import create_engine, text, Engine, Connection, Table, MetaData, Column, Uuid, Integer, Text, JSON, String, DateTime, UniqueConstraint, ForeignKeyConstraint
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+# --- Synchronous Imports ---
+from sqlalchemy import (
+    create_engine, text, Engine, Connection, Table, MetaData, Column,
+    Uuid, Integer, Text, JSON, String, DateTime, UniqueConstraint, ForeignKeyConstraint, Index
+)
+from sqlalchemy.dialects.postgresql import insert as pg_insert, JSONB # Use JSONB
 from sqlalchemy.exc import SQLAlchemyError
-# --- End Synchronous Imports ---
 
 from app.core.config import settings
 from app.models.domain import DocumentStatus
@@ -1431,27 +1433,31 @@ _pool: Optional[asyncpg.Pool] = None
 _sync_engine: Optional[Engine] = None
 _sync_engine_dsn: Optional[str] = None
 
-# --- Sync SQLAlchemy Metadata (for Core API) ---
+# --- Sync SQLAlchemy Metadata ---
 _metadata = MetaData()
 document_chunks_table = Table(
     'document_chunks',
     _metadata,
-    Column('id', Uuid, primary_key=True, server_default=text("gen_random_uuid()")),
-    Column('document_id', Uuid, nullable=False),
-    Column('company_id', Uuid, nullable=False),
+    Column('id', Uuid(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")), # Use Uuid type
+    Column('document_id', Uuid(as_uuid=True), nullable=False),
+    Column('company_id', Uuid(as_uuid=True), nullable=False),
     Column('chunk_index', Integer, nullable=False),
     Column('content', Text, nullable=False),
-    Column('metadata', JSON(none_as_null=True)),
-    Column('embedding_id', String(255)),
+    Column('metadata', JSONB), # Use JSONB for better indexing/querying if needed
+    Column('embedding_id', String(255)), # Milvus PK (often string)
     Column('created_at', DateTime(timezone=True), server_default=text("timezone('utc', now())")),
     Column('vector_status', String(50), default='pending'),
     UniqueConstraint('document_id', 'chunk_index', name='uq_document_chunk_index'),
-    # ForeignKeyConstraint(['document_id'], ['documents.id'], name='fk_document_chunks_document', ondelete='CASCADE'),
-    # ForeignKeyConstraint(['company_id'], ['companies.id'], name='fk_document_chunks_company', ondelete='CASCADE') # Optional
+    ForeignKeyConstraint(['document_id'], ['documents.id'], name='fk_document_chunks_document', ondelete='CASCADE'),
+    # Optional FK to companies table
+    # ForeignKeyConstraint(['company_id'], ['companies.id'], name='fk_document_chunks_company', ondelete='CASCADE'),
+    Index('idx_document_chunks_document_id', 'document_id'), # Explicit index definition
+    Index('idx_document_chunks_company_id', 'company_id'),
+    Index('idx_document_chunks_embedding_id', 'embedding_id'),
 )
 
 
-# --- Async Pool Management (No changes) ---
+# --- Async Pool Management ---
 # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - DB Async Pool Management
 async def get_db_pool() -> asyncpg.Pool:
     global _pool
@@ -1468,7 +1474,14 @@ async def get_db_pool() -> asyncpg.Pool:
                 return json.dumps(value)
 
             def _json_decoder(value):
-                return json.loads(value)
+                # Handle potential double-encoded JSON if DB returns string
+                if isinstance(value, str):
+                    try:
+                        return json.loads(value)
+                    except json.JSONDecodeError:
+                         log.warning("Failed to decode JSON string from DB", raw_value=value)
+                         return None # Or return the raw string?
+                return value # Assume it's already decoded by asyncpg
 
             async def init_connection(conn):
                 await conn.set_type_codec(
@@ -1476,7 +1489,7 @@ async def get_db_pool() -> asyncpg.Pool:
                     encoder=_json_encoder,
                     decoder=_json_decoder,
                     schema='pg_catalog',
-                    format='text'
+                    format='text' # Important for custom encoder/decoder
                 )
                 await conn.set_type_codec(
                     'json',
@@ -1497,23 +1510,15 @@ async def get_db_pool() -> asyncpg.Pool:
                 timeout=30.0,
                 command_timeout=60.0,
                 init=init_connection,
-                statement_cache_size=0
+                statement_cache_size=0 # Disable cache for safety with type codecs
             )
             log.info("PostgreSQL async connection pool created successfully.")
         except (asyncpg.exceptions.InvalidPasswordError, OSError, ConnectionRefusedError) as conn_err:
-            log.critical(
-                "CRITICAL: Failed to connect to PostgreSQL (async pool)",
-                error=str(conn_err),
-                exc_info=True
-            )
+            log.critical("CRITICAL: Failed to connect to PostgreSQL (async pool)", error=str(conn_err), exc_info=True)
             _pool = None
             raise ConnectionError(f"Failed to connect to PostgreSQL (async pool): {conn_err}") from conn_err
         except Exception as e:
-            log.critical(
-                "CRITICAL: Failed to create PostgreSQL async connection pool",
-                error=str(e),
-                exc_info=True
-            )
+            log.critical("CRITICAL: Failed to create PostgreSQL async connection pool", error=str(e), exc_info=True)
             _pool = None
             raise RuntimeError(f"Failed to create PostgreSQL async pool: {e}") from e
     return _pool
@@ -1544,13 +1549,12 @@ async def check_db_connection() -> bool:
 # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - DB Async Pool Management
 
 
-# --- Synchronous Engine Management (No changes) ---
+# --- Synchronous Engine Management ---
 # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - DB Sync Engine Management
 def get_sync_engine() -> Engine:
     """
     Creates and returns a SQLAlchemy synchronous engine instance.
     Caches the engine globally per process.
-    Requires `sqlalchemy` and `psycopg2-binary` to be installed.
     """
     global _sync_engine, _sync_engine_dsn
     sync_log = log.bind(component="SyncEngine")
@@ -1568,7 +1572,7 @@ def get_sync_engine() -> Engine:
                 pool_timeout=30,
                 pool_recycle=1800,
                 json_serializer=json.dumps, # Ensure JSON is serialized correctly
-                json_deserializer=json.loads
+                json_deserializer=json.loads # Ensure JSON is deserialized correctly
             )
             with _sync_engine.connect() as conn_test:
                 conn_test.execute(text("SELECT 1"))
@@ -1601,7 +1605,7 @@ def dispose_sync_engine():
 
 # --- Synchronous Document Operations ---
 
-# LLM_FLAG: FUNCTIONAL_CODE - Synchronous DB update function
+# LLM_FLAG: FUNCTIONAL_CODE - Synchronous DB update function for documents table
 def set_status_sync(
     engine: Engine,
     document_id: uuid.UUID,
@@ -1611,7 +1615,6 @@ def set_status_sync(
 ) -> bool:
     """
     Synchronously updates the status, chunk_count, and/or error_message of a document.
-    Uses SQLAlchemy Core API with the provided synchronous engine.
     """
     update_log = log.bind(document_id=str(document_id), new_status=status.value, component="SyncDBUpdate")
     update_log.debug("Attempting synchronous DB status update.")
@@ -1638,9 +1641,8 @@ def set_status_sync(
 
     try:
         with engine.connect() as connection:
-            with connection.begin(): # Start transaction
+            with connection.begin():
                 result = connection.execute(query, params)
-
             if result.rowcount == 0:
                 update_log.warning("Attempted to update status for non-existent document_id (sync).")
                 return False
@@ -1650,7 +1652,6 @@ def set_status_sync(
             else:
                  update_log.error("Unexpected number of rows updated (sync).", row_count=result.rowcount)
                  return False
-
     except SQLAlchemyError as e:
         update_log.error("SQLAlchemyError during synchronous status update", error=str(e), query=str(query), params=params, exc_info=True)
         raise Exception(f"Sync DB update failed: {e}") from e
@@ -1658,7 +1659,7 @@ def set_status_sync(
         update_log.error("Unexpected error during synchronous status update", error=str(e), query=str(query), params=params, exc_info=True)
         raise Exception(f"Unexpected sync DB update error: {e}") from e
 
-# LLM_FLAG: NEW FUNCTION - Synchronous bulk chunk insertion
+# LLM_FLAG: NEW FUNCTION - Synchronous bulk chunk insertion for document_chunks table
 def bulk_insert_chunks_sync(engine: Engine, chunks_data: List[Dict[str, Any]]) -> int:
     """
     Synchronously inserts multiple document chunks into the document_chunks table.
@@ -1671,19 +1672,42 @@ def bulk_insert_chunks_sync(engine: Engine, chunks_data: List[Dict[str, Any]]) -
     insert_log = log.bind(component="SyncDBBulkInsert", num_chunks=len(chunks_data), document_id=chunks_data[0].get('document_id'))
     insert_log.info("Attempting synchronous bulk insert of document chunks.")
 
+    # Convert UUIDs to strings if they are UUID objects, as psycopg2 might expect strings
+    # and handle metadata dict serialization
+    prepared_data = []
+    for chunk in chunks_data:
+        prepared_chunk = chunk.copy()
+        if isinstance(prepared_chunk.get('document_id'), uuid.UUID):
+            prepared_chunk['document_id'] = str(prepared_chunk['document_id'])
+        if isinstance(prepared_chunk.get('company_id'), uuid.UUID):
+             prepared_chunk['company_id'] = str(prepared_chunk['company_id'])
+        # Ensure metadata is serializable (SQLAlchemy handles dict -> JSONB well with json_serializer)
+        if 'metadata' in prepared_chunk and not isinstance(prepared_chunk['metadata'], (dict, list, type(None))):
+             log.warning("Invalid metadata type for chunk, attempting conversion", chunk_index=prepared_chunk.get('chunk_index'))
+             prepared_chunk['metadata'] = {} # Default to empty dict on error
+
+        prepared_data.append(prepared_chunk)
+
+
     try:
         with engine.connect() as connection:
             with connection.begin(): # Start transaction
                 # Using Core Table object for insert
-                stmt = pg_insert(document_chunks_table).values(chunks_data)
-                # Optional: Add ON CONFLICT DO NOTHING or UPDATE if needed, but UNIQUE constraint should handle it
-                # stmt = stmt.on_conflict_do_nothing(index_elements=['document_id', 'chunk_index'])
+                # Ensure column names match exactly those in the prepared_data dict keys
+                stmt = document_chunks_table.insert().values(prepared_data)
+                # Optional: ON CONFLICT DO NOTHING based on the unique constraint
+                stmt = stmt.on_conflict_do_nothing(
+                     index_elements=['document_id', 'chunk_index']
+                )
                 result = connection.execute(stmt)
-                # rowcount might not be reliable for INSERT depending on driver/DB,
-                # but we assume success if no exception occurs within the transaction.
-                insert_log.info("Bulk insert statement executed.", row_count_reported=result.rowcount)
-                # Returning the number of chunks we attempted to insert as success indicator
-                return len(chunks_data)
+
+            # rowcount might not be reliable with ON CONFLICT DO NOTHING
+            # We assume success if no exception is raised.
+            # To get the actual inserted count, a SELECT COUNT(*) or RETURNING clause might be needed,
+            # but complicates the bulk insert. For now, return the intended count on success.
+            inserted_count = len(prepared_data) # Assuming all were inserted or ignored successfully
+            insert_log.info("Bulk insert statement executed successfully.", intended_count=len(prepared_data), reported_rowcount=result.rowcount)
+            return inserted_count
 
     except SQLAlchemyError as e:
         insert_log.error("SQLAlchemyError during synchronous bulk chunk insert", error=str(e), exc_info=True)
@@ -1693,7 +1717,7 @@ def bulk_insert_chunks_sync(engine: Engine, chunks_data: List[Dict[str, Any]]) -
         raise Exception(f"Unexpected sync DB bulk chunk insert error: {e}") from e
 
 
-# --- Async Document Operations (No changes needed) ---
+# --- Async Document Operations ---
 
 # LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH create_document_record DB logic lightly
 async def create_document_record(
@@ -1718,8 +1742,8 @@ async def create_document_record(
         NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC'
     );
     """
-    metadata_db = json.dumps(metadata) if metadata else None
-    params = [ doc_id, company_id, filename, file_type, file_path, metadata_db, status.value, 0 ]
+    # asyncpg handles dict -> jsonb directly with codec
+    params = [ doc_id, company_id, filename, file_type, file_path, metadata, status.value, 0 ]
     insert_log = log.bind(company_id=str(company_id), filename=filename, doc_id=str(doc_id))
     try:
         await conn.execute(query, *params)
@@ -1804,14 +1828,7 @@ async def get_document_by_id(conn: asyncpg.Connection, doc_id: uuid.UUID, compan
     try:
         record = await conn.fetchrow(query, doc_id, company_id)
         if not record: get_log.warning("Document not found or company mismatch (async)"); return None
-        # Convert metadata from string if needed (asyncpg handles json/jsonb well with set_type_codec)
-        record_dict = dict(record)
-        # Ensure metadata is a dict or None before returning
-        # metadata_val = record_dict.get('metadata')
-        # if isinstance(metadata_val, str):
-        #     try: record_dict['metadata'] = json.loads(metadata_val)
-        #     except json.JSONDecodeError: record_dict['metadata'] = None # Or some error indicator
-        return record_dict
+        return dict(record) # asyncpg handles jsonb decoding with codec
     except Exception as e: get_log.error("Failed to get document by ID (async)", error=str(e), exc_info=True); raise
 
 # LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH list_documents_paginated DB logic lightly
@@ -1827,11 +1844,7 @@ async def list_documents_paginated(conn: asyncpg.Connection, company_id: uuid.UU
             for r in rows:
                 row_dict = dict(r)
                 row_dict.pop('total_count', None)
-                # Ensure metadata is a dict or None
-                # metadata_val = row_dict.get('metadata')
-                # if isinstance(metadata_val, str):
-                #     try: row_dict['metadata'] = json.loads(metadata_val)
-                #     except json.JSONDecodeError: row_dict['metadata'] = None
+                # metadata should be dict due to codec
                 results.append(row_dict)
         list_log.debug("Fetched paginated documents (async)", count=len(results), total=total)
         return results, total
@@ -1839,8 +1852,7 @@ async def list_documents_paginated(conn: asyncpg.Connection, company_id: uuid.UU
 
 # LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH delete_document DB logic lightly
 async def delete_document(conn: asyncpg.Connection, doc_id: uuid.UUID, company_id: uuid.UUID) -> bool:
-    """Elimina un documento verificando la compañía (Async)."""
-    # Assumes ON DELETE CASCADE is set for document_chunks FK
+    """Elimina un documento verificando la compañía (Async). Assumes ON DELETE CASCADE."""
     query = "DELETE FROM documents WHERE id = $1 AND company_id = $2 RETURNING id;"
     delete_log = log.bind(document_id=str(doc_id), company_id=str(company_id))
     try:
@@ -2017,7 +2029,7 @@ async def health_check():
     """
     return PlainTextResponse("OK", status_code=fastapi_status.HTTP_200_OK)
 
-# --- Local execution ---
+# --- Local execution ----
 if __name__ == "__main__":
     port = 8001
     log_level_str = settings.LOG_LEVEL.lower()
@@ -2042,7 +2054,7 @@ class DocumentStatus(str, Enum):
     UPLOADED = "uploaded"
     PROCESSING = "processing"
     PROCESSED = "processed"
-    INDEXED = "indexed" # Podríamos unir processed e indexed
+    # INDEXED = "indexed" # Merged into PROCESSED
     ERROR = "error"
     PENDING = "pending"
 
@@ -3393,7 +3405,7 @@ structlog = "^24.1.0"
 google-cloud-storage = "^2.16.0"
 
 # --- ONNX Runtime ---
-onnxruntime = "^1.18.0"
+onnxruntime = "^1.18.0" # Check compatibility if needed
 
 # --- Core Processing Dependencies (v0.3.0) ---
 pymupdf = "^1.25.0"                # PyMuPDF for PDF extraction
@@ -3413,7 +3425,7 @@ h2 = "^4.1.0"
 
 # --- Synchronous DB Dependencies (Worker - Keep) ---
 sqlalchemy = "^2.0.28"
-psycopg2-binary = "^2.9.9"
+psycopg2-binary = "^2.9.9" # Use psycopg2-binary for ease of install
 
 # --- REMOVED Dependencies ---
 # fastembed = ">=0.2.1,<0.3.0"
