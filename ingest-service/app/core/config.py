@@ -28,6 +28,7 @@ MILVUS_DEFAULT_INDEX_PARAMS = '{"metric_type": "IP", "index_type": "HNSW", "para
 MILVUS_DEFAULT_SEARCH_PARAMS = '{"metric_type": "IP", "params": {"ef": 128}}'
 DEFAULT_EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_EMBEDDING_DIM = 384
+DEFAULT_TIKTOKEN_ENCODING = "cl100k_base" # Encoding for token counting
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -55,19 +56,13 @@ class Settings(BaseSettings):
     MILVUS_URI: str = Field(default=f"http://{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}")
     MILVUS_COLLECTION_NAME: str = MILVUS_DEFAULT_COLLECTION
     MILVUS_GRPC_TIMEOUT: int = 10
-    MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name"])
+    # Deprecated - Schema now defined directly in ingest_pipeline.py
+    # MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name"])
     MILVUS_CONTENT_FIELD: str = "content"
     MILVUS_EMBEDDING_FIELD: str = "embedding"
     MILVUS_CONTENT_FIELD_MAX_LENGTH: int = 20000 # Límite de bytes para el campo de texto en Milvus
     MILVUS_INDEX_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_INDEX_PARAMS))
     MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_SEARCH_PARAMS))
-
-    # --- MinIO (REMOVED) ---
-    # MINIO_ENDPOINT: str = Field(default=f"{MINIO_K8S_SVC}:{MINIO_K8S_PORT_DEFAULT}")
-    # MINIO_ACCESS_KEY: SecretStr
-    # MINIO_SECRET_KEY: SecretStr
-    # MINIO_BUCKET_NAME: str = MINIO_BUCKET_DEFAULT
-    # MINIO_USE_SECURE: bool = False
 
     # --- Google Cloud Storage (GCS) ---
     GCS_BUCKET_NAME: str = Field(default="atenex", description="Name of the Google Cloud Storage bucket for storing original files.")
@@ -76,6 +71,9 @@ class Settings(BaseSettings):
     # --- Embeddings (ACTUALIZADO) ---
     EMBEDDING_MODEL_ID: str = Field(default=DEFAULT_EMBEDDING_MODEL_ID)
     EMBEDDING_DIMENSION: int = Field(default=DEFAULT_EMBEDDING_DIM)
+
+    # --- Tokenizer ---
+    TIKTOKEN_ENCODING_NAME: str = Field(default=DEFAULT_TIKTOKEN_ENCODING, description="Name of the tiktoken encoding to use for token counting.")
 
     # --- Clients ---
     HTTP_CLIENT_TIMEOUT: int = 60
@@ -115,7 +113,6 @@ class Settings(BaseSettings):
         logging.debug(f"Using EMBEDDING_DIMENSION: {v}")
         return v
 
-    # @field_validator('POSTGRES_PASSWORD', 'MINIO_ACCESS_KEY', 'MINIO_SECRET_KEY', mode='before') # MODIFIED VALIDATOR
     @field_validator('POSTGRES_PASSWORD', mode='before')
     @classmethod
     def check_required_secret_value_present(cls, v: Any, info: ValidationInfo) -> Any:
@@ -158,16 +155,10 @@ try:
     temp_log.info(f"  MILVUS_URI:               {settings.MILVUS_URI}")
     temp_log.info(f"  MILVUS_COLLECTION_NAME:   {settings.MILVUS_COLLECTION_NAME}")
     temp_log.info(f"  MILVUS_GRPC_TIMEOUT:      {settings.MILVUS_GRPC_TIMEOUT}s")
-    # --- REMOVED MINIO LOGS ---
-    # temp_log.info(f"  MINIO_ENDPOINT:           {settings.MINIO_ENDPOINT}")
-    # temp_log.info(f"  MINIO_BUCKET_NAME:        {settings.MINIO_BUCKET_NAME}")
-    # temp_log.info(f"  MINIO_ACCESS_KEY:         {'*** SET ***' if settings.MINIO_ACCESS_KEY else '!!! NOT SET !!!'}")
-    # temp_log.info(f"  MINIO_SECRET_KEY:         {'*** SET ***' if settings.MINIO_SECRET_KEY else '!!! NOT SET !!!'}")
-    # temp_log.info(f"  MINIO_USE_SECURE:         {settings.MINIO_USE_SECURE}")
-    # --- ADDED GCS LOG ---
     temp_log.info(f"  GCS_BUCKET_NAME:          {settings.GCS_BUCKET_NAME}")
     temp_log.info(f"  EMBEDDING_MODEL_ID:       {settings.EMBEDDING_MODEL_ID}")
     temp_log.info(f"  EMBEDDING_DIMENSION:      {settings.EMBEDDING_DIMENSION}")
+    temp_log.info(f"  TIKTOKEN_ENCODING_NAME:   {settings.TIKTOKEN_ENCODING_NAME}")
     temp_log.info(f"  SUPPORTED_CONTENT_TYPES:  {settings.SUPPORTED_CONTENT_TYPES}")
     temp_log.info(f"  SPLITTER_CHUNK_SIZE:      {settings.SPLITTER_CHUNK_SIZE}")
     temp_log.info(f"  SPLITTER_CHUNK_OVERLAP:   {settings.SPLITTER_CHUNK_OVERLAP}")

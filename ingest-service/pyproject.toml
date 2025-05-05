@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "ingest-service"
-version = "0.3.0" # Incrementamos versión por refactorización MiniLM/PyMuPDF
+version = "0.3.0" # Version incrementada para reflejar cambios
 description = "Ingest service for Atenex B2B SaaS (Postgres/GCS/Milvus/SentenceTransformers - CPU - Prefork)"
 authors = ["Atenex Team <dev@atenex.com>"]
 readme = "README.md"
@@ -13,7 +13,6 @@ gunicorn = "^21.2.0"
 pydantic = {extras = ["email"], version = "^2.6.4"}
 pydantic-settings = "^2.2.1"
 celery = {extras = ["redis"], version = "^5.3.6"}
-# gevent ya no es necesario con prefork
 asyncpg = "^0.29.0" # Keep for API
 tenacity = "^8.2.3"
 python-multipart = "^0.0.9"
@@ -22,30 +21,31 @@ structlog = "^24.1.0"
 google-cloud-storage = "^2.16.0"
 
 # --- ONNX Runtime ---
-onnxruntime = "^1.18.0"
+onnxruntime = "^1.18.0" # Check compatibility if needed
 
-# --- Core Processing Dependencies (REFACTORIZADO) ---
+# --- Core Processing Dependencies (v0.3.0) ---
 pymupdf = "^1.25.0"                # PyMuPDF for PDF extraction
 sentence-transformers = "^2.7"     # For MiniLM embeddings
 pymilvus = ">=2.4.1,<2.5.0"         # Official Milvus client
+tiktoken = "^0.7.0"                # For token counting metadata
 
-# --- Converter Dependencies (Standalone - MANTENER) ---
-# pypdf = ">=4.0.1,<5.0.0"          # ELIMINADO/COMENTADO - Reemplazado por PyMuPDF
+# --- Converter Dependencies (Standalone - Keep) ---
 python-docx = ">=1.1.0,<2.0.0"
 markdown = ">=3.5.1,<4.0.0"
 beautifulsoup4 = ">=4.12.3,<5.0.0"
-html2text = ">=2024.1.0,<2025.0.0"  # For Markdown -> HTML -> Text conversion
+html2text = ">=2024.1.0,<2025.0.0"
 
-# --- HTTP Client (API - MANTENER) ---
+# --- HTTP Client (API - Keep) ---
 httpx = {extras = ["http2"], version = "^0.27.0"}
 h2 = "^4.1.0"
 
-# --- Synchronous DB Dependencies (Worker - MANTENER) ---
+# --- Synchronous DB Dependencies (Worker - Keep) ---
 sqlalchemy = "^2.0.28"
-psycopg2-binary = "^2.9.9"
+psycopg2-binary = "^2.9.9" # Use psycopg2-binary for ease of install
 
-# --- ELIMINADO ---
-# fastembed = ">=0.2.1,<0.3.0"      # ELIMINADO
+# --- REMOVED Dependencies ---
+# fastembed = ">=0.2.1,<0.3.0"
+# pypdf = ">=4.0.1,<5.0.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"

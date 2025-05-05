@@ -46,13 +46,23 @@ Este documento detalla el plan de refactorización para el `ingest-service` de A
 3.  **Sincronización con Milvus:** Los campos escalares en Milvus deben incluir los metadatos enriquecidos (además de `company_id`, `document_id`, `file_name`, `content`). El schema de Milvus debe ser actualizado.
 4.  **Consistencia de `chunk_count`:** El campo `chunk_count` en la tabla `documents` debe reflejar la cantidad de chunks *exitosamente* escritos tanto en PostgreSQL (`document_chunks`) como en Milvus.
 
-## 4. Plan Detallado de Refactorización
+## 4. Reglas de Oro para la Refactorización
 
-### 4.1. Base de Datos (PostgreSQL)
+*   **NO MODIFICAR RUTAS API:** El enrutamiento (`/api/v1/ingest/...`) y la forma en que se definen las rutas en `app/main.py` (`app.include_router`) son correctos y están integrados con el API Gateway. **NO CAMBIAR EL PREFIJO `/api/v1/ingest` NI LA LÓGICA DE INCLUSIÓN DEL ROUTER.**
+*   **MODIFICAR ENDPOINTS EXISTENTES CON CUIDADO:** Si necesitas cambiar la lógica interna de un endpoint (ej., `DELETE`), hazlo sin alterar su firma (path, método, parámetros esperados) a menos que sea absolutamente necesario y coordinado con el API Gateway y los clientes.
+*   **NUEVOS ENDPOINTS:** Si se requieren endpoints adicionales, agrégalos al router existente (`app/api/v1/endpoints/ingest.py`) siguiendo el patrón actual.
+*   **MANTENER OPERACIONES SÍNCRONAS EN WORKER:** El worker Celery (`process_document.py`) debe seguir realizando operaciones de base de datos (PostgreSQL) y almacenamiento (GCS/Milvus) de forma síncrona usando las librerías correspondientes (`SQLAlchemy`, `GCSClient sync methods`, `pymilvus`).
+*   **AISLAMIENTO:** Asegúrate de que todas las operaciones (DB, Milvus, GCS) estén correctamente aisladas por `company_id` y `document_id` donde corresponda.
+*   **ENFOQUE EN LO NECESARIO:** Edita solo las partes del código directamente implicadas en la persistencia de chunks en PG, generación de metadatos y sincronización con Milvus. Evita refactorizaciones cosméticas o cambios en lógica no relacionada para minimizar riesgos.
+
+## 5. Plan Detallado de Refactorización
+
+### 5.1. Base de Datos (PostgreSQL)
 
 *   **Acción:** Crear la tabla `document_chunks`.
 *   **SQL (Ejecutar como migración):**
     ```sql
+    -- Crear la tabla si no existe
     CREATE TABLE IF NOT EXISTS document_chunks (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         document_id UUID NOT NULL,
@@ -60,7 +70,7 @@ Este documento detalla el plan de refactorización para el `ingest-service` de A
         chunk_index INTEGER NOT NULL,
         content TEXT NOT NULL,
         metadata JSONB, -- Almacenará page, title, tokens, content_hash, etc.
-        embedding_id VARCHAR(255), -- PK de Milvus (VARCHAR si son strings, o BIGINT si son numéricos auto_id)
+        embedding_id VARCHAR(255), -- PK de Milvus (VARCHAR porque auto_id de Milvus suele ser string ahora, ajustar si es BIGINT)
         created_at TIMESTAMPTZ DEFAULT timezone('utc', now()),
         vector_status VARCHAR(50) DEFAULT 'pending', -- 'created', 'error'
 
@@ -78,143 +88,136 @@ Este documento detalla el plan de refactorización para el `ingest-service` de A
         UNIQUE (document_id, chunk_index) -- Un chunk específico por documento
     );
 
-    -- Índices Esenciales
+    -- Crear Índices Esenciales si no existen
     CREATE INDEX IF NOT EXISTS idx_document_chunks_document_id ON document_chunks(document_id);
     CREATE INDEX IF NOT EXISTS idx_document_chunks_company_id ON document_chunks(company_id);
-    CREATE INDEX IF NOT EXISTS idx_document_chunks_embedding_id ON document_chunks(embedding_id); -- Para buscar por ID de Milvus si es necesario
-
-    -- Índice para posible búsqueda de contenido (usado por BM25 de query-service)
-    -- Considerar tipo de índice según uso: GIN para búsquedas de texto completo si se usa tsvector
-    -- CREATE INDEX IF NOT EXISTS idx_document_chunks_content_gin ON document_chunks USING gin(to_tsvector('simple', content));
-    -- O un índice B-tree normal si solo se recupera por ID y BM25 se hace en memoria
-    -- No crear índice de texto completo aquí si BM25 construye índice en memoria en query-service
+    CREATE INDEX IF NOT EXISTS idx_document_chunks_embedding_id ON document_chunks(embedding_id); -- Para buscar por ID de Milvus
 
     -- Actualizar la tabla documents si falta error_message (verificado en README v0.2.0)
     ALTER TABLE documents ADD COLUMN IF NOT EXISTS error_message TEXT;
     ```
 *   **Verificar:** Asegurar que las FKs (especialmente a `documents`) y los tipos de datos sean correctos.
 
-### 4.2. Modelos (SQLAlchemy/Pydantic)
+### 5.2. Modelos (SQLAlchemy/Pydantic)
 
 *   **Acción:** Definir modelos/schemas para `DocumentChunk`.
-*   **SQLAlchemy (`app/db/models.py` - Nuevo archivo o existente):** Crear una clase `DocumentChunkOrm` que mapee a la tabla `document_chunks` para ser usada por el worker síncrono (SQLAlchemy).
-*   **Pydantic (`app/models/domain.py` o `schemas.py`):** Crear un schema `DocumentChunkData` para representar los datos de un chunk internamente antes de la inserción, incluyendo todos los metadatos.
+*   **SQLAlchemy (`app/db/postgres_client.py`):** Definición de la tabla `document_chunks_table` usando SQLAlchemy Core Metadata.
+*   **Pydantic (`app/models/domain.py`):** Crear schemas `DocumentChunkMetadata` y `DocumentChunkData` para representar los datos de un chunk internamente.
 
-### 4.3. Pipeline de Ingesta (`app/services/ingest_pipeline.py`)
+### 5.3. Pipeline de Ingesta (`app/services/ingest_pipeline.py`)
 
 *   **Extracción:**
-    *   Modificar `extract_text_from_pdf` (usando PyMuPDF) para devolver una estructura que incluya el texto *y* el número de página de origen. Podría devolver una lista de tuplas `(page_num, page_text)`.
-    *   Otros extractores (DOCX, TXT, etc.) podrían no tener noción de página; asignar un número de página genérico (e.g., 0 o 1) o manejarlo como Nulo.
+    *   Modificar `extract_text_from_pdf` para devolver `List[Tuple[int, str]]` (page_num, page_text).
+    *   Otros extractores devuelven `str`.
 *   **Chunking (`app/services/text_splitter.py` / `ingest_pipeline.py`):**
-    *   La lógica de chunking *debe* preservar la asociación con el número de página original.
-    *   En lugar de juntar todo el texto y luego dividirlo, iterar sobre las páginas (si aplica), dividir el texto de cada página y mantener el `page_num` asociado a cada chunk resultante.
-    *   Modificar `split_text` para que opcionalmente acepte metadatos iniciales (como `page_num`) o manejar la asociación en el bucle que llama al splitter en `ingest_document_pipeline`.
+    *   Adaptar `ingest_document_pipeline` para iterar sobre el contenido extraído (texto único o lista de páginas).
+    *   Llamar a `split_text` para cada bloque/página.
+    *   Asociar `page_num` a los chunks resultantes.
 *   **Generación de Metadatos:**
-    *   *Después* de obtener los chunks de texto:
-        *   Calcular `tokens` para cada chunk (ej., `import tiktoken; enc = tiktoken.get_encoding("cl100k_base"); len(enc.encode(chunk_text))`).
-        *   Calcular `content_hash` (ej., `import hashlib; hashlib.sha256(chunk_text.encode()).hexdigest()`).
-        *   Extraer `page` (del paso de chunking).
-        *   Generar `title` (heurística simple: primeras N palabras, o `Document X, Page Y, Chunk Z`).
-        *   Empaquetar estos metadatos en un diccionario para el campo `metadata` JSONB.
-*   **Estructura de Datos:** Crear una lista de objetos `DocumentChunkData` (o diccionarios) que contengan `content` y el `metadata` enriquecido.
+    *   En `ingest_document_pipeline`, *después* de obtener los chunks de texto:
+        *   Calcular `tokens` (usando `tiktoken`).
+        *   Calcular `content_hash` (SHA256).
+        *   Asignar `page`.
+        *   Generar `title` (heurística).
+        *   Empaquetar en objeto `DocumentChunkMetadata`.
+*   **Estructura de Datos:** Crear lista de `DocumentChunkData` (Pydantic).
 *   **Milvus Insertion:**
-    *   Asegurarse de que el schema de Milvus (`_create_milvus_collection`) incluya los nuevos campos escalares (`page INT64`, `title VARCHAR`, `tokens INT64`, `content_hash VARCHAR`).
-    *   Modificar `collection.insert(data_to_insert)`:
-        *   `data_to_insert` debe ser una lista de listas/arrays, donde cada sublista corresponde a un campo del schema (vector, content, company_id, document_id, file_name, **page**, **title**, **tokens**, **content_hash**).
-        *   **IMPORTANTE:** Capturar los `ids` (Primary Keys) devueltos por `mutation_result = collection.insert(...)`. Estos son los `embedding_id` que se necesitan para PostgreSQL. `mutation_result.primary_keys` contendrá la lista de PKs generados por Milvus (si `auto_id=True`).
-    *   Devolver la lista de `embedding_id`s generados junto con el `inserted_count` desde `ingest_document_pipeline`.
+    *   Asegurar que el schema Milvus (`_create_milvus_collection`) incluya `page`, `title`, `tokens`, `content_hash`. **PK cambiado a VARCHAR.**
+    *   Modificar `collection.insert()`:
+        *   Usar PKs customizados (ej: `f"{document_id}_{chunk_index}"`).
+        *   Incluir los nuevos campos escalares en `data_to_insert`.
+        *   Validar `mutation_result.insert_count` y `mutation_result.primary_keys`.
+    *   Devolver `(inserted_count, primary_keys, processed_chunk_data_list)` desde `ingest_document_pipeline`.
 
-### 4.4. Persistencia de Chunks en PostgreSQL (`app/tasks/process_document.py` / `app/db/postgres_client.py`)
+### 5.4. Persistencia de Chunks en PostgreSQL (`app/tasks/process_document.py` / `app/db/postgres_client.py`)
 
 *   **Nueva Función DB (`postgres_client.py`):**
     *   Crear `bulk_insert_chunks_sync(engine: Engine, chunks_data: List[Dict[str, Any]]) -> int`.
-    *   `chunks_data` será una lista de diccionarios, cada uno representando un chunk e incluyendo `document_id`, `company_id`, `chunk_index`, `content`, `metadata` (JSONB), `embedding_id` (el PK de Milvus), `vector_status`.
-    *   Utilizar SQLAlchemy Core (`engine.connect()`, `connection.execute(table.insert().values(chunks_data))`) para realizar una inserción masiva eficiente. Manejar la serialización JSONB para `metadata`.
-    *   Devolver el número de filas insertadas.
+    *   Usar SQLAlchemy Core (`document_chunks_table.insert()`) para inserción masiva.
+    *   Manejar serialización JSONB.
+    *   Devolver número de filas insertadas.
 *   **Tarea Celery (`process_document.py`):**
-    *   Llamar a `ingest_document_pipeline`. Si tiene éxito, devolverá `(inserted_milvus_count, milvus_pks)`.
-    *   Construir la lista `chunks_data` para la inserción en PostgreSQL, asegurándose de incluir los `milvus_pks` como `embedding_id`.
-    *   Llamar a `bulk_insert_chunks_sync` con `chunks_data`.
-    *   **Manejo de Errores:** Si la inserción en Milvus tiene éxito pero la inserción en PostgreSQL falla, el estado del documento debe ser `ERROR`. Idealmente, se deberían eliminar los chunks de Milvus para mantener la consistencia, o marcar los chunks en PG con un estado de error vectorial. Por simplicidad inicial, marcar el documento como `ERROR` si la inserción en PG falla.
-    *   **Status Final:** Actualizar `documents.status` a `PROCESSED` y `documents.chunk_count` con el número de chunks *exitosamente insertados en PostgreSQL* (devuelto por `bulk_insert_chunks_sync`).
+    *   Llamar a `ingest_document_pipeline` para obtener `(inserted_milvus_count, milvus_pks, processed_chunks_data)`.
+    *   Construir `chunks_for_pg` (lista de dicts) a partir de `processed_chunks_data`, asignando `embedding_id`.
+    *   Llamar a `bulk_insert_chunks_sync` con `chunks_for_pg`.
+    *   **Manejo de Errores:** Si `bulk_insert_chunks_sync` falla, loguear error crítico, intentar eliminar de Milvus (`delete_milvus_chunks`), marcar documento como `ERROR`, y lanzar `Reject`.
+    *   **Status Final:** Actualizar `documents.status` a `PROCESSED` y `documents.chunk_count` con el resultado de `bulk_insert_chunks_sync`.
 
-### 4.5. Schema Milvus (`app/services/ingest_pipeline.py`)
+### 5.5. Schema Milvus (`app/services/ingest_pipeline.py`)
 
 *   **Acción:** Modificar `_create_milvus_collection`.
-*   Añadir los `FieldSchema` para `page`, `title`, `tokens`, `content_hash` con los `DataType` apropiados (e.g., `INT64`, `VARCHAR`, `VARCHAR`).
-*   **Opcional:** Considerar añadir índices (`collection.create_index`) a estos campos escalares si se prevé filtrar por ellos en el futuro, aunque no es un requisito inmediato del `query-service` v0.3.0.
+*   Añadir `FieldSchema` para `page`, `title`, `tokens`, `content_hash`.
+*   Cambiar `MILVUS_PK_FIELD` a `DataType.VARCHAR`.
+*   **Opcional:** Añadir índices escalares para los nuevos campos.
 
-### 4.6. Manejo de Errores (General)
+### 5.6. Manejo de Errores (General)
 
-*   Reforzar el manejo de excepciones en `process_document_standalone` para diferenciar entre fallos de descarga (GCS), extracción, chunking, embedding, inserción en Milvus e inserción en PostgreSQL.
-*   Asegurar que el estado final del documento (`documents.status`, `documents.error_message`) refleje correctamente dónde ocurrió el fallo.
-*   Si falla la inserción en PostgreSQL después de Milvus, intentar una operación de compensación (eliminar de Milvus) o, como mínimo, loguear un error crítico y marcar el documento como erróneo.
+*   Reforzar manejo de excepciones en `process_document_standalone`.
+*   Asegurar que `documents.error_message` sea descriptivo.
+*   Implementar intento de limpieza de Milvus si falla la inserción en PG.
 
-### 4.7. API Endpoints (`app/api/v1/endpoints/ingest.py`)
+### 5.7. API Endpoints (`app/api/v1/endpoints/ingest.py`)
 
 *   **`GET /status/{id}` y `GET /status`:**
-    *   No requieren cambios funcionales *inmediatos*, ya que verifican GCS y Milvus.
-    *   **Mejora Opcional Futura:** Podrían añadir una verificación de consistencia comparando `documents.chunk_count` con el conteo real en `document_chunks` (PostgreSQL), además de Milvus.
-    *   El valor `chunk_count` devuelto ahora debe ser el validado tras la escritura en PostgreSQL.
+    *   Sin cambios funcionales requeridos inmediatamente. `chunk_count` reflejará el conteo de PG.
 *   **`DELETE /{document_id}`:**
-    *   Actualmente elimina de Milvus, GCS y `documents`.
-    *   **Modificación:** Debe asegurarse de que la eliminación en cascada (`ON DELETE CASCADE`) en la FK de `document_chunks` funcione correctamente al eliminar el registro de `documents`. Si no se usa `CASCADE`, se debe añadir un paso explícito para eliminar los registros de `document_chunks` *antes* de eliminar el registro de `documents`.
+    *   Verificar que `ON DELETE CASCADE` en FK de `document_chunks` esté funcionando. (Confirmado: Sí está en el SQL).
 
-### 4.8. Configuración (`app/core/config.py`)
+### 5.8. Configuración (`app/core/config.py`)
 
-*   Añadir `TIKTOKEN_ENCODING_NAME` (ej. `"cl100k_base"`) si se usa `tiktoken`.
-*   Verificar/actualizar `MILVUS_METADATA_FIELDS` si es necesario (aunque la inserción ahora es más explícita).
+*   Añadir `TIKTOKEN_ENCODING_NAME`.
+*   Eliminar `MILVUS_METADATA_FIELDS` (obsoleto).
 
-### 4.9. Dependencias (`pyproject.toml`)
+### 5.9. Dependencias (`pyproject.toml`)
 
-*   Añadir `tiktoken` si se decide usarlo para el conteo de tokens.
-*   Verificar que `sqlalchemy`, `psycopg2-binary`, `pymilvus`, `google-cloud-storage`, `sentence-transformers`, `pymupdf`, etc., estén presentes y en versiones compatibles.
+*   Añadir `tiktoken`.
+*   Verificar/actualizar versiones.
 
-## 5. Consideraciones Adicionales
+## 6. Consideraciones Adicionales
 
-*   **Transaccionalidad:** No hay transacciones distribuidas fáciles entre Milvus y PostgreSQL. Se priorizará marcar el documento como `ERROR` si hay inconsistencias (ej., éxito en Milvus, fallo en PG). Podría implementarse un job de limpieza periódico para documentos en error.
-*   **Rendimiento:** La inserción masiva (`bulk_insert_chunks_sync`) es crucial para el rendimiento del worker. Monitorizar tiempos de procesamiento.
-*   **Retrocompatibilidad:** Los documentos ingeridos con v0.2.0 no tendrán datos en la tabla `document_chunks`. El `query-service` debe ser consciente de esto (BM25 solo funcionará para documentos nuevos/re-ingeridos) o se debe planificar una re-ingesta.
+*   **Transaccionalidad:** Priorizar marcar como `ERROR` en caso de inconsistencia Milvus/PG. Considerar job de limpieza.
+*   **Rendimiento:** Monitorizar `bulk_insert_chunks_sync`.
+*   **Retrocompatibilidad:** Documentos antiguos no tendrán chunks en PG. `query-service` debe manejarlo. Considerar re-ingesta.
 
-## 6. Checklist de Refactorización v0.3.0
+## 7. Checklist de Refactorización v0.3.0 (Actualizado)
 
 **Base de Datos (PostgreSQL):**
 
-*   [ ] Definir y aplicar migración SQL para crear tabla `document_chunks` con todas las columnas, FKs e índices.
-*   [ ] Verificar/Añadir columna `error_message` a tabla `documents`.
-*   [ ] Crear función síncrona `bulk_insert_chunks_sync` en `postgres_client.py` usando SQLAlchemy.
+*   [X] Definir y aplicar migración SQL para crear tabla `document_chunks` con todas las columnas, FKs e índices.
+*   [X] Verificar/Añadir columna `error_message` a tabla `documents`.
+*   [X] Crear función síncrona `bulk_insert_chunks_sync` en `postgres_client.py` usando SQLAlchemy.
 
 **Código:**
 
 *   **Modelos:**
-    *   [ ] Definir modelo SQLAlchemy `DocumentChunkOrm`.
-    *   [ ] Definir schema Pydantic `DocumentChunkData`.
+    *   [X] Definir definición de tabla `document_chunks_table` en `postgres_client.py` (SQLAlchemy Core).
+    *   [X] Definir schemas Pydantic `DocumentChunkMetadata`, `DocumentChunkData`, `ChunkVectorStatus` en `app/models/domain.py`.
 *   **Servicios (`app/services/`):**
-    *   [ ] Modificar extractores (especialmente PDF) para devolver metadatos (ej. `page`).
-    *   [ ] Adaptar lógica de chunking para preservar/asociar metadatos (`page`).
-    *   [ ] Añadir lógica en `ingest_pipeline.py` para generar metadatos (`tokens`, `content_hash`, `title`).
-    *   [ ] Modificar `ingest_document_pipeline` para estructurar datos enriquecidos.
-    *   [ ] Actualizar inserción en Milvus (`collection.insert`) en `ingest_pipeline.py` para incluir nuevos campos escalares.
-    *   [ ] Capturar y devolver los PKs de Milvus (`embedding_id`) desde `ingest_document_pipeline`.
-    *   [ ] Modificar schema Milvus (`_create_milvus_collection`) para incluir nuevos campos escalares.
+    *   [X] Modificar extractor PDF (`pdf_extractor.py`) para devolver `List[Tuple[int, str]]`.
+    *   [X] Adaptar lógica de chunking en `ingest_pipeline.py` para preservar/asociar metadatos (`page`).
+    *   [X] Añadir lógica en `ingest_pipeline.py` para generar metadatos (`tokens`, `content_hash`, `title`).
+    *   [X] Modificar `ingest_document_pipeline` para estructurar datos enriquecidos en `DocumentChunkData`.
+    *   [X] Actualizar inserción en Milvus (`collection.insert`) en `ingest_pipeline.py` para incluir nuevos campos escalares y usar PK VARCHAR.
+    *   [X] Capturar y devolver los PKs de Milvus (`embedding_id`) desde `ingest_document_pipeline`.
+    *   [X] Modificar schema Milvus (`_create_milvus_collection`) para incluir nuevos campos escalares y PK VARCHAR.
 *   **Tareas Celery (`app/tasks/process_document.py`):**
-    *   [ ] Modificar `process_document_standalone` para llamar a `ingest_document_pipeline` y recibir `(count, pks)`.
-    *   [ ] Preparar `chunks_data` con `embedding_id` de Milvus.
-    *   [ ] Llamar a `bulk_insert_chunks_sync` para guardar chunks en PostgreSQL.
-    *   [ ] Actualizar `documents.status` y `documents.chunk_count` basado en el resultado de la inserción en PG.
-    *   [ ] Mejorar manejo de errores (fallo PG post-Milvus).
+    *   [X] Modificar `process_document_standalone` para llamar a `ingest_document_pipeline` y recibir `(count, pks, chunk_data)`.
+    *   [X] Preparar `chunks_for_pg` (lista de dicts) con `embedding_id` de Milvus.
+    *   [X] Llamar a `bulk_insert_chunks_sync` para guardar chunks en PostgreSQL.
+    *   [X] Actualizar `documents.status` y `documents.chunk_count` basado en el resultado de la inserción en PG.
+    *   [X] Mejorar manejo de errores (fallo PG post-Milvus, intentar limpieza Milvus).
 *   **API (`app/api/v1/endpoints/ingest.py`):**
-    *   [ ] Revisar/Adaptar `DELETE /{document_id}` para asegurar limpieza de `document_chunks` (vía CASCADE o explícita).
-    *   [ ] (Opcional) Considerar añadir chequeo de conteo en `document_chunks` (PG) en endpoints de status.
+    *   [X] Revisar/Adaptar `DELETE /{document_id}` para asegurar limpieza de `document_chunks` (Confirmado: `CASCADE` ok).
+    *   [ ] (Opcional) Considerar añadir chequeo de conteo en `document_chunks` (PG) en endpoints de status. (Pospuesto)
 
 **Configuración y Dependencias:**
 
-*   [ ] Añadir `tiktoken` a `pyproject.toml` si se usa.
-*   [ ] Verificar todas las dependencias (`pyproject.toml`).
-*   [ ] Actualizar `settings` (`config.py`) si es necesario.
+*   [X] Añadir `tiktoken` a `pyproject.toml`.
+*   [X] Verificar todas las dependencias (`pyproject.toml`).
+*   [X] Actualizar `settings` (`config.py`) - Añadido `TIKTOKEN_ENCODING_NAME`.
 
 **Testing y Documentación:**
 
-*   [ ] Añadir/Actualizar tests unitarios para las nuevas funciones (DB, pipeline).
-*   [ ] Añadir/Actualizar tests de integración para el flujo completo de ingesta.
-*   [ ] Actualizar README.md de `ingest-service` para reflejar la nueva arquitectura (v0.3.0).
+*   [ ] Actualizar README.md de `ingest-service` para reflejar la nueva arquitectura (v0.3.0). (Pendiente - Hacer después de merge)
+
+**Progreso General:** ¡La refactorización principal del código está completa según el plan! Quedan pendientes los tests y la actualización de la documentación principal.

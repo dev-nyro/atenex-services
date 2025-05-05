@@ -6,10 +6,13 @@ import structlog
 import json
 from datetime import datetime, timezone
 
-# --- Synchronous Imports (Added for Step 4.3) ---
-from sqlalchemy import create_engine, text, Engine, Connection
+# --- Synchronous Imports ---
+from sqlalchemy import (
+    create_engine, text, Engine, Connection, Table, MetaData, Column,
+    Uuid, Integer, Text, JSON, String, DateTime, UniqueConstraint, ForeignKeyConstraint, Index
+)
+from sqlalchemy.dialects.postgresql import insert as pg_insert, JSONB # Use JSONB
 from sqlalchemy.exc import SQLAlchemyError
-# --- End Synchronous Imports ---
 
 from app.core.config import settings
 from app.models.domain import DocumentStatus
@@ -23,8 +26,31 @@ _pool: Optional[asyncpg.Pool] = None
 _sync_engine: Optional[Engine] = None
 _sync_engine_dsn: Optional[str] = None
 
+# --- Sync SQLAlchemy Metadata ---
+_metadata = MetaData()
+document_chunks_table = Table(
+    'document_chunks',
+    _metadata,
+    Column('id', Uuid(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")), # Use Uuid type
+    Column('document_id', Uuid(as_uuid=True), nullable=False),
+    Column('company_id', Uuid(as_uuid=True), nullable=False),
+    Column('chunk_index', Integer, nullable=False),
+    Column('content', Text, nullable=False),
+    Column('metadata', JSONB), # Use JSONB for better indexing/querying if needed
+    Column('embedding_id', String(255)), # Milvus PK (often string)
+    Column('created_at', DateTime(timezone=True), server_default=text("timezone('utc', now())")),
+    Column('vector_status', String(50), default='pending'),
+    UniqueConstraint('document_id', 'chunk_index', name='uq_document_chunk_index'),
+    ForeignKeyConstraint(['document_id'], ['documents.id'], name='fk_document_chunks_document', ondelete='CASCADE'),
+    # Optional FK to companies table
+    # ForeignKeyConstraint(['company_id'], ['companies.id'], name='fk_document_chunks_company', ondelete='CASCADE'),
+    Index('idx_document_chunks_document_id', 'document_id'), # Explicit index definition
+    Index('idx_document_chunks_company_id', 'company_id'),
+    Index('idx_document_chunks_embedding_id', 'embedding_id'),
+)
 
-# --- Async Pool Management (No changes) ---
+
+# --- Async Pool Management ---
 # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - DB Async Pool Management
 async def get_db_pool() -> asyncpg.Pool:
     global _pool
@@ -41,7 +67,14 @@ async def get_db_pool() -> asyncpg.Pool:
                 return json.dumps(value)
 
             def _json_decoder(value):
-                return json.loads(value)
+                # Handle potential double-encoded JSON if DB returns string
+                if isinstance(value, str):
+                    try:
+                        return json.loads(value)
+                    except json.JSONDecodeError:
+                         log.warning("Failed to decode JSON string from DB", raw_value=value)
+                         return None # Or return the raw string?
+                return value # Assume it's already decoded by asyncpg
 
             async def init_connection(conn):
                 await conn.set_type_codec(
@@ -49,7 +82,7 @@ async def get_db_pool() -> asyncpg.Pool:
                     encoder=_json_encoder,
                     decoder=_json_decoder,
                     schema='pg_catalog',
-                    format='text'
+                    format='text' # Important for custom encoder/decoder
                 )
                 await conn.set_type_codec(
                     'json',
@@ -70,23 +103,15 @@ async def get_db_pool() -> asyncpg.Pool:
                 timeout=30.0,
                 command_timeout=60.0,
                 init=init_connection,
-                statement_cache_size=0
+                statement_cache_size=0 # Disable cache for safety with type codecs
             )
             log.info("PostgreSQL async connection pool created successfully.")
         except (asyncpg.exceptions.InvalidPasswordError, OSError, ConnectionRefusedError) as conn_err:
-            log.critical(
-                "CRITICAL: Failed to connect to PostgreSQL (async pool)",
-                error=str(conn_err),
-                exc_info=True
-            )
+            log.critical("CRITICAL: Failed to connect to PostgreSQL (async pool)", error=str(conn_err), exc_info=True)
             _pool = None
             raise ConnectionError(f"Failed to connect to PostgreSQL (async pool): {conn_err}") from conn_err
         except Exception as e:
-            log.critical(
-                "CRITICAL: Failed to create PostgreSQL async connection pool",
-                error=str(e),
-                exc_info=True
-            )
+            log.critical("CRITICAL: Failed to create PostgreSQL async connection pool", error=str(e), exc_info=True)
             _pool = None
             raise RuntimeError(f"Failed to create PostgreSQL async pool: {e}") from e
     return _pool
@@ -117,36 +142,31 @@ async def check_db_connection() -> bool:
 # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - DB Async Pool Management
 
 
-# --- Synchronous Engine Management (Added for Step 4.3) ---
+# --- Synchronous Engine Management ---
 # LLM_FLAG: SENSITIVE_CODE_BLOCK_START - DB Sync Engine Management
 def get_sync_engine() -> Engine:
     """
     Creates and returns a SQLAlchemy synchronous engine instance.
     Caches the engine globally per process.
-    Requires `sqlalchemy` and `psycopg2-binary` to be installed.
     """
     global _sync_engine, _sync_engine_dsn
     sync_log = log.bind(component="SyncEngine")
 
-    # Construct DSN only once or if settings changed (not really possible here, but good practice)
     if not _sync_engine_dsn:
          _sync_engine_dsn = f"postgresql+psycopg2://{settings.POSTGRES_USER}:{settings.POSTGRES_PASSWORD.get_secret_value()}@{settings.POSTGRES_SERVER}:{settings.POSTGRES_PORT}/{settings.POSTGRES_DB}"
 
     if _sync_engine is None:
         sync_log.info("Creating SQLAlchemy synchronous engine...")
         try:
-            # Example pool settings for sync engine (adjust based on worker concurrency)
-            # `pool_size` should ideally match or be slightly larger than Celery worker concurrency (`-c`)
-            # `max_overflow` allows temporary extra connections under load.
             _sync_engine = create_engine(
                 _sync_engine_dsn,
-                pool_size=5, # Example: Start with slightly more than worker -c 4
+                pool_size=5,
                 max_overflow=5,
-                pool_timeout=30, # Seconds to wait for a connection from the pool
-                pool_recycle=1800 # Recycle connections older than 30 mins
-                # Add connect_args for SSL if needed: connect_args={'sslmode': 'require'}
+                pool_timeout=30,
+                pool_recycle=1800,
+                json_serializer=json.dumps, # Ensure JSON is serialized correctly
+                json_deserializer=json.loads # Ensure JSON is deserialized correctly
             )
-            # Optional: Test connection on creation
             with _sync_engine.connect() as conn_test:
                 conn_test.execute(text("SELECT 1"))
             sync_log.info("SQLAlchemy synchronous engine created and tested successfully.")
@@ -155,7 +175,7 @@ def get_sync_engine() -> Engine:
             raise RuntimeError("Missing SQLAlchemy/psycopg2 dependency") from ie
         except SQLAlchemyError as sa_err:
             sync_log.critical("Failed to create or connect SQLAlchemy synchronous engine", error=str(sa_err), exc_info=True)
-            _sync_engine = None # Ensure it's None on failure
+            _sync_engine = None
             raise ConnectionError(f"Failed to connect sync engine: {sa_err}") from sa_err
         except Exception as e:
              sync_log.critical("Unexpected error creating SQLAlchemy synchronous engine", error=str(e), exc_info=True)
@@ -176,8 +196,9 @@ def dispose_sync_engine():
 # LLM_FLAG: SENSITIVE_CODE_BLOCK_END - DB Sync Engine Management
 
 
-# --- Synchronous Document Operations (Added for Step 4.3) ---
-# LLM_FLAG: FUNCTIONAL_CODE - Synchronous DB update function
+# --- Synchronous Document Operations ---
+
+# LLM_FLAG: FUNCTIONAL_CODE - Synchronous DB update function for documents table
 def set_status_sync(
     engine: Engine,
     document_id: uuid.UUID,
@@ -187,7 +208,6 @@ def set_status_sync(
 ) -> bool:
     """
     Synchronously updates the status, chunk_count, and/or error_message of a document.
-    Uses SQLAlchemy Core API with the provided synchronous engine.
     """
     update_log = log.bind(document_id=str(document_id), new_status=status.value, component="SyncDBUpdate")
     update_log.debug("Attempting synchronous DB status update.")
@@ -203,23 +223,19 @@ def set_status_sync(
         set_clauses.append("chunk_count = :chunk_count")
         params["chunk_count"] = chunk_count
 
-    # Explicitly set error message based on status
     if status == DocumentStatus.ERROR:
         set_clauses.append("error_message = :error_message")
         params["error_message"] = error_message
     else:
-        # Clear error message if status is not ERROR
         set_clauses.append("error_message = NULL")
-        # params["error_message"] = None # Not needed if using NULL directly
 
     set_clause_str = ", ".join(set_clauses)
     query = text(f"UPDATE documents SET {set_clause_str} WHERE id = :doc_id")
 
     try:
         with engine.connect() as connection:
-            with connection.begin(): # Start transaction
+            with connection.begin():
                 result = connection.execute(query, params)
-
             if result.rowcount == 0:
                 update_log.warning("Attempted to update status for non-existent document_id (sync).")
                 return False
@@ -227,28 +243,80 @@ def set_status_sync(
                 update_log.info("Document status updated successfully in PostgreSQL (sync).", updated_fields=set_clauses)
                 return True
             else:
-                 # Should not happen with WHERE id = :doc_id
                  update_log.error("Unexpected number of rows updated (sync).", row_count=result.rowcount)
-                 return False # Or raise an error?
-
+                 return False
     except SQLAlchemyError as e:
         update_log.error("SQLAlchemyError during synchronous status update", error=str(e), query=str(query), params=params, exc_info=True)
-        # Depending on the error, this might indicate a connection issue or SQL error.
-        # Re-raise as a standard Exception to be caught by Celery's retry logic if applicable.
         raise Exception(f"Sync DB update failed: {e}") from e
     except Exception as e:
         update_log.error("Unexpected error during synchronous status update", error=str(e), query=str(query), params=params, exc_info=True)
         raise Exception(f"Unexpected sync DB update error: {e}") from e
 
+# LLM_FLAG: NEW FUNCTION - Synchronous bulk chunk insertion for document_chunks table
+def bulk_insert_chunks_sync(engine: Engine, chunks_data: List[Dict[str, Any]]) -> int:
+    """
+    Synchronously inserts multiple document chunks into the document_chunks table.
+    Uses SQLAlchemy Core API for efficient bulk insertion.
+    """
+    if not chunks_data:
+        log.warning("bulk_insert_chunks_sync called with empty data list.")
+        return 0
 
-# --- Async Document Operations (No changes needed for these) ---
+    insert_log = log.bind(component="SyncDBBulkInsert", num_chunks=len(chunks_data), document_id=chunks_data[0].get('document_id'))
+    insert_log.info("Attempting synchronous bulk insert of document chunks.")
+
+    # Convert UUIDs to strings if they are UUID objects, as psycopg2 might expect strings
+    # and handle metadata dict serialization
+    prepared_data = []
+    for chunk in chunks_data:
+        prepared_chunk = chunk.copy()
+        if isinstance(prepared_chunk.get('document_id'), uuid.UUID):
+            prepared_chunk['document_id'] = str(prepared_chunk['document_id'])
+        if isinstance(prepared_chunk.get('company_id'), uuid.UUID):
+             prepared_chunk['company_id'] = str(prepared_chunk['company_id'])
+        # Ensure metadata is serializable (SQLAlchemy handles dict -> JSONB well with json_serializer)
+        if 'metadata' in prepared_chunk and not isinstance(prepared_chunk['metadata'], (dict, list, type(None))):
+             log.warning("Invalid metadata type for chunk, attempting conversion", chunk_index=prepared_chunk.get('chunk_index'))
+             prepared_chunk['metadata'] = {} # Default to empty dict on error
+
+        prepared_data.append(prepared_chunk)
+
+
+    try:
+        with engine.connect() as connection:
+            with connection.begin(): # Start transaction
+                # Using Core Table object for insert
+                # Ensure column names match exactly those in the prepared_data dict keys
+                stmt = document_chunks_table.insert().values(prepared_data)
+                # Optional: ON CONFLICT DO NOTHING based on the unique constraint
+                stmt = stmt.on_conflict_do_nothing(
+                     index_elements=['document_id', 'chunk_index']
+                )
+                result = connection.execute(stmt)
+
+            # rowcount might not be reliable with ON CONFLICT DO NOTHING
+            # We assume success if no exception is raised.
+            # To get the actual inserted count, a SELECT COUNT(*) or RETURNING clause might be needed,
+            # but complicates the bulk insert. For now, return the intended count on success.
+            inserted_count = len(prepared_data) # Assuming all were inserted or ignored successfully
+            insert_log.info("Bulk insert statement executed successfully.", intended_count=len(prepared_data), reported_rowcount=result.rowcount)
+            return inserted_count
+
+    except SQLAlchemyError as e:
+        insert_log.error("SQLAlchemyError during synchronous bulk chunk insert", error=str(e), exc_info=True)
+        raise Exception(f"Sync DB bulk chunk insert failed: {e}") from e
+    except Exception as e:
+        insert_log.error("Unexpected error during synchronous bulk chunk insert", error=str(e), exc_info=True)
+        raise Exception(f"Unexpected sync DB bulk chunk insert error: {e}") from e
+
+
+# --- Async Document Operations ---
 
 # LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH create_document_record DB logic lightly
 async def create_document_record(
     conn: asyncpg.Connection,
     doc_id: uuid.UUID,
     company_id: uuid.UUID,
-    # user_id: uuid.UUID,  # REMOVED Parameter
     filename: str,
     file_type: str,
     file_path: str,
@@ -267,8 +335,8 @@ async def create_document_record(
         NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC'
     );
     """
-    metadata_db = json.dumps(metadata) if metadata else None
-    params = [ doc_id, company_id, filename, file_type, file_path, metadata_db, status.value, 0 ]
+    # asyncpg handles dict -> jsonb directly with codec
+    params = [ doc_id, company_id, filename, file_type, file_path, metadata, status.value, 0 ]
     insert_log = log.bind(company_id=str(company_id), filename=filename, doc_id=str(doc_id))
     try:
         await conn.execute(query, *params)
@@ -353,7 +421,7 @@ async def get_document_by_id(conn: asyncpg.Connection, doc_id: uuid.UUID, compan
     try:
         record = await conn.fetchrow(query, doc_id, company_id)
         if not record: get_log.warning("Document not found or company mismatch (async)"); return None
-        return dict(record)
+        return dict(record) # asyncpg handles jsonb decoding with codec
     except Exception as e: get_log.error("Failed to get document by ID (async)", error=str(e), exc_info=True); raise
 
 # LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH list_documents_paginated DB logic lightly
@@ -363,118 +431,31 @@ async def list_documents_paginated(conn: asyncpg.Connection, company_id: uuid.UU
     list_log = log.bind(company_id=str(company_id), limit=limit, offset=offset)
     try:
         rows = await conn.fetch(query, company_id, limit, offset); total = 0; results = []
-        if rows: total = rows[0]['total_count']; results = [dict(r) for r in rows]; [r.pop('total_count', None) for r in results]
+        if rows:
+            total = rows[0]['total_count']
+            results = []
+            for r in rows:
+                row_dict = dict(r)
+                row_dict.pop('total_count', None)
+                # metadata should be dict due to codec
+                results.append(row_dict)
         list_log.debug("Fetched paginated documents (async)", count=len(results), total=total)
         return results, total
     except Exception as e: list_log.error("Failed to list paginated documents (async)", error=str(e), exc_info=True); raise
 
 # LLM_FLAG: FUNCTIONAL_CODE - DO NOT TOUCH delete_document DB logic lightly
 async def delete_document(conn: asyncpg.Connection, doc_id: uuid.UUID, company_id: uuid.UUID) -> bool:
-    """Elimina un documento verificando la compañía (Async)."""
+    """Elimina un documento verificando la compañía (Async). Assumes ON DELETE CASCADE."""
     query = "DELETE FROM documents WHERE id = $1 AND company_id = $2 RETURNING id;"
     delete_log = log.bind(document_id=str(doc_id), company_id=str(company_id))
     try:
         deleted_id = await conn.fetchval(query, doc_id, company_id)
-        if deleted_id: delete_log.info("Document deleted from PostgreSQL (async)", deleted_id=str(deleted_id)); return True
-        else: delete_log.warning("Document not found or company mismatch during delete attempt (async)."); return False
-    except Exception as e: delete_log.error("Error deleting document record (async)", error=str(e), exc_info=True); raise
-
-# --- Chat Functions (Placeholder - Likely Unused, No Changes Needed) ---
-# LLM_FLAG: SENSITIVE_CODE_BLOCK_START - Chat Functions (Likely Unused)
-async def create_chat(user_id: uuid.UUID, company_id: uuid.UUID, title: Optional[str] = None) -> uuid.UUID:
-    pool = await get_db_pool()
-    chat_id = uuid.uuid4()
-    query = """
-    INSERT INTO chats (id, user_id, company_id, title, created_at, updated_at)
-    VALUES ($1, $2, $3, $4, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC')
-    RETURNING id;
-    """
-    try:
-        async with pool.acquire() as conn:
-            result = await conn.fetchval(query, chat_id, user_id, company_id, title or f"Chat {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}")
-            return result
+        if deleted_id:
+            delete_log.info("Document deleted from PostgreSQL (async), associated chunks deleted via CASCADE.", deleted_id=str(deleted_id))
+            return True
+        else:
+            delete_log.warning("Document not found or company mismatch during delete attempt (async).")
+            return False
     except Exception as e:
-        log.error("Failed create_chat (ingest context - likely unused)", error=str(e))
+        delete_log.error("Error deleting document record (async)", error=str(e), exc_info=True)
         raise
-
-async def get_user_chats(user_id: uuid.UUID, company_id: uuid.UUID, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
-    pool = await get_db_pool()
-    query = """
-    SELECT id, title, updated_at
-    FROM chats
-    WHERE user_id = $1 AND company_id = $2
-    ORDER BY updated_at DESC
-    LIMIT $3 OFFSET $4;
-    """
-    try:
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(query, user_id, company_id, limit, offset)
-            return [dict(row) for row in rows]
-    except Exception as e:
-        log.error("Failed get_user_chats (ingest context - likely unused)", error=str(e))
-        raise
-
-async def check_chat_ownership(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID) -> bool:
-    pool = await get_db_pool()
-    query = "SELECT EXISTS (SELECT 1 FROM chats WHERE id = $1 AND user_id = $2 AND company_id = $3);"
-    try:
-        async with pool.acquire() as conn:
-            exists = await conn.fetchval(query, chat_id, user_id, company_id)
-            return exists is True
-    except Exception as e:
-        log.error("Failed check_chat_ownership (ingest context - likely unused)", error=str(e))
-        return False
-
-async def get_chat_messages(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-    pool = await get_db_pool()
-    owner = await check_chat_ownership(chat_id, user_id, company_id)
-    if not owner:
-        return []
-    messages_query = """
-    SELECT id, role, content, sources, created_at
-    FROM messages
-    WHERE chat_id = $1
-    ORDER BY created_at ASC
-    LIMIT $2 OFFSET $3;
-    """
-    try:
-        async with pool.acquire() as conn:
-            message_rows = await conn.fetch(messages_query, chat_id, limit, offset)
-            return [dict(row) for row in message_rows]
-    except Exception as e:
-        log.error("Failed get_chat_messages (ingest context - likely unused)", error=str(e))
-        raise
-
-async def save_message(chat_id: uuid.UUID, role: str, content: str, sources: Optional[List[Dict[str, Any]]] = None) -> uuid.UUID:
-    pool = await get_db_pool()
-    message_id = uuid.uuid4()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            try:
-                update_chat_query = "UPDATE chats SET updated_at = NOW() AT TIME ZONE 'UTC' WHERE id = $1 RETURNING id;"
-                chat_updated = await conn.fetchval(update_chat_query, chat_id)
-                if not chat_updated:
-                    raise ValueError(f"Chat {chat_id} not found (ingest context - likely unused).")
-                insert_message_query = """
-                INSERT INTO messages (id, chat_id, role, content, sources, created_at)
-                VALUES ($1, $2, $3, $4, $5, NOW() AT TIME ZONE 'UTC')
-                RETURNING id;
-                """
-                result = await conn.fetchval(insert_message_query, message_id, chat_id, role, content, json.dumps(sources or []))
-                return result
-            except Exception as e:
-                log.error("Failed save_message (ingest context - likely unused)", error=str(e))
-                raise
-
-async def delete_chat(chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID) -> bool:
-    pool = await get_db_pool()
-    query = "DELETE FROM chats WHERE id = $1 AND user_id = $2 AND company_id = $3 RETURNING id;"
-    delete_log = log.bind(chat_id=str(chat_id), user_id=str(user_id))
-    try:
-        async with pool.acquire() as conn:
-            deleted_id = await conn.fetchval(query, chat_id, user_id, company_id)
-            return deleted_id is not None
-    except Exception as e:
-        delete_log.error("Failed to delete chat (ingest context - likely unused)", error=str(e))
-        raise
-# LLM_FLAG: SENSITIVE_CODE_BLOCK_END - Chat Functions
