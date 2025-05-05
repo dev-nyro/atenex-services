@@ -34,9 +34,7 @@ from app.infrastructure.vectorstores.milvus_adapter import MilvusAdapter
 from app.infrastructure.llms.gemini_adapter import GeminiAdapter
 from app.infrastructure.retrievers.bm25_retriever import BM25sRetriever
 from app.infrastructure.rerankers.bge_reranker import BGEReranker
-# --- CORRECTION: Import both MMR and Stub Filters ---
 from app.infrastructure.filters.diversity_filter import MMRDiversityFilter, StubDiversityFilter
-# --- END CORRECTION ---
 
 # Import Use Case
 from app.application.use_cases.ask_query_use_case import AskQueryUseCase
@@ -90,18 +88,27 @@ async def lifespan(app: FastAPI):
     if dependencies_ok:
         try:
             vector_store_instance = MilvusAdapter()
+            # Attempt to get collection, which includes connection and load
             await vector_store_instance._get_collection()
             log.info("Milvus Adapter initialized and collection checked/loaded.")
         except Exception as e:
-            log.critical("CRITICAL: Failed to initialize Milvus Adapter or load collection.", error=str(e), exc_info=True)
+            # Log the error clearly, including potential Milvus error details
+            log.critical(
+                "CRITICAL: Failed to initialize Milvus Adapter or load collection. Service may not function correctly.",
+                error=str(e), exc_info=True, adapter_error=getattr(e, 'message', 'N/A') # Log Milvus specific message if available
+            )
             dependencies_ok = False
+            # LLM_FLAG: Even if Milvus fails, continue startup to potentially serve other endpoints?
+            # Decision: For now, mark dependencies as failed, but let the service start partially
+            # log.warning("Continuing startup despite Milvus initialization failure.")
 
     if dependencies_ok:
         try:
             llm_instance = GeminiAdapter()
             if not llm_instance.model:
                  log.critical("CRITICAL: Gemini Adapter initialized but model failed to load (check API key).")
-                 log.warning("Continuing startup despite Gemini model load failure.")
+                 # Treat this as critical failure for query functionality
+                 dependencies_ok = False
             else:
                  log.info("Gemini Adapter initialized successfully.")
         except Exception as e:
@@ -138,21 +145,16 @@ async def lifespan(app: FastAPI):
             log.error("Failed to initialize BGE Reranker.", error=str(e), exc_info=True)
             reranker_instance = None
 
-    # --- CORRECTION: Initialize Diversity Filter based on setting ---
     if dependencies_ok and settings.DIVERSITY_FILTER_ENABLED:
         try:
             diversity_filter_instance = MMRDiversityFilter(lambda_mult=settings.QUERY_DIVERSITY_LAMBDA)
             log.info("MMR Diversity Filter initialized.")
         except Exception as e:
             log.error("Failed to initialize MMR Diversity Filter. Falling back to Stub.", error=str(e), exc_info=True)
-            # Fallback to Stub if MMR fails
             diversity_filter_instance = StubDiversityFilter()
     else:
-        # If disabled, explicitly set to None or Stub (depending on desired behavior if accidentally called)
-        # Using Stub makes the AskQueryUseCase logic simpler as it doesn't need to check for None
         log.info("Diversity filter disabled, using StubDiversityFilter as placeholder.")
         diversity_filter_instance = StubDiversityFilter()
-    # --- END CORRECTION ---
 
 
     # 3. Instantiate Use Case
@@ -166,17 +168,35 @@ async def lifespan(app: FastAPI):
                  sparse_retriever=sparse_retriever_instance,
                  chunk_content_repo=chunk_content_repo_instance,
                  reranker=reranker_instance,
-                 diversity_filter=diversity_filter_instance # Pass the initialized filter (MMR or Stub)
+                 diversity_filter=diversity_filter_instance
              )
              log.info("AskQueryUseCase instantiated successfully.")
-             SERVICE_READY = True
-             log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY.")
+
+             # --- CORRECTION: Warm up embedder after use case initialization ---
+             log.info("Warming up embedding model...")
+             try:
+                 # Access the internal embedder instance and warm it up
+                 await asyncio.to_thread(ask_query_use_case_instance._embedder.warm_up)
+                 log.info("Embedding model warmed up successfully.")
+                 SERVICE_READY = True # Service is only ready if embedder also warms up
+                 log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY.")
+             except Exception as embed_err:
+                 log.critical("CRITICAL: Failed to warm up embedding model.", error=str(embed_err), exc_info=True)
+                 SERVICE_READY = False # Mark as not ready if embedder fails
+                 dependencies_ok = False # Update overall status
+             # --- END CORRECTION ---
+
          except Exception as e:
               log.critical("CRITICAL: Failed to instantiate AskQueryUseCase.", error=str(e), exc_info=True)
               SERVICE_READY = False
+              dependencies_ok = False
     else:
-        log.critical(f"{settings.PROJECT_NAME} startup finished. Some critical dependencies failed. SERVICE NOT READY.")
+        log.critical(f"{settings.PROJECT_NAME} startup check failed. Some critical dependencies might be missing or failed.",
+                     db_ok=db_pool_initialized, milvus_ok=bool(vector_store_instance), llm_ok=bool(llm_instance and llm_instance.model))
         SERVICE_READY = False
+        # Update status if dependencies failed before use case instantiation
+        if not dependencies_ok:
+           log.critical(f"{settings.PROJECT_NAME} startup finished. Some critical dependencies failed. SERVICE NOT READY.")
 
 
     yield # Application runs here
@@ -256,7 +276,10 @@ def get_chat_repository() -> ChatRepositoryPort:
     return chat_repo_instance
 
 def get_ask_query_use_case() -> AskQueryUseCase:
-    if not ask_query_use_case_instance: raise HTTPException(status_code=503, detail="Ask Query Use Case not available")
+    # Check service readiness which includes successful use case initialization AND embedder warm-up
+    if not SERVICE_READY or not ask_query_use_case_instance:
+         log.error("Dependency Injection Failed: AskQueryUseCase requested but service is not ready.")
+         raise HTTPException(status_code=503, detail="Query processing service is not ready. Check logs for initialization errors.")
     return ask_query_use_case_instance
 
 # --- Routers ---

@@ -54,6 +54,8 @@ app/
 ├── main.py
 ├── models
 │   └── __init__.py
+├── pipelines
+│   └── rag_pipeline.py
 └── utils
     ├── __init__.py
     └── helpers.py
@@ -2793,6 +2795,11 @@ if __name__ == "__main__":
 ```
 
 ## File: `app\models\__init__.py`
+```py
+
+```
+
+## File: `app\pipelines\rag_pipeline.py`
 ```py
 
 ```
