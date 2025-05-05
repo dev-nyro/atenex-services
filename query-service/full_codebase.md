@@ -2753,8 +2753,13 @@ google-generativeai = "^0.5.4" # Gemini client
 
 # --- RAG Component Dependencies ---
 sentence-transformers = "^2.7.0" # For BGE Reranker adapter
-bm2s = "^0.2.0"                # For BM25s sparse retriever adapter
-numpy = "^1.26.4"              # Often a dependency for ML/vector libraries
+# --- CORRECTION: Changed package name and version ---
+bm25s = "^0.1.3"                # For BM25s sparse retriever adapter (Corrected name and version)
+# --- END CORRECTION ---
+# --- CORRECTION: Updated numpy version constraint ---
+numpy = "^2.1.0"              # Often a dependency for ML/vector libraries - Updated to >=2.1.0
+# --- END CORRECTION ---
+
 
 # Optional for performance
 # onnxruntime = { version = "^1.17.1", optional = true }
