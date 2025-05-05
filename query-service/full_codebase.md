@@ -15,7 +15,7 @@ app/
 │   ├── __init__.py
 │   ├── ports
 │   │   ├── __init__.py
-│   │   ├── lllm_port.py
+│   │   ├── llm_port.py
 │   │   ├── repository_ports.py
 │   │   ├── retrieval_ports.py
 │   │   └── vector_store_port.py
@@ -32,7 +32,8 @@ app/
 ├── infrastructure
 │   ├── __init__.py
 │   ├── filters
-│   │   └── __init__.py
+│   │   ├── __init__.py
+│   │   └── diversity_filter.py
 │   ├── llms
 │   │   ├── __init__.py
 │   │   └── gemini_adapter.py
@@ -480,7 +481,7 @@ __all__ = [
 ]
 ```
 
-## File: `app\application\ports\lllm_port.py`
+## File: `app\application\ports\llm_port.py`
 ```py
 # query-service/app/application/ports/llm_port.py
 import abc
@@ -1410,6 +1411,44 @@ class QueryLog(BaseModel):
 ## File: `app\infrastructure\filters\__init__.py`
 ```py
 # query-service/app/infrastructure/filters/__init__.py
+```
+
+## File: `app\infrastructure\filters\diversity_filter.py`
+```py
+# query-service/app/infrastructure/filters/diversity_filter.py
+import structlog
+from typing import List
+
+from app.application.ports.retrieval_ports import DiversityFilterPort
+from app.domain.models import RetrievedChunk
+
+log = structlog.get_logger(__name__)
+
+class StubDiversityFilter(DiversityFilterPort):
+    """
+    Implementación Stub del filtro de diversidad.
+    Simplemente devuelve los primeros k_final chunks sin aplicar lógica de diversidad.
+    """
+
+    def __init__(self):
+        log.warning("Using StubDiversityFilter. No diversity logic is applied.", adapter="StubDiversityFilter")
+
+    async def filter(self, chunks: List[RetrievedChunk], k_final: int) -> List[RetrievedChunk]:
+        """Devuelve los primeros k_final chunks."""
+        filter_log = log.bind(adapter="StubDiversityFilter", action="filter", k_final=k_final, input_count=len(chunks))
+        if not chunks:
+            filter_log.debug("No chunks to filter.")
+            return []
+
+        filtered_chunks = chunks[:k_final]
+        filter_log.debug(f"Returning top {len(filtered_chunks)} chunks without diversity filtering.")
+        return filtered_chunks
+
+# TODO: Implementar MMRDiversityFilter o DartboardFilter aquí en el futuro.
+# class MMRDiversityFilter(DiversityFilterPort):
+#     async def filter(self, chunks: List[RetrievedChunk], k_final: int) -> List[RetrievedChunk]:
+#         # Implementación de MMR... necesitaría embeddings
+#         raise NotImplementedError
 ```
 
 ## File: `app\infrastructure\llms\__init__.py`
