@@ -30,6 +30,7 @@ htmlcov/
 .vscode/
 *.sublime-project
 *.sublime-workspace
+.cleanup_milvus.py
 
 # Archivos específicos del SO
 *.DS_Store

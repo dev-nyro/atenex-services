@@ -1030,7 +1030,9 @@ MILVUS_DEFAULT_CONTENT_FIELD = "content"
 MILVUS_DEFAULT_COMPANY_ID_FIELD = "company_id"
 MILVUS_DEFAULT_DOCUMENT_ID_FIELD = "document_id"
 MILVUS_DEFAULT_FILENAME_FIELD = "file_name"
-MILVUS_DEFAULT_GRPC_TIMEOUT = 10
+MILVUS_DEFAULT_GRPC_TIMEOUT = 15 # Increased default timeout slightly
+# --- Default Milvus Search Params ---
+MILVUS_DEFAULT_SEARCH_PARAMS = {"metric_type": "L2", "params": {"nprobe": 10}}
 # RAG Prompts
 DEFAULT_RAG_PROMPT_TEMPLATE = """
 Basándote estrictamente en los siguientes documentos recuperados, responde a la pregunta del usuario.
@@ -1061,16 +1063,16 @@ DEFAULT_FASTEMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_FASTEMBED_QUERY_PREFIX = "query: "
 DEFAULT_EMBEDDING_DIMENSION = 384
 DEFAULT_GEMINI_MODEL = "gemini-1.5-flash-latest"
-# LLM_REFACTOR_STEP_4: Add default for reranker
 DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-base"
 # RAG Pipeline Parameters
 DEFAULT_RETRIEVER_TOP_K = 5
-# LLM_REFACTOR_STEP_4: Add defaults for new RAG components
-DEFAULT_BM25_ENABLED: bool = True # Control if BM25 is used
-DEFAULT_RERANKER_ENABLED: bool = True # Control if Reranker is used
-DEFAULT_DIVERSITY_FILTER_ENABLED: bool = False # Control if Diversity Filter is used (start disabled)
-DEFAULT_DIVERSITY_K_FINAL: int = 10 # Number of docs after diversity filter
-DEFAULT_HYBRID_ALPHA: float = 0.5 # Weight for dense vs sparse fusion (0=sparse only, 1=dense only)
+DEFAULT_BM25_ENABLED: bool = True
+DEFAULT_RERANKER_ENABLED: bool = True
+DEFAULT_DIVERSITY_FILTER_ENABLED: bool = False
+DEFAULT_DIVERSITY_K_FINAL: int = 10
+DEFAULT_HYBRID_ALPHA: float = 0.5
+# --- Default Diversity Lambda ---
+DEFAULT_DIVERSITY_LAMBDA: float = 0.5
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -1103,9 +1105,8 @@ class Settings(BaseSettings):
     MILVUS_FILENAME_FIELD: str = Field(default=MILVUS_DEFAULT_FILENAME_FIELD)
     MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name", "file_type"])
     MILVUS_GRPC_TIMEOUT: int = Field(default=MILVUS_DEFAULT_GRPC_TIMEOUT)
-    # Index/Search params are usually static, loaded from defaults or env vars as JSON strings
-    # Pydantic v1 style: MILVUS_INDEX_PARAMS: str = MILVUS_DEFAULT_INDEX_PARAMS
-    # Pydantic v1 style: MILVUS_SEARCH_PARAMS: str = MILVUS_DEFAULT_SEARCH_PARAMS
+    # --- Added Milvus Search Params ---
+    MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default=MILVUS_DEFAULT_SEARCH_PARAMS)
 
     # --- Embedding Model (FastEmbed) ---
     FASTEMBED_MODEL_NAME: str = Field(default=DEFAULT_FASTEMBED_MODEL)
@@ -1117,27 +1118,21 @@ class Settings(BaseSettings):
     GEMINI_MODEL_NAME: str = Field(default=DEFAULT_GEMINI_MODEL)
 
     # --- Reranker Model ---
-    # LLM_REFACTOR_STEP_4: Add Reranker config
     RERANKER_ENABLED: bool = Field(default=DEFAULT_RERANKER_ENABLED)
     RERANKER_MODEL_NAME: str = Field(default=DEFAULT_RERANKER_MODEL, description="Sentence Transformer model name/path for reranking.")
-    # RERANKER_ONNX_PATH: Optional[str] = Field(None, description="Path to ONNX version of reranker model (optional).")
-    # RERANKER_DEVICE: Optional[str] = Field(None, description="Device for reranker ('cpu', 'cuda', 'mps'). Auto-detected if None.")
 
     # --- Sparse Retriever (BM25) ---
-    # LLM_REFACTOR_STEP_4: Add BM25 config
     BM25_ENABLED: bool = Field(default=DEFAULT_BM25_ENABLED)
-    # BM25_INDEX_PATH: Optional[str] = Field(None, description="Path to pre-built BM25 index (if using Pyserini).")
 
     # --- Diversity Filter ---
-    # LLM_REFACTOR_STEP_4: Add Diversity config
     DIVERSITY_FILTER_ENABLED: bool = Field(default=DEFAULT_DIVERSITY_FILTER_ENABLED)
-    # DIVERSITY_FILTER_METHOD: str = Field(default="stub", description="Diversity method ('stub', 'mmr', 'dartboard').")
     DIVERSITY_K_FINAL: int = Field(default=DEFAULT_DIVERSITY_K_FINAL, gt=0, description="Target number of documents after diversity filtering.")
-    # DIVERSITY_LAMBDA: float = Field(default=0.5, ge=0.0, le=1.0, description="Lambda parameter for MMR diversity (if used).")
+    # --- Added Diversity Lambda ---
+    QUERY_DIVERSITY_LAMBDA: float = Field(default=DEFAULT_DIVERSITY_LAMBDA, ge=0.0, le=1.0, description="Lambda for MMR diversity (0=max diversity, 1=max relevance).")
+
 
     # --- RAG Pipeline Parameters ---
     RETRIEVER_TOP_K: int = Field(default=DEFAULT_RETRIEVER_TOP_K, gt=0, le=50)
-    # LLM_REFACTOR_STEP_4: Add fusion parameter
     HYBRID_FUSION_ALPHA: float = Field(default=DEFAULT_HYBRID_ALPHA, ge=0.0, le=1.0, description="Weighting factor for dense vs sparse fusion (0=sparse, 1=dense). Used for simple linear fusion.")
     RAG_PROMPT_TEMPLATE: str = Field(default=DEFAULT_RAG_PROMPT_TEMPLATE)
     GENERAL_PROMPT_TEMPLATE: str = Field(default=DEFAULT_GENERAL_PROMPT_TEMPLATE)
@@ -1161,11 +1156,9 @@ class Settings(BaseSettings):
     @field_validator('POSTGRES_PASSWORD', 'GEMINI_API_KEY', mode='before')
     @classmethod
     def check_secret_value_present(cls, v: Any, info: ValidationInfo) -> Any:
-        if v is None or (isinstance(v, str) and v == ""): # Check for None or empty string
+        if v is None or (isinstance(v, str) and v == ""):
             field_name = info.field_name if info.field_name else "Unknown Secret Field"
-            # Raise ValueError for config loading phase
             raise ValueError(f"Required secret field 'QUERY_{field_name.upper()}' cannot be empty.")
-        # Return as SecretStr implicitly by Pydantic
         return v
 
     @field_validator('EMBEDDING_DIMENSION')
@@ -1173,7 +1166,6 @@ class Settings(BaseSettings):
     def check_embedding_dimension(cls, v: int, info: ValidationInfo) -> int:
         if v <= 0:
             raise ValueError("EMBEDDING_DIMENSION must be a positive integer.")
-        # LLM_FLAG: This validation logic relies on specific model names. Might need updates if models change frequently.
         model_name = info.data.get('FASTEMBED_MODEL_NAME', DEFAULT_FASTEMBED_MODEL)
         expected_dim = -1
         if 'all-MiniLM-L6-v2' in model_name: expected_dim = 384
@@ -1188,19 +1180,17 @@ class Settings(BaseSettings):
         return v
 
 # --- Global Settings Instance ---
-# Setup temporary logger for loading phase
 temp_log = logging.getLogger("query_service.config.loader")
 if not temp_log.handlers:
     handler = logging.StreamHandler(sys.stdout)
     formatter = logging.Formatter('%(levelname)s: [%(name)s] %(message)s')
     handler.setFormatter(formatter)
     temp_log.addHandler(handler)
-    temp_log.setLevel(logging.INFO) # Set to INFO or DEBUG as needed
+    temp_log.setLevel(logging.INFO)
 
 try:
     temp_log.info("Loading Query Service settings...")
     settings = Settings()
-    # Log loaded settings (omitting secrets)
     temp_log.info("Query Service Settings Loaded Successfully:")
     log_data = settings.model_dump(exclude={'POSTGRES_PASSWORD', 'GEMINI_API_KEY'})
     for key, value in log_data.items():
@@ -1209,24 +1199,16 @@ try:
     temp_log.info(f"  GEMINI_API_KEY: *** SET ***")
 
 except (ValidationError, ValueError) as e:
-    # Log detailed validation errors
     error_details = ""
     if isinstance(e, ValidationError):
-        try:
-            # Use Pydantic v2 error formatting
-             error_details = f"\nValidation Errors:\n{json.dumps(e.errors(), indent=2)}"
-        except Exception:
-             # Fallback for unexpected formatting issues
-             error_details = f"\nRaw Errors: {e}" # Simple string representation
-    else: # Handle plain ValueError from custom validators
-        error_details = f"\nError: {e}"
-
+        try: error_details = f"\nValidation Errors:\n{json.dumps(e.errors(), indent=2)}"
+        except Exception: error_details = f"\nRaw Errors: {e}"
+    else: error_details = f"\nError: {e}"
     temp_log.critical(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     temp_log.critical(f"! FATAL: Query Service configuration validation failed!{error_details}")
     temp_log.critical(f"! Check environment variables (prefixed with QUERY_) or .env file.")
-    # temp_log.critical(f"! Original Error Traceback:", exc_info=True) # Optional: include traceback
     temp_log.critical(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-    sys.exit(1) # Exit if configuration fails
+    sys.exit(1)
 except Exception as e:
     temp_log.exception(f"FATAL: Unexpected error loading Query Service settings: {e}")
     sys.exit(1)
@@ -1365,6 +1347,9 @@ class RetrievedChunk(BaseModel):
     content: Optional[str] = None # Contenido textual del chunk
     score: Optional[float] = None # Puntuación de relevancia
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    # --- Añadir campo para embedding ---
+    embedding: Optional[List[float]] = None # Embedding vectorial del chunk
+    # --- Fin adición ---
     # Campos comunes esperados en metadata
     document_id: Optional[str] = Field(None, alias="document_id") # Alias para mapeo desde meta
     file_name: Optional[str] = Field(None, alias="file_name")
@@ -1382,11 +1367,15 @@ class RetrievedChunk(BaseModel):
         doc_id_str = str(doc_meta.get("document_id")) if doc_meta.get("document_id") else None
         company_id_str = str(doc_meta.get("company_id")) if doc_meta.get("company_id") else None
 
+        # Extraer embedding si existe en el documento Haystack
+        embedding_vector = getattr(doc, 'embedding', None)
+
         return cls(
             id=str(doc.id),
             content=doc.content,
             score=doc.score,
             metadata=doc_meta,
+            embedding=embedding_vector, # Añadir embedding
             document_id=doc_id_str,
             file_name=doc_meta.get("file_name"),
             company_id=company_id_str
@@ -1417,38 +1406,118 @@ class QueryLog(BaseModel):
 ```py
 # query-service/app/infrastructure/filters/diversity_filter.py
 import structlog
-from typing import List
+import asyncio
+from typing import List, Optional, Tuple
+import numpy as np
 
 from app.application.ports.retrieval_ports import DiversityFilterPort
 from app.domain.models import RetrievedChunk
+from app.core.config import settings
 
 log = structlog.get_logger(__name__)
 
-class StubDiversityFilter(DiversityFilterPort):
+def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
+    """Calcula la similitud coseno entre dos vectores."""
+    if not vec1 or not vec2:
+        return 0.0
+    v1 = np.array(vec1)
+    v2 = np.array(vec2)
+    dot_product = np.dot(v1, v2)
+    norm_v1 = np.linalg.norm(v1)
+    norm_v2 = np.linalg.norm(v2)
+    if norm_v1 == 0 or norm_v2 == 0:
+        return 0.0
+    return dot_product / (norm_v1 * norm_v2)
+
+class MMRDiversityFilter(DiversityFilterPort):
     """
-    Implementación Stub del filtro de diversidad.
-    Simplemente devuelve los primeros k_final chunks sin aplicar lógica de diversidad.
+    Filtro de diversidad usando Maximal Marginal Relevance (MMR).
+    Selecciona chunks que son relevantes para la consulta pero diversos entre sí.
     """
 
+    def __init__(self, lambda_mult: float = settings.QUERY_DIVERSITY_LAMBDA):
+        """
+        Inicializa el filtro MMR.
+        Args:
+            lambda_mult: Factor de balance entre relevancia y diversidad (0 a 1).
+                         Alto (e.g., 0.7) prioriza relevancia.
+                         Bajo (e.g., 0.3) prioriza diversidad.
+        """
+        if not (0.0 <= lambda_mult <= 1.0):
+            raise ValueError("lambda_mult must be between 0.0 and 1.0")
+        self.lambda_mult = lambda_mult
+        log.info("MMRDiversityFilter initialized", lambda_mult=self.lambda_mult, adapter="MMRDiversityFilter")
+
+    async def filter(self, chunks: List[RetrievedChunk], k_final: int) -> List[RetrievedChunk]:
+        """
+        Aplica el filtro MMR a la lista de chunks.
+        Requiere que los chunks tengan embeddings.
+        """
+        filter_log = log.bind(adapter="MMRDiversityFilter", action="filter", k_final=k_final, lambda_mult=self.lambda_mult, input_count=len(chunks))
+
+        if not chunks or k_final <= 0:
+            filter_log.debug("No chunks to filter or k_final <= 0.")
+            return []
+
+        # Filtrar chunks que no tengan embedding
+        chunks_with_embeddings = [c for c in chunks if c.embedding is not None]
+        if not chunks_with_embeddings:
+            filter_log.warning("No chunks with embeddings found. Returning original top-k chunks (or fewer).")
+            # Devuelve los primeros k_final chunks originales (aunque no tengan embedding)
+            return chunks[:k_final]
+
+        num_chunks_with_embeddings = len(chunks_with_embeddings)
+        if k_final >= num_chunks_with_embeddings:
+            filter_log.debug(f"k_final ({k_final}) >= number of chunks with embeddings ({num_chunks_with_embeddings}). Returning all chunks with embeddings.")
+            return chunks_with_embeddings # Devolver todos los que tienen embedding si k es mayor o igual
+
+        # El primer chunk seleccionado es siempre el más relevante (asume que la lista está ordenada por relevancia)
+        selected_indices = {0}
+        selected_chunks = [chunks_with_embeddings[0]]
+
+        remaining_indices = set(range(1, num_chunks_with_embeddings))
+
+        while len(selected_chunks) < k_final and remaining_indices:
+            mmr_scores = {}
+            # Calcular la similitud máxima de cada candidato con los ya seleccionados
+            for candidate_idx in remaining_indices:
+                candidate_chunk = chunks_with_embeddings[candidate_idx]
+                max_similarity = 0.0
+                for selected_idx in selected_indices:
+                    similarity = cosine_similarity(candidate_chunk.embedding, chunks_with_embeddings[selected_idx].embedding)
+                    max_similarity = max(max_similarity, similarity)
+
+                # Calcular score MMR
+                # Usamos el score original del chunk como medida de relevancia (podría ser similitud con query si la tuviéramos)
+                relevance_score = candidate_chunk.score or 0.0 # Usar 0 si no hay score
+                mmr_score = self.lambda_mult * relevance_score - (1 - self.lambda_mult) * max_similarity
+                mmr_scores[candidate_idx] = mmr_score
+
+            # Encontrar el mejor candidato según MMR
+            if not mmr_scores: break # Salir si no hay más candidatos con score
+            best_candidate_idx = max(mmr_scores, key=mmr_scores.get)
+
+            # Añadir el mejor candidato y moverlo de conjuntos
+            selected_indices.add(best_candidate_idx)
+            selected_chunks.append(chunks_with_embeddings[best_candidate_idx])
+            remaining_indices.remove(best_candidate_idx)
+
+        filter_log.info(f"MMR filtering complete. Selected {len(selected_chunks)} diverse chunks.")
+        return selected_chunks
+
+class StubDiversityFilter(DiversityFilterPort):
+    """Implementación Stub (Fallback si MMR falla o está deshabilitado)."""
     def __init__(self):
         log.warning("Using StubDiversityFilter. No diversity logic is applied.", adapter="StubDiversityFilter")
 
     async def filter(self, chunks: List[RetrievedChunk], k_final: int) -> List[RetrievedChunk]:
-        """Devuelve los primeros k_final chunks."""
         filter_log = log.bind(adapter="StubDiversityFilter", action="filter", k_final=k_final, input_count=len(chunks))
         if not chunks:
             filter_log.debug("No chunks to filter.")
             return []
-
         filtered_chunks = chunks[:k_final]
         filter_log.debug(f"Returning top {len(filtered_chunks)} chunks without diversity filtering.")
         return filtered_chunks
-
-# TODO: Implementar MMRDiversityFilter o DartboardFilter aquí en el futuro.
-# class MMRDiversityFilter(DiversityFilterPort):
-#     async def filter(self, chunks: List[RetrievedChunk], k_final: int) -> List[RetrievedChunk]:
-#         # Implementación de MMR... necesitaría embeddings
-#         raise NotImplementedError
 ```
 
 ## File: `app\infrastructure\llms\__init__.py`
@@ -2323,16 +2392,15 @@ class MilvusAdapter(VectorStorePort):
 
                 collection = Collection(name=collection_name, using=self._alias)
 
-                # Check if loaded, load if necessary
-                # This check can be expensive, consider loading strategy (e.g., always load on startup/first use)
-                # For simplicity here, we check and load if needed.
                 if not collection.has_index():
                      collection_log.warning("Collection exists but has no index. Retrieval quality may be affected.")
-                     # Decide if loading is still useful without an index, or raise error?
                      # Let's try loading anyway for now.
 
                 collection_log.debug("Loading Milvus collection into memory...")
-                collection.load() # Load data into memory for search
+                # Specify partition names if applicable and needed for loading specific data
+                # partition_names = ["_default"] # Example if partitions are used
+                # collection.load(partition_names=partition_names)
+                collection.load() # Load default partition or all partitions if not specified
                 collection_log.info("Milvus collection loaded successfully.")
                 self._collection = collection
 
@@ -2343,7 +2411,6 @@ class MilvusAdapter(VectorStorePort):
                  collection_log.exception("Unexpected error accessing Milvus collection")
                  raise RuntimeError(f"Unexpected error accessing Milvus collection: {e}") from e
 
-        # Double check if collection is valid after potential errors
         if not isinstance(self._collection, Collection):
             log.critical("Milvus collection object is unexpectedly None or invalid after initialization attempt.")
             raise RuntimeError("Failed to obtain a valid Milvus collection object.")
@@ -2356,21 +2423,26 @@ class MilvusAdapter(VectorStorePort):
         try:
             collection = await self._get_collection()
 
-            search_params = settings.MILVUS_SEARCH_PARAMS
+            # --- CORRECTION: Added Default Milvus Search Params ---
+            # Use reasonable defaults if not explicitly set in config
+            search_params = getattr(settings, "MILVUS_SEARCH_PARAMS", {"metric_type": "L2", "params": {"nprobe": 10}})
+            # ------------------------------------------------------
+
             filter_expr = f'{settings.MILVUS_COMPANY_ID_FIELD} == "{company_id}"'
             search_log.debug("Using filter expression", expr=filter_expr)
 
-            # Define output fields based on config, ensuring content and necessary meta are included
+            # --- CORRECTION: Ensure embedding field is requested ---
             output_fields = list(set([
                 settings.MILVUS_CONTENT_FIELD, # Ensure content is requested
+                settings.MILVUS_EMBEDDING_FIELD, # Ensure embedding is requested
                 settings.MILVUS_COMPANY_ID_FIELD,
                 settings.MILVUS_DOCUMENT_ID_FIELD,
                 settings.MILVUS_FILENAME_FIELD,
             ] + settings.MILVUS_METADATA_FIELDS)) # Add other configured metadata fields
+            # --------------------------------------------------------
 
             search_log.debug("Performing Milvus vector search...", vector_field=settings.MILVUS_EMBEDDING_FIELD, output_fields=output_fields)
 
-            # Execute search asynchronously (run_in_executor as Milvus client might be blocking)
             loop = asyncio.get_running_loop()
             search_results = await loop.run_in_executor(
                 None,
@@ -2381,28 +2453,30 @@ class MilvusAdapter(VectorStorePort):
                     limit=top_k,
                     expr=filter_expr,
                     output_fields=output_fields,
-                    consistency_level="Strong" # Or match ingest consistency
+                    consistency_level="Strong"
                 )
             )
 
             search_log.debug(f"Milvus search completed. Hits: {len(search_results[0]) if search_results else 0}")
 
-            # Convert Milvus results to Domain RetrievedChunk objects
             domain_chunks: List[RetrievedChunk] = []
             if search_results and search_results[0]:
                 for hit in search_results[0]:
-                    entity_data = hit.entity.to_dict() # Convert entity to dict
+                    entity_data = hit.entity.to_dict()
                     content = entity_data.get(settings.MILVUS_CONTENT_FIELD, "")
+                    # --- CORRECTION: Extract embedding vector ---
+                    embedding_vector = entity_data.get(settings.MILVUS_EMBEDDING_FIELD)
+                    # ---------------------------------------------
 
                     # Prepare metadata, excluding the embedding field itself
                     metadata = {k: v for k, v in entity_data.items() if k != settings.MILVUS_EMBEDDING_FIELD}
 
                     chunk = RetrievedChunk(
-                        id=str(hit.id), # Use Milvus primary key as ID
+                        id=str(hit.id),
                         content=content,
-                        score=hit.score, # Or hit.distance
+                        score=hit.score,
                         metadata=metadata,
-                        # Populate top-level fields from metadata for convenience
+                        embedding=embedding_vector, # <-- Store the embedding
                         document_id=str(metadata.get(settings.MILVUS_DOCUMENT_ID_FIELD)) if metadata.get(settings.MILVUS_DOCUMENT_ID_FIELD) else None,
                         file_name=metadata.get(settings.MILVUS_FILENAME_FIELD),
                         company_id=str(metadata.get(settings.MILVUS_COMPANY_ID_FIELD)) if metadata.get(settings.MILVUS_COMPANY_ID_FIELD) else None
@@ -2414,24 +2488,20 @@ class MilvusAdapter(VectorStorePort):
 
         except MilvusException as me:
              search_log.error("Milvus search failed", error_code=me.code, error_message=me.message)
-             # Raise ConnectionError for infrastructure issues
              raise ConnectionError(f"Vector DB search error (Code: {me.code}): {me.message}") from me
         except Exception as e:
             search_log.exception("Unexpected error during Milvus search")
             raise ConnectionError(f"Vector DB search service error: {e}") from e
 
-    # Optional: Add a method for explicit connection/disconnection if needed outside lifespan
     async def connect(self):
-        """Explicitly establishes the connection."""
         await self._ensure_connection()
 
     async def disconnect(self):
-        """Disconnects from Milvus."""
         if self._connected and self._alias in connections.list_connections():
             log.info("Disconnecting from Milvus...", adapter="MilvusAdapter", alias=self._alias)
             connections.disconnect(self._alias)
             self._connected = False
-            self._collection = None # Reset collection object on disconnect
+            self._collection = None
             log.info("Disconnected from Milvus.", adapter="MilvusAdapter")
 ```
 
@@ -2449,7 +2519,7 @@ import asyncio
 import json
 import uuid
 from contextlib import asynccontextmanager
-from typing import Annotated # For explicit dependency injection hints
+from typing import Annotated, Optional # Explicit type hint for Optionals
 
 # Configurar logging primero
 from app.core.config import settings
@@ -2473,7 +2543,9 @@ from app.infrastructure.vectorstores.milvus_adapter import MilvusAdapter
 from app.infrastructure.llms.gemini_adapter import GeminiAdapter
 from app.infrastructure.retrievers.bm25_retriever import BM25sRetriever
 from app.infrastructure.rerankers.bge_reranker import BGEReranker
-from app.infrastructure.filters.diversity_filter import StubDiversityFilter # Use Stub for now
+# --- CORRECTION: Import both MMR and Stub Filters ---
+from app.infrastructure.filters.diversity_filter import MMRDiversityFilter, StubDiversityFilter
+# --- END CORRECTION ---
 
 # Import Use Case
 from app.application.use_cases.ask_query_use_case import AskQueryUseCase
@@ -2484,7 +2556,6 @@ from app.infrastructure.persistence import postgres_connector
 # Global state
 SERVICE_READY = False
 # Global instances for simplified DI (replace with proper container if needed)
-# LLM_REFACTOR_FINAL: Instantiate adapters globally or within lifespan for reuse
 chat_repo_instance: Optional[ChatRepositoryPort] = None
 log_repo_instance: Optional[LogRepositoryPort] = None
 chunk_content_repo_instance: Optional[ChunkContentRepositoryPort] = None
@@ -2492,7 +2563,7 @@ vector_store_instance: Optional[VectorStorePort] = None
 llm_instance: Optional[LLMPort] = None
 sparse_retriever_instance: Optional[SparseRetrieverPort] = None
 reranker_instance: Optional[RerankerPort] = None
-diversity_filter_instance: Optional[DiversityFilterPort] = None
+diversity_filter_instance: Optional[DiversityFilterPort] = None # Will hold either MMR or Stub
 ask_query_use_case_instance: Optional[AskQueryUseCase] = None
 
 
@@ -2514,7 +2585,6 @@ async def lifespan(app: FastAPI):
         if db_ready:
             log.info("PostgreSQL connection pool initialized and verified.")
             db_pool_initialized = True
-            # Instantiate DB-dependent repositories
             chat_repo_instance = PostgresChatRepository()
             log_repo_instance = PostgresLogRepository()
             chunk_content_repo_instance = PostgresChunkContentRepository()
@@ -2525,12 +2595,11 @@ async def lifespan(app: FastAPI):
         log.critical("CRITICAL: Failed PostgreSQL pool initialization.", error=str(e), exc_info=True)
         dependencies_ok = False
 
-    # 2. Initialize other adapters (conditionally based on config where applicable)
+    # 2. Initialize other adapters
     if dependencies_ok:
         try:
             vector_store_instance = MilvusAdapter()
-            # Attempt initial connection/collection load for readiness check
-            await vector_store_instance._get_collection() # Use internal method to force load/check
+            await vector_store_instance._get_collection()
             log.info("Milvus Adapter initialized and collection checked/loaded.")
         except Exception as e:
             log.critical("CRITICAL: Failed to initialize Milvus Adapter or load collection.", error=str(e), exc_info=True)
@@ -2539,10 +2608,8 @@ async def lifespan(app: FastAPI):
     if dependencies_ok:
         try:
             llm_instance = GeminiAdapter()
-            if not llm_instance.model: # Check if model loaded successfully (API key validity)
+            if not llm_instance.model:
                  log.critical("CRITICAL: Gemini Adapter initialized but model failed to load (check API key).")
-                 # Decide if this is fatal - for now, let's allow startup but warn heavily
-                 # dependencies_ok = False
                  log.warning("Continuing startup despite Gemini model load failure.")
             else:
                  log.info("Gemini Adapter initialized successfully.")
@@ -2550,7 +2617,7 @@ async def lifespan(app: FastAPI):
             log.critical("CRITICAL: Failed to initialize Gemini Adapter.", error=str(e), exc_info=True)
             dependencies_ok = False
 
-    # Initialize optional components if enabled
+    # Initialize optional components
     if dependencies_ok and settings.BM25_ENABLED:
         try:
             if chunk_content_repo_instance:
@@ -2561,33 +2628,43 @@ async def lifespan(app: FastAPI):
                  sparse_retriever_instance = None
         except ImportError:
             log.error("BM25sRetriever dependency (bm2s) not installed. BM25 disabled.")
+            sparse_retriever_instance = None
         except Exception as e:
             log.error("Failed to initialize BM25s Retriever.", error=str(e), exc_info=True)
             sparse_retriever_instance = None
 
     if dependencies_ok and settings.RERANKER_ENABLED:
         try:
-            reranker_instance = BGEReranker() # Add device='cpu' if needed
-            if not reranker_instance.model: # Check if underlying model loaded
+            reranker_instance = BGEReranker()
+            if not reranker_instance.model:
                 log.warning("BGE Reranker initialized but model loading failed. Reranking might not work.")
             else:
                  log.info("BGE Reranker initialized.")
         except ImportError:
             log.error("BGEReranker dependency (sentence-transformers) not installed. Reranker disabled.")
+            reranker_instance = None
         except Exception as e:
             log.error("Failed to initialize BGE Reranker.", error=str(e), exc_info=True)
             reranker_instance = None
 
+    # --- CORRECTION: Initialize Diversity Filter based on setting ---
     if dependencies_ok and settings.DIVERSITY_FILTER_ENABLED:
         try:
-            # For now, always use the Stub. Replace if MMR/Dartboard is implemented.
-            diversity_filter_instance = StubDiversityFilter()
-            log.info("Stub Diversity Filter initialized.")
+            diversity_filter_instance = MMRDiversityFilter(lambda_mult=settings.QUERY_DIVERSITY_LAMBDA)
+            log.info("MMR Diversity Filter initialized.")
         except Exception as e:
-            log.error("Failed to initialize Diversity Filter.", error=str(e), exc_info=True)
-            diversity_filter_instance = None
+            log.error("Failed to initialize MMR Diversity Filter. Falling back to Stub.", error=str(e), exc_info=True)
+            # Fallback to Stub if MMR fails
+            diversity_filter_instance = StubDiversityFilter()
+    else:
+        # If disabled, explicitly set to None or Stub (depending on desired behavior if accidentally called)
+        # Using Stub makes the AskQueryUseCase logic simpler as it doesn't need to check for None
+        log.info("Diversity filter disabled, using StubDiversityFilter as placeholder.")
+        diversity_filter_instance = StubDiversityFilter()
+    # --- END CORRECTION ---
 
-    # 3. Instantiate Use Case if all required dependencies are OK
+
+    # 3. Instantiate Use Case
     if dependencies_ok and chat_repo_instance and log_repo_instance and vector_store_instance and llm_instance:
          try:
              ask_query_use_case_instance = AskQueryUseCase(
@@ -2595,13 +2672,13 @@ async def lifespan(app: FastAPI):
                  log_repo=log_repo_instance,
                  vector_store=vector_store_instance,
                  llm=llm_instance,
-                 sparse_retriever=sparse_retriever_instance, # Will be None if not enabled/failed
-                 chunk_content_repo=chunk_content_repo_instance, # Required for BM25
-                 reranker=reranker_instance,               # Will be None if not enabled/failed
-                 diversity_filter=diversity_filter_instance # Will be None if not enabled/failed
+                 sparse_retriever=sparse_retriever_instance,
+                 chunk_content_repo=chunk_content_repo_instance,
+                 reranker=reranker_instance,
+                 diversity_filter=diversity_filter_instance # Pass the initialized filter (MMR or Stub)
              )
              log.info("AskQueryUseCase instantiated successfully.")
-             SERVICE_READY = True # Service is ready only if UseCase could be created
+             SERVICE_READY = True
              log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY.")
          except Exception as e:
               log.critical("CRITICAL: Failed to instantiate AskQueryUseCase.", error=str(e), exc_info=True)
@@ -2617,7 +2694,7 @@ async def lifespan(app: FastAPI):
     log.info(f"Shutting down {settings.PROJECT_NAME}...")
     await postgres_connector.close_db_pool()
     if vector_store_instance and hasattr(vector_store_instance, 'disconnect'):
-        await vector_store_instance.disconnect() # Disconnect Milvus if adapter supports it
+        await vector_store_instance.disconnect()
     log.info("Shutdown complete.")
 
 # --- FastAPI App Initialization ---
@@ -2657,7 +2734,6 @@ async def add_request_id_timing_logging(request: Request, call_next):
     return response
 
 # --- Exception Handlers ---
-# ... (Handlers remain the same as previous step) ...
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     log_level = log.warning if exc.status_code < 500 else log.error
@@ -2684,8 +2760,6 @@ async def generic_exception_handler(request: Request, exc: Exception):
 
 
 # --- Simplified Dependency Injection Functions ---
-# These functions provide the globally instantiated adapters/repos to the endpoints
-
 def get_chat_repository() -> ChatRepositoryPort:
     if not chat_repo_instance: raise HTTPException(status_code=503, detail="Chat Repository not available")
     return chat_repo_instance
@@ -2693,10 +2767,6 @@ def get_chat_repository() -> ChatRepositoryPort:
 def get_ask_query_use_case() -> AskQueryUseCase:
     if not ask_query_use_case_instance: raise HTTPException(status_code=503, detail="Ask Query Use Case not available")
     return ask_query_use_case_instance
-
-# Update endpoint dependencies to use the new provider functions
-# (The existing Depends(get_ask_query_use_case) and Depends(get_chat_repository) in endpoints are now correct)
-
 
 # --- Routers ---
 app.include_router(query_router_module.router, prefix=settings.API_V1_STR, tags=["Query Interaction"])
@@ -2709,15 +2779,7 @@ async def read_root():
     health_log = log.bind(check="liveness_readiness")
     if not SERVICE_READY:
         health_log.warning("Health check failed: Service not ready.")
-        # Return 503 directly without checking DB if SERVICE_READY is False
         raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service Not Ready")
-
-    # If SERVICE_READY is True, we assume DB was OK during startup.
-    # A deeper readiness probe could re-check dependencies here if needed.
-    # db_ok = await postgres_connector.check_db_connection()
-    # if not db_ok:
-    #      health_log.error("Readiness check failed: DB check FAILED.")
-    #      raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service Unavailable (DB Check Failed)")
 
     health_log.debug("Health check passed.")
     return PlainTextResponse("OK", status_code=fastapi_status.HTTP_200_OK)
