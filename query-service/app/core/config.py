@@ -14,35 +14,23 @@ POSTGRES_K8S_PORT_DEFAULT = 5432
 POSTGRES_K8S_DB_DEFAULT = "atenex"
 POSTGRES_K8S_USER_DEFAULT = "postgres"
 
-# --- CORRECTION: Align Milvus Collection Name with Ingest Service ---
+# Milvus
 MILVUS_K8S_DEFAULT_URI = "http://milvus-standalone.nyro-develop.svc.cluster.local:19530"
-# LLM_COMMENT: Default collection name MUST match the one used by ingest-service
 MILVUS_DEFAULT_COLLECTION = "document_chunks_minilm"
-# --- END CORRECTION ---
-
-MILVUS_DEFAULT_EMBEDDING_FIELD = "embedding" # Consistent with ingest schema
-MILVUS_DEFAULT_CONTENT_FIELD = "content"     # Consistent with ingest schema
-MILVUS_DEFAULT_COMPANY_ID_FIELD = "company_id" # Consistent with ingest schema
-MILVUS_DEFAULT_DOCUMENT_ID_FIELD = "document_id" # Consistent with ingest schema
-MILVUS_DEFAULT_FILENAME_FIELD = "file_name"   # Consistent with ingest schema
+MILVUS_DEFAULT_EMBEDDING_FIELD = "embedding"
+MILVUS_DEFAULT_CONTENT_FIELD = "content"
+MILVUS_DEFAULT_COMPANY_ID_FIELD = "company_id"
+MILVUS_DEFAULT_DOCUMENT_ID_FIELD = "document_id"
+MILVUS_DEFAULT_FILENAME_FIELD = "file_name"
 MILVUS_DEFAULT_GRPC_TIMEOUT = 15
-
-# --- CORRECTION: Align Milvus Search Params - Use IP to match ingest-service and collection ---
-# LLM_COMMENT: Search metric must match index metric (ingest uses IP by default).
 MILVUS_DEFAULT_SEARCH_PARAMS = {"metric_type": "IP", "params": {"nprobe": 10}}
-# --- END CORRECTION ---
-
-# --- CORRECTION: Define Default Metadata Fields based on Ingest Schema ---
-# LLM_COMMENT: These are scalar fields requested from Milvus *in addition* to mandatory fields (pk, vector, content).
-# Should align with fields defined in ingest-service Milvus schema. 'file_type' was removed. Added 'page'.
 MILVUS_DEFAULT_METADATA_FIELDS = ["company_id", "document_id", "file_name", "page", "title"]
-# --- END CORRECTION ---
 
 
 # =====================================================================================
 #  PROMPTS DE ATENEX  –  v1.0  (Copiar y pegar tal cual en config.py ó prompt_builder.py)
 # =====================================================================================
-
+# --- LLM_COMMENT: Atenex prompts remain unchanged ---
 ATENEX_RAG_PROMPT_TEMPLATE = r"""
 ╭───────────────────────────────  SISTEMA  ───────────────────────────────╮
 │  Rol: Eres **Atenex**, un asistente de IA corporativo, omnisciente en   │
@@ -73,10 +61,10 @@ ATENEX_RAG_PROMPT_TEMPLATE = r"""
 
 ╭──────────────────────────  DOCUMENTOS RECUPERADOS  ─────────────────────╮
 {% for doc in documents %}
-● Documento {{ loop.index }}  
-  ├─ Archivo : {{ doc.meta.file_name or "desconocido" }}  
-  ├─ Título  : {{ doc.meta.title or "sin título" }}  
-  ├─ Página  : {{ doc.meta.page or "?" }}  
+● Documento {{ loop.index }}
+  ├─ Archivo : {{ doc.meta.file_name or "desconocido" }}
+  ├─ Título  : {{ doc.meta.title or "sin título" }}
+  ├─ Página  : {{ doc.meta.page or "?" }}
   └─ Extracto: {{ doc.content }}
 {% if not loop.last %}─────────────────────────────────────────────────────{% endif %}
 {% endfor %}
@@ -87,7 +75,7 @@ ATENEX_RAG_PROMPT_TEMPLATE = r"""
 ╰──────────────────────────────────────────────────────────────────────────╯
 
 ╭────────────────────────────── RESPUESTA ────────────────────────────────╮
-(Escribe aquí la respuesta cumpliendo los objetivos 1‑6.)  
+(Escribe aquí la respuesta cumpliendo los objetivos 1‑6.)
 ╰──────────────────────────────────────────────────────────────────────────╯
 """
 
@@ -103,20 +91,26 @@ Pregunta del usuario:
 
 Respuesta:
 """
-# Models (No change needed)
+# Models
 DEFAULT_FASTEMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_FASTEMBED_QUERY_PREFIX = "query: "
 DEFAULT_EMBEDDING_DIMENSION = 384
+# --- LLM_CORRECTION: Ensure correct model name ---
 DEFAULT_GEMINI_MODEL = "gemini-1.5-flash-latest"
 DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-base"
-# RAG Pipeline Parameters (No change needed)
-DEFAULT_RETRIEVER_TOP_K = 5
+
+# RAG Pipeline Parameters
+# --- LLM_CORRECTION: Increase retrieval K substantially ---
+DEFAULT_RETRIEVER_TOP_K = 100 # Increased from 5/10
 DEFAULT_BM25_ENABLED: bool = True
 DEFAULT_RERANKER_ENABLED: bool = True
-DEFAULT_DIVERSITY_FILTER_ENABLED: bool = False
-DEFAULT_DIVERSITY_K_FINAL: int = 10
+DEFAULT_DIVERSITY_FILTER_ENABLED: bool = False # Keep disabled by default for max context
+# --- LLM_CORRECTION: Rename and increase final context chunk limit ---
+DEFAULT_MAX_CONTEXT_CHUNKS: int = 75 # Increased from 7/10 (Renamed from DIVERSITY_K_FINAL)
 DEFAULT_HYBRID_ALPHA: float = 0.5
 DEFAULT_DIVERSITY_LAMBDA: float = 0.5
+# --- LLM_CORRECTION: Increase max prompt tokens significantly ---
+DEFAULT_MAX_PROMPT_TOKENS: int = 500000 # Increased from 7000 for Gemini Flash 1.5 (aiming for 500k target)
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -141,15 +135,12 @@ class Settings(BaseSettings):
 
     # --- Vector Store (Milvus) ---
     MILVUS_URI: AnyHttpUrl = Field(default=AnyHttpUrl(MILVUS_K8S_DEFAULT_URI))
-    # --- CORRECTION: Use corrected default ---
     MILVUS_COLLECTION_NAME: str = Field(default=MILVUS_DEFAULT_COLLECTION)
-    # LLM_COMMENT: Ensure these field names exactly match the ingest-service Milvus schema
     MILVUS_EMBEDDING_FIELD: str = Field(default=MILVUS_DEFAULT_EMBEDDING_FIELD)
     MILVUS_CONTENT_FIELD: str = Field(default=MILVUS_DEFAULT_CONTENT_FIELD)
     MILVUS_COMPANY_ID_FIELD: str = Field(default=MILVUS_DEFAULT_COMPANY_ID_FIELD)
     MILVUS_DOCUMENT_ID_FIELD: str = Field(default=MILVUS_DEFAULT_DOCUMENT_ID_FIELD)
     MILVUS_FILENAME_FIELD: str = Field(default=MILVUS_DEFAULT_FILENAME_FIELD)
-    # --- CORRECTION: Use corrected default ---
     MILVUS_METADATA_FIELDS: List[str] = Field(default=MILVUS_DEFAULT_METADATA_FIELDS)
     MILVUS_GRPC_TIMEOUT: int = Field(default=MILVUS_DEFAULT_GRPC_TIMEOUT)
     MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default=MILVUS_DEFAULT_SEARCH_PARAMS)
@@ -172,16 +163,19 @@ class Settings(BaseSettings):
 
     # --- Diversity Filter ---
     DIVERSITY_FILTER_ENABLED: bool = Field(default=DEFAULT_DIVERSITY_FILTER_ENABLED)
-    DIVERSITY_K_FINAL: int = Field(default=DEFAULT_DIVERSITY_K_FINAL, gt=0, description="Target number of documents after diversity filtering.")
+    # --- LLM_CORRECTION: Use renamed setting ---
+    MAX_CONTEXT_CHUNKS: int = Field(default=DEFAULT_MAX_CONTEXT_CHUNKS, gt=0, description="Max number of retrieved/reranked chunks to pass to LLM context.")
     QUERY_DIVERSITY_LAMBDA: float = Field(default=DEFAULT_DIVERSITY_LAMBDA, ge=0.0, le=1.0, description="Lambda for MMR diversity (0=max diversity, 1=max relevance).")
 
 
     # --- RAG Pipeline Parameters ---
-    RETRIEVER_TOP_K: int = Field(default=DEFAULT_RETRIEVER_TOP_K, gt=0, le=50)
+    # --- LLM_CORRECTION: Use updated default ---
+    RETRIEVER_TOP_K: int = Field(default=DEFAULT_RETRIEVER_TOP_K, gt=0, le=500) # Allow up to 500 retrieval
     HYBRID_FUSION_ALPHA: float = Field(default=DEFAULT_HYBRID_ALPHA, ge=0.0, le=1.0, description="Weighting factor for dense vs sparse fusion (0=sparse, 1=dense). Used for simple linear fusion.")
     RAG_PROMPT_TEMPLATE: str = Field(default=ATENEX_RAG_PROMPT_TEMPLATE)
     GENERAL_PROMPT_TEMPLATE: str = Field(default=ATENEX_GENERAL_PROMPT_TEMPLATE)
-    MAX_PROMPT_TOKENS: Optional[int] = Field(default=7000)
+    # --- LLM_CORRECTION: Use updated default ---
+    MAX_PROMPT_TOKENS: Optional[int] = Field(default=DEFAULT_MAX_PROMPT_TOKENS)
 
     # --- Service Client Config ---
     HTTP_CLIENT_TIMEOUT: int = Field(default=60)
@@ -222,6 +216,20 @@ class Settings(BaseSettings):
         elif expected_dim == -1:
             logging.warning(f"Unknown standard embedding dimension for model '{model_name}'. Using configured dimension {v}. Verify this matches the actual model output.")
         logging.debug(f"Using EMBEDDING_DIMENSION: {v} for model: {model_name}")
+        return v
+
+    # --- LLM_CORRECTION: Add validator for max context chunks ---
+    @field_validator('MAX_CONTEXT_CHUNKS')
+    @classmethod
+    def check_max_context_chunks(cls, v: int, info: ValidationInfo) -> int:
+        retriever_k = info.data.get('RETRIEVER_TOP_K', DEFAULT_RETRIEVER_TOP_K)
+        # fusion_fetch_k is retriever_k * 2 in the code logic
+        max_possible_after_fusion = retriever_k * 2
+        if v > max_possible_after_fusion:
+            logging.warning(f"MAX_CONTEXT_CHUNKS ({v}) is greater than the maximum possible chunks after fusion ({max_possible_after_fusion} based on RETRIEVER_TOP_K={retriever_k}). Effective limit will be {max_possible_after_fusion}.")
+            # We don't strictly need to cap 'v' here, the code logic will handle it, but warning is good.
+        if v <= 0:
+             raise ValueError("MAX_CONTEXT_CHUNKS must be a positive integer.")
         return v
 
 # --- Global Settings Instance ---

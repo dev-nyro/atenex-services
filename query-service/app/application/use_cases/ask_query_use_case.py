@@ -51,6 +51,7 @@ class AskQueryUseCase:
         self.sparse_retriever = sparse_retriever if settings.BM25_ENABLED else None
         self.chunk_content_repo = chunk_content_repo
         self.reranker = reranker if settings.RERANKER_ENABLED else None
+        # LLM_CORRECTION: Use diversity_filter if enabled, store the instance (could be MMR or Stub based on main.py logic)
         self.diversity_filter = diversity_filter if settings.DIVERSITY_FILTER_ENABLED else None
 
         self._embedder = self._initialize_embedder()
@@ -60,7 +61,9 @@ class AskQueryUseCase:
         log.info("AskQueryUseCase Initialized",
                  bm25_enabled=bool(self.sparse_retriever),
                  reranker_enabled=bool(self.reranker),
-                 diversity_filter_enabled=bool(self.diversity_filter))
+                 diversity_filter_enabled=settings.DIVERSITY_FILTER_ENABLED, # Check the setting directly
+                 diversity_filter_type=type(self.diversity_filter).__name__ if self.diversity_filter else "None"
+                 )
         if self.sparse_retriever and not self.chunk_content_repo:
             log.error("SparseRetriever is enabled but ChunkContentRepositoryPort is missing!")
 
@@ -109,6 +112,15 @@ class AskQueryUseCase:
                 result = await asyncio.to_thread(prompt_builder.run, query=query)
             prompt = result.get("prompt")
             if not prompt: raise ValueError("Prompt generation returned empty.")
+
+            # --- LLM_COMMENT: Add token estimation/logging if needed ---
+            # try:
+            #    # Requires tokenizer library (e.g., tiktoken or Gemini's)
+            #    # token_count = estimate_tokens(prompt)
+            #    # builder_log.info("Estimated prompt token count", count=token_count)
+            # except Exception as tok_err:
+            #     builder_log.warning("Could not estimate prompt token count", error=str(tok_err))
+
             builder_log.debug("Prompt built successfully.")
             return prompt
         except Exception as e:
@@ -123,12 +135,10 @@ class AskQueryUseCase:
         fused_scores: Dict[str, float] = {}
         # Process dense results
         for rank, chunk in enumerate(dense_results):
-            # Use chunk.id directly, it's already a string from MilvusAdapter/DomainModel
             fused_scores[chunk.id] = fused_scores.get(chunk.id, 0.0) + 1.0 / (k + rank + 1)
 
         # Process sparse results
         for rank, (chunk_id, _) in enumerate(sparse_results):
-             # chunk_id from BM25Retriever is already a string
              fused_scores[chunk_id] = fused_scores.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
         return fused_scores
 
@@ -136,7 +146,8 @@ class AskQueryUseCase:
         self,
         fused_scores: Dict[str, float],
         dense_map: Dict[str, RetrievedChunk],
-        top_n: int
+        # --- LLM_CORRECTION: Fetch up to the final context chunk limit or slightly more ---
+        top_n: int # Use settings.MAX_CONTEXT_CHUNKS here or slightly larger buffer
         ) -> List[RetrievedChunk]:
         """
         Gets the top_n chunks based on fused scores and fetches content
@@ -145,10 +156,11 @@ class AskQueryUseCase:
         if not fused_scores: return []
 
         sorted_chunk_ids = sorted(fused_scores.items(), key=lambda item: item[1], reverse=True)
+        # Fetch content for the top N based on fused score, respecting the top_n limit passed in
         top_ids = [cid for cid, score in sorted_chunk_ids[:top_n]]
         chunks_with_content: List[RetrievedChunk] = []
         ids_needing_content: List[str] = []
-        final_scores: Dict[str, float] = dict(sorted_chunk_ids[:top_n])
+        final_scores: Dict[str, float] = dict(sorted_chunk_ids[:top_n]) # Scores only for the top N requested
 
         for cid in top_ids:
             if cid in dense_map and dense_map[cid].content:
@@ -156,24 +168,48 @@ class AskQueryUseCase:
                 chunk.score = final_scores[cid] # Update with fused score
                 chunks_with_content.append(chunk)
             else:
-                ids_needing_content.append(cid)
+                # Check if we already have this chunk from dense map but without content (shouldn't happen ideally)
+                if cid in dense_map:
+                     chunk = dense_map[cid]
+                     chunk.score = final_scores[cid]
+                     # Still needs content fetching, but keep existing metadata/embedding
+                     ids_needing_content.append(cid)
+                     # Add placeholder to maintain order temporarily
+                     chunks_with_content.append(chunk)
+                else:
+                    # Truly only found via sparse search
+                    ids_needing_content.append(cid)
+                    # Add placeholder to maintain order temporarily
+                    # Create a temporary chunk with ID and score, content and metadata to be filled
+                    chunks_with_content.append(RetrievedChunk(id=cid, score=final_scores[cid], content=None, metadata={"retrieval_source": "sparse/fused"}))
+
 
         if ids_needing_content and self.chunk_content_repo:
              log.debug("Fetching content for chunks found via sparse/fused search", count=len(ids_needing_content))
              try:
                  content_map = await self.chunk_content_repo.get_chunk_contents_by_ids(ids_needing_content)
+                 # Create a map for faster lookup of chunks needing content
+                 chunk_map_to_update = {c.id: c for c in chunks_with_content if c.id in ids_needing_content}
+
                  for cid in ids_needing_content:
                      if cid in content_map:
-                         # Create chunk with fetched content and fused score
-                         chunk = RetrievedChunk(id=cid, content=content_map[cid], score=final_scores[cid], metadata={"retrieval_source": "sparse/fused"})
-                         chunks_with_content.append(chunk)
+                         chunk_to_update = chunk_map_to_update.get(cid)
+                         if chunk_to_update:
+                              chunk_to_update.content = content_map[cid]
+                              # Add fetched flag to metadata if needed
+                              chunk_to_update.metadata["content_fetched"] = True
+                         else:
+                            log.warning("Chunk needing content not found in placeholder list", chunk_id=cid)
                      else: log.warning("Content not found for sparsely retrieved chunk after fetch", chunk_id=cid)
              except Exception: log.exception("Failed to fetch content for sparse/fused results")
         elif ids_needing_content: log.warning("Cannot fetch content for sparse/fused results, ChunkContentRepository not available.")
 
-        # Re-sort the final list by score, as fetching might change order
-        chunks_with_content.sort(key=lambda c: c.score or 0.0, reverse=True)
-        return chunks_with_content
+        # Filter out chunks that still don't have content after fetch attempt
+        final_chunks = [c for c in chunks_with_content if c.content is not None]
+
+        # Re-sort the final list by score, as fetching might change order slightly if placeholders were used
+        final_chunks.sort(key=lambda c: c.score or 0.0, reverse=True)
+        return final_chunks
 
 
     async def execute(
@@ -182,7 +218,10 @@ class AskQueryUseCase:
     ) -> Tuple[str, List[RetrievedChunk], Optional[uuid.UUID], uuid.UUID]:
         """ Orchestrates the full RAG pipeline """
         exec_log = log.bind(use_case="AskQueryUseCase", company_id=str(company_id), user_id=str(user_id), query=truncate_text(query, 50))
-        retriever_k = top_k or settings.RETRIEVER_TOP_K
+        # --- LLM_CORRECTION: Use configured retriever_k, allow override via request ---
+        retriever_k = top_k if top_k is not None and 0 < top_k <= settings.RETRIEVER_TOP_K else settings.RETRIEVER_TOP_K
+        exec_log = exec_log.bind(effective_retriever_k=retriever_k)
+
         pipeline_stages_used = ["dense_retrieval", "llm_generation"] # Base stages
         final_chat_id: uuid.UUID
         log_id: Optional[uuid.UUID] = None
@@ -227,19 +266,21 @@ class AskQueryUseCase:
             dense_chunks, sparse_results_maybe = await asyncio.gather(dense_task, sparse_task)
             if self.sparse_retriever: # Ensure sparse_results list is populated if run
                 sparse_results = sparse_results_maybe if isinstance(sparse_results_maybe, list) else []
-            exec_log.info("Retrieval phase completed", dense_count=len(dense_chunks), sparse_count=len(sparse_results))
+            exec_log.info("Retrieval phase completed", dense_count=len(dense_chunks), sparse_count=len(sparse_results), retriever_k=retriever_k)
 
-            # 6. Fusion
+            # 6. Fusion & Content Fetch
             pipeline_stages_used.append("fusion (rrf)")
-            dense_map = {c.id: c for c in dense_chunks}
+            dense_map = {c.id: c for c in dense_chunks} # Map dense chunks by ID for easy lookup
             fused_scores = self._reciprocal_rank_fusion(dense_chunks, sparse_results)
-            fusion_fetch_k = retriever_k * 2
-            combined_chunks = await self._fetch_content_for_fused_results(fused_scores, dense_map, fusion_fetch_k)
-            exec_log.info("Fusion completed", initial_fused_count=len(fused_scores), chunks_with_content=len(combined_chunks))
 
-            # Filter out chunks without content before next steps
-            chunks_for_next_steps = [c for c in combined_chunks if c.content]
-            if not chunks_for_next_steps:
+            # --- LLM_CORRECTION: Fetch content for up to MAX_CONTEXT_CHUNKS candidates after fusion ---
+            # Fetch slightly more than needed in case some lack content, but respect the final limit target.
+            fusion_fetch_k = settings.MAX_CONTEXT_CHUNKS + 10 # Add a small buffer
+            combined_chunks_with_content = await self._fetch_content_for_fused_results(fused_scores, dense_map, fusion_fetch_k)
+            exec_log.info("Fusion & Content Fetch completed", initial_fused_count=len(fused_scores), chunks_with_content=len(combined_chunks_with_content), fetch_limit=fusion_fetch_k)
+
+            # Check if any chunks remain after fetching content
+            if not combined_chunks_with_content:
                  exec_log.warning("No chunks with content available after fusion/fetch.")
                  final_prompt = await self._build_prompt(query, []) # Use general prompt
                  answer = await self.llm.generate(final_prompt)
@@ -250,30 +291,43 @@ class AskQueryUseCase:
                  return answer, [], log_id, final_chat_id # Return empty list for retrieved docs
 
             # 7. Reranking (Conditional)
-            reranked_chunks = chunks_for_next_steps
+            chunks_to_process_further = combined_chunks_with_content
             if self.reranker: # Check if reranker instance exists (implies enabled and loaded)
                 pipeline_stages_used.append("reranking (bge)")
-                exec_log.debug("Performing reranking...", count=len(chunks_for_next_steps))
-                reranked_chunks = await self.reranker.rerank(query, chunks_for_next_steps)
-                exec_log.info("Reranking completed.", count=len(reranked_chunks))
+                exec_log.debug("Performing reranking...", count=len(chunks_to_process_further))
+                # Pass only up to MAX_CONTEXT_CHUNKS + buffer to reranker if it's very large? For now, rerank all fetched.
+                chunks_to_process_further = await self.reranker.rerank(query, chunks_to_process_further)
+                exec_log.info("Reranking completed.", count=len(chunks_to_process_further))
 
-            # 8. Diversity Filtering (Conditional)
-            final_chunks_for_llm = reranked_chunks
-            if self.diversity_filter: # Check if filter instance exists
-                pipeline_stages_used.append("diversity_filter (stub)")
-                k_final = settings.DIVERSITY_K_FINAL
-                exec_log.debug(f"Applying diversity filter k={k_final}...", count=len(reranked_chunks))
-                final_chunks_for_llm = await self.diversity_filter.filter(reranked_chunks, k_final)
-                exec_log.info("Diversity filter applied.", final_count=len(final_chunks_for_llm))
+            # 8. Apply Diversity Filter / Final Limit
+            final_chunks_for_llm = chunks_to_process_further
+            # --- LLM_CORRECTION: Apply diversity filter OR truncate to MAX_CONTEXT_CHUNKS ---
+            if self.diversity_filter: # Check if filter instance exists (covers enabled/disabled logic from init)
+                 # Use the MAX_CONTEXT_CHUNKS setting as the target size 'k_final' for the filter
+                 k_final = settings.MAX_CONTEXT_CHUNKS
+                 filter_type = type(self.diversity_filter).__name__
+                 pipeline_stages_used.append(f"diversity_filter ({filter_type})")
+                 exec_log.debug(f"Applying {filter_type} k={k_final}...", count=len(chunks_to_process_further))
+                 final_chunks_for_llm = await self.diversity_filter.filter(chunks_to_process_further, k_final)
+                 exec_log.info(f"{filter_type} applied.", final_count=len(final_chunks_for_llm))
+            else:
+                 # If diversity_filter is None (because not enabled in settings),
+                 # apply the limit manually before sending to LLM.
+                 final_chunks_for_llm = chunks_to_process_further[:settings.MAX_CONTEXT_CHUNKS]
+                 exec_log.info(f"Diversity filter disabled. Truncating to MAX_CONTEXT_CHUNKS.", final_count=len(final_chunks_for_llm), limit=settings.MAX_CONTEXT_CHUNKS)
+
 
             # 9. Build Prompt
             haystack_docs_for_prompt = [
                 Document(id=c.id, content=c.content, meta=c.metadata, score=c.score)
-                for c in final_chunks_for_llm if c.content
+                for c in final_chunks_for_llm if c.content # Double check content exists
             ]
             if not haystack_docs_for_prompt:
                  exec_log.warning("No documents remaining after filtering for RAG prompt, using general prompt.")
-            final_prompt = await self._build_prompt(query, haystack_docs_for_prompt)
+                 final_prompt = await self._build_prompt(query, [])
+            else:
+                 exec_log.info(f"Building RAG prompt with {len(haystack_docs_for_prompt)} final chunks.")
+                 final_prompt = await self._build_prompt(query, haystack_docs_for_prompt)
 
             # 10. Generate Answer
             answer = await self.llm.generate(final_prompt)
@@ -282,16 +336,24 @@ class AskQueryUseCase:
             # 11. Save Assistant Message
             assistant_sources = [
                 {"chunk_id": c.id, "document_id": c.document_id, "file_name": c.file_name, "score": c.score, "preview": truncate_text(c.content, 150)}
-                for c in final_chunks_for_llm
+                for c in final_chunks_for_llm # Use the final list passed to LLM
             ]
             await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=assistant_sources or None)
 
             # 12. Log Interaction
             try:
+                # --- LLM_CORRECTION: Use final_chunks_for_llm for logging sources ---
                 docs_for_log = [RetrievedDocumentSchema(**c.model_dump()).model_dump(exclude_none=True) for c in final_chunks_for_llm]
-                log_metadata = { "pipeline_stages": pipeline_stages_used, "retriever_k": retriever_k,
-                                 "fusion_fetch_k": fusion_fetch_k, "diversity_k_final": settings.DIVERSITY_K_FINAL if self.diversity_filter else None,
-                                 "num_final_to_llm": len(final_chunks_for_llm) }
+                log_metadata = {
+                    "pipeline_stages": pipeline_stages_used,
+                    "retriever_k": retriever_k,
+                    "fusion_fetch_k": fusion_fetch_k, # Log the fetch limit
+                    "max_context_chunks_limit": settings.MAX_CONTEXT_CHUNKS, # Log the setting value
+                    "num_final_chunks_to_llm": len(final_chunks_for_llm),
+                    "diversity_filter_enabled": settings.DIVERSITY_FILTER_ENABLED,
+                    "reranker_enabled": settings.RERANKER_ENABLED,
+                    "bm25_enabled": settings.BM25_ENABLED,
+                 }
                 log_id = await self.log_repo.log_query_interaction(
                     company_id=company_id, user_id=user_id, query=query, answer=answer,
                     retrieved_documents_data=docs_for_log, chat_id=final_chat_id, metadata=log_metadata
@@ -301,6 +363,7 @@ class AskQueryUseCase:
                 exec_log.error("Failed to log RAG interaction", error=str(log_err), exc_info=False)
 
             exec_log.info("Use case execution finished successfully.")
+            # --- LLM_CORRECTION: Return final_chunks_for_llm ---
             return answer, final_chunks_for_llm, log_id, final_chat_id
 
         except ConnectionError as ce:
