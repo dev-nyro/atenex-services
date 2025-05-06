@@ -37,7 +37,10 @@ from app.infrastructure.rerankers.bge_reranker import BGEReranker
 from app.infrastructure.filters.diversity_filter import MMRDiversityFilter, StubDiversityFilter
 
 # Import Use Case
+
+# Import AskQueryUseCase and dependency setter from dependencies.py
 from app.application.use_cases.ask_query_use_case import AskQueryUseCase
+from app.dependencies import set_ask_query_use_case_instance
 
 # Import DB Connector
 from app.infrastructure.persistence import postgres_connector
@@ -170,16 +173,20 @@ async def lifespan(app: FastAPI):
                  log.info("Embedding model warmed up successfully.")
                  # Only set ready if ALL critical steps succeeded
                  SERVICE_READY = True
+                 # Set the singleton in dependencies.py for use in endpoints
+                 set_ask_query_use_case_instance(ask_query_use_case_instance, SERVICE_READY)
                  log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY.")
              except Exception as embed_err:
                  critical_failure_message = "Failed to warm up embedding model."
                  log.critical(f"CRITICAL: {critical_failure_message}", error=str(embed_err), exc_info=True)
                  SERVICE_READY = False # Ensure service is not ready
+                 set_ask_query_use_case_instance(None, False)
 
          except Exception as e:
               critical_failure_message = "Failed to instantiate AskQueryUseCase."
               log.critical(f"CRITICAL: {critical_failure_message}", error=str(e), exc_info=True)
               SERVICE_READY = False
+              set_ask_query_use_case_instance(None, False)
     else:
         # Log final status if dependencies failed earlier
         log.critical(f"{settings.PROJECT_NAME} startup sequence aborted due to critical failure: {critical_failure_message}")
@@ -274,12 +281,7 @@ def get_chat_repository() -> ChatRepositoryPort:
         raise HTTPException(status_code=503, detail="Chat service component not available.")
     return chat_repo_instance
 
-def get_ask_query_use_case() -> AskQueryUseCase:
-    # More robust check: verify both the instance exists AND the service was marked as ready
-    if not SERVICE_READY or not ask_query_use_case_instance:
-         log.error("Dependency Injection Failed: AskQueryUseCase requested but service is not ready.", service_ready=SERVICE_READY, instance_exists=bool(ask_query_use_case_instance))
-         raise HTTPException(status_code=503, detail="Query processing service is not ready. Check startup logs.")
-    return ask_query_use_case_instance
+# get_ask_query_use_case is now provided by app/dependencies.py
 
 # --- Routers ---
 app.include_router(query_router_module.router, prefix=settings.API_V1_STR, tags=["Query Interaction"])

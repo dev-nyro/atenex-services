@@ -30,8 +30,8 @@ GREETING_REGEX = re.compile(r"^\s*(hola|hello|hi|buenos días|buenas tardes|buen
 
 
 # --- Dependency Injection Setup ---
-# Usar el singleton global inicializado y calentado en main.py
-from app.main import get_ask_query_use_case
+# Usar el singleton global inicializado y calentado en main.py, vía dependencies.py
+from app.dependencies import get_ask_query_use_case
 
 # --- Endpoint Refactored to use AskQueryUseCase ---
 @router.post(
