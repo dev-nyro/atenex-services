@@ -27,10 +27,9 @@ MILVUS_DEFAULT_DOCUMENT_ID_FIELD = "document_id" # Consistent with ingest schema
 MILVUS_DEFAULT_FILENAME_FIELD = "file_name"   # Consistent with ingest schema
 MILVUS_DEFAULT_GRPC_TIMEOUT = 15
 
-# --- CORRECTION: Align Milvus Search Params - Use L2 based on previous logs, but comment on ingest (IP) ---
-# LLM_COMMENT: Search metric should ideally match index metric (ingest uses IP default).
-# Using L2 as per previous query-service logs, but verify consistency if issues arise.
-MILVUS_DEFAULT_SEARCH_PARAMS = {"metric_type": "L2", "params": {"nprobe": 10}}
+# --- CORRECTION: Align Milvus Search Params - Use IP to match ingest-service and collection ---
+# LLM_COMMENT: Search metric must match index metric (ingest uses IP by default).
+MILVUS_DEFAULT_SEARCH_PARAMS = {"metric_type": "IP", "params": {"nprobe": 10}}
 # --- END CORRECTION ---
 
 # --- CORRECTION: Define Default Metadata Fields based on Ingest Schema ---
