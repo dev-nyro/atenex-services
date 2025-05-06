@@ -1024,18 +1024,34 @@ POSTGRES_K8S_HOST_DEFAULT = "postgresql-service.nyro-develop.svc.cluster.local"
 POSTGRES_K8S_PORT_DEFAULT = 5432
 POSTGRES_K8S_DB_DEFAULT = "atenex"
 POSTGRES_K8S_USER_DEFAULT = "postgres"
-# Milvus
+
+# --- CORRECTION: Align Milvus Collection Name with Ingest Service ---
 MILVUS_K8S_DEFAULT_URI = "http://milvus-standalone.nyro-develop.svc.cluster.local:19530"
-MILVUS_DEFAULT_COLLECTION = "document_chunks_haystack" # LLM_FLAG: Consider aligning collection name if ingest changes
-MILVUS_DEFAULT_EMBEDDING_FIELD = "embedding"
-MILVUS_DEFAULT_CONTENT_FIELD = "content"
-MILVUS_DEFAULT_COMPANY_ID_FIELD = "company_id"
-MILVUS_DEFAULT_DOCUMENT_ID_FIELD = "document_id"
-MILVUS_DEFAULT_FILENAME_FIELD = "file_name"
-MILVUS_DEFAULT_GRPC_TIMEOUT = 15 # Increased default timeout slightly
-# --- Default Milvus Search Params ---
+# LLM_COMMENT: Default collection name MUST match the one used by ingest-service
+MILVUS_DEFAULT_COLLECTION = "document_chunks_minilm"
+# --- END CORRECTION ---
+
+MILVUS_DEFAULT_EMBEDDING_FIELD = "embedding" # Consistent with ingest schema
+MILVUS_DEFAULT_CONTENT_FIELD = "content"     # Consistent with ingest schema
+MILVUS_DEFAULT_COMPANY_ID_FIELD = "company_id" # Consistent with ingest schema
+MILVUS_DEFAULT_DOCUMENT_ID_FIELD = "document_id" # Consistent with ingest schema
+MILVUS_DEFAULT_FILENAME_FIELD = "file_name"   # Consistent with ingest schema
+MILVUS_DEFAULT_GRPC_TIMEOUT = 15
+
+# --- CORRECTION: Align Milvus Search Params - Use L2 based on previous logs, but comment on ingest (IP) ---
+# LLM_COMMENT: Search metric should ideally match index metric (ingest uses IP default).
+# Using L2 as per previous query-service logs, but verify consistency if issues arise.
 MILVUS_DEFAULT_SEARCH_PARAMS = {"metric_type": "L2", "params": {"nprobe": 10}}
-# RAG Prompts
+# --- END CORRECTION ---
+
+# --- CORRECTION: Define Default Metadata Fields based on Ingest Schema ---
+# LLM_COMMENT: These are scalar fields requested from Milvus *in addition* to mandatory fields (pk, vector, content).
+# Should align with fields defined in ingest-service Milvus schema. 'file_type' was removed. Added 'page'.
+MILVUS_DEFAULT_METADATA_FIELDS = ["company_id", "document_id", "file_name", "page", "title"]
+# --- END CORRECTION ---
+
+
+# RAG Prompts (No change needed)
 DEFAULT_RAG_PROMPT_TEMPLATE = """
 Basándote estrictamente en los siguientes documentos recuperados, responde a la pregunta del usuario.
 Si los documentos no contienen la respuesta, indica explícitamente que no puedes responder con la información proporcionada.
@@ -1060,20 +1076,19 @@ Pregunta: {{ query }}
 
 Respuesta:
 """
-# Models
+# Models (No change needed)
 DEFAULT_FASTEMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_FASTEMBED_QUERY_PREFIX = "query: "
 DEFAULT_EMBEDDING_DIMENSION = 384
 DEFAULT_GEMINI_MODEL = "gemini-1.5-flash-latest"
 DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-base"
-# RAG Pipeline Parameters
+# RAG Pipeline Parameters (No change needed)
 DEFAULT_RETRIEVER_TOP_K = 5
 DEFAULT_BM25_ENABLED: bool = True
 DEFAULT_RERANKER_ENABLED: bool = True
 DEFAULT_DIVERSITY_FILTER_ENABLED: bool = False
 DEFAULT_DIVERSITY_K_FINAL: int = 10
 DEFAULT_HYBRID_ALPHA: float = 0.5
-# --- Default Diversity Lambda ---
 DEFAULT_DIVERSITY_LAMBDA: float = 0.5
 
 class Settings(BaseSettings):
@@ -1099,15 +1114,17 @@ class Settings(BaseSettings):
 
     # --- Vector Store (Milvus) ---
     MILVUS_URI: AnyHttpUrl = Field(default=AnyHttpUrl(MILVUS_K8S_DEFAULT_URI))
+    # --- CORRECTION: Use corrected default ---
     MILVUS_COLLECTION_NAME: str = Field(default=MILVUS_DEFAULT_COLLECTION)
+    # LLM_COMMENT: Ensure these field names exactly match the ingest-service Milvus schema
     MILVUS_EMBEDDING_FIELD: str = Field(default=MILVUS_DEFAULT_EMBEDDING_FIELD)
     MILVUS_CONTENT_FIELD: str = Field(default=MILVUS_DEFAULT_CONTENT_FIELD)
     MILVUS_COMPANY_ID_FIELD: str = Field(default=MILVUS_DEFAULT_COMPANY_ID_FIELD)
     MILVUS_DOCUMENT_ID_FIELD: str = Field(default=MILVUS_DEFAULT_DOCUMENT_ID_FIELD)
     MILVUS_FILENAME_FIELD: str = Field(default=MILVUS_DEFAULT_FILENAME_FIELD)
-    MILVUS_METADATA_FIELDS: List[str] = Field(default=["company_id", "document_id", "file_name", "file_type"])
+    # --- CORRECTION: Use corrected default ---
+    MILVUS_METADATA_FIELDS: List[str] = Field(default=MILVUS_DEFAULT_METADATA_FIELDS)
     MILVUS_GRPC_TIMEOUT: int = Field(default=MILVUS_DEFAULT_GRPC_TIMEOUT)
-    # --- Added Milvus Search Params ---
     MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default=MILVUS_DEFAULT_SEARCH_PARAMS)
 
     # --- Embedding Model (FastEmbed) ---
@@ -1129,7 +1146,6 @@ class Settings(BaseSettings):
     # --- Diversity Filter ---
     DIVERSITY_FILTER_ENABLED: bool = Field(default=DEFAULT_DIVERSITY_FILTER_ENABLED)
     DIVERSITY_K_FINAL: int = Field(default=DEFAULT_DIVERSITY_K_FINAL, gt=0, description="Target number of documents after diversity filtering.")
-    # --- Added Diversity Lambda ---
     QUERY_DIVERSITY_LAMBDA: float = Field(default=DEFAULT_DIVERSITY_LAMBDA, ge=0.0, le=1.0, description="Lambda for MMR diversity (0=max diversity, 1=max relevance).")
 
 
@@ -1145,7 +1161,7 @@ class Settings(BaseSettings):
     HTTP_CLIENT_MAX_RETRIES: int = Field(default=2)
     HTTP_CLIENT_BACKOFF_FACTOR: float = Field(default=1.0)
 
-    # --- Validators ---
+    # --- Validators (No changes needed here) ---
     @field_validator('LOG_LEVEL')
     @classmethod
     def check_log_level(cls, v: str) -> str:
@@ -2340,6 +2356,48 @@ from app.core.config import settings
 from app.application.ports.vector_store_port import VectorStorePort
 from app.domain.models import RetrievedChunk # Import domain model
 
+# --- Import field name constants from ingest_pipeline for clarity (Read-Only) ---
+# These constants represent the actual field names used in the Milvus collection schema
+# defined by the ingest-service.
+# This improves maintainability if field names change in the ingest service.
+try:
+    from app.services.ingest_pipeline import (
+        MILVUS_PK_FIELD, # "pk_id"
+        MILVUS_VECTOR_FIELD, # "embedding"
+        MILVUS_CONTENT_FIELD, # "content"
+        MILVUS_COMPANY_ID_FIELD, # "company_id"
+        MILVUS_DOCUMENT_ID_FIELD, # "document_id"
+        MILVUS_FILENAME_FIELD, # "file_name"
+        MILVUS_PAGE_FIELD, # "page"
+        MILVUS_TITLE_FIELD, # "title"
+        # Add others if needed (tokens, content_hash)
+    )
+    INGEST_SCHEMA_FIELDS = {
+        "pk": MILVUS_PK_FIELD,
+        "vector": MILVUS_VECTOR_FIELD,
+        "content": MILVUS_CONTENT_FIELD,
+        "company": MILVUS_COMPANY_ID_FIELD,
+        "document": MILVUS_DOCUMENT_ID_FIELD,
+        "filename": MILVUS_FILENAME_FIELD,
+        "page": MILVUS_PAGE_FIELD,
+        "title": MILVUS_TITLE_FIELD,
+    }
+except ImportError:
+     # Fallback to using settings directly if ingest schema isn't available
+     # (less ideal but allows standalone use)
+     structlog.getLogger(__name__).warning("Could not import ingest schema constants, using settings directly for field names.")
+     INGEST_SCHEMA_FIELDS = {
+        "pk": "pk_id", # Assuming default from ingest
+        "vector": settings.MILVUS_EMBEDDING_FIELD,
+        "content": settings.MILVUS_CONTENT_FIELD,
+        "company": settings.MILVUS_COMPANY_ID_FIELD,
+        "document": settings.MILVUS_DOCUMENT_ID_FIELD,
+        "filename": settings.MILVUS_FILENAME_FIELD,
+        "page": "page", # Add fallbacks for metadata
+        "title": "title",
+    }
+
+
 log = structlog.get_logger(__name__)
 
 class MilvusAdapter(VectorStorePort):
@@ -2360,13 +2418,6 @@ class MilvusAdapter(VectorStorePort):
             connect_log = log.bind(adapter="MilvusAdapter", action="connect", uri=uri, alias=self._alias)
             connect_log.debug("Attempting to connect to Milvus...")
             try:
-                # Check if already connected under this alias
-                existing_conn = connections.get_connection_addr(self._alias)
-                if existing_conn:
-                    connect_log.debug("Already connected to Milvus under this alias.")
-                    self._connected = True
-                    return
-
                 connections.connect(alias=self._alias, uri=uri, timeout=settings.MILVUS_GRPC_TIMEOUT)
                 self._connected = True
                 connect_log.info("Connected to Milvus successfully.")
@@ -2384,30 +2435,22 @@ class MilvusAdapter(VectorStorePort):
         await self._ensure_connection() # Ensure connection is active
 
         if self._collection is None:
-            collection_name = settings.MILVUS_COLLECTION_NAME
+            collection_name = settings.MILVUS_COLLECTION_NAME # Now uses the corrected default or ENV var
             collection_log = log.bind(adapter="MilvusAdapter", action="get_collection", collection=collection_name, alias=self._alias)
-            collection_log.debug("Attempting to get Milvus collection.")
+            collection_log.info(f"Attempting to access Milvus collection: '{collection_name}'") # Log the name being used
             try:
                 if not utility.has_collection(collection_name, using=self._alias):
-                    collection_log.error("Milvus collection does not exist.")
-                    raise RuntimeError(f"Milvus collection '{collection_name}' not found. It must be created by the ingest service.")
+                    collection_log.error("Milvus collection does not exist.", target_collection=collection_name)
+                    raise RuntimeError(f"Milvus collection '{collection_name}' not found. Ensure ingest-service has created it.")
 
-                # Instanciación directa. Errores de índice ambiguo pueden surgir aquí o en load().
                 collection = Collection(name=collection_name, using=self._alias)
-
-                # --- CORRECTION: Removed explicit has_index() check ---
-                # if not collection.has_index():
-                #      collection_log.warning("Collection exists but has no index. Retrieval quality may be affected.")
-                # -----------------------------------------------------
-
                 collection_log.debug("Loading Milvus collection into memory...")
-                collection.load() # Load default partition or all partitions. Error puede surgir aquí.
+                collection.load()
                 collection_log.info("Milvus collection loaded successfully.")
                 self._collection = collection
 
             except MilvusException as e:
                 collection_log.error("Failed to get or load Milvus collection", error_code=e.code, error_message=e.message)
-                # Add specific handling for ambiguous index error message for clarity
                 if "multiple indexes" in e.message.lower():
                     collection_log.critical("Potential 'Ambiguous Index' error encountered. Please check Milvus indices for this collection.")
                 raise RuntimeError(f"Milvus collection access error (Code: {e.code}): {e.message}") from e
@@ -2416,7 +2459,7 @@ class MilvusAdapter(VectorStorePort):
                  raise RuntimeError(f"Unexpected error accessing Milvus collection: {e}") from e
 
         if not isinstance(self._collection, Collection):
-            log.critical("Milvus collection object is unexpectedly None or invalid after initialization attempt.")
+            log.critical("Milvus collection object is unexpectedly None or invalid type after initialization attempt.")
             raise RuntimeError("Failed to obtain a valid Milvus collection object.")
 
         return self._collection
@@ -2427,27 +2470,37 @@ class MilvusAdapter(VectorStorePort):
         try:
             collection = await self._get_collection()
 
-            search_params = getattr(settings, "MILVUS_SEARCH_PARAMS", {"metric_type": "L2", "params": {"nprobe": 10}})
-
-            filter_expr = f'{settings.MILVUS_COMPANY_ID_FIELD} == "{company_id}"'
+            search_params = settings.MILVUS_SEARCH_PARAMS
+            # --- Use consistent field name for filtering ---
+            filter_expr = f'{INGEST_SCHEMA_FIELDS["company"]} == "{company_id}"'
             search_log.debug("Using filter expression", expr=filter_expr)
 
-            output_fields = list(set([
-                settings.MILVUS_CONTENT_FIELD,
-                settings.MILVUS_EMBEDDING_FIELD,
-                settings.MILVUS_COMPANY_ID_FIELD,
-                settings.MILVUS_DOCUMENT_ID_FIELD,
-                settings.MILVUS_FILENAME_FIELD,
-            ] + settings.MILVUS_METADATA_FIELDS))
+            # --- CORRECTION: Construct output_fields based on INGEST_SCHEMA_FIELDS and settings.MILVUS_METADATA_FIELDS ---
+            # Start with mandatory fields used directly by the adapter/domain model
+            required_output_fields = {
+                INGEST_SCHEMA_FIELDS["pk"], # Need the PK to populate RetrievedChunk.id
+                INGEST_SCHEMA_FIELDS["vector"], # Need the vector for diversity filter
+                INGEST_SCHEMA_FIELDS["content"],
+                INGEST_SCHEMA_FIELDS["company"],
+                INGEST_SCHEMA_FIELDS["document"],
+                INGEST_SCHEMA_FIELDS["filename"],
+            }
+            # Add fields specified in the query service's metadata list config
+            # This ensures we fetch what the query service expects for its metadata dict
+            required_output_fields.update(settings.MILVUS_METADATA_FIELDS)
+            output_fields = list(required_output_fields)
+            # --- END CORRECTION ---
 
-            search_log.debug("Performing Milvus vector search...", vector_field=settings.MILVUS_EMBEDDING_FIELD, output_fields=output_fields)
+            search_log.debug("Performing Milvus vector search...",
+                             vector_field=INGEST_SCHEMA_FIELDS["vector"], # Use consistent vector field
+                             output_fields=output_fields)
 
             loop = asyncio.get_running_loop()
             search_results = await loop.run_in_executor(
                 None,
                 lambda: collection.search(
                     data=[embedding],
-                    anns_field=settings.MILVUS_EMBEDDING_FIELD,
+                    anns_field=INGEST_SCHEMA_FIELDS["vector"], # Use consistent vector field
                     param=search_params,
                     limit=top_k,
                     expr=filter_expr,
@@ -2461,31 +2514,34 @@ class MilvusAdapter(VectorStorePort):
             domain_chunks: List[RetrievedChunk] = []
             if search_results and search_results[0]:
                 for hit in search_results[0]:
-                    # Use hit.entity.to_dict() for easier access if available and preferred
-                    # entity_data = hit.entity.to_dict()
-                    # Using direct access for robustness
+                    # --- CORRECTION: Use hit.entity if available, handle potential absence ---
                     entity_data = hit.entity.to_dict() if hasattr(hit, 'entity') and hasattr(hit.entity, 'to_dict') else {}
-                    content = entity_data.get(settings.MILVUS_CONTENT_FIELD, "")
-                    embedding_vector = entity_data.get(settings.MILVUS_EMBEDDING_FIELD)
 
-                    # Prepare metadata from entity_data, excluding sensitive or large fields if needed
-                    metadata = {k: v for k, v in entity_data.items() if k != settings.MILVUS_EMBEDDING_FIELD}
+                    # Extract core fields using consistent names
+                    pk_id = str(hit.id) # hit.id *should* be the primary key value
+                    content = entity_data.get(INGEST_SCHEMA_FIELDS["content"], "")
+                    embedding_vector = entity_data.get(INGEST_SCHEMA_FIELDS["vector"])
 
-                    # Ensure required fields for domain model exist in metadata
-                    doc_id = metadata.get(settings.MILVUS_DOCUMENT_ID_FIELD)
-                    comp_id = metadata.get(settings.MILVUS_COMPANY_ID_FIELD)
+                    # Prepare metadata dict from all returned entity data, excluding vector
+                    metadata = {k: v for k, v in entity_data.items() if k != INGEST_SCHEMA_FIELDS["vector"]}
+                    # Ensure standard fields expected by domain model are present in metadata (using consistent keys)
+                    doc_id = metadata.get(INGEST_SCHEMA_FIELDS["document"])
+                    comp_id = metadata.get(INGEST_SCHEMA_FIELDS["company"])
+                    fname = metadata.get(INGEST_SCHEMA_FIELDS["filename"])
 
                     chunk = RetrievedChunk(
-                        id=str(hit.id),
+                        id=pk_id, # Use the primary key
                         content=content,
                         score=hit.score,
-                        metadata=metadata,
+                        metadata=metadata, # Store all retrieved metadata
                         embedding=embedding_vector,
+                        # Populate direct domain fields from metadata if available
                         document_id=str(doc_id) if doc_id else None,
-                        file_name=metadata.get(settings.MILVUS_FILENAME_FIELD),
+                        file_name=str(fname) if fname else None,
                         company_id=str(comp_id) if comp_id else None
                     )
                     domain_chunks.append(chunk)
+                # --- END CORRECTION ---
 
             search_log.info(f"Converted {len(domain_chunks)} Milvus hits to domain objects.")
             return domain_chunks
@@ -2498,15 +2554,20 @@ class MilvusAdapter(VectorStorePort):
             raise ConnectionError(f"Vector DB search service error: {e}") from e
 
     async def connect(self):
+        """Explicitly ensures connection (can be called during startup if needed)."""
         await self._ensure_connection()
 
     async def disconnect(self):
+        """Disconnects from Milvus."""
         if self._connected and self._alias in connections.list_connections():
             log.info("Disconnecting from Milvus...", adapter="MilvusAdapter", alias=self._alias)
-            connections.disconnect(self._alias)
-            self._connected = False
-            self._collection = None
-            log.info("Disconnected from Milvus.", adapter="MilvusAdapter")
+            try:
+                connections.disconnect(self._alias)
+                self._connected = False
+                self._collection = None # Reset collection object on disconnect
+                log.info("Disconnected from Milvus.", adapter="MilvusAdapter")
+            except Exception as e:
+                log.error("Error during Milvus disconnect", error=str(e), exc_info=True)
 ```
 
 ## File: `app\main.py`

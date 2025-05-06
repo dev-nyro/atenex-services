@@ -29,30 +29,9 @@ router = APIRouter()
 GREETING_REGEX = re.compile(r"^\s*(hola|hello|hi|buenos días|buenas tardes|buenas noches|hey|qué tal|hi there)\s*[\.,!?]*\s*$", re.IGNORECASE)
 
 
-# --- Dependency Injection Setup (Simplified Example) ---
-# LLM_REFACTOR_STEP_3: In a real app, use a framework like FastAPI Injector or manual setup in main.py
-# For now, we instantiate dependencies directly here for simplicity.
-def get_ask_query_use_case() -> AskQueryUseCase:
-    # Instantiate concrete implementations
-    chat_repo = PostgresChatRepository()
-    log_repo = PostgresLogRepository()
-    vector_store = MilvusAdapter()
-    llm_adapter = GeminiAdapter()
-    chunk_content_repo = PostgresChunkContentRepository() # Needed for future BM25
-
-    # Instantiate the use case with concrete dependencies
-    # For optional ones (BM25, Reranker, Filter), pass None for now
-    use_case = AskQueryUseCase(
-        chat_repo=chat_repo,
-        log_repo=log_repo,
-        vector_store=vector_store,
-        llm=llm_adapter,
-        sparse_retriever=None, # Not implemented yet
-        chunk_content_repo=chunk_content_repo, # Pass if needed by sparse retriever
-        reranker=None,         # Not implemented yet
-        diversity_filter=None  # Not implemented yet
-    )
-    return use_case
+# --- Dependency Injection Setup ---
+# Usar el singleton global inicializado y calentado en main.py
+from app.main import get_ask_query_use_case
 
 # --- Endpoint Refactored to use AskQueryUseCase ---
 @router.post(
