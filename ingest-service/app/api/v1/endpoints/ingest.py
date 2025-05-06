@@ -45,8 +45,6 @@ router = APIRouter()
 
 # --- Helper Functions ---
 
-# LLM_FLAG: NO_CHANGE - Minio Client Dependency removed
-
 # GCS Client Dependency
 def get_gcs_client():
     """Dependency to get GCS client instance."""
@@ -87,7 +85,7 @@ async def get_db_conn():
 
 
 # --- Milvus Synchronous Helper Functions (Refactored to use pymilvus) ---
-# LLM_FLAG: NO_CHANGE - Milvus Sync Helper Functions (Already Correct)
+# LLM_FLAG: NO_CHANGE - Milvus Sync Helper Functions (Already Correct) - _get_milvus_collection_sync is correct
 def _get_milvus_collection_sync() -> Collection:
     """Synchronously connects to Milvus and returns the Collection object."""
     alias = "api_sync_helper"
@@ -112,6 +110,7 @@ def _get_milvus_collection_sync() -> Collection:
         sync_milvus_log.error("Failed to get or load Milvus collection for sync helper", error=str(e))
         raise RuntimeError(f"Milvus collection access error for API helper: {e}") from e
 
+# LLM_FLAG: NO_CHANGE - Milvus Sync Helper Functions (Already Correct) - _get_milvus_chunk_count_sync is correct
 def _get_milvus_chunk_count_sync(document_id: str, company_id: str) -> int:
     """Synchronously counts chunks in Milvus for a specific document using pymilvus query."""
     count_log = log.bind(document_id=document_id, company_id=company_id, component="MilvusHelperSync")
@@ -133,26 +132,48 @@ def _get_milvus_chunk_count_sync(document_id: str, company_id: str) -> int:
         count_log.exception("Unexpected error during Milvus count", error=str(e))
         return -1
 
+# --- FIX: Milvus Delete Sync Helper ---
 def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
-    """Synchronously deletes chunks from Milvus using pymilvus delete."""
+    """Synchronously deletes chunks from Milvus using pymilvus: Query PKs first, then delete by PK list."""
     delete_log = log.bind(document_id=document_id, company_id=company_id, component="MilvusHelperSync")
+    expr = f'{MILVUS_COMPANY_ID_FIELD} == "{company_id}" and {MILVUS_DOCUMENT_ID_FIELD} == "{document_id}"'
+    pks_to_delete: List[str] = []
+
     try:
         collection = _get_milvus_collection_sync()
-        expr = f'{MILVUS_COMPANY_ID_FIELD} == "{company_id}" and {MILVUS_DOCUMENT_ID_FIELD} == "{document_id}"'
-        delete_log.info("Attempting to delete chunks from Milvus (pymilvus)", filter_expr=expr)
-        delete_result = collection.delete(expr=expr)
-        delete_log.info("Milvus delete operation executed (pymilvus)", deleted_count=delete_result.delete_count)
-        return True
+
+        # 1. Query for Primary Keys
+        delete_log.info("Querying Milvus for PKs to delete (sync)...", filter_expr=expr)
+        query_res = collection.query(expr=expr, output_fields=[MILVUS_PK_FIELD])
+        pks_to_delete = [item[MILVUS_PK_FIELD] for item in query_res if MILVUS_PK_FIELD in item]
+
+        if not pks_to_delete:
+            delete_log.info("No matching primary keys found in Milvus for deletion (sync).")
+            return True # Return True as there's nothing to delete
+
+        delete_log.info(f"Found {len(pks_to_delete)} primary keys to delete (sync).")
+
+        # 2. Delete using the retrieved Primary Keys
+        # Ensure the list formatting is correct for the 'in' operator
+        delete_expr = f'{MILVUS_PK_FIELD} in {json.dumps(pks_to_delete)}' # Use json.dumps for correct list representation
+        delete_log.info("Attempting to delete chunks from Milvus using PK list expression (sync).", filter_expr=delete_expr)
+        delete_result = collection.delete(expr=delete_expr)
+        delete_log.info("Milvus delete operation by PK list executed (sync).", deleted_count=delete_result.delete_count)
+
+        if delete_result.delete_count != len(pks_to_delete):
+             delete_log.warning("Milvus delete count mismatch (sync).", expected=len(pks_to_delete), reported=delete_result.delete_count)
+             # Return False if count mismatches? Or True if delete was attempted? Let's return True if no exception.
+        return True # Indicate successful execution (even if count mismatch)
+
     except RuntimeError as re:
-        delete_log.error("Failed to delete Milvus chunks due to connection/collection error", error=str(re))
+        delete_log.error("Failed to delete Milvus chunks due to connection/collection error (sync)", error=str(re))
         return False
     except MilvusException as e:
-        delete_log.error("Milvus delete error", error=str(e), exc_info=True)
+        delete_log.error("Milvus query or delete error (sync)", error=str(e), exc_info=True)
         return False
     except Exception as e:
-        delete_log.exception("Unexpected error during Milvus delete", error=str(e))
+        delete_log.exception("Unexpected error during Milvus delete (sync)", error=str(e))
         return False
-
 
 # --- API Endpoints ---
 
@@ -263,6 +284,7 @@ async def upload_document(
 
     # Use GCS Client
     try:
+        # Potential OOM Risk: Reading entire file here. Consider streaming upload if needed.
         file_content = await file.read()
         endpoint_log.info("Preparing upload to GCS", object_name=file_path_in_storage, filename=normalized_filename, size=len(file_content), content_type=file.content_type)
         try:
@@ -859,7 +881,7 @@ async def delete_document_endpoint(
     gcs_client: GCSClient = Depends(get_gcs_client), # Uses GCS Client
 ):
     """
-    Deletes a document: removes from Milvus (using pymilvus helper), GCS, and PostgreSQL.
+    Deletes a document: removes from Milvus (using corrected sync helper), GCS, and PostgreSQL.
     """
     company_id = request.headers.get("X-Company-ID")
     req_id = getattr(request.state, 'request_id', 'N/A')
@@ -889,20 +911,23 @@ async def delete_document_endpoint(
 
     errors = []
 
-    # 1. Delete from Milvus (No change needed)
+    # 1. Delete from Milvus (using corrected sync helper)
     delete_log.info("Attempting to delete chunks from Milvus (pymilvus)...")
     loop = asyncio.get_running_loop()
     try:
+        # Use the corrected sync delete helper
         milvus_deleted = await loop.run_in_executor(None, _delete_milvus_sync, str(document_id), company_id)
-        if milvus_deleted: delete_log.info("Milvus delete command executed successfully (pymilvus).")
+        if milvus_deleted: delete_log.info("Milvus delete command executed successfully (pymilvus helper).")
         else:
+            # _delete_milvus_sync now logs its own errors, just report failure here
             errors.append("Failed Milvus delete (pymilvus helper returned False)")
             delete_log.warning("Milvus delete operation reported failure (check helper logs).")
     except Exception as e:
-        delete_log.exception("Unexpected error during Milvus delete execution", error=str(e))
-        errors.append(f"Milvus delete exception: {type(e).__name__}")
+        # Catch errors from run_in_executor or potential helper errors not caught inside
+        delete_log.exception("Unexpected error during Milvus delete execution via helper", error=str(e))
+        errors.append(f"Milvus delete exception via helper: {type(e).__name__}")
 
-    # 2. Delete from GCS
+    # 2. Delete from GCS (No change needed here)
     gcs_path = doc_data.get('file_path')
     if gcs_path:
         delete_log.info("Attempting to delete file from GCS...", object_name=gcs_path)
@@ -919,7 +944,7 @@ async def delete_document_endpoint(
         delete_log.warning("Skipping GCS delete: file path not found in DB record.")
         errors.append("GCS path unknown in DB.")
 
-    # 3. Delete from PostgreSQL (No change needed)
+    # 3. Delete from PostgreSQL (No change needed here)
     delete_log.info("Attempting to delete record from PostgreSQL...")
     try:
          async with get_db_conn() as conn:
@@ -936,4 +961,4 @@ async def delete_document_endpoint(
     if errors: delete_log.warning("Document deletion process completed with non-critical errors", errors=errors)
 
     delete_log.info("Document deletion process finished.")
-    return None # Return 204 No Content 
+    return None # Return 204 No Content

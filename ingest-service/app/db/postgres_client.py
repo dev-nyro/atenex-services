@@ -11,7 +11,8 @@ from sqlalchemy import (
     create_engine, text, Engine, Connection, Table, MetaData, Column,
     Uuid, Integer, Text, JSON, String, DateTime, UniqueConstraint, ForeignKeyConstraint, Index
 )
-from sqlalchemy.dialects.postgresql import insert as pg_insert, JSONB # Use JSONB
+# --- FIX: Import dialect-specific insert for on_conflict ---
+from sqlalchemy.dialects.postgresql import insert as pg_insert, JSONB # Use JSONB and import postgresql insert
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.config import settings
@@ -256,7 +257,7 @@ def set_status_sync(
 def bulk_insert_chunks_sync(engine: Engine, chunks_data: List[Dict[str, Any]]) -> int:
     """
     Synchronously inserts multiple document chunks into the document_chunks table.
-    Uses SQLAlchemy Core API for efficient bulk insertion.
+    Uses SQLAlchemy Core API for efficient bulk insertion and handles conflicts.
     """
     if not chunks_data:
         log.warning("bulk_insert_chunks_sync called with empty data list.")
@@ -265,41 +266,37 @@ def bulk_insert_chunks_sync(engine: Engine, chunks_data: List[Dict[str, Any]]) -
     insert_log = log.bind(component="SyncDBBulkInsert", num_chunks=len(chunks_data), document_id=chunks_data[0].get('document_id'))
     insert_log.info("Attempting synchronous bulk insert of document chunks.")
 
-    # Convert UUIDs to strings if they are UUID objects, as psycopg2 might expect strings
-    # and handle metadata dict serialization
     prepared_data = []
     for chunk in chunks_data:
         prepared_chunk = chunk.copy()
+        # Ensure UUIDs are handled correctly by SQLAlchemy/psycopg2
         if isinstance(prepared_chunk.get('document_id'), uuid.UUID):
-            prepared_chunk['document_id'] = str(prepared_chunk['document_id'])
+            prepared_chunk['document_id'] = prepared_chunk['document_id'] # Keep as UUID
         if isinstance(prepared_chunk.get('company_id'), uuid.UUID):
-             prepared_chunk['company_id'] = str(prepared_chunk['company_id'])
-        # Ensure metadata is serializable (SQLAlchemy handles dict -> JSONB well with json_serializer)
+             prepared_chunk['company_id'] = prepared_chunk['company_id'] # Keep as UUID
+
         if 'metadata' in prepared_chunk and not isinstance(prepared_chunk['metadata'], (dict, list, type(None))):
              log.warning("Invalid metadata type for chunk, attempting conversion", chunk_index=prepared_chunk.get('chunk_index'))
-             prepared_chunk['metadata'] = {} # Default to empty dict on error
+             prepared_chunk['metadata'] = {}
+        elif isinstance(prepared_chunk['metadata'], dict):
+             # Optionally clean metadata further if needed (e.g., remove non-JSON serializable types)
+             pass
 
         prepared_data.append(prepared_chunk)
-
 
     try:
         with engine.connect() as connection:
             with connection.begin(): # Start transaction
-                # Using Core Table object for insert
-                # Ensure column names match exactly those in the prepared_data dict keys
-                stmt = document_chunks_table.insert().values(prepared_data)
-                # Optional: ON CONFLICT DO NOTHING based on the unique constraint
+                # --- FIX: Use pg_insert from dialect import ---
+                stmt = pg_insert(document_chunks_table).values(prepared_data)
+                # Specify the conflict target and action
                 stmt = stmt.on_conflict_do_nothing(
                      index_elements=['document_id', 'chunk_index']
                 )
                 result = connection.execute(stmt)
 
-            # rowcount might not be reliable with ON CONFLICT DO NOTHING
-            # We assume success if no exception is raised.
-            # To get the actual inserted count, a SELECT COUNT(*) or RETURNING clause might be needed,
-            # but complicates the bulk insert. For now, return the intended count on success.
-            inserted_count = len(prepared_data) # Assuming all were inserted or ignored successfully
-            insert_log.info("Bulk insert statement executed successfully.", intended_count=len(prepared_data), reported_rowcount=result.rowcount)
+            inserted_count = len(prepared_data) # Assume success if no exception
+            insert_log.info("Bulk insert statement executed successfully (ON CONFLICT DO NOTHING).", intended_count=len(prepared_data), reported_rowcount=result.rowcount if result else -1)
             return inserted_count
 
     except SQLAlchemyError as e:

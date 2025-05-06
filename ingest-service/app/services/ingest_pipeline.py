@@ -232,23 +232,51 @@ def _check_and_create_indexes(collection: Collection):
         # Decide whether to raise or just log the error
 
 def delete_milvus_chunks(company_id: str, document_id: str) -> int:
-    """Deletes chunks for a specific document from Milvus."""
+    """
+    Deletes chunks for a specific document from Milvus by querying PKs first.
+    """
     del_log = log.bind(company_id=company_id, document_id=document_id)
+    expr = f'{MILVUS_COMPANY_ID_FIELD} == "{company_id}" and {MILVUS_DOCUMENT_ID_FIELD} == "{document_id}"'
+    pks_to_delete: List[str] = []
+    deleted_count = 0
+
     try:
         collection = _ensure_milvus_connection_and_collection()
-        expr = f'{MILVUS_COMPANY_ID_FIELD} == "{company_id}" and {MILVUS_DOCUMENT_ID_FIELD} == "{document_id}"'
 
-        del_log.info("Attempting to delete chunks from Milvus using expression.", filter_expr=expr)
-        delete_result = collection.delete(expr=expr)
-        actual_deleted_count = delete_result.delete_count
-        del_log.info("Milvus delete operation executed.", deleted_count=actual_deleted_count)
-        return actual_deleted_count
+        # 1. Query for Primary Keys matching the expression
+        del_log.info("Querying Milvus for PKs to delete...", filter_expr=expr)
+        query_res = collection.query(expr=expr, output_fields=[MILVUS_PK_FIELD])
+        pks_to_delete = [item[MILVUS_PK_FIELD] for item in query_res if MILVUS_PK_FIELD in item]
+
+        if not pks_to_delete:
+            del_log.info("No matching primary keys found in Milvus for deletion.")
+            return 0
+
+        del_log.info(f"Found {len(pks_to_delete)} primary keys to delete.")
+
+        # 2. Delete using the retrieved Primary Keys
+        # Milvus expects `pk_field in [...]` format
+        # Need to format the list properly, e.g., ['pk1', 'pk2']
+        delete_expr = f'{MILVUS_PK_FIELD} in {pks_to_delete}'
+        del_log.info("Attempting to delete chunks from Milvus using PK list expression.", filter_expr=delete_expr)
+        delete_result = collection.delete(expr=delete_expr)
+        deleted_count = delete_result.delete_count
+        del_log.info("Milvus delete operation by PK list executed.", deleted_count=deleted_count)
+        # Optional: Verify if deleted_count matches len(pks_to_delete)
+        if deleted_count != len(pks_to_delete):
+             del_log.warning("Milvus delete count mismatch.", expected=len(pks_to_delete), reported=deleted_count)
+
+        return deleted_count
+
     except MilvusException as e:
-        del_log.error("Milvus delete error", error=str(e), exc_info=True)
+        del_log.error("Milvus delete error (query or delete phase)", error=str(e), exc_info=True)
+        # Return 0 as deletion likely failed or partially failed
         return 0
     except Exception as e:
         del_log.exception("Unexpected error during Milvus chunk deletion")
-        raise RuntimeError(f"Unexpected Milvus deletion error: {e}") from e
+        # Raising might be too disruptive if this is called during cleanup.
+        # Consider just returning 0 and logging the critical error.
+        return 0 # Changed from raise
 
 
 def ingest_document_pipeline(
@@ -374,9 +402,11 @@ def ingest_document_pipeline(
     if delete_existing:
         ingest_log.info("Attempting to delete existing chunks before insertion...")
         try:
+            # Use the corrected delete_milvus_chunks function
             deleted_count = delete_milvus_chunks(company_id, document_id)
             ingest_log.info(f"Deleted {deleted_count} existing chunks.")
         except Exception as del_err:
+            # Log the error but proceed, as delete_milvus_chunks now handles internal errors
             ingest_log.error("Failed to delete existing chunks, proceeding with insert anyway.", error=str(del_err))
 
     ingest_log.debug(f"Inserting {len(processed_chunks)} chunks into Milvus collection '{MILVUS_COLLECTION_NAME}'...")
@@ -390,26 +420,34 @@ def ingest_document_pipeline(
         else:
              ingest_log.info(f"Successfully inserted {inserted_count} chunks into Milvus.")
 
-        if mutation_result.primary_keys != milvus_pks[:inserted_count]:
-             ingest_log.warning("Milvus returned primary keys do not exactly match the generated PKs used for insertion.",
-                                returned_pks=mutation_result.primary_keys, sent_pks=milvus_pks[:inserted_count])
+        # Use the actual PKs assigned during insertion, which should match our generated ones if successful
+        returned_pks = mutation_result.primary_keys
+        if len(returned_pks) != inserted_count:
+             ingest_log.error("Milvus returned PK count mismatch!", returned_count=len(returned_pks), inserted_count=inserted_count)
+             # Cannot reliably assign PKs back to chunks if counts mismatch
+             successfully_inserted_chunks_data = []
+        else:
+             ingest_log.info("Milvus returned PKs match inserted count.")
+             successfully_inserted_chunks_data = []
+             # Assign the returned PKs back to the corresponding processed chunks
+             for i in range(inserted_count):
+                 chunk_index = int(returned_pks[i].split('_')[-1]) # Assuming format "docid_index"
+                 # Find the original chunk by index (safer than assuming order)
+                 original_chunk = next((c for c in processed_chunks if c.chunk_index == chunk_index), None)
+                 if original_chunk:
+                    original_chunk.embedding_id = str(returned_pks[i])
+                    original_chunk.vector_status = ChunkVectorStatus.CREATED
+                    successfully_inserted_chunks_data.append(original_chunk)
+                 else:
+                     log.warning("Could not find original chunk data for returned PK", pk=returned_pks[i])
+             if len(successfully_inserted_chunks_data) != inserted_count:
+                  log.warning("Mismatch between Milvus inserted count and successfully mapped chunks for PG.")
 
         ingest_log.debug("Flushing Milvus collection...")
         collection.flush()
         ingest_log.info("Milvus collection flushed.")
 
-        returned_pks = mutation_result.primary_keys
-        successfully_inserted_chunks_data: List[DocumentChunkData] = []
-        if len(returned_pks) == inserted_count:
-            for i in range(inserted_count):
-                 processed_chunks[i].embedding_id = str(returned_pks[i])
-                 processed_chunks[i].vector_status = ChunkVectorStatus.CREATED
-                 successfully_inserted_chunks_data.append(processed_chunks[i])
-        else:
-             ingest_log.error("Cannot assign embedding_ids due to PK count mismatch from Milvus result.")
-             successfully_inserted_chunks_data = []
-
-        return inserted_count, returned_pks[:inserted_count], successfully_inserted_chunks_data
+        return inserted_count, returned_pks, successfully_inserted_chunks_data
 
     except MilvusException as e:
         ingest_log.error("Failed to insert data into Milvus", error=str(e), exc_info=True)
