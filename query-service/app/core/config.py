@@ -28,89 +28,97 @@ MILVUS_DEFAULT_METADATA_FIELDS = ["company_id", "document_id", "file_name", "pag
 
 
 # ==========================================================================================
-#  ATENEX PROMPT TEMPLATES – v1.2  (sustituir esta sección en config.py o prompt_builder.py)
+#  ATENEX SYSTEM PROMPT ADAPTADO - v1.3 (Mayo 2025)
 # ==========================================================================================
+# Adaptado del System Prompt detallado, enfocado en instrucciones para el LLM en tiempo de ejecución.
 
 ATENEX_RAG_PROMPT_TEMPLATE = r"""
-Eres **Atenex**, el Gestor de Conocimiento Empresarial.
-Actúa como un analista experto que lee, sintetiza y razona **solo** con los
-documentos proporcionados. **Nunca** utilices conocimiento externo ni inventes
-hechos.
+════════════════════════════════════════════════════════════════════
+A T E N E X · INSTRUCCIONES DE GENERACIÓN (Gemini 2.5 Flash)
+════════════════════════════════════════════════════════════════════
 
-PENSAMIENTO INTERNO (no lo muestres):
-1. Lee cada documento y extrae los datos clave pertinentes a la pregunta.
-2. Si la pregunta es demasiado amplia/ambigua (ej. “toda la información”),
-   identifica los temas principales y prepara 1‑3 preguntas aclaratorias.
-3. Decide si puedes responder o necesitas clarificar.
-4. Planifica la respuesta siguiendo el FORMATO DE SALIDA.
-5. Redacta la respuesta (sin revelar estos pasos).
+1 · IDENTIDAD Y TONO
+Eres **Atenex**, un asistente de IA experto en consulta de documentación empresarial (PDFs, manuales, etc.). Eres profesional, directo, verificable y empático. Escribe en **español latino** claro y conciso. Prioriza la precisión y la seguridad.
 
-──────────────────────── DOCUMENTOS ────────────────────────
+2 · PRINCIPIOS CLAVE
+   - **BASATE SOLO EN EL CONTEXTO:** Usa *únicamente* la información del HISTORIAL RECIENTE y los DOCUMENTOS RECUPERADOS a continuación. **No inventes**, especules ni uses conocimiento externo. Si la respuesta no está explícitamente en el contexto, indícalo claramente.
+   - **CITACIÓN:** Cuando uses información de un documento recuperado, añade una cita al final de la frase o párrafo relevante indicando el documento y página. Formato preferido: `[Doc N]`. El formato detallado de la fuente se listará al final.
+   - **NO ESPECULACIÓN:** Si la información solicitada no se encuentra, responde claramente: "No encontré información específica sobre eso en los documentos proporcionados ni en el historial reciente." y, si es posible, sugiere cómo el usuario podría encontrarla (ej. probar otros términos, revisar un documento específico si parece muy relevante).
+   - **NO CÓDIGO:** No generes bloques de código ejecutable. Puedes explicar conceptos o pseudocódigo si es útil.
+   - **PREGUNTAS AMPLIAS:** Si la pregunta es muy general (ej. "dame todo sobre X"), en lugar de intentar resumir todo, identifica 1-3 temas clave cubiertos en los documentos y formula preguntas aclaratorias al usuario para enfocar la consulta. Ejemplo: "Los documentos mencionan X en relación a Y y Z. ¿Te interesa algún aspecto en particular?".
+   - **PETICIONES DE ARCHIVOS:** Si el usuario pide explícitamente "el PDF" o "el documento" y varios chunks recuperados pertenecen al mismo archivo (identificable por `doc.meta.file_name`), tu respuesta debe indicar que tienes información *proveniente* de ese archivo específico, resumir lo más relevante según la consulta, y citarlo. **No puedes entregar el archivo binario**, solo responder basado en su contenido textual.
+
+3 · CONTEXTO PROPORCIONADO
+{% if chat_history %}
+───────────────────── HISTORIAL RECIENTE (Más antiguo a más nuevo) ─────────────────────
+{{ chat_history }}
+────────────────────────────────────────────────────────────────────────────────────────
+{% endif %}
+──────────────────── DOCUMENTOS RECUPERADOS (Ordenados por relevancia) ──────────────────
 {% for doc in documents %}
-[Doc {{ loop.index }}] «{{ doc.meta.file_name | default("sin_nombre") }}»
-· Título : {{ doc.meta.title | default("sin título") }}
-· Página : {{ doc.meta.page | default("?") }}
-· Extracto:
-{{ doc.content }}
-{% endfor %}
-────────────────────────────────────────────────────────────
+[Doc {{ loop.index }}] «{{ doc.meta.file_name | default("Archivo Desconocido") }}»
+ Título : {{ doc.meta.title | default("Sin Título") }}
+ Página : {{ doc.meta.page | default("?") }}
+ Score  : {{ "%.3f"|format(doc.score) if doc.score is not none else "N/A" }}
+ Extracto: {{ doc.content | trim }}
+--------------------------------------------------------------------------------------------{% endfor %}
+────────────────────────────────────────────────────────────────────────────────────────
 
-PREGUNTA DEL USUARIO: {{ query }}
+4 · PREGUNTA ACTUAL DEL USUARIO
+{{ query }}
 
-──────────────────────── INSTRUCCIONES ─────────────────────
-• Utiliza **únicamente** la información de los documentos.
-• Si la respuesta no está, contesta:
-  “No dispongo de información suficiente en los documentos proporcionados.”
-• Si la pregunta es muy amplia/ambigüa, **no respondas aún**; formula las
-  preguntas aclaratorias definidas en el paso 2 e indica los temas que puedes
-  cubrir.
-• En otro caso, responde siguiendo el FORMATO DE SALIDA.
+5 · FORMATO DE RESPUESTA REQUERIDO
+   - **Respuesta Principal:** Escribe una respuesta natural, fluida y conversacional directamente abordando la pregunta del usuario. Si la respuesta es extensa (más de ~160 palabras), puedes iniciar con un breve resumen ejecutivo (1-2 frases). Integra la información clave y las citas `[Doc N]` donde corresponda. Evita usar explícitamente etiquetas como "Respuesta directa:" o "Siguiente acción sugerida:". Concluye la respuesta sugiriendo un próximo paso lógico o una pregunta relacionada si tiene sentido para continuar la conversación productivamente.
+   - **Sección de Fuentes:** Obligatoriamente después de tu respuesta principal, añade una sección titulada `**Fuentes:**`. Lista aquí *solo* los documentos que **efectivamente utilizaste** para construir tu respuesta (basándote en las citas `[Doc N]` que incluiste). Usa una lista numerada ordenada por relevancia (el Doc 1 suele ser el más relevante). Formato:
+     `1. «Nombre Archivo» (Título: <Título si existe>, Pág: <Página>)`
+     `2. «Otro Archivo» (Pág: <Página>)`
+     ... (No incluyas documentos que no citaste en la respuesta principal).
 
-────────────────────── FORMATO DE SALIDA ───────────────────
-1. **Respuesta directa** – Clara, concisa y alineada al negocio.
-2. **Resumen ejecutivo** (≤ 80 palabras) – *solo* si la respuesta supera
-   160 palabras o el usuario lo solicita.
-3. **Siguiente acción sugerida** – Pregunta o paso recomendado para avanzar.
-4. **Fuentes** – Lista numerada (por relevancia):
-     · Nombre de archivo · Título (si existe) · Página.
-
-(Mantén exactamente este orden; no agregues secciones adicionales.)
+════════════════════════════════════════════════════════════════════
+RESPUESTA DE ATENEX (en español latino):
+════════════════════════════════════════════════════════════════════
 """
 
 # ------------------------------------------------------------------------------
 
 ATENEX_GENERAL_PROMPT_TEMPLATE = r"""
-Eres **Atenex**, el Gestor de Conocimiento Empresarial.
-Responde de forma útil y concisa.
-Si la consulta requiere datos que aún no te han sido proporcionados mediante
-RAG, indícalo amablemente y sugiere al usuario subir un documento o precisar
-su pregunta.
+Eres **Atenex**, el Gestor de Conocimiento Empresarial. Responde de forma útil, concisa y profesional en español latino.
 
-Pregunta del usuario:
+{% if chat_history %}
+───────────────────── HISTORIAL RECIENTE (Más antiguo a más nuevo) ─────────────────────
+{{ chat_history }}
+────────────────────────────────────────────────────────────────────────────────────────
+{% endif %}
+
+PREGUNTA ACTUAL DEL USUARIO:
 {{ query }}
 
-Respuesta:
+INSTRUCCIONES:
+- Basándote únicamente en el HISTORIAL RECIENTE (si existe) y tu conocimiento general como asistente, responde la pregunta.
+- Si la consulta requiere información específica de documentos que no te han sido proporcionados en esta interacción (porque no se activó el RAG), indica amablemente que no tienes acceso a documentos externos para responder y sugiere al usuario subir un documento relevante o precisar su pregunta si busca información documental.
+- NO inventes información que no tengas.
+
+RESPUESTA DE ATENEX (en español latino):
 """
 # Models
 DEFAULT_FASTEMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_FASTEMBED_QUERY_PREFIX = "query: "
 DEFAULT_EMBEDDING_DIMENSION = 384
-# --- LLM_CORRECTION: Ensure correct model name ---
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-preview-04-17"
+DEFAULT_GEMINI_MODEL = "gemini-1.5-flash-latest" # Ensure flash model is used
 DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-base"
 
 # RAG Pipeline Parameters
-# --- LLM_CORRECTION: Increase retrieval K substantially ---
-DEFAULT_RETRIEVER_TOP_K = 100 # Increased from 5/10
-DEFAULT_BM25_ENABLED: bool = True
+DEFAULT_RETRIEVER_TOP_K = 100
+DEFAULT_BM25_ENABLED: bool = True # User must ensure bm2s is installed
 DEFAULT_RERANKER_ENABLED: bool = True
-DEFAULT_DIVERSITY_FILTER_ENABLED: bool = False # Keep disabled by default for max context
-# --- LLM_CORRECTION: Rename and increase final context chunk limit ---
-DEFAULT_MAX_CONTEXT_CHUNKS: int = 75 # Increased from 7/10 (Renamed from DIVERSITY_K_FINAL)
+DEFAULT_DIVERSITY_FILTER_ENABLED: bool = False
+DEFAULT_MAX_CONTEXT_CHUNKS: int = 75
 DEFAULT_HYBRID_ALPHA: float = 0.5
 DEFAULT_DIVERSITY_LAMBDA: float = 0.5
-# --- LLM_CORRECTION: Increase max prompt tokens significantly ---
-DEFAULT_MAX_PROMPT_TOKENS: int = 500000 # Increased from 7000 for Gemini Flash 1.5 (aiming for 500k target)
+DEFAULT_MAX_PROMPT_TOKENS: int = 500000
+DEFAULT_MAX_CHAT_HISTORY_MESSAGES = 10
+DEFAULT_NUM_SOURCES_TO_SHOW = 7 # Keep this lower than MAX_CONTEXT_CHUNKS
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -163,26 +171,24 @@ class Settings(BaseSettings):
 
     # --- Diversity Filter ---
     DIVERSITY_FILTER_ENABLED: bool = Field(default=DEFAULT_DIVERSITY_FILTER_ENABLED)
-    # --- LLM_CORRECTION: Use renamed setting ---
     MAX_CONTEXT_CHUNKS: int = Field(default=DEFAULT_MAX_CONTEXT_CHUNKS, gt=0, description="Max number of retrieved/reranked chunks to pass to LLM context.")
     QUERY_DIVERSITY_LAMBDA: float = Field(default=DEFAULT_DIVERSITY_LAMBDA, ge=0.0, le=1.0, description="Lambda for MMR diversity (0=max diversity, 1=max relevance).")
 
-
     # --- RAG Pipeline Parameters ---
-    # --- LLM_CORRECTION: Use updated default ---
-    RETRIEVER_TOP_K: int = Field(default=DEFAULT_RETRIEVER_TOP_K, gt=0, le=500) # Allow up to 500 retrieval
-    HYBRID_FUSION_ALPHA: float = Field(default=DEFAULT_HYBRID_ALPHA, ge=0.0, le=1.0, description="Weighting factor for dense vs sparse fusion (0=sparse, 1=dense). Used for simple linear fusion.")
+    RETRIEVER_TOP_K: int = Field(default=DEFAULT_RETRIEVER_TOP_K, gt=0, le=500)
+    HYBRID_FUSION_ALPHA: float = Field(default=DEFAULT_HYBRID_ALPHA, ge=0.0, le=1.0)
     RAG_PROMPT_TEMPLATE: str = Field(default=ATENEX_RAG_PROMPT_TEMPLATE)
     GENERAL_PROMPT_TEMPLATE: str = Field(default=ATENEX_GENERAL_PROMPT_TEMPLATE)
-    # --- LLM_CORRECTION: Use updated default ---
     MAX_PROMPT_TOKENS: Optional[int] = Field(default=DEFAULT_MAX_PROMPT_TOKENS)
+    MAX_CHAT_HISTORY_MESSAGES: int = Field(default=DEFAULT_MAX_CHAT_HISTORY_MESSAGES, ge=0)
+    NUM_SOURCES_TO_SHOW: int = Field(default=DEFAULT_NUM_SOURCES_TO_SHOW, ge=0)
 
     # --- Service Client Config ---
     HTTP_CLIENT_TIMEOUT: int = Field(default=60)
     HTTP_CLIENT_MAX_RETRIES: int = Field(default=2)
     HTTP_CLIENT_BACKOFF_FACTOR: float = Field(default=1.0)
 
-    # --- Validators (No changes needed here) ---
+    # --- Validators ---
     @field_validator('LOG_LEVEL')
     @classmethod
     def check_log_level(cls, v: str) -> str:
@@ -218,19 +224,28 @@ class Settings(BaseSettings):
         logging.debug(f"Using EMBEDDING_DIMENSION: {v} for model: {model_name}")
         return v
 
-    # --- LLM_CORRECTION: Add validator for max context chunks ---
     @field_validator('MAX_CONTEXT_CHUNKS')
     @classmethod
     def check_max_context_chunks(cls, v: int, info: ValidationInfo) -> int:
         retriever_k = info.data.get('RETRIEVER_TOP_K', DEFAULT_RETRIEVER_TOP_K)
-        # fusion_fetch_k is retriever_k * 2 in the code logic
         max_possible_after_fusion = retriever_k * 2
         if v > max_possible_after_fusion:
             logging.warning(f"MAX_CONTEXT_CHUNKS ({v}) is greater than the maximum possible chunks after fusion ({max_possible_after_fusion} based on RETRIEVER_TOP_K={retriever_k}). Effective limit will be {max_possible_after_fusion}.")
-            # We don't strictly need to cap 'v' here, the code logic will handle it, but warning is good.
         if v <= 0:
              raise ValueError("MAX_CONTEXT_CHUNKS must be a positive integer.")
         return v
+
+    @field_validator('NUM_SOURCES_TO_SHOW')
+    @classmethod
+    def check_num_sources_to_show(cls, v: int, info: ValidationInfo) -> int:
+        max_chunks = info.data.get('MAX_CONTEXT_CHUNKS', DEFAULT_MAX_CONTEXT_CHUNKS)
+        if v > max_chunks:
+             logging.warning(f"NUM_SOURCES_TO_SHOW ({v}) is greater than MAX_CONTEXT_CHUNKS ({max_chunks}). Will only show up to {max_chunks} sources.")
+             return max_chunks
+        if v < 0:
+            raise ValueError("NUM_SOURCES_TO_SHOW cannot be negative.")
+        return v
+
 
 # --- Global Settings Instance ---
 temp_log = logging.getLogger("query_service.config.loader")
@@ -247,7 +262,11 @@ try:
     temp_log.info("Query Service Settings Loaded Successfully:")
     log_data = settings.model_dump(exclude={'POSTGRES_PASSWORD', 'GEMINI_API_KEY'})
     for key, value in log_data.items():
-        temp_log.info(f"  {key}: {value}")
+        # Truncate long prompt templates for cleaner logs
+        if key.endswith('_PROMPT_TEMPLATE') and isinstance(value, str) and len(value) > 200:
+             temp_log.info(f"  {key}: {value[:100]}... (truncated)")
+        else:
+             temp_log.info(f"  {key}: {value}")
     temp_log.info(f"  POSTGRES_PASSWORD: *** SET ***")
     temp_log.info(f"  GEMINI_API_KEY: *** SET ***")
 

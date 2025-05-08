@@ -671,6 +671,7 @@ import asyncio
 import uuid
 import re
 from typing import Dict, Any, List, Tuple, Optional, Type, Set
+from datetime import datetime, timezone, timedelta
 
 # Import Ports and Domain Models
 from app.application.ports import (
@@ -696,6 +697,23 @@ GREETING_REGEX = re.compile(r"^\s*(hola|hello|hi|buenos días|buenas tardes|buen
 # RRF Constant
 RRF_K = 60
 
+# --- LLM_FEATURE: Helper function for simple time delta formatting ---
+def format_time_delta(dt: datetime) -> str:
+    now = datetime.now(timezone.utc)
+    delta = now - dt
+    if delta < timedelta(minutes=1):
+        return "justo ahora"
+    elif delta < timedelta(hours=1):
+        minutes = int(delta.total_seconds() / 60)
+        return f"hace {minutes} min" if minutes > 1 else "hace 1 min"
+    elif delta < timedelta(days=1):
+        hours = int(delta.total_seconds() / 3600)
+        return f"hace {hours} h" if hours > 1 else "hace 1 h"
+    else:
+        days = delta.days
+        return f"hace {days} días" if days > 1 else "hace 1 día"
+
+
 class AskQueryUseCase:
     """
     Caso de uso para procesar una consulta de usuario, manejar el chat y ejecutar el pipeline RAG completo.
@@ -714,7 +732,6 @@ class AskQueryUseCase:
         self.log_repo = log_repo
         self.vector_store = vector_store
         self.llm = llm
-        # Assign components based on settings
         self.sparse_retriever = sparse_retriever if settings.BM25_ENABLED else None
         self.chunk_content_repo = chunk_content_repo
         self.reranker = reranker if settings.RERANKER_ENABLED else None
@@ -727,7 +744,9 @@ class AskQueryUseCase:
         log.info("AskQueryUseCase Initialized",
                  bm25_enabled=bool(self.sparse_retriever),
                  reranker_enabled=bool(self.reranker),
-                 diversity_filter_enabled=bool(self.diversity_filter))
+                 diversity_filter_enabled=settings.DIVERSITY_FILTER_ENABLED,
+                 diversity_filter_type=type(self.diversity_filter).__name__ if self.diversity_filter else "None"
+                 )
         if self.sparse_retriever and not self.chunk_content_repo:
             log.error("SparseRetriever is enabled but ChunkContentRepositoryPort is missing!")
 
@@ -748,7 +767,10 @@ class AskQueryUseCase:
 
     def _initialize_prompt_builder(self, template: str) -> PromptBuilder:
         log.debug("Initializing PromptBuilder...")
-        return PromptBuilder(template=template)
+        # --- LLM_FEATURE: Add chat_history to required_variables if needed ---
+        # Haystack's PromptBuilder can infer variables, but explicitly defining them is safer.
+        # Let's assume the template uses 'query', 'documents', and optionally 'chat_history'.
+        return PromptBuilder(template=template) # required_variables=["query"]) # documents and chat_history are optional in template
 
     async def _embed_query(self, query: str) -> List[float]:
         embed_log = log.bind(action="embed_query_use_case")
@@ -763,19 +785,38 @@ class AskQueryUseCase:
             embed_log.error("Embedding failed", error=str(e), exc_info=True)
             raise ConnectionError(f"Embedding service error: {e}") from e
 
-    async def _build_prompt(self, query: str, documents: List[Document]) -> str:
-        builder_log = log.bind(action="build_prompt_use_case", num_docs=len(documents))
+    # --- LLM_FEATURE: Method to format chat history ---
+    def _format_chat_history(self, messages: List[ChatMessage]) -> str:
+        if not messages:
+            return ""
+        history_str = []
+        for msg in messages:
+            role = "Usuario" if msg.role == 'user' else "Atenex"
+            time_mark = format_time_delta(msg.created_at)
+            history_str.append(f"{role} ({time_mark}): {msg.content}")
+        return "\n".join(history_str)
+
+    # --- LLM_FEATURE: Updated _build_prompt to accept history ---
+    async def _build_prompt(self, query: str, documents: List[Document], chat_history: Optional[str] = None) -> str:
+        builder_log = log.bind(action="build_prompt_use_case", num_docs=len(documents), history_included=bool(chat_history))
+        prompt_data = {"query": query}
         try:
             if documents:
                 prompt_builder = self._prompt_builder_rag
+                prompt_data["documents"] = documents
                 builder_log.debug("Using RAG prompt template.")
-                result = await asyncio.to_thread(prompt_builder.run, query=query, documents=documents)
             else:
                 prompt_builder = self._prompt_builder_general
                 builder_log.debug("Using General prompt template.")
-                result = await asyncio.to_thread(prompt_builder.run, query=query)
+
+            # Add chat history if available
+            if chat_history:
+                prompt_data["chat_history"] = chat_history
+
+            result = await asyncio.to_thread(prompt_builder.run, **prompt_data)
             prompt = result.get("prompt")
             if not prompt: raise ValueError("Prompt generation returned empty.")
+
             builder_log.debug("Prompt built successfully.")
             return prompt
         except Exception as e:
@@ -788,14 +829,9 @@ class AskQueryUseCase:
                                 k: int = RRF_K) -> Dict[str, float]:
         """Combines dense and sparse results using Reciprocal Rank Fusion."""
         fused_scores: Dict[str, float] = {}
-        # Process dense results
         for rank, chunk in enumerate(dense_results):
-            # Use chunk.id directly, it's already a string from MilvusAdapter/DomainModel
             fused_scores[chunk.id] = fused_scores.get(chunk.id, 0.0) + 1.0 / (k + rank + 1)
-
-        # Process sparse results
         for rank, (chunk_id, _) in enumerate(sparse_results):
-             # chunk_id from BM25Retriever is already a string
              fused_scores[chunk_id] = fused_scores.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
         return fused_scores
 
@@ -805,10 +841,7 @@ class AskQueryUseCase:
         dense_map: Dict[str, RetrievedChunk],
         top_n: int
         ) -> List[RetrievedChunk]:
-        """
-        Gets the top_n chunks based on fused scores and fetches content
-        for chunks that were only found in sparse results.
-        """
+        """Gets the top_n chunks based on fused scores and fetches content."""
         if not fused_scores: return []
 
         sorted_chunk_ids = sorted(fused_scores.items(), key=lambda item: item[1], reverse=True)
@@ -816,31 +849,42 @@ class AskQueryUseCase:
         chunks_with_content: List[RetrievedChunk] = []
         ids_needing_content: List[str] = []
         final_scores: Dict[str, float] = dict(sorted_chunk_ids[:top_n])
+        placeholder_map: Dict[str, RetrievedChunk] = {} # Store placeholders
 
         for cid in top_ids:
             if cid in dense_map and dense_map[cid].content:
                 chunk = dense_map[cid]
-                chunk.score = final_scores[cid] # Update with fused score
+                chunk.score = final_scores[cid]
                 chunks_with_content.append(chunk)
             else:
+                chunk_placeholder = dense_map.get(cid) or RetrievedChunk(id=cid, score=final_scores[cid], content=None, metadata={"retrieval_source": "sparse/fused" if cid not in dense_map else "dense_nocontent"})
+                chunk_placeholder.score = final_scores[cid] # Ensure score is updated
+                chunks_with_content.append(chunk_placeholder) # Add placeholder
+                placeholder_map[cid] = chunk_placeholder # Keep track of placeholder
                 ids_needing_content.append(cid)
 
+
         if ids_needing_content and self.chunk_content_repo:
-             log.debug("Fetching content for chunks found via sparse/fused search", count=len(ids_needing_content))
+             log.debug("Fetching content for chunks missing content", count=len(ids_needing_content))
              try:
                  content_map = await self.chunk_content_repo.get_chunk_contents_by_ids(ids_needing_content)
-                 for cid in ids_needing_content:
-                     if cid in content_map:
-                         # Create chunk with fetched content and fused score
-                         chunk = RetrievedChunk(id=cid, content=content_map[cid], score=final_scores[cid], metadata={"retrieval_source": "sparse/fused"})
-                         chunks_with_content.append(chunk)
-                     else: log.warning("Content not found for sparsely retrieved chunk after fetch", chunk_id=cid)
-             except Exception: log.exception("Failed to fetch content for sparse/fused results")
+                 for cid, content in content_map.items():
+                     if cid in placeholder_map:
+                          placeholder_map[cid].content = content
+                          placeholder_map[cid].metadata["content_fetched"] = True
+                     # else: This case should not happen if placeholder_map is correct
+                     #    log.warning("Fetched content for ID not in placeholder map", chunk_id=cid)
+                 missing_after_fetch = [cid for cid in ids_needing_content if cid not in content_map]
+                 if missing_after_fetch:
+                      log.warning("Content not found for some chunks after fetch", missing_ids=missing_after_fetch)
+
+             except Exception: log.exception("Failed to fetch content for fused results")
         elif ids_needing_content: log.warning("Cannot fetch content for sparse/fused results, ChunkContentRepository not available.")
 
-        # Re-sort the final list by score, as fetching might change order
-        chunks_with_content.sort(key=lambda c: c.score or 0.0, reverse=True)
-        return chunks_with_content
+        # Filter out chunks that still don't have content
+        final_chunks = [c for c in chunks_with_content if c.content is not None]
+        final_chunks.sort(key=lambda c: c.score or 0.0, reverse=True)
+        return final_chunks
 
 
     async def execute(
@@ -849,17 +893,35 @@ class AskQueryUseCase:
     ) -> Tuple[str, List[RetrievedChunk], Optional[uuid.UUID], uuid.UUID]:
         """ Orchestrates the full RAG pipeline """
         exec_log = log.bind(use_case="AskQueryUseCase", company_id=str(company_id), user_id=str(user_id), query=truncate_text(query, 50))
-        retriever_k = top_k or settings.RETRIEVER_TOP_K
-        pipeline_stages_used = ["dense_retrieval", "llm_generation"] # Base stages
+        retriever_k = top_k if top_k is not None and 0 < top_k <= settings.RETRIEVER_TOP_K else settings.RETRIEVER_TOP_K
+        exec_log = exec_log.bind(effective_retriever_k=retriever_k)
+
+        pipeline_stages_used = ["dense_retrieval", "llm_generation"]
         final_chat_id: uuid.UUID
         log_id: Optional[uuid.UUID] = None
+        chat_history_str: Optional[str] = None
 
         try:
-            # 1. Manage Chat State
+            # 1. Manage Chat State & Retrieve History
             if chat_id:
                 if not await self.chat_repo.check_chat_ownership(chat_id, user_id, company_id):
                     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Chat not found or access denied.")
                 final_chat_id = chat_id
+                # --- LLM_FEATURE: Retrieve recent messages ---
+                if settings.MAX_CHAT_HISTORY_MESSAGES > 0:
+                    try:
+                        history_messages = await self.chat_repo.get_chat_messages(
+                            chat_id=final_chat_id,
+                            user_id=user_id,
+                            company_id=company_id,
+                            limit=settings.MAX_CHAT_HISTORY_MESSAGES,
+                            offset=0 # Get the most recent ones
+                        )
+                        # Exclude the current user message we are about to save
+                        chat_history_str = self._format_chat_history(history_messages)
+                        exec_log.info("Chat history retrieved and formatted", num_messages=len(history_messages))
+                    except Exception as hist_err:
+                        exec_log.error("Failed to retrieve chat history", error=str(hist_err))
             else:
                 initial_title = f"Chat: {truncate_text(query, 40)}"
                 final_chat_id = await self.chat_repo.create_chat(user_id=user_id, company_id=company_id, title=initial_title)
@@ -882,83 +944,123 @@ class AskQueryUseCase:
             # 4. Embed Query
             query_embedding = await self._embed_query(query)
 
-            # 5. Coarse Retrieval (Dense + Sparse)
+            # 5. Coarse Retrieval (Dense + Optional Sparse)
             dense_task = self.vector_store.search(query_embedding, str(company_id), retriever_k)
-            sparse_task = asyncio.create_task(asyncio.sleep(0)) # Dummy if disabled
-            sparse_results: List[Tuple[str, float]] = [] # Default empty
+            sparse_task = asyncio.create_task(asyncio.sleep(0))
+            sparse_results: List[Tuple[str, float]] = []
             if self.sparse_retriever:
-                 pipeline_stages_used.append("sparse_retrieval (bm25s)")
-                 sparse_task = self.sparse_retriever.search(query, str(company_id), retriever_k)
+                 pipeline_stages_used.append("sparse_retrieval (bm2s)")
+                 # Check if bm2s is actually installed and functional before calling
+                 if bm2s is not None:
+                      sparse_task = self.sparse_retriever.search(query, str(company_id), retriever_k)
+                 else:
+                      exec_log.warning("BM25sRetriever is configured but bm2s library is not installed. Skipping sparse search.")
+                      pipeline_stages_used.append("sparse_retrieval (skipped)")
+            else:
+                 pipeline_stages_used.append("sparse_retrieval (disabled)")
 
-            # Await retrievals
+
             dense_chunks, sparse_results_maybe = await asyncio.gather(dense_task, sparse_task)
-            if self.sparse_retriever: # Ensure sparse_results list is populated if run
-                sparse_results = sparse_results_maybe if isinstance(sparse_results_maybe, list) else []
-            exec_log.info("Retrieval phase completed", dense_count=len(dense_chunks), sparse_count=len(sparse_results))
+            if self.sparse_retriever and bm2s is not None and isinstance(sparse_results_maybe, list):
+                sparse_results = sparse_results_maybe
+            exec_log.info("Retrieval phase completed", dense_count=len(dense_chunks), sparse_count=len(sparse_results), retriever_k=retriever_k)
 
-            # 6. Fusion
+            # 6. Fusion & Content Fetch
             pipeline_stages_used.append("fusion (rrf)")
             dense_map = {c.id: c for c in dense_chunks}
             fused_scores = self._reciprocal_rank_fusion(dense_chunks, sparse_results)
-            fusion_fetch_k = retriever_k * 2
-            combined_chunks = await self._fetch_content_for_fused_results(fused_scores, dense_map, fusion_fetch_k)
-            exec_log.info("Fusion completed", initial_fused_count=len(fused_scores), chunks_with_content=len(combined_chunks))
+            fusion_fetch_k = settings.MAX_CONTEXT_CHUNKS + 10
+            combined_chunks_with_content = await self._fetch_content_for_fused_results(fused_scores, dense_map, fusion_fetch_k)
+            exec_log.info("Fusion & Content Fetch completed", initial_fused_count=len(fused_scores), chunks_with_content=len(combined_chunks_with_content), fetch_limit=fusion_fetch_k)
 
-            # Filter out chunks without content before next steps
-            chunks_for_next_steps = [c for c in combined_chunks if c.content]
-            if not chunks_for_next_steps:
+            if not combined_chunks_with_content:
                  exec_log.warning("No chunks with content available after fusion/fetch.")
-                 final_prompt = await self._build_prompt(query, []) # Use general prompt
+                 # --- LLM_FEATURE: Include history in general prompt ---
+                 final_prompt = await self._build_prompt(query, [], chat_history=chat_history_str)
                  answer = await self.llm.generate(final_prompt)
                  await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=None)
-                 try: # Best effort logging
+                 try:
                     log_id = await self.log_repo.log_query_interaction(company_id=company_id, user_id=user_id, query=query, answer=answer, retrieved_documents_data=[], chat_id=final_chat_id, metadata={"pipeline_stages": pipeline_stages_used, "result": "no_docs_found"})
                  except Exception: exec_log.error("Failed to log interaction for no_docs case")
-                 return answer, [], log_id, final_chat_id # Return empty list for retrieved docs
+                 return answer, [], log_id, final_chat_id
 
             # 7. Reranking (Conditional)
-            reranked_chunks = chunks_for_next_steps
-            if self.reranker: # Check if reranker instance exists (implies enabled and loaded)
+            chunks_to_process_further = combined_chunks_with_content
+            if self.reranker and self.reranker.model: # Check if reranker instance AND model loaded
                 pipeline_stages_used.append("reranking (bge)")
-                exec_log.debug("Performing reranking...", count=len(chunks_for_next_steps))
-                reranked_chunks = await self.reranker.rerank(query, chunks_for_next_steps)
-                exec_log.info("Reranking completed.", count=len(reranked_chunks))
+                exec_log.debug("Performing reranking...", count=len(chunks_to_process_further))
+                chunks_to_process_further = await self.reranker.rerank(query, chunks_to_process_further)
+                exec_log.info("Reranking completed.", count=len(chunks_to_process_further))
+            elif self.reranker: # Instance exists but model failed
+                 pipeline_stages_used.append("reranking (failed_to_load)")
+                 exec_log.warning("Reranker enabled but model not loaded, skipping reranking step.")
+            else:
+                 pipeline_stages_used.append("reranking (disabled)")
 
-            # 8. Diversity Filtering (Conditional)
-            final_chunks_for_llm = reranked_chunks
-            if self.diversity_filter: # Check if filter instance exists
-                pipeline_stages_used.append("diversity_filter (stub)")
-                k_final = settings.DIVERSITY_K_FINAL
-                exec_log.debug(f"Applying diversity filter k={k_final}...", count=len(reranked_chunks))
-                final_chunks_for_llm = await self.diversity_filter.filter(reranked_chunks, k_final)
-                exec_log.info("Diversity filter applied.", final_count=len(final_chunks_for_llm))
 
-            # 9. Build Prompt
+            # 8. Apply Diversity Filter / Final Limit
+            final_chunks_for_llm = chunks_to_process_further
+            if self.diversity_filter:
+                 k_final = settings.MAX_CONTEXT_CHUNKS
+                 filter_type = type(self.diversity_filter).__name__
+                 pipeline_stages_used.append(f"diversity_filter ({filter_type})")
+                 exec_log.debug(f"Applying {filter_type} k={k_final}...", count=len(chunks_to_process_further))
+                 final_chunks_for_llm = await self.diversity_filter.filter(chunks_to_process_further, k_final)
+                 exec_log.info(f"{filter_type} applied.", final_count=len(final_chunks_for_llm))
+            else:
+                 # Apply manual limit if diversity filter is disabled
+                 final_chunks_for_llm = chunks_to_process_further[:settings.MAX_CONTEXT_CHUNKS]
+                 exec_log.info(f"Diversity filter disabled. Truncating to MAX_CONTEXT_CHUNKS.", final_count=len(final_chunks_for_llm), limit=settings.MAX_CONTEXT_CHUNKS)
+
+            # Ensure content exists for final chunks going to prompt builder
+            final_chunks_for_llm = [c for c in final_chunks_for_llm if c.content]
+
+
+            # 9. Build Prompt (with history)
             haystack_docs_for_prompt = [
                 Document(id=c.id, content=c.content, meta=c.metadata, score=c.score)
-                for c in final_chunks_for_llm if c.content
+                for c in final_chunks_for_llm # Already filtered for content
             ]
             if not haystack_docs_for_prompt:
                  exec_log.warning("No documents remaining after filtering for RAG prompt, using general prompt.")
-            final_prompt = await self._build_prompt(query, haystack_docs_for_prompt)
+                 final_prompt = await self._build_prompt(query, [], chat_history=chat_history_str)
+            else:
+                 exec_log.info(f"Building RAG prompt with {len(haystack_docs_for_prompt)} final chunks and history.")
+                 # --- LLM_FEATURE: Pass history to build_prompt ---
+                 final_prompt = await self._build_prompt(query, haystack_docs_for_prompt, chat_history=chat_history_str)
 
             # 10. Generate Answer
             answer = await self.llm.generate(final_prompt)
             exec_log.info("LLM answer generated.", length=len(answer))
 
-            # 11. Save Assistant Message
+            # 11. Save Assistant Message & Limit Sources Shown
+            # --- LLM_FEATURE: Limit sources saved/returned to NUM_SOURCES_TO_SHOW ---
+            sources_to_show_count = settings.NUM_SOURCES_TO_SHOW
             assistant_sources = [
                 {"chunk_id": c.id, "document_id": c.document_id, "file_name": c.file_name, "score": c.score, "preview": truncate_text(c.content, 150)}
-                for c in final_chunks_for_llm
+                for c in final_chunks_for_llm[:sources_to_show_count] # Slice the list
             ]
             await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=assistant_sources or None)
+            exec_log.info(f"Assistant message saved with top {len(assistant_sources)} sources.")
+
 
             # 12. Log Interaction
             try:
-                docs_for_log = [RetrievedDocumentSchema(**c.model_dump()).model_dump(exclude_none=True) for c in final_chunks_for_llm]
-                log_metadata = { "pipeline_stages": pipeline_stages_used, "retriever_k": retriever_k,
-                                 "fusion_fetch_k": fusion_fetch_k, "diversity_k_final": settings.DIVERSITY_K_FINAL if self.diversity_filter else None,
-                                 "num_final_to_llm": len(final_chunks_for_llm) }
+                # Log the sources actually shown, not all chunks sent to LLM
+                docs_for_log = [RetrievedDocumentSchema(**c.model_dump()).model_dump(exclude_none=True) for c in final_chunks_for_llm[:sources_to_show_count]]
+                log_metadata = {
+                    "pipeline_stages": pipeline_stages_used,
+                    "retriever_k": retriever_k,
+                    "fusion_fetch_k": fusion_fetch_k,
+                    "max_context_chunks_limit": settings.MAX_CONTEXT_CHUNKS,
+                    "num_chunks_before_limit": len(chunks_to_process_further),
+                    "num_final_chunks_to_llm": len(final_chunks_for_llm),
+                    "num_sources_shown": len(assistant_sources),
+                    "chat_history_messages_included": len(history_messages) if 'history_messages' in locals() else 0,
+                    "diversity_filter_enabled": settings.DIVERSITY_FILTER_ENABLED,
+                    "reranker_enabled": settings.RERANKER_ENABLED,
+                    "bm25_enabled": settings.BM25_ENABLED,
+                 }
                 log_id = await self.log_repo.log_query_interaction(
                     company_id=company_id, user_id=user_id, query=query, answer=answer,
                     retrieved_documents_data=docs_for_log, chat_id=final_chat_id, metadata=log_metadata
@@ -968,7 +1070,8 @@ class AskQueryUseCase:
                 exec_log.error("Failed to log RAG interaction", error=str(log_err), exc_info=False)
 
             exec_log.info("Use case execution finished successfully.")
-            return answer, final_chunks_for_llm, log_id, final_chat_id
+            # Return the sources actually shown/saved
+            return answer, final_chunks_for_llm[:sources_to_show_count], log_id, final_chat_id
 
         except ConnectionError as ce:
             exec_log.error("Connection error during use case execution", error=str(ce), exc_info=True)
@@ -1005,109 +1108,103 @@ POSTGRES_K8S_PORT_DEFAULT = 5432
 POSTGRES_K8S_DB_DEFAULT = "atenex"
 POSTGRES_K8S_USER_DEFAULT = "postgres"
 
-# --- CORRECTION: Align Milvus Collection Name with Ingest Service ---
+# Milvus
 MILVUS_K8S_DEFAULT_URI = "http://milvus-standalone.nyro-develop.svc.cluster.local:19530"
-# LLM_COMMENT: Default collection name MUST match the one used by ingest-service
 MILVUS_DEFAULT_COLLECTION = "document_chunks_minilm"
-# --- END CORRECTION ---
-
-MILVUS_DEFAULT_EMBEDDING_FIELD = "embedding" # Consistent with ingest schema
-MILVUS_DEFAULT_CONTENT_FIELD = "content"     # Consistent with ingest schema
-MILVUS_DEFAULT_COMPANY_ID_FIELD = "company_id" # Consistent with ingest schema
-MILVUS_DEFAULT_DOCUMENT_ID_FIELD = "document_id" # Consistent with ingest schema
-MILVUS_DEFAULT_FILENAME_FIELD = "file_name"   # Consistent with ingest schema
+MILVUS_DEFAULT_EMBEDDING_FIELD = "embedding"
+MILVUS_DEFAULT_CONTENT_FIELD = "content"
+MILVUS_DEFAULT_COMPANY_ID_FIELD = "company_id"
+MILVUS_DEFAULT_DOCUMENT_ID_FIELD = "document_id"
+MILVUS_DEFAULT_FILENAME_FIELD = "file_name"
 MILVUS_DEFAULT_GRPC_TIMEOUT = 15
-
-# --- CORRECTION: Align Milvus Search Params - Use IP to match ingest-service and collection ---
-# LLM_COMMENT: Search metric must match index metric (ingest uses IP by default).
 MILVUS_DEFAULT_SEARCH_PARAMS = {"metric_type": "IP", "params": {"nprobe": 10}}
-# --- END CORRECTION ---
-
-# --- CORRECTION: Define Default Metadata Fields based on Ingest Schema ---
-# LLM_COMMENT: These are scalar fields requested from Milvus *in addition* to mandatory fields (pk, vector, content).
-# Should align with fields defined in ingest-service Milvus schema. 'file_type' was removed. Added 'page'.
 MILVUS_DEFAULT_METADATA_FIELDS = ["company_id", "document_id", "file_name", "page", "title"]
-# --- END CORRECTION ---
 
 
-# =====================================================================================
-#  PROMPTS DE ATENEX  –  v1.0  (Copiar y pegar tal cual en config.py ó prompt_builder.py)
-# =====================================================================================
+# ==========================================================================================
+#  ATENEX PROMPT TEMPLATES – v1.2  (sustituir esta sección en config.py o prompt_builder.py)
+# ==========================================================================================
 
 ATENEX_RAG_PROMPT_TEMPLATE = r"""
-╭───────────────────────────────  SISTEMA  ───────────────────────────────╮
-│  Rol: Eres **Atenex**, un asistente de IA corporativo, omnisciente en   │
-│  el contexto proporcionado, diseñado para gestionar y sintetizar el     │
-│  conocimiento empresarial recuperado mediante un pipeline RAG.          │
-│                                                                         │
-│  Objetivos al responder:                                                │
-│  1.  Comprender profundamente los documentos recuperados.               │
-│  2.  Responder de forma **exacta**, **concisa** y **factual** a la      │
-│      consulta del usuario, basándote *exclusivamente* en dichos         │
-│      documentos y sus metadatos.                                        │
-│  3.  Incluir siempre:                                                   │
-│      • Una **respuesta directa** a la pregunta.                         │
-│      • (Opcional) Un **resumen ejecutivo** ≤ 80 palabras, si la         │
-│        respuesta excede 160 palabras o el usuario lo solicita.          │
-│      • Una **sugerencia de la siguiente acción** o pregunta de          │
-│        seguimiento que impulse la productividad del usuario.            │
-│      • Una **lista ordenada por relevancia** de los PDF/DOCX usados,    │
-│        con nombre de archivo, título (si existe) y número de página.    │
-│      • (Si aplica) Citas in‑text en el formato ‹Doc n°‑pág› al final de │
-│        cada afirmación tomada de los documentos.                        │
-│  4.  Si la respuesta no se encuentra, declarar claramente               │
-│      “No dispongo de información suficiente en los documentos           │
-│      proporcionados para responder.”                                    │
-│  5.  **Prohibido** inventar datos o usar conocimiento externo.          │
-│  6.  Mantente profesional y utiliza lenguaje inclusivo en español.      │
-╰──────────────────────────────────────────────────────────────────────────╯
+Eres **Atenex**, el Gestor de Conocimiento Empresarial.
+Actúa como un analista experto que lee, sintetiza y razona **solo** con los
+documentos proporcionados. **Nunca** utilices conocimiento externo ni inventes
+hechos.
 
-╭──────────────────────────  DOCUMENTOS RECUPERADOS  ─────────────────────╮
+PENSAMIENTO INTERNO (no lo muestres):
+1. Lee cada documento y extrae los datos clave pertinentes a la pregunta.
+2. Si la pregunta es demasiado amplia/ambigua (ej. “toda la información”),
+   identifica los temas principales y prepara 1‑3 preguntas aclaratorias.
+3. Decide si puedes responder o necesitas clarificar.
+4. Planifica la respuesta siguiendo el FORMATO DE SALIDA.
+5. Redacta la respuesta (sin revelar estos pasos).
+
+──────────────────────── DOCUMENTOS ────────────────────────
 {% for doc in documents %}
-● Documento {{ loop.index }}  
-  ├─ Archivo : {{ doc.meta.file_name or "desconocido" }}  
-  ├─ Título  : {{ doc.meta.title or "sin título" }}  
-  ├─ Página  : {{ doc.meta.page or "?" }}  
-  └─ Extracto: {{ doc.content }}
-{% if not loop.last %}─────────────────────────────────────────────────────{% endif %}
+[Doc {{ loop.index }}] «{{ doc.meta.file_name | default("sin_nombre") }}»
+· Título : {{ doc.meta.title | default("sin título") }}
+· Página : {{ doc.meta.page | default("?") }}
+· Extracto:
+{{ doc.content }}
 {% endfor %}
-╰──────────────────────────────────────────────────────────────────────────╯
+────────────────────────────────────────────────────────────
 
-╭───────────────────────────────  CONSULTA  ──────────────────────────────╮
-{{ query }}
-╰──────────────────────────────────────────────────────────────────────────╯
+PREGUNTA DEL USUARIO: {{ query }}
 
-╭────────────────────────────── RESPUESTA ────────────────────────────────╮
-(Escribe aquí la respuesta cumpliendo los objetivos 1‑6.)  
-╰──────────────────────────────────────────────────────────────────────────╯
+──────────────────────── INSTRUCCIONES ─────────────────────
+• Utiliza **únicamente** la información de los documentos.
+• Si la respuesta no está, contesta:
+  “No dispongo de información suficiente en los documentos proporcionados.”
+• Si la pregunta es muy amplia/ambigüa, **no respondas aún**; formula las
+  preguntas aclaratorias definidas en el paso 2 e indica los temas que puedes
+  cubrir.
+• En otro caso, responde siguiendo el FORMATO DE SALIDA.
+
+────────────────────── FORMATO DE SALIDA ───────────────────
+1. **Respuesta directa** – Clara, concisa y alineada al negocio.
+2. **Resumen ejecutivo** (≤ 80 palabras) – *solo* si la respuesta supera
+   160 palabras o el usuario lo solicita.
+3. **Siguiente acción sugerida** – Pregunta o paso recomendado para avanzar.
+4. **Fuentes** – Lista numerada (por relevancia):
+     · Nombre de archivo · Título (si existe) · Página.
+
+(Mantén exactamente este orden; no agregues secciones adicionales.)
 """
 
+# ------------------------------------------------------------------------------
+
 ATENEX_GENERAL_PROMPT_TEMPLATE = r"""
-Eres **Atenex**, el Gestor de Conocimiento Empresarial. Responde de forma
-útil, concisa y conversacional a la pregunta del usuario. Si la pregunta
-requiere datos externos a tu entrenamiento y no se dispone de documentos
-RAG, indícalo amablemente y sugiere cómo proceder (por ejemplo, subir un
-archivo o reformular la consulta).
+Eres **Atenex**, el Gestor de Conocimiento Empresarial.
+Responde de forma útil y concisa.
+Si la consulta requiere datos que aún no te han sido proporcionados mediante
+RAG, indícalo amablemente y sugiere al usuario subir un documento o precisar
+su pregunta.
 
 Pregunta del usuario:
 {{ query }}
 
 Respuesta:
 """
-# Models (No change needed)
+# Models
 DEFAULT_FASTEMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_FASTEMBED_QUERY_PREFIX = "query: "
 DEFAULT_EMBEDDING_DIMENSION = 384
-DEFAULT_GEMINI_MODEL = "gemini-1.5-flash-latest"
+# --- LLM_CORRECTION: Ensure correct model name ---
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-preview-04-17"
 DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-base"
-# RAG Pipeline Parameters (No change needed)
-DEFAULT_RETRIEVER_TOP_K = 5
+
+# RAG Pipeline Parameters
+# --- LLM_CORRECTION: Increase retrieval K substantially ---
+DEFAULT_RETRIEVER_TOP_K = 100 # Increased from 5/10
 DEFAULT_BM25_ENABLED: bool = True
 DEFAULT_RERANKER_ENABLED: bool = True
-DEFAULT_DIVERSITY_FILTER_ENABLED: bool = False
-DEFAULT_DIVERSITY_K_FINAL: int = 10
+DEFAULT_DIVERSITY_FILTER_ENABLED: bool = False # Keep disabled by default for max context
+# --- LLM_CORRECTION: Rename and increase final context chunk limit ---
+DEFAULT_MAX_CONTEXT_CHUNKS: int = 75 # Increased from 7/10 (Renamed from DIVERSITY_K_FINAL)
 DEFAULT_HYBRID_ALPHA: float = 0.5
 DEFAULT_DIVERSITY_LAMBDA: float = 0.5
+# --- LLM_CORRECTION: Increase max prompt tokens significantly ---
+DEFAULT_MAX_PROMPT_TOKENS: int = 500000 # Increased from 7000 for Gemini Flash 1.5 (aiming for 500k target)
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -1132,15 +1229,12 @@ class Settings(BaseSettings):
 
     # --- Vector Store (Milvus) ---
     MILVUS_URI: AnyHttpUrl = Field(default=AnyHttpUrl(MILVUS_K8S_DEFAULT_URI))
-    # --- CORRECTION: Use corrected default ---
     MILVUS_COLLECTION_NAME: str = Field(default=MILVUS_DEFAULT_COLLECTION)
-    # LLM_COMMENT: Ensure these field names exactly match the ingest-service Milvus schema
     MILVUS_EMBEDDING_FIELD: str = Field(default=MILVUS_DEFAULT_EMBEDDING_FIELD)
     MILVUS_CONTENT_FIELD: str = Field(default=MILVUS_DEFAULT_CONTENT_FIELD)
     MILVUS_COMPANY_ID_FIELD: str = Field(default=MILVUS_DEFAULT_COMPANY_ID_FIELD)
     MILVUS_DOCUMENT_ID_FIELD: str = Field(default=MILVUS_DEFAULT_DOCUMENT_ID_FIELD)
     MILVUS_FILENAME_FIELD: str = Field(default=MILVUS_DEFAULT_FILENAME_FIELD)
-    # --- CORRECTION: Use corrected default ---
     MILVUS_METADATA_FIELDS: List[str] = Field(default=MILVUS_DEFAULT_METADATA_FIELDS)
     MILVUS_GRPC_TIMEOUT: int = Field(default=MILVUS_DEFAULT_GRPC_TIMEOUT)
     MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default=MILVUS_DEFAULT_SEARCH_PARAMS)
@@ -1163,16 +1257,19 @@ class Settings(BaseSettings):
 
     # --- Diversity Filter ---
     DIVERSITY_FILTER_ENABLED: bool = Field(default=DEFAULT_DIVERSITY_FILTER_ENABLED)
-    DIVERSITY_K_FINAL: int = Field(default=DEFAULT_DIVERSITY_K_FINAL, gt=0, description="Target number of documents after diversity filtering.")
+    # --- LLM_CORRECTION: Use renamed setting ---
+    MAX_CONTEXT_CHUNKS: int = Field(default=DEFAULT_MAX_CONTEXT_CHUNKS, gt=0, description="Max number of retrieved/reranked chunks to pass to LLM context.")
     QUERY_DIVERSITY_LAMBDA: float = Field(default=DEFAULT_DIVERSITY_LAMBDA, ge=0.0, le=1.0, description="Lambda for MMR diversity (0=max diversity, 1=max relevance).")
 
 
     # --- RAG Pipeline Parameters ---
-    RETRIEVER_TOP_K: int = Field(default=DEFAULT_RETRIEVER_TOP_K, gt=0, le=50)
+    # --- LLM_CORRECTION: Use updated default ---
+    RETRIEVER_TOP_K: int = Field(default=DEFAULT_RETRIEVER_TOP_K, gt=0, le=500) # Allow up to 500 retrieval
     HYBRID_FUSION_ALPHA: float = Field(default=DEFAULT_HYBRID_ALPHA, ge=0.0, le=1.0, description="Weighting factor for dense vs sparse fusion (0=sparse, 1=dense). Used for simple linear fusion.")
     RAG_PROMPT_TEMPLATE: str = Field(default=ATENEX_RAG_PROMPT_TEMPLATE)
     GENERAL_PROMPT_TEMPLATE: str = Field(default=ATENEX_GENERAL_PROMPT_TEMPLATE)
-    MAX_PROMPT_TOKENS: Optional[int] = Field(default=7000)
+    # --- LLM_CORRECTION: Use updated default ---
+    MAX_PROMPT_TOKENS: Optional[int] = Field(default=DEFAULT_MAX_PROMPT_TOKENS)
 
     # --- Service Client Config ---
     HTTP_CLIENT_TIMEOUT: int = Field(default=60)
@@ -1213,6 +1310,20 @@ class Settings(BaseSettings):
         elif expected_dim == -1:
             logging.warning(f"Unknown standard embedding dimension for model '{model_name}'. Using configured dimension {v}. Verify this matches the actual model output.")
         logging.debug(f"Using EMBEDDING_DIMENSION: {v} for model: {model_name}")
+        return v
+
+    # --- LLM_CORRECTION: Add validator for max context chunks ---
+    @field_validator('MAX_CONTEXT_CHUNKS')
+    @classmethod
+    def check_max_context_chunks(cls, v: int, info: ValidationInfo) -> int:
+        retriever_k = info.data.get('RETRIEVER_TOP_K', DEFAULT_RETRIEVER_TOP_K)
+        # fusion_fetch_k is retriever_k * 2 in the code logic
+        max_possible_after_fusion = retriever_k * 2
+        if v > max_possible_after_fusion:
+            logging.warning(f"MAX_CONTEXT_CHUNKS ({v}) is greater than the maximum possible chunks after fusion ({max_possible_after_fusion} based on RETRIEVER_TOP_K={retriever_k}). Effective limit will be {max_possible_after_fusion}.")
+            # We don't strictly need to cap 'v' here, the code logic will handle it, but warning is good.
+        if v <= 0:
+             raise ValueError("MAX_CONTEXT_CHUNKS must be a positive integer.")
         return v
 
 # --- Global Settings Instance ---
@@ -2134,11 +2245,14 @@ class BGEReranker(RerankerPort):
             # max_length puede necesitar ajuste basado en el modelo y longitud esperada de query+chunk
             self.model = CrossEncoder(self.model_name, max_length=512, device=self.device)
             load_time = time.time() - start_time
-            init_log.info("BGE Reranker model loaded successfully.", duration_ms=load_time * 1000, effective_device=self.model.device)
+            # --- LLM_FIX: Remove problematic .device access ---
+            # The CrossEncoder object itself might not have a simple public '.device' attribute after auto-detection.
+            # Log success without trying to access the device attribute directly from self.model here.
+            init_log.info("BGE Reranker model loaded successfully.", duration_ms=load_time * 1000)
+            # If you need to confirm the device later, you might need to inspect internal attributes or PyTorch state.
         except Exception as e:
             init_log.exception("Failed to load BGE Reranker model")
             self.model = None # Ensure model is None if loading fails
-            # No levantar error aquí necesariamente, podría intentarse de nuevo o fallar en rerank
 
     async def rerank(self, query: str, chunks: List[RetrievedChunk]) -> List[RetrievedChunk]:
         """Reordena chunks usando el modelo BGE CrossEncoder."""
@@ -2173,8 +2287,7 @@ class BGEReranker(RerankerPort):
 
         try:
             # Ejecutar predicción en thread separado ya que puede ser intensivo en CPU/GPU
-            # El modelo de SBERT ya maneja batching interno si le pasas una lista
-            scores = await asyncio.to_thread(self.model.predict, sentence_pairs, show_progress_bar=False) # Deshabilitar barra si corre en servidor
+            scores = await asyncio.to_thread(self.model.predict, sentence_pairs, show_progress_bar=False)
             predict_time = time.time() - start_time
             rerank_log.debug("Reranker prediction complete.", duration_ms=predict_time * 1000)
 
@@ -2185,11 +2298,11 @@ class BGEReranker(RerankerPort):
             scored_chunks.sort(key=lambda x: x[0], reverse=True)
 
             # Extraer los chunks reordenados
-            reranked_chunks = [chunk for score, chunk in scored_chunks]
+            reranked_chunks = []
+            for score, chunk in scored_chunks:
+                chunk.score = float(score) # Sobrescribir score original con el del reranker
+                reranked_chunks.append(chunk)
 
-            # Actualizar el score en los chunks reordenados (opcional)
-            # for score, chunk in scored_chunks:
-            #     chunk.score = float(score) # Sobrescribir score original con el del reranker
 
             rerank_log.info(f"Reranked {len(reranked_chunks)} chunks successfully.")
             return reranked_chunks

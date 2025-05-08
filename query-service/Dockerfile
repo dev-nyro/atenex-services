@@ -2,19 +2,12 @@
 FROM python:3.10-slim
 
 # Establecer variables de entorno como en ingest-service
-# (POETRY_HOME es importante para que el script de instalación sepa dónde poner poetry)
 ENV PYTHONUNBUFFERED=1 \
     PYTHONFAULTHANDLER=1 \
     POETRY_VERSION=1.7.1 \
     POETRY_HOME="/opt/poetry" \
-    # Ya no necesitamos POETRY_VENV en el PATH si llamamos a poetry directamente
-    # POETRY_VENV="/opt/poetry/venv" \
-    # Importante: Asegurar que poetry no cree un venv en el proyecto
     POETRY_VIRTUALENVS_CREATE=false \
-    # Añadir SOLO el binario de poetry al PATH para uso general si es necesario
-    # Pero para el RUN específico, usaremos la ruta completa.
     PATH="$POETRY_HOME/bin:$PATH" \
-    # Puerto por defecto para query-service
     PORT=8001
 
 # Instalar dependencias del sistema (curl para instalar poetry)
@@ -24,7 +17,6 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Instalar Poetry usando el script oficial
-# El script usará POETRY_HOME para decidir dónde instalarse (/opt/poetry)
 RUN curl -sSL https://install.python-poetry.org | python3 -
 
 # Establecer directorio de trabajo
@@ -34,9 +26,8 @@ WORKDIR /app
 COPY pyproject.toml ./
 
 # Instalar dependencias del proyecto usando Poetry
-# *** CORRECCIÓN: Llamar a poetry usando la ruta absoluta ***
-# *** CORRECTION: Replaced deprecated --no-dev with --only main ***
-RUN /opt/poetry/bin/poetry install --no-root --only main --no-interaction --no-ansi
+# *** LLM_FIX: Removed --only main to ensure all non-dev dependencies like bm2s are installed reliably ***
+RUN /opt/poetry/bin/poetry install --no-root --no-interaction --no-ansi
 
 # Copiar el código de la aplicación al contenedor
 COPY app ./app
@@ -45,8 +36,8 @@ COPY app ./app
 EXPOSE ${PORT}
 
 # Comando para correr la aplicación con Gunicorn
-# (Igual que antes, usando el puerto definido)
-CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "4", "-b", "0.0.0.0:${PORT}", "app.main:app"]
+# (Ajustar workers '-w' según sea necesario, 2 es un punto de partida razonable)
+CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "2", "-b", "0.0.0.0:${PORT}", "app.main:app"]
 
-# Comando alternativo para correr con Uvicorn directamente
-# CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "${PORT}"]
+# Comando alternativo para correr con Uvicorn directamente (útil para debug local)
+# CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "${PORT}", "--reload"]

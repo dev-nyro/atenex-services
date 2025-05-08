@@ -4,6 +4,7 @@ import asyncio
 import uuid
 import re
 from typing import Dict, Any, List, Tuple, Optional, Type, Set
+from datetime import datetime, timezone, timedelta
 
 # Import Ports and Domain Models
 from app.application.ports import (
@@ -13,6 +14,12 @@ from app.application.ports import (
 from app.domain.models import RetrievedChunk, ChatMessage
 
 # Keep necessary components (Embedder, PromptBuilder)
+# LLM_FIX: Ensure bm2s is checked for availability here if sparse_retriever depends on it
+try:
+    import bm2s
+except ImportError:
+    bm2s = None
+
 from haystack_integrations.components.embedders.fastembed import FastembedTextEmbedder
 from haystack.components.builders.prompt_builder import PromptBuilder
 from haystack import Document # Still needed for PromptBuilder context
@@ -28,6 +35,23 @@ GREETING_REGEX = re.compile(r"^\s*(hola|hello|hi|buenos días|buenas tardes|buen
 
 # RRF Constant
 RRF_K = 60
+
+# --- LLM_FEATURE: Helper function for simple time delta formatting ---
+def format_time_delta(dt: datetime) -> str:
+    now = datetime.now(timezone.utc)
+    delta = now - dt
+    if delta < timedelta(minutes=1):
+        return "justo ahora"
+    elif delta < timedelta(hours=1):
+        minutes = int(delta.total_seconds() / 60)
+        return f"hace {minutes} min" if minutes > 1 else "hace 1 min"
+    elif delta < timedelta(days=1):
+        hours = int(delta.total_seconds() / 3600)
+        return f"hace {hours} h" if hours > 1 else "hace 1 h"
+    else:
+        days = delta.days
+        return f"hace {days} días" if days > 1 else "hace 1 día"
+
 
 class AskQueryUseCase:
     """
@@ -47,11 +71,10 @@ class AskQueryUseCase:
         self.log_repo = log_repo
         self.vector_store = vector_store
         self.llm = llm
-        # Assign components based on settings
-        self.sparse_retriever = sparse_retriever if settings.BM25_ENABLED else None
+        # LLM_FIX: Only assign sparse_retriever if bm2s is available AND it's enabled
+        self.sparse_retriever = sparse_retriever if settings.BM25_ENABLED and bm2s is not None else None
         self.chunk_content_repo = chunk_content_repo
         self.reranker = reranker if settings.RERANKER_ENABLED else None
-        # LLM_CORRECTION: Use diversity_filter if enabled, store the instance (could be MMR or Stub based on main.py logic)
         self.diversity_filter = diversity_filter if settings.DIVERSITY_FILTER_ENABLED else None
 
         self._embedder = self._initialize_embedder()
@@ -59,13 +82,17 @@ class AskQueryUseCase:
         self._prompt_builder_general = self._initialize_prompt_builder(settings.GENERAL_PROMPT_TEMPLATE)
 
         log.info("AskQueryUseCase Initialized",
-                 bm25_enabled=bool(self.sparse_retriever),
+                 bm25_enabled=bool(self.sparse_retriever), # Reflects actual state now
                  reranker_enabled=bool(self.reranker),
-                 diversity_filter_enabled=settings.DIVERSITY_FILTER_ENABLED, # Check the setting directly
+                 diversity_filter_enabled=settings.DIVERSITY_FILTER_ENABLED,
                  diversity_filter_type=type(self.diversity_filter).__name__ if self.diversity_filter else "None"
                  )
+        if settings.BM25_ENABLED and bm2s is None:
+             log.error("BM25_ENABLED is true in settings, but 'bm2s' library is not installed. Sparse retrieval will be skipped.")
         if self.sparse_retriever and not self.chunk_content_repo:
             log.error("SparseRetriever is enabled but ChunkContentRepositoryPort is missing!")
+        if settings.RERANKER_ENABLED and self.reranker and not getattr(self.reranker, 'model', None):
+             log.warning("RERANKER_ENABLED is true, but the reranker model failed to load during initialization.")
 
 
     def _initialize_embedder(self) -> FastembedTextEmbedder:
@@ -83,7 +110,7 @@ class AskQueryUseCase:
             raise RuntimeError(f"Could not initialize embedding model: {e}") from e
 
     def _initialize_prompt_builder(self, template: str) -> PromptBuilder:
-        log.debug("Initializing PromptBuilder...")
+        log.debug("Initializing PromptBuilder...", template_start=template[:100]+"...")
         return PromptBuilder(template=template)
 
     async def _embed_query(self, query: str) -> List[float]:
@@ -99,27 +126,35 @@ class AskQueryUseCase:
             embed_log.error("Embedding failed", error=str(e), exc_info=True)
             raise ConnectionError(f"Embedding service error: {e}") from e
 
-    async def _build_prompt(self, query: str, documents: List[Document]) -> str:
-        builder_log = log.bind(action="build_prompt_use_case", num_docs=len(documents))
+    def _format_chat_history(self, messages: List[ChatMessage]) -> str:
+        if not messages:
+            return ""
+        history_str = []
+        for msg in reversed(messages): # Show newest first in context? Or oldest? Let's try oldest first for chronology.
+            role = "Usuario" if msg.role == 'user' else "Atenex"
+            time_mark = format_time_delta(msg.created_at)
+            history_str.append(f"{role} ({time_mark}): {msg.content}")
+        # Reverse back to chronological for the LLM
+        return "\n".join(reversed(history_str))
+
+    async def _build_prompt(self, query: str, documents: List[Document], chat_history: Optional[str] = None) -> str:
+        builder_log = log.bind(action="build_prompt_use_case", num_docs=len(documents), history_included=bool(chat_history))
+        prompt_data = {"query": query}
         try:
             if documents:
                 prompt_builder = self._prompt_builder_rag
+                prompt_data["documents"] = documents
                 builder_log.debug("Using RAG prompt template.")
-                result = await asyncio.to_thread(prompt_builder.run, query=query, documents=documents)
             else:
                 prompt_builder = self._prompt_builder_general
                 builder_log.debug("Using General prompt template.")
-                result = await asyncio.to_thread(prompt_builder.run, query=query)
+
+            if chat_history:
+                prompt_data["chat_history"] = chat_history
+
+            result = await asyncio.to_thread(prompt_builder.run, **prompt_data)
             prompt = result.get("prompt")
             if not prompt: raise ValueError("Prompt generation returned empty.")
-
-            # --- LLM_COMMENT: Add token estimation/logging if needed ---
-            # try:
-            #    # Requires tokenizer library (e.g., tiktoken or Gemini's)
-            #    # token_count = estimate_tokens(prompt)
-            #    # builder_log.info("Estimated prompt token count", count=token_count)
-            # except Exception as tok_err:
-            #     builder_log.warning("Could not estimate prompt token count", error=str(tok_err))
 
             builder_log.debug("Prompt built successfully.")
             return prompt
@@ -133,81 +168,67 @@ class AskQueryUseCase:
                                 k: int = RRF_K) -> Dict[str, float]:
         """Combines dense and sparse results using Reciprocal Rank Fusion."""
         fused_scores: Dict[str, float] = {}
-        # Process dense results
         for rank, chunk in enumerate(dense_results):
-            fused_scores[chunk.id] = fused_scores.get(chunk.id, 0.0) + 1.0 / (k + rank + 1)
-
-        # Process sparse results
+            if chunk.id: # Ensure chunk has an ID
+                 fused_scores[chunk.id] = fused_scores.get(chunk.id, 0.0) + 1.0 / (k + rank + 1)
         for rank, (chunk_id, _) in enumerate(sparse_results):
-             fused_scores[chunk_id] = fused_scores.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
+             if chunk_id: # Ensure chunk_id is valid
+                 fused_scores[chunk_id] = fused_scores.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
         return fused_scores
 
     async def _fetch_content_for_fused_results(
         self,
         fused_scores: Dict[str, float],
         dense_map: Dict[str, RetrievedChunk],
-        # --- LLM_CORRECTION: Fetch up to the final context chunk limit or slightly more ---
-        top_n: int # Use settings.MAX_CONTEXT_CHUNKS here or slightly larger buffer
+        top_n: int
         ) -> List[RetrievedChunk]:
-        """
-        Gets the top_n chunks based on fused scores and fetches content
-        for chunks that were only found in sparse results.
-        """
+        """Gets the top_n chunks based on fused scores and fetches content."""
+        fetch_log = log.bind(action="fetch_content_for_fused", top_n=top_n, fused_count=len(fused_scores))
         if not fused_scores: return []
 
         sorted_chunk_ids = sorted(fused_scores.items(), key=lambda item: item[1], reverse=True)
-        # Fetch content for the top N based on fused score, respecting the top_n limit passed in
         top_ids = [cid for cid, score in sorted_chunk_ids[:top_n]]
+        fetch_log.debug("Top IDs after fusion", top_ids_count=len(top_ids))
+
         chunks_with_content: List[RetrievedChunk] = []
         ids_needing_content: List[str] = []
-        final_scores: Dict[str, float] = dict(sorted_chunk_ids[:top_n]) # Scores only for the top N requested
+        final_scores: Dict[str, float] = dict(sorted_chunk_ids[:top_n])
+        placeholder_map: Dict[str, RetrievedChunk] = {}
 
         for cid in top_ids:
+            if not cid: # Skip if ID is somehow invalid
+                 fetch_log.warning("Skipping invalid chunk ID found during fusion processing.")
+                 continue
             if cid in dense_map and dense_map[cid].content:
                 chunk = dense_map[cid]
-                chunk.score = final_scores[cid] # Update with fused score
+                chunk.score = final_scores[cid]
                 chunks_with_content.append(chunk)
             else:
-                # Check if we already have this chunk from dense map but without content (shouldn't happen ideally)
-                if cid in dense_map:
-                     chunk = dense_map[cid]
-                     chunk.score = final_scores[cid]
-                     # Still needs content fetching, but keep existing metadata/embedding
-                     ids_needing_content.append(cid)
-                     # Add placeholder to maintain order temporarily
-                     chunks_with_content.append(chunk)
-                else:
-                    # Truly only found via sparse search
-                    ids_needing_content.append(cid)
-                    # Add placeholder to maintain order temporarily
-                    # Create a temporary chunk with ID and score, content and metadata to be filled
-                    chunks_with_content.append(RetrievedChunk(id=cid, score=final_scores[cid], content=None, metadata={"retrieval_source": "sparse/fused"}))
-
+                # Create or retrieve placeholder
+                chunk_placeholder = dense_map.get(cid) or RetrievedChunk(id=cid, score=final_scores[cid], content=None, metadata={"retrieval_source": "sparse/fused" if cid not in dense_map else "dense_nocontent"})
+                chunk_placeholder.score = final_scores[cid]
+                chunks_with_content.append(chunk_placeholder)
+                placeholder_map[cid] = chunk_placeholder
+                ids_needing_content.append(cid)
 
         if ids_needing_content and self.chunk_content_repo:
-             log.debug("Fetching content for chunks found via sparse/fused search", count=len(ids_needing_content))
+             fetch_log.info("Fetching content for chunks missing content", count=len(ids_needing_content))
              try:
                  content_map = await self.chunk_content_repo.get_chunk_contents_by_ids(ids_needing_content)
-                 # Create a map for faster lookup of chunks needing content
-                 chunk_map_to_update = {c.id: c for c in chunks_with_content if c.id in ids_needing_content}
+                 for cid, content in content_map.items():
+                     if cid in placeholder_map:
+                          placeholder_map[cid].content = content
+                          placeholder_map[cid].metadata["content_fetched"] = True
+                 missing_after_fetch = [cid for cid in ids_needing_content if cid not in content_map]
+                 if missing_after_fetch:
+                      fetch_log.warning("Content not found for some chunks after fetch", missing_ids=missing_after_fetch)
+             except Exception as e:
+                 fetch_log.exception("Failed to fetch content for fused results", error=str(e))
+        elif ids_needing_content: fetch_log.warning("Cannot fetch content for sparse/fused results, ChunkContentRepository not available.")
 
-                 for cid in ids_needing_content:
-                     if cid in content_map:
-                         chunk_to_update = chunk_map_to_update.get(cid)
-                         if chunk_to_update:
-                              chunk_to_update.content = content_map[cid]
-                              # Add fetched flag to metadata if needed
-                              chunk_to_update.metadata["content_fetched"] = True
-                         else:
-                            log.warning("Chunk needing content not found in placeholder list", chunk_id=cid)
-                     else: log.warning("Content not found for sparsely retrieved chunk after fetch", chunk_id=cid)
-             except Exception: log.exception("Failed to fetch content for sparse/fused results")
-        elif ids_needing_content: log.warning("Cannot fetch content for sparse/fused results, ChunkContentRepository not available.")
-
-        # Filter out chunks that still don't have content after fetch attempt
-        final_chunks = [c for c in chunks_with_content if c.content is not None]
-
-        # Re-sort the final list by score, as fetching might change order slightly if placeholders were used
+        # Filter out chunks that *still* don't have content and re-sort
+        final_chunks = [c for c in chunks_with_content if c.content]
+        fetch_log.debug("Chunks remaining after content check", count=len(final_chunks))
         final_chunks.sort(key=lambda c: c.score or 0.0, reverse=True)
         return final_chunks
 
@@ -218,20 +239,31 @@ class AskQueryUseCase:
     ) -> Tuple[str, List[RetrievedChunk], Optional[uuid.UUID], uuid.UUID]:
         """ Orchestrates the full RAG pipeline """
         exec_log = log.bind(use_case="AskQueryUseCase", company_id=str(company_id), user_id=str(user_id), query=truncate_text(query, 50))
-        # --- LLM_CORRECTION: Use configured retriever_k, allow override via request ---
         retriever_k = top_k if top_k is not None and 0 < top_k <= settings.RETRIEVER_TOP_K else settings.RETRIEVER_TOP_K
         exec_log = exec_log.bind(effective_retriever_k=retriever_k)
 
-        pipeline_stages_used = ["dense_retrieval", "llm_generation"] # Base stages
+        pipeline_stages_used = ["dense_retrieval", "llm_generation"]
         final_chat_id: uuid.UUID
         log_id: Optional[uuid.UUID] = None
+        chat_history_str: Optional[str] = None
+        history_messages: List[ChatMessage] = [] # Keep track of messages retrieved
 
         try:
-            # 1. Manage Chat State
+            # 1. Manage Chat State & Retrieve History
             if chat_id:
                 if not await self.chat_repo.check_chat_ownership(chat_id, user_id, company_id):
                     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Chat not found or access denied.")
                 final_chat_id = chat_id
+                if settings.MAX_CHAT_HISTORY_MESSAGES > 0:
+                    try:
+                        history_messages = await self.chat_repo.get_chat_messages(
+                            chat_id=final_chat_id, user_id=user_id, company_id=company_id,
+                            limit=settings.MAX_CHAT_HISTORY_MESSAGES, offset=0
+                        )
+                        chat_history_str = self._format_chat_history(history_messages)
+                        exec_log.info("Chat history retrieved and formatted", num_messages=len(history_messages))
+                    except Exception as hist_err:
+                        exec_log.error("Failed to retrieve chat history", error=str(hist_err))
             else:
                 initial_title = f"Chat: {truncate_text(query, 40)}"
                 final_chat_id = await self.chat_repo.create_chat(user_id=user_id, company_id=company_id, title=initial_title)
@@ -254,56 +286,61 @@ class AskQueryUseCase:
             # 4. Embed Query
             query_embedding = await self._embed_query(query)
 
-            # 5. Coarse Retrieval (Dense + Sparse)
+            # 5. Coarse Retrieval (Dense + Optional Sparse)
             dense_task = self.vector_store.search(query_embedding, str(company_id), retriever_k)
-            sparse_task = asyncio.create_task(asyncio.sleep(0)) # Dummy if disabled
-            sparse_results: List[Tuple[str, float]] = [] # Default empty
+            sparse_task = asyncio.create_task(asyncio.sleep(0))
+            sparse_results: List[Tuple[str, float]] = []
+            # LLM_FIX: Use self.sparse_retriever which is already checked for None in __init__
             if self.sparse_retriever:
-                 pipeline_stages_used.append("sparse_retrieval (bm25s)")
+                 pipeline_stages_used.append("sparse_retrieval (bm2s)")
                  sparse_task = self.sparse_retriever.search(query, str(company_id), retriever_k)
+            elif settings.BM25_ENABLED: # Log if enabled but instance failed
+                 pipeline_stages_used.append("sparse_retrieval (skipped_no_lib)")
+                 exec_log.warning("BM25 enabled but retriever instance is not available (likely missing library).")
+            else:
+                 pipeline_stages_used.append("sparse_retrieval (disabled)")
 
-            # Await retrievals
             dense_chunks, sparse_results_maybe = await asyncio.gather(dense_task, sparse_task)
-            if self.sparse_retriever: # Ensure sparse_results list is populated if run
-                sparse_results = sparse_results_maybe if isinstance(sparse_results_maybe, list) else []
+            # Only assign if the task actually ran and returned a list
+            if self.sparse_retriever and isinstance(sparse_results_maybe, list):
+                sparse_results = sparse_results_maybe
             exec_log.info("Retrieval phase completed", dense_count=len(dense_chunks), sparse_count=len(sparse_results), retriever_k=retriever_k)
 
             # 6. Fusion & Content Fetch
             pipeline_stages_used.append("fusion (rrf)")
-            dense_map = {c.id: c for c in dense_chunks} # Map dense chunks by ID for easy lookup
+            dense_map = {c.id: c for c in dense_chunks if c.id} # Map dense chunks by ID for easy lookup, skip if id is missing
             fused_scores = self._reciprocal_rank_fusion(dense_chunks, sparse_results)
-
-            # --- LLM_CORRECTION: Fetch content for up to MAX_CONTEXT_CHUNKS candidates after fusion ---
-            # Fetch slightly more than needed in case some lack content, but respect the final limit target.
-            fusion_fetch_k = settings.MAX_CONTEXT_CHUNKS + 10 # Add a small buffer
+            fusion_fetch_k = settings.MAX_CONTEXT_CHUNKS + 10 # Fetch slightly more
             combined_chunks_with_content = await self._fetch_content_for_fused_results(fused_scores, dense_map, fusion_fetch_k)
             exec_log.info("Fusion & Content Fetch completed", initial_fused_count=len(fused_scores), chunks_with_content=len(combined_chunks_with_content), fetch_limit=fusion_fetch_k)
 
-            # Check if any chunks remain after fetching content
             if not combined_chunks_with_content:
                  exec_log.warning("No chunks with content available after fusion/fetch.")
-                 final_prompt = await self._build_prompt(query, []) # Use general prompt
+                 final_prompt = await self._build_prompt(query, [], chat_history=chat_history_str)
                  answer = await self.llm.generate(final_prompt)
                  await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=None)
-                 try: # Best effort logging
+                 try:
                     log_id = await self.log_repo.log_query_interaction(company_id=company_id, user_id=user_id, query=query, answer=answer, retrieved_documents_data=[], chat_id=final_chat_id, metadata={"pipeline_stages": pipeline_stages_used, "result": "no_docs_found"})
                  except Exception: exec_log.error("Failed to log interaction for no_docs case")
-                 return answer, [], log_id, final_chat_id # Return empty list for retrieved docs
+                 return answer, [], log_id, final_chat_id
 
             # 7. Reranking (Conditional)
             chunks_to_process_further = combined_chunks_with_content
-            if self.reranker: # Check if reranker instance exists (implies enabled and loaded)
+            # LLM_FIX: Check if reranker *model* loaded successfully, not just the instance
+            if self.reranker and getattr(self.reranker, 'model', None):
                 pipeline_stages_used.append("reranking (bge)")
                 exec_log.debug("Performing reranking...", count=len(chunks_to_process_further))
-                # Pass only up to MAX_CONTEXT_CHUNKS + buffer to reranker if it's very large? For now, rerank all fetched.
                 chunks_to_process_further = await self.reranker.rerank(query, chunks_to_process_further)
                 exec_log.info("Reranking completed.", count=len(chunks_to_process_further))
+            elif self.reranker: # Instance exists but model failed
+                 pipeline_stages_used.append("reranking (skipped_model_load_failed)")
+                 exec_log.warning("Reranker enabled but model not loaded, skipping reranking step.")
+            else:
+                 pipeline_stages_used.append("reranking (disabled)")
 
             # 8. Apply Diversity Filter / Final Limit
             final_chunks_for_llm = chunks_to_process_further
-            # --- LLM_CORRECTION: Apply diversity filter OR truncate to MAX_CONTEXT_CHUNKS ---
-            if self.diversity_filter: # Check if filter instance exists (covers enabled/disabled logic from init)
-                 # Use the MAX_CONTEXT_CHUNKS setting as the target size 'k_final' for the filter
+            if self.diversity_filter:
                  k_final = settings.MAX_CONTEXT_CHUNKS
                  filter_type = type(self.diversity_filter).__name__
                  pipeline_stages_used.append(f"diversity_filter ({filter_type})")
@@ -311,45 +348,61 @@ class AskQueryUseCase:
                  final_chunks_for_llm = await self.diversity_filter.filter(chunks_to_process_further, k_final)
                  exec_log.info(f"{filter_type} applied.", final_count=len(final_chunks_for_llm))
             else:
-                 # If diversity_filter is None (because not enabled in settings),
-                 # apply the limit manually before sending to LLM.
+                 # Apply manual limit if diversity filter is disabled
                  final_chunks_for_llm = chunks_to_process_further[:settings.MAX_CONTEXT_CHUNKS]
                  exec_log.info(f"Diversity filter disabled. Truncating to MAX_CONTEXT_CHUNKS.", final_count=len(final_chunks_for_llm), limit=settings.MAX_CONTEXT_CHUNKS)
 
+            # Ensure content exists for final chunks going to prompt builder
+            final_chunks_for_llm = [c for c in final_chunks_for_llm if c.content]
+            if not final_chunks_for_llm:
+                 # This could happen if MAX_CONTEXT_CHUNKS is small and top ones lack content
+                 exec_log.warning("No chunks with content remaining after final limiting/filtering.")
+                 final_prompt = await self._build_prompt(query, [], chat_history=chat_history_str)
+                 answer = await self.llm.generate(final_prompt)
+                 await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=None)
+                 try:
+                    log_id = await self.log_repo.log_query_interaction(company_id=company_id, user_id=user_id, query=query, answer=answer, retrieved_documents_data=[], chat_id=final_chat_id, metadata={"pipeline_stages": pipeline_stages_used, "result": "no_docs_after_limit"})
+                 except Exception: exec_log.error("Failed to log interaction for no_docs_after_limit case")
+                 return answer, [], log_id, final_chat_id
 
-            # 9. Build Prompt
+
+            # 9. Build Prompt (with history)
             haystack_docs_for_prompt = [
                 Document(id=c.id, content=c.content, meta=c.metadata, score=c.score)
-                for c in final_chunks_for_llm if c.content # Double check content exists
+                for c in final_chunks_for_llm
             ]
-            if not haystack_docs_for_prompt:
-                 exec_log.warning("No documents remaining after filtering for RAG prompt, using general prompt.")
-                 final_prompt = await self._build_prompt(query, [])
-            else:
-                 exec_log.info(f"Building RAG prompt with {len(haystack_docs_for_prompt)} final chunks.")
-                 final_prompt = await self._build_prompt(query, haystack_docs_for_prompt)
+            exec_log.info(f"Building RAG prompt with {len(haystack_docs_for_prompt)} final chunks and history.")
+            final_prompt = await self._build_prompt(query, haystack_docs_for_prompt, chat_history=chat_history_str)
 
             # 10. Generate Answer
             answer = await self.llm.generate(final_prompt)
             exec_log.info("LLM answer generated.", length=len(answer))
 
-            # 11. Save Assistant Message
+            # 11. Save Assistant Message & Limit Sources Shown
+            sources_to_show_count = settings.NUM_SOURCES_TO_SHOW
+            # Ensure we use the final list that went to the LLM (final_chunks_for_llm)
+            # And only take up to NUM_SOURCES_TO_SHOW from that list
             assistant_sources = [
-                {"chunk_id": c.id, "document_id": c.document_id, "file_name": c.file_name, "score": c.score, "preview": truncate_text(c.content, 150)}
-                for c in final_chunks_for_llm # Use the final list passed to LLM
+                {"chunk_id": c.id, "document_id": c.document_id, "file_name": c.file_name, "score": c.score, "preview": truncate_text(c.content, 150) if c.content else "Error: Contenido no disponible"}
+                for c in final_chunks_for_llm[:sources_to_show_count]
             ]
             await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=assistant_sources or None)
+            exec_log.info(f"Assistant message saved with top {len(assistant_sources)} sources.")
+
 
             # 12. Log Interaction
             try:
-                # --- LLM_CORRECTION: Use final_chunks_for_llm for logging sources ---
-                docs_for_log = [RetrievedDocumentSchema(**c.model_dump()).model_dump(exclude_none=True) for c in final_chunks_for_llm]
+                # Log the sources actually shown
+                docs_for_log = [RetrievedDocumentSchema(**c.model_dump()).model_dump(exclude_none=True) for c in final_chunks_for_llm[:sources_to_show_count]]
                 log_metadata = {
                     "pipeline_stages": pipeline_stages_used,
                     "retriever_k": retriever_k,
-                    "fusion_fetch_k": fusion_fetch_k, # Log the fetch limit
-                    "max_context_chunks_limit": settings.MAX_CONTEXT_CHUNKS, # Log the setting value
+                    "fusion_fetch_k": fusion_fetch_k,
+                    "max_context_chunks_limit": settings.MAX_CONTEXT_CHUNKS,
+                    "num_chunks_after_rerank_or_fetch": len(chunks_to_process_further),
                     "num_final_chunks_to_llm": len(final_chunks_for_llm),
+                    "num_sources_shown": len(assistant_sources),
+                    "chat_history_messages_included": len(history_messages),
                     "diversity_filter_enabled": settings.DIVERSITY_FILTER_ENABLED,
                     "reranker_enabled": settings.RERANKER_ENABLED,
                     "bm25_enabled": settings.BM25_ENABLED,
@@ -363,8 +416,8 @@ class AskQueryUseCase:
                 exec_log.error("Failed to log RAG interaction", error=str(log_err), exc_info=False)
 
             exec_log.info("Use case execution finished successfully.")
-            # --- LLM_CORRECTION: Return final_chunks_for_llm ---
-            return answer, final_chunks_for_llm, log_id, final_chat_id
+            # Return the sources actually shown/saved
+            return answer, final_chunks_for_llm[:sources_to_show_count], log_id, final_chat_id
 
         except ConnectionError as ce:
             exec_log.error("Connection error during use case execution", error=str(ce), exc_info=True)

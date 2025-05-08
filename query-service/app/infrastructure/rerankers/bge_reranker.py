@@ -44,11 +44,14 @@ class BGEReranker(RerankerPort):
             # max_length puede necesitar ajuste basado en el modelo y longitud esperada de query+chunk
             self.model = CrossEncoder(self.model_name, max_length=512, device=self.device)
             load_time = time.time() - start_time
-            init_log.info("BGE Reranker model loaded successfully.", duration_ms=load_time * 1000, effective_device=self.model.device)
+            # --- LLM_FIX: Remove problematic .device access ---
+            # The CrossEncoder object itself might not have a simple public '.device' attribute after auto-detection.
+            # Log success without trying to access the device attribute directly from self.model here.
+            init_log.info("BGE Reranker model loaded successfully.", duration_ms=load_time * 1000)
+            # If you need to confirm the device later, you might need to inspect internal attributes or PyTorch state.
         except Exception as e:
             init_log.exception("Failed to load BGE Reranker model")
             self.model = None # Ensure model is None if loading fails
-            # No levantar error aquí necesariamente, podría intentarse de nuevo o fallar en rerank
 
     async def rerank(self, query: str, chunks: List[RetrievedChunk]) -> List[RetrievedChunk]:
         """Reordena chunks usando el modelo BGE CrossEncoder."""
@@ -83,8 +86,7 @@ class BGEReranker(RerankerPort):
 
         try:
             # Ejecutar predicción en thread separado ya que puede ser intensivo en CPU/GPU
-            # El modelo de SBERT ya maneja batching interno si le pasas una lista
-            scores = await asyncio.to_thread(self.model.predict, sentence_pairs, show_progress_bar=False) # Deshabilitar barra si corre en servidor
+            scores = await asyncio.to_thread(self.model.predict, sentence_pairs, show_progress_bar=False)
             predict_time = time.time() - start_time
             rerank_log.debug("Reranker prediction complete.", duration_ms=predict_time * 1000)
 
@@ -95,11 +97,11 @@ class BGEReranker(RerankerPort):
             scored_chunks.sort(key=lambda x: x[0], reverse=True)
 
             # Extraer los chunks reordenados
-            reranked_chunks = [chunk for score, chunk in scored_chunks]
+            reranked_chunks = []
+            for score, chunk in scored_chunks:
+                chunk.score = float(score) # Sobrescribir score original con el del reranker
+                reranked_chunks.append(chunk)
 
-            # Actualizar el score en los chunks reordenados (opcional)
-            # for score, chunk in scored_chunks:
-            #     chunk.score = float(score) # Sobrescribir score original con el del reranker
 
             rerank_log.info(f"Reranked {len(reranked_chunks)} chunks successfully.")
             return reranked_chunks
