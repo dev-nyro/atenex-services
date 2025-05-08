@@ -26,7 +26,7 @@ WORKDIR /app
 COPY pyproject.toml ./
 
 # Instalar dependencias del proyecto usando Poetry
-# *** LLM_FIX: Removed --only main to ensure all non-dev dependencies like bm2s are installed reliably ***
+# Esto debería instalar todas las dependencias listadas en pyproject.toml, incluyendo bm2s.
 RUN /opt/poetry/bin/poetry install --no-root --no-interaction --no-ansi
 
 # Copiar el código de la aplicación al contenedor
@@ -36,8 +36,9 @@ COPY app ./app
 EXPOSE ${PORT}
 
 # Comando para correr la aplicación con Gunicorn
-# (Ajustar workers '-w' según sea necesario, 2 es un punto de partida razonable)
-CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "2", "-b", "0.0.0.0:${PORT}", "app.main:app"]
+# Ajustar workers '-w' según sea necesario, 2 es un punto de partida razonable.
+# --- LLM_FLAG: Se ha añadido --timeout 120 para Gunicorn ---
+CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "2", "--timeout", "120", "-b", "0.0.0.0:${PORT}", "app.main:app"]
 
 # Comando alternativo para correr con Uvicorn directamente (útil para debug local)
 # CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "${PORT}", "--reload"]
