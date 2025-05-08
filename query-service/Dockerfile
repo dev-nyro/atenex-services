@@ -7,8 +7,11 @@ ENV PYTHONUNBUFFERED=1 \
     POETRY_VERSION=1.7.1 \
     POETRY_HOME="/opt/poetry" \
     POETRY_VIRTUALENVS_CREATE=false \
-    PATH="$POETRY_HOME/bin:$PATH" \
     PORT=8001
+
+# --- LLM_CORRECTION: Definir PATH en una directiva ENV separada para claridad y robustez ---
+ENV PATH="${POETRY_HOME}/bin:${PATH}"
+# --- END CORRECTION ---
 
 # Instalar dependencias del sistema (curl para instalar poetry)
 # Combinar comandos para reducir capas
@@ -29,10 +32,12 @@ COPY pyproject.toml poetry.lock* ./
 
 
 # Instalar dependencias del proyecto usando Poetry
+# Se asume que si poetry.lock existe y está actualizado, se usará.
+# Si no, o si está desactualizado respecto a pyproject.toml, poetry install generará/actualizará el lock.
 RUN /opt/poetry/bin/poetry install --no-root --no-interaction --no-ansi
 
-# --- LLM_CORRECTION: Añadir paso de verificación para bm2s ---
-RUN python -c "import sys; print('Verifying bm2s import...'); import bm2s; print('bm2s imported successfully!')"
+# --- LLM_CORRECTION: Añadir paso de verificación para bm2s usando poetry run ---
+RUN /opt/poetry/bin/poetry run python -c "import sys; print('Verifying bm2s import...'); import bm2s; print('bm2s imported successfully!')"
 # --- END CORRECTION ---
 
 

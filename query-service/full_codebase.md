@@ -680,6 +680,7 @@ from app.application.ports import (
 )
 from app.domain.models import RetrievedChunk, ChatMessage
 
+
 # Keep necessary components (Embedder, PromptBuilder)
 # LLM_FIX: Ensure bm2s is checked for availability here if sparse_retriever depends on it
 try:
@@ -837,10 +838,10 @@ class AskQueryUseCase:
         fused_scores: Dict[str, float] = {}
         for rank, chunk in enumerate(dense_results):
             if chunk.id: # Ensure chunk has an ID
-                 fused_scores[chunk.id] = fused_scores.get(chunk.id, 0.0) + 1.0 / (k + rank + 1)
+                fused_scores[chunk.id] = fused_scores.get(chunk.id, 0.0) + 1.0 / (k + rank + 1)
         for rank, (chunk_id, _) in enumerate(sparse_results):
-             if chunk_id: # Ensure chunk_id is valid
-                 fused_scores[chunk_id] = fused_scores.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
+            if chunk_id: # Ensure chunk_id is valid
+                fused_scores[chunk_id] = fused_scores.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
         return fused_scores
 
     async def _fetch_content_for_fused_results(
