@@ -14,7 +14,6 @@ from app.application.ports import (
 from app.domain.models import RetrievedChunk, ChatMessage
 
 # Keep necessary components (Embedder, PromptBuilder)
-# LLM_FIX: Ensure bm2s is checked for availability here if sparse_retriever depends on it
 try:
     import bm2s
 except ImportError:
@@ -35,9 +34,13 @@ GREETING_REGEX = re.compile(r"^\s*(hola|hello|hi|buenos días|buenas tardes|buen
 
 # RRF Constant
 RRF_K = 60
+# --- LLM_CORRECTION: Define a constant or setting for max chunks BEFORE reranking ---
+MAX_CHUNKS_BEFORE_RERANK = 30 # Limit chunks sent to CPU reranker
+# --- END CORRECTION ---
 
 # --- LLM_FEATURE: Helper function for simple time delta formatting ---
 def format_time_delta(dt: datetime) -> str:
+    # ... (código existente sin cambios)
     now = datetime.now(timezone.utc)
     delta = now - dt
     if delta < timedelta(minutes=1):
@@ -71,7 +74,6 @@ class AskQueryUseCase:
         self.log_repo = log_repo
         self.vector_store = vector_store
         self.llm = llm
-        # LLM_FIX: Only assign sparse_retriever if bm2s is available AND it's enabled
         self.sparse_retriever = sparse_retriever if settings.BM25_ENABLED and bm2s is not None else None
         self.chunk_content_repo = chunk_content_repo
         self.reranker = reranker if settings.RERANKER_ENABLED else None
@@ -82,7 +84,7 @@ class AskQueryUseCase:
         self._prompt_builder_general = self._initialize_prompt_builder(settings.GENERAL_PROMPT_TEMPLATE)
 
         log.info("AskQueryUseCase Initialized",
-                 bm25_enabled=bool(self.sparse_retriever), # Reflects actual state now
+                 bm25_enabled=bool(self.sparse_retriever),
                  reranker_enabled=bool(self.reranker),
                  diversity_filter_enabled=settings.DIVERSITY_FILTER_ENABLED,
                  diversity_filter_type=type(self.diversity_filter).__name__ if self.diversity_filter else "None"
@@ -96,6 +98,7 @@ class AskQueryUseCase:
 
 
     def _initialize_embedder(self) -> FastembedTextEmbedder:
+        # ... (código existente sin cambios)
         embedder_log = log.bind(component="FastembedTextEmbedder", model=settings.FASTEMBED_MODEL_NAME)
         embedder_log.debug("Initializing FastEmbed Embedder...")
         try:
@@ -110,10 +113,12 @@ class AskQueryUseCase:
             raise RuntimeError(f"Could not initialize embedding model: {e}") from e
 
     def _initialize_prompt_builder(self, template: str) -> PromptBuilder:
+        # ... (código existente sin cambios)
         log.debug("Initializing PromptBuilder...", template_start=template[:100]+"...")
         return PromptBuilder(template=template)
 
     async def _embed_query(self, query: str) -> List[float]:
+        # ... (código existente sin cambios)
         embed_log = log.bind(action="embed_query_use_case")
         try:
             result = await asyncio.to_thread(self._embedder.run, text=query)
@@ -127,6 +132,7 @@ class AskQueryUseCase:
             raise ConnectionError(f"Embedding service error: {e}") from e
 
     def _format_chat_history(self, messages: List[ChatMessage]) -> str:
+        # ... (código existente sin cambios)
         if not messages:
             return ""
         history_str = []
@@ -138,6 +144,7 @@ class AskQueryUseCase:
         return "\n".join(reversed(history_str))
 
     async def _build_prompt(self, query: str, documents: List[Document], chat_history: Optional[str] = None) -> str:
+        # ... (código existente sin cambios)
         builder_log = log.bind(action="build_prompt_use_case", num_docs=len(documents), history_included=bool(chat_history))
         prompt_data = {"query": query}
         try:
@@ -166,7 +173,7 @@ class AskQueryUseCase:
                                 dense_results: List[RetrievedChunk],
                                 sparse_results: List[Tuple[str, float]],
                                 k: int = RRF_K) -> Dict[str, float]:
-        """Combines dense and sparse results using Reciprocal Rank Fusion."""
+        # ... (código existente sin cambios)
         fused_scores: Dict[str, float] = {}
         for rank, chunk in enumerate(dense_results):
             if chunk.id: # Ensure chunk has an ID
@@ -182,7 +189,7 @@ class AskQueryUseCase:
         dense_map: Dict[str, RetrievedChunk],
         top_n: int
         ) -> List[RetrievedChunk]:
-        """Gets the top_n chunks based on fused scores and fetches content."""
+        # ... (código existente sin cambios)
         fetch_log = log.bind(action="fetch_content_for_fused", top_n=top_n, fused_count=len(fused_scores))
         if not fused_scores: return []
 
@@ -196,7 +203,7 @@ class AskQueryUseCase:
         placeholder_map: Dict[str, RetrievedChunk] = {}
 
         for cid in top_ids:
-            if not cid: # Skip if ID is somehow invalid
+            if not cid:
                  fetch_log.warning("Skipping invalid chunk ID found during fusion processing.")
                  continue
             if cid in dense_map and dense_map[cid].content:
@@ -204,7 +211,6 @@ class AskQueryUseCase:
                 chunk.score = final_scores[cid]
                 chunks_with_content.append(chunk)
             else:
-                # Create or retrieve placeholder
                 chunk_placeholder = dense_map.get(cid) or RetrievedChunk(id=cid, score=final_scores[cid], content=None, metadata={"retrieval_source": "sparse/fused" if cid not in dense_map else "dense_nocontent"})
                 chunk_placeholder.score = final_scores[cid]
                 chunks_with_content.append(chunk_placeholder)
@@ -226,7 +232,6 @@ class AskQueryUseCase:
                  fetch_log.exception("Failed to fetch content for fused results", error=str(e))
         elif ids_needing_content: fetch_log.warning("Cannot fetch content for sparse/fused results, ChunkContentRepository not available.")
 
-        # Filter out chunks that *still* don't have content and re-sort
         final_chunks = [c for c in chunks_with_content if c.content]
         fetch_log.debug("Chunks remaining after content check", count=len(final_chunks))
         final_chunks.sort(key=lambda c: c.score or 0.0, reverse=True)
@@ -250,6 +255,7 @@ class AskQueryUseCase:
 
         try:
             # 1. Manage Chat State & Retrieve History
+            # ... (código existente sin cambios)
             if chat_id:
                 if not await self.chat_repo.check_chat_ownership(chat_id, user_id, company_id):
                     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Chat not found or access denied.")
@@ -271,9 +277,12 @@ class AskQueryUseCase:
             exec_log.info("Chat state managed", is_new=(not chat_id))
 
             # 2. Save User Message
+            # ... (código existente sin cambios)
             await self.chat_repo.save_message(chat_id=final_chat_id, role='user', content=query)
 
+
             # 3. Handle Greetings
+            # ... (código existente sin cambios)
             if GREETING_REGEX.match(query):
                 answer = "¡Hola! ¿En qué puedo ayudarte hoy con la información de tus documentos?"
                 await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=None)
@@ -284,37 +293,41 @@ class AskQueryUseCase:
             exec_log.info("Proceeding with RAG pipeline...")
 
             # 4. Embed Query
+            # ... (código existente sin cambios)
             query_embedding = await self._embed_query(query)
 
             # 5. Coarse Retrieval (Dense + Optional Sparse)
+            # ... (código existente sin cambios)
             dense_task = self.vector_store.search(query_embedding, str(company_id), retriever_k)
             sparse_task = asyncio.create_task(asyncio.sleep(0))
             sparse_results: List[Tuple[str, float]] = []
-            # LLM_FIX: Use self.sparse_retriever which is already checked for None in __init__
             if self.sparse_retriever:
                  pipeline_stages_used.append("sparse_retrieval (bm2s)")
                  sparse_task = self.sparse_retriever.search(query, str(company_id), retriever_k)
-            elif settings.BM25_ENABLED: # Log if enabled but instance failed
+            elif settings.BM25_ENABLED:
                  pipeline_stages_used.append("sparse_retrieval (skipped_no_lib)")
                  exec_log.warning("BM25 enabled but retriever instance is not available (likely missing library).")
             else:
                  pipeline_stages_used.append("sparse_retrieval (disabled)")
 
             dense_chunks, sparse_results_maybe = await asyncio.gather(dense_task, sparse_task)
-            # Only assign if the task actually ran and returned a list
             if self.sparse_retriever and isinstance(sparse_results_maybe, list):
                 sparse_results = sparse_results_maybe
             exec_log.info("Retrieval phase completed", dense_count=len(dense_chunks), sparse_count=len(sparse_results), retriever_k=retriever_k)
 
             # 6. Fusion & Content Fetch
+            # ... (código existente sin cambios)
             pipeline_stages_used.append("fusion (rrf)")
-            dense_map = {c.id: c for c in dense_chunks if c.id} # Map dense chunks by ID for easy lookup, skip if id is missing
+            dense_map = {c.id: c for c in dense_chunks if c.id}
             fused_scores = self._reciprocal_rank_fusion(dense_chunks, sparse_results)
-            fusion_fetch_k = settings.MAX_CONTEXT_CHUNKS + 10 # Fetch slightly more
+            # Fetch enough to have options for reranker, but maybe not ALL possible chunks if fusion results are huge
+            # Let's keep fetching MAX_CONTEXT_CHUNKS + buffer for now, as reranker is main bottleneck
+            fusion_fetch_k = settings.MAX_CONTEXT_CHUNKS + 10
             combined_chunks_with_content = await self._fetch_content_for_fused_results(fused_scores, dense_map, fusion_fetch_k)
             exec_log.info("Fusion & Content Fetch completed", initial_fused_count=len(fused_scores), chunks_with_content=len(combined_chunks_with_content), fetch_limit=fusion_fetch_k)
 
             if not combined_chunks_with_content:
+                 # ... (código existente sin cambios para caso sin documentos)
                  exec_log.warning("No chunks with content available after fusion/fetch.")
                  final_prompt = await self._build_prompt(query, [], chat_history=chat_history_str)
                  answer = await self.llm.generate(final_prompt)
@@ -324,38 +337,49 @@ class AskQueryUseCase:
                  except Exception: exec_log.error("Failed to log interaction for no_docs case")
                  return answer, [], log_id, final_chat_id
 
-            # 7. Reranking (Conditional)
+
+            # 7. Reranking (Conditional & Optimized)
             chunks_to_process_further = combined_chunks_with_content
-            # LLM_FIX: Check if reranker *model* loaded successfully, not just the instance
             if self.reranker and getattr(self.reranker, 'model', None):
                 pipeline_stages_used.append("reranking (bge)")
-                exec_log.debug("Performing reranking...", count=len(chunks_to_process_further))
-                chunks_to_process_further = await self.reranker.rerank(query, chunks_to_process_further)
-                exec_log.info("Reranking completed.", count=len(chunks_to_process_further))
-            elif self.reranker: # Instance exists but model failed
+                # --- LLM_CORRECTION: Limit chunks BEFORE reranking ---
+                chunks_for_reranking = combined_chunks_with_content[:MAX_CHUNKS_BEFORE_RERANK]
+                exec_log.info(f"Performing reranking on top {len(chunks_for_reranking)} chunks (limit: {MAX_CHUNKS_BEFORE_RERANK})...")
+                reranked_top_chunks = await self.reranker.rerank(query, chunks_for_reranking)
+
+                # Combine reranked top chunks with the rest (which were not reranked)
+                # Keep the order: reranked first, then the rest in their original fused order
+                remaining_chunks = [c for c in combined_chunks_with_content if c.id not in {rc.id for rc in reranked_top_chunks}]
+                chunks_to_process_further = reranked_top_chunks + remaining_chunks
+                # --- END CORRECTION ---
+                exec_log.info("Reranking completed.", count_reranked=len(reranked_top_chunks), total_after_combining=len(chunks_to_process_further))
+            elif self.reranker:
                  pipeline_stages_used.append("reranking (skipped_model_load_failed)")
                  exec_log.warning("Reranker enabled but model not loaded, skipping reranking step.")
             else:
                  pipeline_stages_used.append("reranking (disabled)")
 
-            # 8. Apply Diversity Filter / Final Limit
+
+            # 8. Apply Diversity Filter / Final Limit (Applied AFTER potential reranking)
             final_chunks_for_llm = chunks_to_process_further
             if self.diversity_filter:
                  k_final = settings.MAX_CONTEXT_CHUNKS
                  filter_type = type(self.diversity_filter).__name__
                  pipeline_stages_used.append(f"diversity_filter ({filter_type})")
                  exec_log.debug(f"Applying {filter_type} k={k_final}...", count=len(chunks_to_process_further))
+                 # Pass the potentially re-ordered list (if reranked) to the filter
                  final_chunks_for_llm = await self.diversity_filter.filter(chunks_to_process_further, k_final)
                  exec_log.info(f"{filter_type} applied.", final_count=len(final_chunks_for_llm))
             else:
                  # Apply manual limit if diversity filter is disabled
+                 # Use the list potentially re-ordered by reranker
                  final_chunks_for_llm = chunks_to_process_further[:settings.MAX_CONTEXT_CHUNKS]
                  exec_log.info(f"Diversity filter disabled. Truncating to MAX_CONTEXT_CHUNKS.", final_count=len(final_chunks_for_llm), limit=settings.MAX_CONTEXT_CHUNKS)
 
             # Ensure content exists for final chunks going to prompt builder
             final_chunks_for_llm = [c for c in final_chunks_for_llm if c.content]
             if not final_chunks_for_llm:
-                 # This could happen if MAX_CONTEXT_CHUNKS is small and top ones lack content
+                 # ... (código existente sin cambios para caso sin documentos final)
                  exec_log.warning("No chunks with content remaining after final limiting/filtering.")
                  final_prompt = await self._build_prompt(query, [], chat_history=chat_history_str)
                  answer = await self.llm.generate(final_prompt)
@@ -367,6 +391,7 @@ class AskQueryUseCase:
 
 
             # 9. Build Prompt (with history)
+            # ... (código existente sin cambios)
             haystack_docs_for_prompt = [
                 Document(id=c.id, content=c.content, meta=c.metadata, score=c.score)
                 for c in final_chunks_for_llm
@@ -375,13 +400,13 @@ class AskQueryUseCase:
             final_prompt = await self._build_prompt(query, haystack_docs_for_prompt, chat_history=chat_history_str)
 
             # 10. Generate Answer
+            # ... (código existente sin cambios)
             answer = await self.llm.generate(final_prompt)
             exec_log.info("LLM answer generated.", length=len(answer))
 
             # 11. Save Assistant Message & Limit Sources Shown
+            # ... (código existente sin cambios)
             sources_to_show_count = settings.NUM_SOURCES_TO_SHOW
-            # Ensure we use the final list that went to the LLM (final_chunks_for_llm)
-            # And only take up to NUM_SOURCES_TO_SHOW from that list
             assistant_sources = [
                 {"chunk_id": c.id, "document_id": c.document_id, "file_name": c.file_name, "score": c.score, "preview": truncate_text(c.content, 150) if c.content else "Error: Contenido no disponible"}
                 for c in final_chunks_for_llm[:sources_to_show_count]
@@ -391,15 +416,18 @@ class AskQueryUseCase:
 
 
             # 12. Log Interaction
+            # ... (código existente sin cambios)
             try:
-                # Log the sources actually shown
                 docs_for_log = [RetrievedDocumentSchema(**c.model_dump()).model_dump(exclude_none=True) for c in final_chunks_for_llm[:sources_to_show_count]]
                 log_metadata = {
                     "pipeline_stages": pipeline_stages_used,
                     "retriever_k": retriever_k,
                     "fusion_fetch_k": fusion_fetch_k,
                     "max_context_chunks_limit": settings.MAX_CONTEXT_CHUNKS,
-                    "num_chunks_after_rerank_or_fetch": len(chunks_to_process_further),
+                    # --- LLM_CORRECTION: Log reranked count if applicable ---
+                    "num_chunks_before_rerank": len(combined_chunks_with_content),
+                    "num_chunks_actually_reranked": len(reranked_top_chunks) if self.reranker and getattr(self.reranker, 'model', None) else 0,
+                    # --- END CORRECTION ---
                     "num_final_chunks_to_llm": len(final_chunks_for_llm),
                     "num_sources_shown": len(assistant_sources),
                     "chat_history_messages_included": len(history_messages),
@@ -416,16 +444,18 @@ class AskQueryUseCase:
                 exec_log.error("Failed to log RAG interaction", error=str(log_err), exc_info=False)
 
             exec_log.info("Use case execution finished successfully.")
-            # Return the sources actually shown/saved
             return answer, final_chunks_for_llm[:sources_to_show_count], log_id, final_chat_id
 
         except ConnectionError as ce:
-            exec_log.error("Connection error during use case execution", error=str(ce), exc_info=True)
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"A dependency is unavailable: {ce}")
+            # ... (código existente sin cambios)
+             exec_log.error("Connection error during use case execution", error=str(ce), exc_info=True)
+             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"A dependency is unavailable: {ce}")
         except ValueError as ve:
-            exec_log.error("Value error during use case execution", error=str(ve), exc_info=True)
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Data processing error: {ve}")
+             # ... (código existente sin cambios)
+             exec_log.error("Value error during use case execution", error=str(ve), exc_info=True)
+             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Data processing error: {ve}")
         except HTTPException as http_exc: raise http_exc
         except Exception as e:
-            exec_log.exception("Unexpected error during use case execution")
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An internal error occurred: {type(e).__name__}")
+             # ... (código existente sin cambios)
+             exec_log.exception("Unexpected error during use case execution")
+             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An internal error occurred: {type(e).__name__}")

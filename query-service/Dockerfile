@@ -22,12 +22,19 @@ RUN curl -sSL https://install.python-poetry.org | python3 -
 # Establecer directorio de trabajo
 WORKDIR /app
 
-# Copiar solo pyproject.toml primero
-COPY pyproject.toml ./
+# Copiar solo pyproject.toml y poetry.lock primero
+# --- LLM_CORRECTION: Copiar también poetry.lock ---
+COPY pyproject.toml poetry.lock* ./
+# --- END CORRECTION ---
+
 
 # Instalar dependencias del proyecto usando Poetry
-# Esto debería instalar todas las dependencias listadas en pyproject.toml, incluyendo bm2s.
 RUN /opt/poetry/bin/poetry install --no-root --no-interaction --no-ansi
+
+# --- LLM_CORRECTION: Añadir paso de verificación para bm2s ---
+RUN python -c "import sys; print('Verifying bm2s import...'); import bm2s; print('bm2s imported successfully!')"
+# --- END CORRECTION ---
+
 
 # Copiar el código de la aplicación al contenedor
 COPY app ./app
@@ -36,9 +43,8 @@ COPY app ./app
 EXPOSE ${PORT}
 
 # Comando para correr la aplicación con Gunicorn
-# Ajustar workers '-w' según sea necesario, 2 es un punto de partida razonable.
-# --- LLM_FLAG: Se ha añadido --timeout 120 para Gunicorn ---
-CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "2", "--timeout", "120", "-b", "0.0.0.0:${PORT}", "app.main:app"]
+# Timeout ya está en 120s, especificado en el Deployment YAML
+CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "2", "-b", "0.0.0.0:${PORT}", "app.main:app"]
 
 # Comando alternativo para correr con Uvicorn directamente (útil para debug local)
 # CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "${PORT}", "--reload"]

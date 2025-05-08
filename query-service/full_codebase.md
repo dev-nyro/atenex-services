@@ -681,6 +681,12 @@ from app.application.ports import (
 from app.domain.models import RetrievedChunk, ChatMessage
 
 # Keep necessary components (Embedder, PromptBuilder)
+# LLM_FIX: Ensure bm2s is checked for availability here if sparse_retriever depends on it
+try:
+    import bm2s
+except ImportError:
+    bm2s = None
+
 from haystack_integrations.components.embedders.fastembed import FastembedTextEmbedder
 from haystack.components.builders.prompt_builder import PromptBuilder
 from haystack import Document # Still needed for PromptBuilder context
@@ -732,7 +738,8 @@ class AskQueryUseCase:
         self.log_repo = log_repo
         self.vector_store = vector_store
         self.llm = llm
-        self.sparse_retriever = sparse_retriever if settings.BM25_ENABLED else None
+        # LLM_FIX: Only assign sparse_retriever if bm2s is available AND it's enabled
+        self.sparse_retriever = sparse_retriever if settings.BM25_ENABLED and bm2s is not None else None
         self.chunk_content_repo = chunk_content_repo
         self.reranker = reranker if settings.RERANKER_ENABLED else None
         self.diversity_filter = diversity_filter if settings.DIVERSITY_FILTER_ENABLED else None
@@ -742,13 +749,17 @@ class AskQueryUseCase:
         self._prompt_builder_general = self._initialize_prompt_builder(settings.GENERAL_PROMPT_TEMPLATE)
 
         log.info("AskQueryUseCase Initialized",
-                 bm25_enabled=bool(self.sparse_retriever),
+                 bm25_enabled=bool(self.sparse_retriever), # Reflects actual state now
                  reranker_enabled=bool(self.reranker),
                  diversity_filter_enabled=settings.DIVERSITY_FILTER_ENABLED,
                  diversity_filter_type=type(self.diversity_filter).__name__ if self.diversity_filter else "None"
                  )
+        if settings.BM25_ENABLED and bm2s is None:
+             log.error("BM25_ENABLED is true in settings, but 'bm2s' library is not installed. Sparse retrieval will be skipped.")
         if self.sparse_retriever and not self.chunk_content_repo:
             log.error("SparseRetriever is enabled but ChunkContentRepositoryPort is missing!")
+        if settings.RERANKER_ENABLED and self.reranker and not getattr(self.reranker, 'model', None):
+             log.warning("RERANKER_ENABLED is true, but the reranker model failed to load during initialization.")
 
 
     def _initialize_embedder(self) -> FastembedTextEmbedder:
@@ -766,11 +777,8 @@ class AskQueryUseCase:
             raise RuntimeError(f"Could not initialize embedding model: {e}") from e
 
     def _initialize_prompt_builder(self, template: str) -> PromptBuilder:
-        log.debug("Initializing PromptBuilder...")
-        # --- LLM_FEATURE: Add chat_history to required_variables if needed ---
-        # Haystack's PromptBuilder can infer variables, but explicitly defining them is safer.
-        # Let's assume the template uses 'query', 'documents', and optionally 'chat_history'.
-        return PromptBuilder(template=template) # required_variables=["query"]) # documents and chat_history are optional in template
+        log.debug("Initializing PromptBuilder...", template_start=template[:100]+"...")
+        return PromptBuilder(template=template)
 
     async def _embed_query(self, query: str) -> List[float]:
         embed_log = log.bind(action="embed_query_use_case")
@@ -785,18 +793,17 @@ class AskQueryUseCase:
             embed_log.error("Embedding failed", error=str(e), exc_info=True)
             raise ConnectionError(f"Embedding service error: {e}") from e
 
-    # --- LLM_FEATURE: Method to format chat history ---
     def _format_chat_history(self, messages: List[ChatMessage]) -> str:
         if not messages:
             return ""
         history_str = []
-        for msg in messages:
+        for msg in reversed(messages): # Show newest first in context? Or oldest? Let's try oldest first for chronology.
             role = "Usuario" if msg.role == 'user' else "Atenex"
             time_mark = format_time_delta(msg.created_at)
             history_str.append(f"{role} ({time_mark}): {msg.content}")
-        return "\n".join(history_str)
+        # Reverse back to chronological for the LLM
+        return "\n".join(reversed(history_str))
 
-    # --- LLM_FEATURE: Updated _build_prompt to accept history ---
     async def _build_prompt(self, query: str, documents: List[Document], chat_history: Optional[str] = None) -> str:
         builder_log = log.bind(action="build_prompt_use_case", num_docs=len(documents), history_included=bool(chat_history))
         prompt_data = {"query": query}
@@ -809,7 +816,6 @@ class AskQueryUseCase:
                 prompt_builder = self._prompt_builder_general
                 builder_log.debug("Using General prompt template.")
 
-            # Add chat history if available
             if chat_history:
                 prompt_data["chat_history"] = chat_history
 
@@ -830,9 +836,11 @@ class AskQueryUseCase:
         """Combines dense and sparse results using Reciprocal Rank Fusion."""
         fused_scores: Dict[str, float] = {}
         for rank, chunk in enumerate(dense_results):
-            fused_scores[chunk.id] = fused_scores.get(chunk.id, 0.0) + 1.0 / (k + rank + 1)
+            if chunk.id: # Ensure chunk has an ID
+                 fused_scores[chunk.id] = fused_scores.get(chunk.id, 0.0) + 1.0 / (k + rank + 1)
         for rank, (chunk_id, _) in enumerate(sparse_results):
-             fused_scores[chunk_id] = fused_scores.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
+             if chunk_id: # Ensure chunk_id is valid
+                 fused_scores[chunk_id] = fused_scores.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
         return fused_scores
 
     async def _fetch_content_for_fused_results(
@@ -842,47 +850,52 @@ class AskQueryUseCase:
         top_n: int
         ) -> List[RetrievedChunk]:
         """Gets the top_n chunks based on fused scores and fetches content."""
+        fetch_log = log.bind(action="fetch_content_for_fused", top_n=top_n, fused_count=len(fused_scores))
         if not fused_scores: return []
 
         sorted_chunk_ids = sorted(fused_scores.items(), key=lambda item: item[1], reverse=True)
         top_ids = [cid for cid, score in sorted_chunk_ids[:top_n]]
+        fetch_log.debug("Top IDs after fusion", top_ids_count=len(top_ids))
+
         chunks_with_content: List[RetrievedChunk] = []
         ids_needing_content: List[str] = []
         final_scores: Dict[str, float] = dict(sorted_chunk_ids[:top_n])
-        placeholder_map: Dict[str, RetrievedChunk] = {} # Store placeholders
+        placeholder_map: Dict[str, RetrievedChunk] = {}
 
         for cid in top_ids:
+            if not cid: # Skip if ID is somehow invalid
+                 fetch_log.warning("Skipping invalid chunk ID found during fusion processing.")
+                 continue
             if cid in dense_map and dense_map[cid].content:
                 chunk = dense_map[cid]
                 chunk.score = final_scores[cid]
                 chunks_with_content.append(chunk)
             else:
+                # Create or retrieve placeholder
                 chunk_placeholder = dense_map.get(cid) or RetrievedChunk(id=cid, score=final_scores[cid], content=None, metadata={"retrieval_source": "sparse/fused" if cid not in dense_map else "dense_nocontent"})
-                chunk_placeholder.score = final_scores[cid] # Ensure score is updated
-                chunks_with_content.append(chunk_placeholder) # Add placeholder
-                placeholder_map[cid] = chunk_placeholder # Keep track of placeholder
+                chunk_placeholder.score = final_scores[cid]
+                chunks_with_content.append(chunk_placeholder)
+                placeholder_map[cid] = chunk_placeholder
                 ids_needing_content.append(cid)
 
-
         if ids_needing_content and self.chunk_content_repo:
-             log.debug("Fetching content for chunks missing content", count=len(ids_needing_content))
+             fetch_log.info("Fetching content for chunks missing content", count=len(ids_needing_content))
              try:
                  content_map = await self.chunk_content_repo.get_chunk_contents_by_ids(ids_needing_content)
                  for cid, content in content_map.items():
                      if cid in placeholder_map:
                           placeholder_map[cid].content = content
                           placeholder_map[cid].metadata["content_fetched"] = True
-                     # else: This case should not happen if placeholder_map is correct
-                     #    log.warning("Fetched content for ID not in placeholder map", chunk_id=cid)
                  missing_after_fetch = [cid for cid in ids_needing_content if cid not in content_map]
                  if missing_after_fetch:
-                      log.warning("Content not found for some chunks after fetch", missing_ids=missing_after_fetch)
+                      fetch_log.warning("Content not found for some chunks after fetch", missing_ids=missing_after_fetch)
+             except Exception as e:
+                 fetch_log.exception("Failed to fetch content for fused results", error=str(e))
+        elif ids_needing_content: fetch_log.warning("Cannot fetch content for sparse/fused results, ChunkContentRepository not available.")
 
-             except Exception: log.exception("Failed to fetch content for fused results")
-        elif ids_needing_content: log.warning("Cannot fetch content for sparse/fused results, ChunkContentRepository not available.")
-
-        # Filter out chunks that still don't have content
-        final_chunks = [c for c in chunks_with_content if c.content is not None]
+        # Filter out chunks that *still* don't have content and re-sort
+        final_chunks = [c for c in chunks_with_content if c.content]
+        fetch_log.debug("Chunks remaining after content check", count=len(final_chunks))
         final_chunks.sort(key=lambda c: c.score or 0.0, reverse=True)
         return final_chunks
 
@@ -900,6 +913,7 @@ class AskQueryUseCase:
         final_chat_id: uuid.UUID
         log_id: Optional[uuid.UUID] = None
         chat_history_str: Optional[str] = None
+        history_messages: List[ChatMessage] = [] # Keep track of messages retrieved
 
         try:
             # 1. Manage Chat State & Retrieve History
@@ -907,17 +921,12 @@ class AskQueryUseCase:
                 if not await self.chat_repo.check_chat_ownership(chat_id, user_id, company_id):
                     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Chat not found or access denied.")
                 final_chat_id = chat_id
-                # --- LLM_FEATURE: Retrieve recent messages ---
                 if settings.MAX_CHAT_HISTORY_MESSAGES > 0:
                     try:
                         history_messages = await self.chat_repo.get_chat_messages(
-                            chat_id=final_chat_id,
-                            user_id=user_id,
-                            company_id=company_id,
-                            limit=settings.MAX_CHAT_HISTORY_MESSAGES,
-                            offset=0 # Get the most recent ones
+                            chat_id=final_chat_id, user_id=user_id, company_id=company_id,
+                            limit=settings.MAX_CHAT_HISTORY_MESSAGES, offset=0
                         )
-                        # Exclude the current user message we are about to save
                         chat_history_str = self._format_chat_history(history_messages)
                         exec_log.info("Chat history retrieved and formatted", num_messages=len(history_messages))
                     except Exception as hist_err:
@@ -948,34 +957,32 @@ class AskQueryUseCase:
             dense_task = self.vector_store.search(query_embedding, str(company_id), retriever_k)
             sparse_task = asyncio.create_task(asyncio.sleep(0))
             sparse_results: List[Tuple[str, float]] = []
+            # LLM_FIX: Use self.sparse_retriever which is already checked for None in __init__
             if self.sparse_retriever:
                  pipeline_stages_used.append("sparse_retrieval (bm2s)")
-                 # Check if bm2s is actually installed and functional before calling
-                 if bm2s is not None:
-                      sparse_task = self.sparse_retriever.search(query, str(company_id), retriever_k)
-                 else:
-                      exec_log.warning("BM25sRetriever is configured but bm2s library is not installed. Skipping sparse search.")
-                      pipeline_stages_used.append("sparse_retrieval (skipped)")
+                 sparse_task = self.sparse_retriever.search(query, str(company_id), retriever_k)
+            elif settings.BM25_ENABLED: # Log if enabled but instance failed
+                 pipeline_stages_used.append("sparse_retrieval (skipped_no_lib)")
+                 exec_log.warning("BM25 enabled but retriever instance is not available (likely missing library).")
             else:
                  pipeline_stages_used.append("sparse_retrieval (disabled)")
 
-
             dense_chunks, sparse_results_maybe = await asyncio.gather(dense_task, sparse_task)
-            if self.sparse_retriever and bm2s is not None and isinstance(sparse_results_maybe, list):
+            # Only assign if the task actually ran and returned a list
+            if self.sparse_retriever and isinstance(sparse_results_maybe, list):
                 sparse_results = sparse_results_maybe
             exec_log.info("Retrieval phase completed", dense_count=len(dense_chunks), sparse_count=len(sparse_results), retriever_k=retriever_k)
 
             # 6. Fusion & Content Fetch
             pipeline_stages_used.append("fusion (rrf)")
-            dense_map = {c.id: c for c in dense_chunks}
+            dense_map = {c.id: c for c in dense_chunks if c.id} # Map dense chunks by ID for easy lookup, skip if id is missing
             fused_scores = self._reciprocal_rank_fusion(dense_chunks, sparse_results)
-            fusion_fetch_k = settings.MAX_CONTEXT_CHUNKS + 10
+            fusion_fetch_k = settings.MAX_CONTEXT_CHUNKS + 10 # Fetch slightly more
             combined_chunks_with_content = await self._fetch_content_for_fused_results(fused_scores, dense_map, fusion_fetch_k)
             exec_log.info("Fusion & Content Fetch completed", initial_fused_count=len(fused_scores), chunks_with_content=len(combined_chunks_with_content), fetch_limit=fusion_fetch_k)
 
             if not combined_chunks_with_content:
                  exec_log.warning("No chunks with content available after fusion/fetch.")
-                 # --- LLM_FEATURE: Include history in general prompt ---
                  final_prompt = await self._build_prompt(query, [], chat_history=chat_history_str)
                  answer = await self.llm.generate(final_prompt)
                  await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=None)
@@ -986,17 +993,17 @@ class AskQueryUseCase:
 
             # 7. Reranking (Conditional)
             chunks_to_process_further = combined_chunks_with_content
-            if self.reranker and self.reranker.model: # Check if reranker instance AND model loaded
+            # LLM_FIX: Check if reranker *model* loaded successfully, not just the instance
+            if self.reranker and getattr(self.reranker, 'model', None):
                 pipeline_stages_used.append("reranking (bge)")
                 exec_log.debug("Performing reranking...", count=len(chunks_to_process_further))
                 chunks_to_process_further = await self.reranker.rerank(query, chunks_to_process_further)
                 exec_log.info("Reranking completed.", count=len(chunks_to_process_further))
             elif self.reranker: # Instance exists but model failed
-                 pipeline_stages_used.append("reranking (failed_to_load)")
+                 pipeline_stages_used.append("reranking (skipped_model_load_failed)")
                  exec_log.warning("Reranker enabled but model not loaded, skipping reranking step.")
             else:
                  pipeline_stages_used.append("reranking (disabled)")
-
 
             # 8. Apply Diversity Filter / Final Limit
             final_chunks_for_llm = chunks_to_process_further
@@ -1014,31 +1021,37 @@ class AskQueryUseCase:
 
             # Ensure content exists for final chunks going to prompt builder
             final_chunks_for_llm = [c for c in final_chunks_for_llm if c.content]
+            if not final_chunks_for_llm:
+                 # This could happen if MAX_CONTEXT_CHUNKS is small and top ones lack content
+                 exec_log.warning("No chunks with content remaining after final limiting/filtering.")
+                 final_prompt = await self._build_prompt(query, [], chat_history=chat_history_str)
+                 answer = await self.llm.generate(final_prompt)
+                 await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=None)
+                 try:
+                    log_id = await self.log_repo.log_query_interaction(company_id=company_id, user_id=user_id, query=query, answer=answer, retrieved_documents_data=[], chat_id=final_chat_id, metadata={"pipeline_stages": pipeline_stages_used, "result": "no_docs_after_limit"})
+                 except Exception: exec_log.error("Failed to log interaction for no_docs_after_limit case")
+                 return answer, [], log_id, final_chat_id
 
 
             # 9. Build Prompt (with history)
             haystack_docs_for_prompt = [
                 Document(id=c.id, content=c.content, meta=c.metadata, score=c.score)
-                for c in final_chunks_for_llm # Already filtered for content
+                for c in final_chunks_for_llm
             ]
-            if not haystack_docs_for_prompt:
-                 exec_log.warning("No documents remaining after filtering for RAG prompt, using general prompt.")
-                 final_prompt = await self._build_prompt(query, [], chat_history=chat_history_str)
-            else:
-                 exec_log.info(f"Building RAG prompt with {len(haystack_docs_for_prompt)} final chunks and history.")
-                 # --- LLM_FEATURE: Pass history to build_prompt ---
-                 final_prompt = await self._build_prompt(query, haystack_docs_for_prompt, chat_history=chat_history_str)
+            exec_log.info(f"Building RAG prompt with {len(haystack_docs_for_prompt)} final chunks and history.")
+            final_prompt = await self._build_prompt(query, haystack_docs_for_prompt, chat_history=chat_history_str)
 
             # 10. Generate Answer
             answer = await self.llm.generate(final_prompt)
             exec_log.info("LLM answer generated.", length=len(answer))
 
             # 11. Save Assistant Message & Limit Sources Shown
-            # --- LLM_FEATURE: Limit sources saved/returned to NUM_SOURCES_TO_SHOW ---
             sources_to_show_count = settings.NUM_SOURCES_TO_SHOW
+            # Ensure we use the final list that went to the LLM (final_chunks_for_llm)
+            # And only take up to NUM_SOURCES_TO_SHOW from that list
             assistant_sources = [
-                {"chunk_id": c.id, "document_id": c.document_id, "file_name": c.file_name, "score": c.score, "preview": truncate_text(c.content, 150)}
-                for c in final_chunks_for_llm[:sources_to_show_count] # Slice the list
+                {"chunk_id": c.id, "document_id": c.document_id, "file_name": c.file_name, "score": c.score, "preview": truncate_text(c.content, 150) if c.content else "Error: Contenido no disponible"}
+                for c in final_chunks_for_llm[:sources_to_show_count]
             ]
             await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=assistant_sources or None)
             exec_log.info(f"Assistant message saved with top {len(assistant_sources)} sources.")
@@ -1046,17 +1059,17 @@ class AskQueryUseCase:
 
             # 12. Log Interaction
             try:
-                # Log the sources actually shown, not all chunks sent to LLM
+                # Log the sources actually shown
                 docs_for_log = [RetrievedDocumentSchema(**c.model_dump()).model_dump(exclude_none=True) for c in final_chunks_for_llm[:sources_to_show_count]]
                 log_metadata = {
                     "pipeline_stages": pipeline_stages_used,
                     "retriever_k": retriever_k,
                     "fusion_fetch_k": fusion_fetch_k,
                     "max_context_chunks_limit": settings.MAX_CONTEXT_CHUNKS,
-                    "num_chunks_before_limit": len(chunks_to_process_further),
+                    "num_chunks_after_rerank_or_fetch": len(chunks_to_process_further),
                     "num_final_chunks_to_llm": len(final_chunks_for_llm),
                     "num_sources_shown": len(assistant_sources),
-                    "chat_history_messages_included": len(history_messages) if 'history_messages' in locals() else 0,
+                    "chat_history_messages_included": len(history_messages),
                     "diversity_filter_enabled": settings.DIVERSITY_FILTER_ENABLED,
                     "reranker_enabled": settings.RERANKER_ENABLED,
                     "bm25_enabled": settings.BM25_ENABLED,
@@ -1122,89 +1135,97 @@ MILVUS_DEFAULT_METADATA_FIELDS = ["company_id", "document_id", "file_name", "pag
 
 
 # ==========================================================================================
-#  ATENEX PROMPT TEMPLATES – v1.2  (sustituir esta sección en config.py o prompt_builder.py)
+#  ATENEX SYSTEM PROMPT ADAPTADO - v1.3 (Mayo 2025)
 # ==========================================================================================
+# Adaptado del System Prompt detallado, enfocado en instrucciones para el LLM en tiempo de ejecución.
 
 ATENEX_RAG_PROMPT_TEMPLATE = r"""
-Eres **Atenex**, el Gestor de Conocimiento Empresarial.
-Actúa como un analista experto que lee, sintetiza y razona **solo** con los
-documentos proporcionados. **Nunca** utilices conocimiento externo ni inventes
-hechos.
+════════════════════════════════════════════════════════════════════
+A T E N E X · INSTRUCCIONES DE GENERACIÓN (Gemini 2.5 Flash)
+════════════════════════════════════════════════════════════════════
 
-PENSAMIENTO INTERNO (no lo muestres):
-1. Lee cada documento y extrae los datos clave pertinentes a la pregunta.
-2. Si la pregunta es demasiado amplia/ambigua (ej. “toda la información”),
-   identifica los temas principales y prepara 1‑3 preguntas aclaratorias.
-3. Decide si puedes responder o necesitas clarificar.
-4. Planifica la respuesta siguiendo el FORMATO DE SALIDA.
-5. Redacta la respuesta (sin revelar estos pasos).
+1 · IDENTIDAD Y TONO
+Eres **Atenex**, un asistente de IA experto en consulta de documentación empresarial (PDFs, manuales, etc.). Eres profesional, directo, verificable y empático. Escribe en **español latino** claro y conciso. Prioriza la precisión y la seguridad.
 
-──────────────────────── DOCUMENTOS ────────────────────────
+2 · PRINCIPIOS CLAVE
+   - **BASATE SOLO EN EL CONTEXTO:** Usa *únicamente* la información del HISTORIAL RECIENTE y los DOCUMENTOS RECUPERADOS a continuación. **No inventes**, especules ni uses conocimiento externo. Si la respuesta no está explícitamente en el contexto, indícalo claramente.
+   - **CITACIÓN:** Cuando uses información de un documento recuperado, añade una cita al final de la frase o párrafo relevante indicando el documento y página. Formato preferido: `[Doc N]`. El formato detallado de la fuente se listará al final.
+   - **NO ESPECULACIÓN:** Si la información solicitada no se encuentra, responde claramente: "No encontré información específica sobre eso en los documentos proporcionados ni en el historial reciente." y, si es posible, sugiere cómo el usuario podría encontrarla (ej. probar otros términos, revisar un documento específico si parece muy relevante).
+   - **NO CÓDIGO:** No generes bloques de código ejecutable. Puedes explicar conceptos o pseudocódigo si es útil.
+   - **PREGUNTAS AMPLIAS:** Si la pregunta es muy general (ej. "dame todo sobre X"), en lugar de intentar resumir todo, identifica 1-3 temas clave cubiertos en los documentos y formula preguntas aclaratorias al usuario para enfocar la consulta. Ejemplo: "Los documentos mencionan X en relación a Y y Z. ¿Te interesa algún aspecto en particular?".
+   - **PETICIONES DE ARCHIVOS:** Si el usuario pide explícitamente "el PDF" o "el documento" y varios chunks recuperados pertenecen al mismo archivo (identificable por `doc.meta.file_name`), tu respuesta debe indicar que tienes información *proveniente* de ese archivo específico, resumir lo más relevante según la consulta, y citarlo. **No puedes entregar el archivo binario**, solo responder basado en su contenido textual.
+
+3 · CONTEXTO PROPORCIONADO
+{% if chat_history %}
+───────────────────── HISTORIAL RECIENTE (Más antiguo a más nuevo) ─────────────────────
+{{ chat_history }}
+────────────────────────────────────────────────────────────────────────────────────────
+{% endif %}
+──────────────────── DOCUMENTOS RECUPERADOS (Ordenados por relevancia) ──────────────────
 {% for doc in documents %}
-[Doc {{ loop.index }}] «{{ doc.meta.file_name | default("sin_nombre") }}»
-· Título : {{ doc.meta.title | default("sin título") }}
-· Página : {{ doc.meta.page | default("?") }}
-· Extracto:
-{{ doc.content }}
-{% endfor %}
-────────────────────────────────────────────────────────────
+[Doc {{ loop.index }}] «{{ doc.meta.file_name | default("Archivo Desconocido") }}»
+ Título : {{ doc.meta.title | default("Sin Título") }}
+ Página : {{ doc.meta.page | default("?") }}
+ Score  : {{ "%.3f"|format(doc.score) if doc.score is not none else "N/A" }}
+ Extracto: {{ doc.content | trim }}
+--------------------------------------------------------------------------------------------{% endfor %}
+────────────────────────────────────────────────────────────────────────────────────────
 
-PREGUNTA DEL USUARIO: {{ query }}
+4 · PREGUNTA ACTUAL DEL USUARIO
+{{ query }}
 
-──────────────────────── INSTRUCCIONES ─────────────────────
-• Utiliza **únicamente** la información de los documentos.
-• Si la respuesta no está, contesta:
-  “No dispongo de información suficiente en los documentos proporcionados.”
-• Si la pregunta es muy amplia/ambigüa, **no respondas aún**; formula las
-  preguntas aclaratorias definidas en el paso 2 e indica los temas que puedes
-  cubrir.
-• En otro caso, responde siguiendo el FORMATO DE SALIDA.
+5 · FORMATO DE RESPUESTA REQUERIDO
+   - **Respuesta Principal:** Escribe una respuesta natural, fluida y conversacional directamente abordando la pregunta del usuario. Si la respuesta es extensa (más de ~160 palabras), puedes iniciar con un breve resumen ejecutivo (1-2 frases). Integra la información clave y las citas `[Doc N]` donde corresponda. Evita usar explícitamente etiquetas como "Respuesta directa:" o "Siguiente acción sugerida:". Concluye la respuesta sugiriendo un próximo paso lógico o una pregunta relacionada si tiene sentido para continuar la conversación productivamente.
+   - **Sección de Fuentes:** Obligatoriamente después de tu respuesta principal, añade una sección titulada `**Fuentes:**`. Lista aquí *solo* los documentos que **efectivamente utilizaste** para construir tu respuesta (basándote en las citas `[Doc N]` que incluiste). Usa una lista numerada ordenada por relevancia (el Doc 1 suele ser el más relevante). Formato:
+     `1. «Nombre Archivo» (Título: <Título si existe>, Pág: <Página>)`
+     `2. «Otro Archivo» (Pág: <Página>)`
+     ... (No incluyas documentos que no citaste en la respuesta principal).
 
-────────────────────── FORMATO DE SALIDA ───────────────────
-1. **Respuesta directa** – Clara, concisa y alineada al negocio.
-2. **Resumen ejecutivo** (≤ 80 palabras) – *solo* si la respuesta supera
-   160 palabras o el usuario lo solicita.
-3. **Siguiente acción sugerida** – Pregunta o paso recomendado para avanzar.
-4. **Fuentes** – Lista numerada (por relevancia):
-     · Nombre de archivo · Título (si existe) · Página.
-
-(Mantén exactamente este orden; no agregues secciones adicionales.)
+════════════════════════════════════════════════════════════════════
+RESPUESTA DE ATENEX (en español latino):
+════════════════════════════════════════════════════════════════════
 """
 
 # ------------------------------------------------------------------------------
 
 ATENEX_GENERAL_PROMPT_TEMPLATE = r"""
-Eres **Atenex**, el Gestor de Conocimiento Empresarial.
-Responde de forma útil y concisa.
-Si la consulta requiere datos que aún no te han sido proporcionados mediante
-RAG, indícalo amablemente y sugiere al usuario subir un documento o precisar
-su pregunta.
+Eres **Atenex**, el Gestor de Conocimiento Empresarial. Responde de forma útil, concisa y profesional en español latino.
 
-Pregunta del usuario:
+{% if chat_history %}
+───────────────────── HISTORIAL RECIENTE (Más antiguo a más nuevo) ─────────────────────
+{{ chat_history }}
+────────────────────────────────────────────────────────────────────────────────────────
+{% endif %}
+
+PREGUNTA ACTUAL DEL USUARIO:
 {{ query }}
 
-Respuesta:
+INSTRUCCIONES:
+- Basándote únicamente en el HISTORIAL RECIENTE (si existe) y tu conocimiento general como asistente, responde la pregunta.
+- Si la consulta requiere información específica de documentos que no te han sido proporcionados en esta interacción (porque no se activó el RAG), indica amablemente que no tienes acceso a documentos externos para responder y sugiere al usuario subir un documento relevante o precisar su pregunta si busca información documental.
+- NO inventes información que no tengas.
+
+RESPUESTA DE ATENEX (en español latino):
 """
 # Models
 DEFAULT_FASTEMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_FASTEMBED_QUERY_PREFIX = "query: "
 DEFAULT_EMBEDDING_DIMENSION = 384
-# --- LLM_CORRECTION: Ensure correct model name ---
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-preview-04-17"
+DEFAULT_GEMINI_MODEL = "gemini-1.5-flash-latest" # Ensure flash model is used
 DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-base"
 
 # RAG Pipeline Parameters
-# --- LLM_CORRECTION: Increase retrieval K substantially ---
-DEFAULT_RETRIEVER_TOP_K = 100 # Increased from 5/10
-DEFAULT_BM25_ENABLED: bool = True
+DEFAULT_RETRIEVER_TOP_K = 100
+DEFAULT_BM25_ENABLED: bool = True # User must ensure bm2s is installed
 DEFAULT_RERANKER_ENABLED: bool = True
-DEFAULT_DIVERSITY_FILTER_ENABLED: bool = False # Keep disabled by default for max context
-# --- LLM_CORRECTION: Rename and increase final context chunk limit ---
-DEFAULT_MAX_CONTEXT_CHUNKS: int = 75 # Increased from 7/10 (Renamed from DIVERSITY_K_FINAL)
+DEFAULT_DIVERSITY_FILTER_ENABLED: bool = False
+DEFAULT_MAX_CONTEXT_CHUNKS: int = 75
 DEFAULT_HYBRID_ALPHA: float = 0.5
 DEFAULT_DIVERSITY_LAMBDA: float = 0.5
-# --- LLM_CORRECTION: Increase max prompt tokens significantly ---
-DEFAULT_MAX_PROMPT_TOKENS: int = 500000 # Increased from 7000 for Gemini Flash 1.5 (aiming for 500k target)
+DEFAULT_MAX_PROMPT_TOKENS: int = 500000
+DEFAULT_MAX_CHAT_HISTORY_MESSAGES = 10
+DEFAULT_NUM_SOURCES_TO_SHOW = 7 # Keep this lower than MAX_CONTEXT_CHUNKS
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -1257,26 +1278,24 @@ class Settings(BaseSettings):
 
     # --- Diversity Filter ---
     DIVERSITY_FILTER_ENABLED: bool = Field(default=DEFAULT_DIVERSITY_FILTER_ENABLED)
-    # --- LLM_CORRECTION: Use renamed setting ---
     MAX_CONTEXT_CHUNKS: int = Field(default=DEFAULT_MAX_CONTEXT_CHUNKS, gt=0, description="Max number of retrieved/reranked chunks to pass to LLM context.")
     QUERY_DIVERSITY_LAMBDA: float = Field(default=DEFAULT_DIVERSITY_LAMBDA, ge=0.0, le=1.0, description="Lambda for MMR diversity (0=max diversity, 1=max relevance).")
 
-
     # --- RAG Pipeline Parameters ---
-    # --- LLM_CORRECTION: Use updated default ---
-    RETRIEVER_TOP_K: int = Field(default=DEFAULT_RETRIEVER_TOP_K, gt=0, le=500) # Allow up to 500 retrieval
-    HYBRID_FUSION_ALPHA: float = Field(default=DEFAULT_HYBRID_ALPHA, ge=0.0, le=1.0, description="Weighting factor for dense vs sparse fusion (0=sparse, 1=dense). Used for simple linear fusion.")
+    RETRIEVER_TOP_K: int = Field(default=DEFAULT_RETRIEVER_TOP_K, gt=0, le=500)
+    HYBRID_FUSION_ALPHA: float = Field(default=DEFAULT_HYBRID_ALPHA, ge=0.0, le=1.0)
     RAG_PROMPT_TEMPLATE: str = Field(default=ATENEX_RAG_PROMPT_TEMPLATE)
     GENERAL_PROMPT_TEMPLATE: str = Field(default=ATENEX_GENERAL_PROMPT_TEMPLATE)
-    # --- LLM_CORRECTION: Use updated default ---
     MAX_PROMPT_TOKENS: Optional[int] = Field(default=DEFAULT_MAX_PROMPT_TOKENS)
+    MAX_CHAT_HISTORY_MESSAGES: int = Field(default=DEFAULT_MAX_CHAT_HISTORY_MESSAGES, ge=0)
+    NUM_SOURCES_TO_SHOW: int = Field(default=DEFAULT_NUM_SOURCES_TO_SHOW, ge=0)
 
     # --- Service Client Config ---
     HTTP_CLIENT_TIMEOUT: int = Field(default=60)
     HTTP_CLIENT_MAX_RETRIES: int = Field(default=2)
     HTTP_CLIENT_BACKOFF_FACTOR: float = Field(default=1.0)
 
-    # --- Validators (No changes needed here) ---
+    # --- Validators ---
     @field_validator('LOG_LEVEL')
     @classmethod
     def check_log_level(cls, v: str) -> str:
@@ -1312,19 +1331,28 @@ class Settings(BaseSettings):
         logging.debug(f"Using EMBEDDING_DIMENSION: {v} for model: {model_name}")
         return v
 
-    # --- LLM_CORRECTION: Add validator for max context chunks ---
     @field_validator('MAX_CONTEXT_CHUNKS')
     @classmethod
     def check_max_context_chunks(cls, v: int, info: ValidationInfo) -> int:
         retriever_k = info.data.get('RETRIEVER_TOP_K', DEFAULT_RETRIEVER_TOP_K)
-        # fusion_fetch_k is retriever_k * 2 in the code logic
         max_possible_after_fusion = retriever_k * 2
         if v > max_possible_after_fusion:
             logging.warning(f"MAX_CONTEXT_CHUNKS ({v}) is greater than the maximum possible chunks after fusion ({max_possible_after_fusion} based on RETRIEVER_TOP_K={retriever_k}). Effective limit will be {max_possible_after_fusion}.")
-            # We don't strictly need to cap 'v' here, the code logic will handle it, but warning is good.
         if v <= 0:
              raise ValueError("MAX_CONTEXT_CHUNKS must be a positive integer.")
         return v
+
+    @field_validator('NUM_SOURCES_TO_SHOW')
+    @classmethod
+    def check_num_sources_to_show(cls, v: int, info: ValidationInfo) -> int:
+        max_chunks = info.data.get('MAX_CONTEXT_CHUNKS', DEFAULT_MAX_CONTEXT_CHUNKS)
+        if v > max_chunks:
+             logging.warning(f"NUM_SOURCES_TO_SHOW ({v}) is greater than MAX_CONTEXT_CHUNKS ({max_chunks}). Will only show up to {max_chunks} sources.")
+             return max_chunks
+        if v < 0:
+            raise ValueError("NUM_SOURCES_TO_SHOW cannot be negative.")
+        return v
+
 
 # --- Global Settings Instance ---
 temp_log = logging.getLogger("query_service.config.loader")
@@ -1341,7 +1369,11 @@ try:
     temp_log.info("Query Service Settings Loaded Successfully:")
     log_data = settings.model_dump(exclude={'POSTGRES_PASSWORD', 'GEMINI_API_KEY'})
     for key, value in log_data.items():
-        temp_log.info(f"  {key}: {value}")
+        # Truncate long prompt templates for cleaner logs
+        if key.endswith('_PROMPT_TEMPLATE') and isinstance(value, str) and len(value) > 200:
+             temp_log.info(f"  {key}: {value[:100]}... (truncated)")
+        else:
+             temp_log.info(f"  {key}: {value}")
     temp_log.info(f"  POSTGRES_PASSWORD: *** SET ***")
     temp_log.info(f"  GEMINI_API_KEY: *** SET ***")
 
