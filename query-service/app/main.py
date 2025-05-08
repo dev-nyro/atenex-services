@@ -300,7 +300,7 @@ async def read_root():
     health_log.debug("Health check passed.")
     return PlainTextResponse("OK", status_code=fastapi_status.HTTP_200_OK)
 
-# --- Main execution ---
+# --- Main execution --- .
 if __name__ == "__main__":
     port = 8002
     log_level_str = settings.LOG_LEVEL.lower()
