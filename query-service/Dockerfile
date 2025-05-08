@@ -45,7 +45,7 @@ RUN echo "Checking for bm25s installation files..." && \
 # --- END CORRECTION ---
 
 # --- LLM_CORRECTION: Añadir paso de verificación para bm2s usando poetry run ---
-RUN /opt/poetry/bin/poetry run python -c "import sys; print('Verifying bm2s import...'); import bm2s; print('bm2s imported successfully!')"
+RUN /opt/poetry/bin/poetry run python -c "import sys; print('Verifying bm25s import...'); import bm25s; print('bm25s imported successfully!')"
 # --- END CORRECTION ---
 
 
