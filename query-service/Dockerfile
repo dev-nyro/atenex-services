@@ -14,10 +14,11 @@ ENV PATH="${POETRY_HOME}/bin:${PATH}"
 # --- END CORRECTION ---
 
 # Instalar dependencias del sistema (curl para instalar poetry)
-# Combinar comandos para reducir capas
+# --- LLM_CORRECTION: Añadir cmake a las dependencias del sistema ---
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl build-essential && \
+    apt-get install -y --no-install-recommends curl build-essential cmake && \
     rm -rf /var/lib/apt/lists/*
+# --- END CORRECTION ---
 
 # Instalar Poetry usando el script oficial
 RUN curl -sSL https://install.python-poetry.org | python3 -
@@ -37,6 +38,7 @@ RUN /opt/poetry/bin/poetry install --no-root --no-interaction --no-ansi -vvv
 # --- END CORRECTION ---
 
 # --- LLM_CORRECTION: Verificar explícitamente la presencia de archivos bm25s ---
+# Este paso es útil para debug, puede comentarse o eliminarse una vez funcione
 RUN echo "Checking for bm25s installation files..." && \
     ls -la /usr/local/lib/python3.10/site-packages/ | grep bm25s || echo "bm25s directory not found in site-packages" && \
     ls -la /usr/local/lib/python3.10/site-packages/bm25s* || echo "bm25s files/directory details not found"
