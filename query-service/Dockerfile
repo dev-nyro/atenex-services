@@ -32,9 +32,15 @@ COPY pyproject.toml poetry.lock* ./
 
 
 # Instalar dependencias del proyecto usando Poetry
-# Se asume que si poetry.lock existe y está actualizado, se usará.
-# Si no, o si está desactualizado respecto a pyproject.toml, poetry install generará/actualizará el lock.
-RUN /opt/poetry/bin/poetry install --no-root --no-interaction --no-ansi
+# --- LLM_CORRECTION: Añadir flag -vvv para máxima verbosidad ---
+RUN /opt/poetry/bin/poetry install --no-root --no-interaction --no-ansi -vvv
+# --- END CORRECTION ---
+
+# --- LLM_CORRECTION: Verificar explícitamente la presencia de archivos bm25s ---
+RUN echo "Checking for bm25s installation files..." && \
+    ls -la /usr/local/lib/python3.10/site-packages/ | grep bm25s || echo "bm25s directory not found in site-packages" && \
+    ls -la /usr/local/lib/python3.10/site-packages/bm25s* || echo "bm25s files/directory details not found"
+# --- END CORRECTION ---
 
 # --- LLM_CORRECTION: Añadir paso de verificación para bm2s usando poetry run ---
 RUN /opt/poetry/bin/poetry run python -c "import sys; print('Verifying bm2s import...'); import bm2s; print('bm2s imported successfully!')"
