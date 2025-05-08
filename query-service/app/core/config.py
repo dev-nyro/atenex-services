@@ -96,7 +96,7 @@ DEFAULT_FASTEMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_FASTEMBED_QUERY_PREFIX = "query: "
 DEFAULT_EMBEDDING_DIMENSION = 384
 # --- LLM_CORRECTION: Ensure correct model name ---
-DEFAULT_GEMINI_MODEL = "gemini-1.5-flash-latest"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-preview-04-17"
 DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-base"
 
 # RAG Pipeline Parameters
