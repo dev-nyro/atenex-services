@@ -158,3 +158,6 @@ if __name__ == "__main__":
         log_level=settings.LOG_LEVEL.lower(),
         reload=True # Enable reload for local development
     )
+
+# === 0.1.0 ===
+# - Initial version with basic structure and logging
