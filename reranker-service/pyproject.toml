@@ -1,38 +1,46 @@
 [tool.poetry]
 name = "reranker-service"
 version = "0.1.0"
-description = "Atenex Reranker Microservice"
+description = "Atenex Reranker Microservice for document relevance scoring."
 authors = ["Atenex Engineering <dev@atenex.com>"]
 readme = "README.md"
+license = "Proprietary"
+# homepage = "https://atenex.ai"
+# repository = "https://github.com/atenex/reranker-service"
 
 [tool.poetry.dependencies]
-python = "^3.10" # Compatible con query-service
-fastapi = "^0.110.0"
+python = "^3.10"
+fastapi = "^0.111.0"
 uvicorn = {extras = ["standard"], version = "^0.29.0"}
-gunicorn = "^22.0.0" # Actualizado a una versión reciente
-pydantic = {extras = ["email"], version = "^2.7.0"}
+gunicorn = "^22.0.0"
+pydantic = {extras = ["email"], version = "^2.7.1"} # Matched with query-service
 pydantic-settings = "^2.2.1"
 structlog = "^24.1.0"
-tenacity = "^8.2.3" # Aunque no se use directamente, es buena práctica tenerla por si se añade resiliencia a la carga del modelo.
+tenacity = "^8.2.3" # For potential retries if needed in future
 
+# Core ML dependency for reranking
 sentence-transformers = "^2.7.0"
-# PyTorch es una dependencia transitiva de sentence-transformers para CrossEncoder.
-# Se puede añadir explícitamente si se quiere controlar la versión de PyTorch:
-# torch = {version = "^2.2.0", source = "pytorch_cpu"} # Ejemplo para CPU
-# torchvision = {version = "^0.17.0", source = "pytorch_cpu"}
-# torchaudio = {version = "^2.2.0", source = "pytorch_cpu"}
+# PyTorch is a transitive dependency of sentence-transformers.
+# Forcing CPU version if specific hardware is not guaranteed or for lighter images.
+# torch = {version = "~2.2.0", source = "pytorch_cpu"} # Example for CPU constraint
+# torchvision = {version = "~0.17.0", source = "pytorch_cpu"}
+# torchaudio = {version = "~0.17.0", source = "pytorch_cpu"}
+# numpy = "~1.26.4" # Often a dependency, good to pin. sentence-transformers will pull a compatible one.
 
-# [[tool.poetry.source]] # Descomentar si se necesita especificar fuente para PyTorch
+# [[tool.poetry.source]]
 # name = "pytorch_cpu"
 # url = "https://download.pytorch.org/whl/cpu"
 # priority = "explicit"
 
 
 [tool.poetry.group.dev.dependencies]
-pytest = "^8.0.0"
-pytest-asyncio = "^0.23.0"
-httpx = "^0.27.0" # Para TestClient
+pytest = "^8.1.1"
+pytest-asyncio = "^0.23.6"
+httpx = "^0.27.0" # For TestClient
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

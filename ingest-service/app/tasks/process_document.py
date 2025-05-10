@@ -13,108 +13,121 @@ import json
 from typing import Optional, Dict, Any, List
 
 import structlog
+import httpx
 from celery import Task, states
 from celery.exceptions import Ignore, Reject, MaxRetriesExceededError, Retry
 from celery.signals import worker_process_init
 from sqlalchemy import Engine
 
-# Embedding components - CLIENT
 from app.services.clients.embedding_service_client import EmbeddingServiceClient, EmbeddingServiceClientError
+from app.services.clients.docproc_service_client import DocProcServiceClient, DocProcServiceClientError
 
-# Custom Application Imports
 from app.core.config import settings
 from app.db.postgres_client import get_sync_engine, set_status_sync, bulk_insert_chunks_sync
-from app.models.domain import DocumentStatus, DocumentChunkData, ChunkVectorStatus
+from app.models.domain import DocumentStatus
 from app.services.gcs_client import GCSClient, GCSClientError
 from app.services.ingest_pipeline import (
-    ingest_document_pipeline,
-    EXTRACTORS,
-    EXTRACTION_ERRORS,
+    index_chunks_in_milvus_and_prepare_for_pg,
     delete_milvus_chunks
 )
 from app.tasks.celery_app import celery_app
-import asyncio # Para ejecutar funciones async desde sync
+import asyncio
 
 task_struct_log = structlog.get_logger(__name__)
 IS_WORKER = "worker" in sys.argv
 
 # --- Global Resources for Worker Process ---
 sync_engine: Optional[Engine] = None
-gcs_client: Optional[GCSClient] = None
-# worker_embedding_model: Optional[SentenceTransformer] = None # Eliminado
-embedding_service_client_global: Optional[EmbeddingServiceClient] = None # Nuevo
+gcs_client_global: Optional[GCSClient] = None # Renamed to avoid conflict
+embedding_service_client_global: Optional[EmbeddingServiceClient] = None
+docproc_service_client_global: Optional[DocProcServiceClient] = None
 
 
 @worker_process_init.connect(weak=False)
 def init_worker_resources(**kwargs):
-    global sync_engine, gcs_client, embedding_service_client_global # Modificado
+    global sync_engine, gcs_client_global, embedding_service_client_global, docproc_service_client_global
     log = task_struct_log.bind(signal="worker_process_init")
     log.info("Worker process initializing resources...")
     try:
         if sync_engine is None:
             sync_engine = get_sync_engine()
-            log.info("Synchronous DB engine initialized.")
+            log.info("Synchronous DB engine initialized for worker.")
         else:
-             log.info("Synchronous DB engine already initialized.")
+             log.info("Synchronous DB engine already initialized for worker.")
 
-        if gcs_client is None:
-            gcs_client = GCSClient()
-            log.info("GCS client initialized.")
+        if gcs_client_global is None:
+            gcs_client_global = GCSClient()
+            log.info("GCS client initialized for worker.")
         else:
-            log.info("GCS client already initialized.")
+            log.info("GCS client already initialized for worker.")
 
-        # if worker_embedding_model is None: # Eliminado
-        #     log.info("Preloading embedding model...")
-        #     worker_embedding_model = get_embedding_model()
-        #     log.info("Embedding model preloaded.")
-        # else:
-        #     log.info("Embedding model already preloaded.")
-
-        if embedding_service_client_global is None: # Nuevo
-            log.info("Initializing Embedding Service client...")
-            # La URL se toma de settings directamente en el cliente
+        if embedding_service_client_global is None:
+            log.info("Initializing Embedding Service client for worker...")
             embedding_service_client_global = EmbeddingServiceClient()
-            # Realizar un health check inicial al servicio de embedding
-            # loop = asyncio.get_event_loop() # No se puede usar get_event_loop en un hilo no principal de asyncio
-            # if not loop.run_until_complete(embedding_service_client_global.health_check()):
-            #    log.critical("Embedding Service health check FAILED during worker init. Client may not function.")
-            # else:
-            #    log.info("Embedding Service client initialized and health check successful.")
-            # Simplificado: No hacer health check aquí para evitar problemas con event loop en worker init.
-            # Se hará un health check implícito al primer uso o se confía en la resiliencia.
-            log.info("Embedding Service client initialized (health check deferred to first use or task).")
-
+            log.info("Embedding Service client initialized for worker.")
         else:
-            log.info("Embedding Service client already initialized.")
-
+            log.info("Embedding Service client already initialized for worker.")
+        
+        if docproc_service_client_global is None:
+            log.info("Initializing Document Processing Service client for worker...")
+            docproc_service_client_global = DocProcServiceClient()
+            log.info("Document Processing Service client initialized for worker.")
+        else:
+            log.info("Document Processing Service client already initialized for worker.")
 
     except Exception as e:
         log.critical("CRITICAL FAILURE during worker resource initialization!", error=str(e), exc_info=True)
         sync_engine = None
-        gcs_client = None
-        # worker_embedding_model = None # Eliminado
-        embedding_service_client_global = None # Nuevo
+        gcs_client_global = None
+        embedding_service_client_global = None
+        docproc_service_client_global = None
 
 
 def run_async_from_sync(awaitable):
-    """Ejecuta una corutina desde código síncrono (Celery task)."""
     try:
         loop = asyncio.get_event_loop()
+        if loop.is_running(): # Check if a loop is already running in this thread
+             # If so, create a new loop for this task execution to avoid interference
+             # This is a common pattern for sync Celery workers calling async code
+             temp_loop = asyncio.new_event_loop()
+             asyncio.set_event_loop(temp_loop)
+             result = temp_loop.run_until_complete(awaitable)
+             temp_loop.close() # Close the temporary loop
+             asyncio.set_event_loop(loop) # Restore original loop if it was running
+             return result
     except RuntimeError: # No current event loop in thread
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-    return loop.run_until_complete(awaitable)
+        try:
+            return loop.run_until_complete(awaitable)
+        finally:
+            loop.close() # Ensure the new loop is closed
+            # No need to restore if there wasn't one before
 
 
 @celery_app.task(
     bind=True,
     name="ingest.process_document",
-    autoretry_for=(EmbeddingServiceClientError, httpx.RequestError, httpx.HTTPStatusError, Exception), # Añadir errores de cliente
-    exclude=(Reject, Ignore, ValueError, ConnectionError, RuntimeError, TypeError, *EXTRACTION_ERRORS),
+    autoretry_for=(
+        EmbeddingServiceClientError, 
+        DocProcServiceClientError,
+        httpx.RequestError, 
+        httpx.HTTPStatusError,
+        GCSClientError,
+        ConnectionRefusedError, # For network issues to dependent services
+        asyncio.TimeoutError, # For timeouts in async calls
+        Exception
+    ),
+    exclude=(
+        Reject, Ignore, ValueError, ConnectionError, RuntimeError, TypeError,
+        # Errors from client-side validation (4xx from services) should not be retried by Celery default
+        # but EmbeddingServiceClientError/DocProcServiceClientError might wrap them.
+        # Custom logic handles retry for 5xx within the task.
+    ),
     retry_backoff=True,
-    retry_backoff_max=600, # 10 minutos
+    retry_backoff_max=600,
     retry_jitter=True,
-    max_retries=5, # Aumentado para el servicio externo
+    max_retries=5, 
     acks_late=True
 )
 def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
@@ -126,11 +139,12 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
     task_id = self.request.id or "unknown_task_id"
     attempt = self.request.retries + 1
     max_attempts = (self.max_retries or 0) + 1
-    log = task_struct_log.bind(
-        task_id=task_id, attempt=f"{attempt}/{max_attempts}", doc_id=document_id_str,
-        company_id=company_id_str, filename=filename, content_type=content_type
-    )
-    log.info("Starting document processing task (uses Embedding Service)")
+    log_context = {
+        "task_id": task_id, "attempt": f"{attempt}/{max_attempts}", "doc_id": document_id_str,
+        "company_id": company_id_str, "filename": filename, "content_type": content_type
+    }
+    log = task_struct_log.bind(**log_context)
+    log.info("Starting document processing task")
 
     if not IS_WORKER:
          log.critical("Task function called outside of a worker context! Rejecting.")
@@ -140,35 +154,23 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
         log.error("Missing required arguments in task payload.", payload_kwargs=kwargs)
         raise Reject("Missing required arguments (doc_id, company_id, filename, content_type)", requeue=False)
 
-    # --- Validar recursos globales del worker ---
-    if not sync_engine:
-         log.critical("Worker Sync DB Engine is not initialized. Task cannot proceed.")
-         raise Reject("Worker sync DB engine initialization failed.", requeue=False) # No reintentar
-    # if not worker_embedding_model: # Eliminado
-    #      log.critical("Worker Embedding Model is not available/loaded. Task cannot proceed.")
-    #      # ...
-    #      raise Reject(error_msg, requeue=False)
-    if not embedding_service_client_global: # Nuevo
-        log.critical("Worker Embedding Service Client is not initialized. Task cannot proceed.")
-        error_msg = "Worker Embedding Service Client init failed."
-        doc_uuid_err_esc = None
-        try: doc_uuid_err_esc = uuid.UUID(document_id_str)
-        except ValueError: pass
-        if doc_uuid_err_esc and sync_engine:
-            try: set_status_sync(engine=sync_engine, document_id=doc_uuid_err_esc, status=DocumentStatus.ERROR, error_message=error_msg)
-            except Exception as db_err: log.critical("Failed to update status after ESC client check failure!", error=str(db_err))
-        raise Reject(error_msg, requeue=False) # No reintentar este error de infraestructura
+    global_resources = {
+        "Sync DB Engine": sync_engine, "GCS Client": gcs_client_global,
+        "Embedding Service Client": embedding_service_client_global,
+        "DocProc Service Client": docproc_service_client_global
+    }
+    for name, resource in global_resources.items():
+        if not resource:
+            log.critical(f"Worker resource '{name}' is not initialized. Task cannot proceed.")
+            error_msg = f"Worker resource '{name}' initialization failed."
+            # Attempt to update DB status only if engine is available
+            if name != "Sync DB Engine" and sync_engine:
+                try: 
+                    doc_uuid_for_error_res = uuid.UUID(document_id_str)
+                    set_status_sync(engine=sync_engine, document_id=doc_uuid_for_error_res, status=DocumentStatus.ERROR, error_message=error_msg)
+                except Exception as db_err_res: log.critical(f"Failed to update status after {name} check failure!", error=str(db_err_res))
+            raise Reject(error_msg, requeue=False)
 
-    if not gcs_client:
-         log.critical("Worker GCS Client is not initialized. Task cannot proceed.")
-         error_msg = "Worker GCS client init failed."
-         doc_uuid_err_gcs = None
-         try: doc_uuid_err_gcs = uuid.UUID(document_id_str)
-         except ValueError: pass
-         if doc_uuid_err_gcs and sync_engine:
-              try: set_status_sync(engine=sync_engine, document_id=doc_uuid_err_gcs, status=DocumentStatus.ERROR, error_message=error_msg)
-              except Exception as db_err: log.critical("Failed to update status after GCS client check failure!", error=str(db_err))
-         raise Reject(error_msg, requeue=False) # No reintentar
 
     try:
         doc_uuid = uuid.UUID(document_id_str)
@@ -176,20 +178,18 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
          log.error("Invalid document_id format received.")
          raise Reject("Invalid document_id format.", requeue=False)
 
-    if content_type not in EXTRACTORS:
-        log.error(f"Unsupported content type provided: {content_type}")
-        error_msg = f"Unsupported content type: {content_type}"
-        try: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg)
-        except Exception as db_err: log.critical("Failed to update status to ERROR for unsupported type!", error=str(db_err))
+    if content_type not in settings.SUPPORTED_CONTENT_TYPES:
+        log.error(f"Unsupported content type: {content_type}")
+        error_msg = f"Unsupported content type by ingest-service: {content_type}"
+        set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg)
         raise Reject(error_msg, requeue=False)
+
 
     normalized_filename = normalize_filename(filename) if filename else filename
     object_name = f"{company_id_str}/{document_id_str}/{normalized_filename}"
     file_bytes: Optional[bytes] = None
-    inserted_milvus_count = 0
-    inserted_pg_count = 0
-    milvus_pks: List[str] = []
-    processed_chunks_data: List[DocumentChunkData] = []
+    
+    processed_chunks_from_docproc: List[Dict[str, Any]] = []
 
     try:
         log.debug("Setting status to PROCESSING in DB.")
@@ -201,21 +201,26 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
             raise Ignore()
         log.info("Status set to PROCESSING.")
 
+        # 1. Descargar archivo de GCS
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_dir_path = pathlib.Path(temp_dir)
             temp_file_path_obj = temp_dir_path / normalized_filename
             log.info(f"Downloading GCS object: {object_name} -> {str(temp_file_path_obj)}")
-            max_gcs_retries = 2; gcs_delay = 2; download_success = False
+            
+            max_gcs_retries = 3; gcs_delay = 2; download_success = False
             for attempt_num in range(1, max_gcs_retries + 1):
                 try:
-                    gcs_client.download_file_sync(object_name, str(temp_file_path_obj))
+                    gcs_client_global.download_file_sync(object_name, str(temp_file_path_obj))
                     log.info("File downloaded successfully from GCS.")
                     file_bytes = temp_file_path_obj.read_bytes()
                     log.info(f"File content read into memory ({len(file_bytes)} bytes).")
                     download_success = True; break
                 except GCSClientError as gce_dl:
-                    if "Object not found" in str(gce_dl) or (hasattr(gce_dl, 'original_exception') and isinstance(gce_dl.original_exception, FileNotFoundError)):
-                        log.warning(f"GCS object not found on download attempt {attempt_num}/{max_gcs_retries}. Retrying in {gcs_delay}s...", error=str(gce_dl))
+                    is_not_found = "Object not found" in str(gce_dl) or \
+                                   (hasattr(gce_dl, 'original_exception') and \
+                                    isinstance(gce_dl.original_exception, FileNotFoundError))
+                    if is_not_found:
+                        log.warning(f"GCS object not found on download attempt {attempt_num}/{max_gcs_retries}. Retrying in {gcs_delay}s...", error_short=str(gce_dl).splitlines()[0])
                         if attempt_num == max_gcs_retries: log.error(f"File still not found in GCS after {max_gcs_retries} attempts. Aborting."); raise
                         time.sleep(gcs_delay); gcs_delay *= 2
                     else: log.error("Non-retriable GCS error during download", error=str(gce_dl)); raise
@@ -225,55 +230,89 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
             if not download_success or file_bytes is None:
                  raise RuntimeError("File download or read failed, bytes not available.")
 
-        log.info("Executing ingest pipeline (extract, chunk, metadata, embed via service, Milvus insert)...")
-        # Ejecutar la función async del pipeline desde el contexto sync de Celery
-        inserted_milvus_count, milvus_pks, processed_chunks_data = run_async_from_sync(
-            ingest_document_pipeline(
-                file_bytes=file_bytes,
-                filename=normalized_filename,
-                company_id=company_id_str,
-                document_id=document_id_str,
-                content_type=content_type,
-                embedding_service_client=embedding_service_client_global, # Pasamos el cliente
-                delete_existing=True
-            )
-        )
-        log.info(f"Ingestion pipeline finished. Milvus insert count: {inserted_milvus_count}, PKs returned: {len(milvus_pks)}")
-
-        if inserted_milvus_count == 0 or not processed_chunks_data:
-             log.warning("Ingestion pipeline reported zero inserted chunks or no data. Assuming processing complete with 0 chunks.")
-             final_status_updated_zero = set_status_sync(
-                 engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.PROCESSED,
-                 chunk_count=0, error_message=None
-             )
-             return {"status": DocumentStatus.PROCESSED.value, "chunks_inserted": 0, "document_id": document_id_str}
-
-        log.info(f"Preparing {len(processed_chunks_data)} chunks for PostgreSQL bulk insert...")
-        chunks_for_pg = []
-        for chunk_obj in processed_chunks_data:
-            if chunk_obj.embedding_id is None:
-                log.warning("Chunk missing embedding_id after Milvus insert, skipping PG insert for this chunk.", chunk_index=chunk_obj.chunk_index)
-                continue
-            chunk_dict = {
-                'document_id': chunk_obj.document_id, 'company_id': chunk_obj.company_id,
-                'chunk_index': chunk_obj.chunk_index, 'content': chunk_obj.content,
-                'metadata': chunk_obj.metadata.model_dump(mode='json'),
-                'embedding_id': chunk_obj.embedding_id, 'vector_status': chunk_obj.vector_status.value
-            }
-            chunks_for_pg.append(chunk_dict)
-
-        if not chunks_for_pg:
-             log.error("No valid chunks prepared for PostgreSQL insertion after Milvus step. Marking document as error.")
-             error_msg_pg_prep = "Milvus insertion succeeded but no valid data for PG."
-             set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg_pg_prep)
-             raise Reject(error_msg_pg_prep, requeue=False)
-
-        log.debug(f"Attempting bulk insert of {len(chunks_for_pg)} chunks into PostgreSQL.")
+        # 2. Llamar al DocProc Service
+        log.info("Calling Document Processing Service...")
         try:
-            inserted_pg_count = bulk_insert_chunks_sync(engine=sync_engine, chunks_data=chunks_for_pg)
+            docproc_response = run_async_from_sync(
+                docproc_service_client_global.process_document(
+                    file_bytes=file_bytes,
+                    original_filename=normalized_filename,
+                    content_type=content_type,
+                    document_id=document_id_str,
+                    company_id=company_id_str
+                )
+            )
+            processed_chunks_from_docproc = docproc_response.get("data", {}).get("chunks", [])
+            log.info(f"Received {len(processed_chunks_from_docproc)} chunks from DocProc Service.")
+        except DocProcServiceClientError as dpce:
+            log.error("DocProc Service Client Error", error_msg=str(dpce), status_code=dpce.status_code, details_preview=str(dpce.detail)[:200], exc_info=True)
+            error_msg_dpce = f"DocProc Error: {str(dpce.detail or dpce.message)[:350]}"
+            set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg_dpce)
+            if dpce.status_code and 500 <= dpce.status_code < 600: # Server-side errors on docproc
+                raise self.retry(exc=dpce, countdown=int(self.default_retry_delay * (self.request.retries + 1)))
+            else: # Client-side errors (4xx) or connection issues
+                raise Reject(f"DocProc Service critical error: {error_msg_dpce}", requeue=False) from dpce
+        
+        if not processed_chunks_from_docproc:
+            log.warning("DocProc Service returned no chunks. Document processing considered complete with 0 chunks.")
+            set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.PROCESSED, chunk_count=0, error_message=None)
+            return {"status": DocumentStatus.PROCESSED.value, "chunks_inserted": 0, "document_id": document_id_str}
+
+        # 3. Preparar textos para Embedding Service
+        chunk_texts_for_embedding = [chunk['text'] for chunk in processed_chunks_from_docproc if chunk.get('text','').strip()]
+        if not chunk_texts_for_embedding:
+            log.warning("No non-empty text found in chunks received from DocProc. Finishing with 0 chunks.")
+            set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.PROCESSED, chunk_count=0, error_message=None)
+            return {"status": DocumentStatus.PROCESSED.value, "chunks_inserted": 0, "document_id": document_id_str}
+
+        # 4. Llamar al Embedding Service
+        log.info(f"Calling Embedding Service for {len(chunk_texts_for_embedding)} texts...")
+        embeddings: List[List[float]] = []
+        try:
+            embeddings, model_info = run_async_from_sync(
+                embedding_service_client_global.get_embeddings(chunk_texts_for_embedding)
+            )
+            log.info(f"Embeddings received from service for {len(embeddings)} chunks. Model: {model_info}")
+            if len(embeddings) != len(chunk_texts_for_embedding):
+                log.error("Embedding count mismatch from Embedding Service.", expected=len(chunk_texts_for_embedding), received=len(embeddings))
+                raise RuntimeError(f"Embedding count mismatch. Expected {len(chunk_texts_for_embedding)}, got {len(embeddings)}.")
+            if embeddings and len(embeddings[0]) != settings.EMBEDDING_DIMENSION:
+                 log.error(f"Received embedding dimension ({len(embeddings[0])}) from service does not match configured Milvus dimension ({settings.EMBEDDING_DIMENSION}).")
+                 raise RuntimeError(f"Embedding dimension mismatch. Expected {settings.EMBEDDING_DIMENSION}, got {len(embeddings[0])}")
+        except EmbeddingServiceClientError as esce:
+            log.error("Embedding Service Client Error", error_msg=str(esce), status_code=esce.status_code, details_preview=str(esce.detail)[:200], exc_info=True)
+            error_msg_esc = f"Embedding Service Error: {str(esce.detail or esce.message)[:350]}"
+            set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg_esc)
+            if esce.status_code and 500 <= esce.status_code < 600: # Server-side errors on embedding service
+                raise self.retry(exc=esce, countdown=int(self.default_retry_delay * (self.request.retries + 1)))
+            else: # Client-side errors (4xx) or connection issues
+                raise Reject(f"Embedding Service critical error: {error_msg_esc}", requeue=False) from esce
+
+        # 5. Indexar en Milvus y preparar para PostgreSQL
+        log.info("Preparing chunks for Milvus and PostgreSQL indexing...")
+        inserted_milvus_count, milvus_pks, chunks_for_pg_insert = index_chunks_in_milvus_and_prepare_for_pg(
+            processed_chunks_from_docproc=[chunk for chunk in processed_chunks_from_docproc if chunk.get('text','').strip()], # Pass only non-empty chunks
+            embeddings=embeddings, # Embeddings match non-empty chunks
+            filename=normalized_filename,
+            company_id_str=company_id_str,
+            document_id_str=document_id_str,
+            delete_existing_milvus_chunks=True
+        )
+        log.info(f"Milvus indexing complete. Inserted: {inserted_milvus_count}, PKs: {len(milvus_pks)}")
+
+        if inserted_milvus_count == 0 or not chunks_for_pg_insert:
+            log.warning("Milvus indexing resulted in zero inserted chunks or no data for PG. Assuming processing complete with 0 chunks.")
+            set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.PROCESSED, chunk_count=0, error_message=None)
+            return {"status": DocumentStatus.PROCESSED.value, "chunks_inserted": 0, "document_id": document_id_str}
+
+        # 6. Indexar en PostgreSQL
+        log.debug(f"Attempting bulk insert of {len(chunks_for_pg_insert)} chunks into PostgreSQL.")
+        inserted_pg_count = 0
+        try:
+            inserted_pg_count = bulk_insert_chunks_sync(engine=sync_engine, chunks_data=chunks_for_pg_insert)
             log.info(f"Successfully bulk inserted {inserted_pg_count} chunks into PostgreSQL.")
-            if inserted_pg_count != len(chunks_for_pg):
-                 log.warning("Mismatch between prepared PG chunks and inserted PG count.", prepared=len(chunks_for_pg), inserted=inserted_pg_count)
+            if inserted_pg_count != len(chunks_for_pg_insert):
+                 log.warning("Mismatch between prepared PG chunks and inserted PG count.", prepared=len(chunks_for_pg_insert), inserted=inserted_pg_count)
         except Exception as pg_insert_err:
              log.critical("CRITICAL: Failed to bulk insert chunks into PostgreSQL after successful Milvus insert!", error=str(pg_insert_err), exc_info=True)
              log.warning("Attempting to clean up Milvus chunks due to PG insert failure.")
@@ -283,76 +322,50 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
              set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg_pg_fail[:500])
              raise Reject(f"PostgreSQL bulk insert failed: {pg_insert_err}", requeue=False) from pg_insert_err
 
+        # 7. Actualización de Estado Final
         log.debug("Setting final status to PROCESSED in DB.")
-        final_status_updated_ok = set_status_sync(
-            engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.PROCESSED,
-            chunk_count=inserted_pg_count, error_message=None
-        )
-        if not final_status_updated_ok:
-             log.warning("Failed to update final status to PROCESSED (document possibly deleted?).")
-
+        set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.PROCESSED, chunk_count=inserted_pg_count, error_message=None)
         log.info(f"Document processing finished successfully. Final chunk count (PG): {inserted_pg_count}")
         return {"status": DocumentStatus.PROCESSED.value, "chunks_inserted": inserted_pg_count, "document_id": document_id_str}
 
     except GCSClientError as gce:
-        log.error(f"GCS Error during processing", error=str(gce), exc_info=True)
+        log.error(f"GCS Error during processing", error_msg=str(gce), exc_info=True)
         error_msg_gcs = f"GCS Error: {str(gce)[:400]}"
         set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg_gcs)
-        if "Object not found" in str(gce): # No reintentar si el objeto no existe
+        if "Object not found" in str(gce): # Non-retriable if object not found after initial upload
             raise Reject(f"GCS Error: Object not found: {object_name}", requeue=False) from gce
-        # Dejar que Celery reintente otros errores de GCS según la configuración de la tarea
-        raise self.retry(exc=gce, countdown=int(self.default_retry_delay * (self.request.retries + 1)))
+        # For other GCS errors, let Celery's autoretry_for handle it.
+        raise # Re-raise for Celery to catch for retry
 
-    except EmbeddingServiceClientError as esce: # Capturar errores del cliente de embedding
-        log.error("Embedding Service Client Error", error=str(esce), status_code=esce.status_code, details=esce.detail, exc_info=True)
-        error_msg_esc = f"Embedding Service Error: {str(esce)[:350]}"
-        set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg_esc)
-        # Reintentar si es un error de servidor (5xx) o de red, no si es un error de cliente (4xx)
-        if esce.status_code and 500 <= esce.status_code < 600:
-            raise self.retry(exc=esce, countdown=int(self.default_retry_delay * (self.request.retries + 1)))
-        else: # Errores 4xx o sin status_code (errores de conexión) no suelen ser recuperables con reintentos simples
-            raise Reject(f"Embedding Service critical error: {error_msg_esc}", requeue=False) from esce
-
-    except (*EXTRACTION_ERRORS, ValueError, RuntimeError, TypeError) as pipeline_err:
-         log.error(f"Non-retriable Pipeline/Data Error: {pipeline_err}", exc_info=True)
-         error_msg_pipe = f"Pipeline Error: {type(pipeline_err).__name__} - {str(pipeline_err)[:400]}"
+    except (ValueError, RuntimeError, TypeError) as non_retriable_err:
+         log.error(f"Non-retriable Error: {non_retriable_err}", exc_info=True)
+         error_msg_pipe = f"Pipeline/Data Error: {type(non_retriable_err).__name__} - {str(non_retriable_err)[:400]}"
          set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg_pipe)
-         raise Reject(f"Pipeline failed: {error_msg_pipe}", requeue=False) from pipeline_err
+         raise Reject(f"Pipeline failed: {error_msg_pipe}", requeue=False) from non_retriable_err
 
     except Reject as r:
          log.error(f"Task rejected permanently: {r.reason}")
-         if sync_engine and doc_uuid and r.reason: # Asegurarse que reason no sea None
+         if sync_engine and doc_uuid and r.reason: # Ensure sync_engine and doc_uuid are valid
              set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=f"Rejected: {str(r.reason)[:500]}")
-         raise # Propagate Reject
-
+         raise 
     except Ignore:
          log.info("Task ignored.")
-         raise # Propagate Ignore
-
-    except Retry as retry_exc: # Captura explícita de la excepción Retry
-        log.warning(f"Task is being retried. Reason: {retry_exc}", exc_info=True)
-        # No actualizar el estado a ERROR aquí, ya que Celery lo está reintentando.
-        # El estado 'processing' es apropiado durante los reintentos.
-        raise # Re-elevar para que Celery maneje el reintento
-
+         raise 
+    except Retry as retry_exc: # Specific catch for Celery's Retry exception
+        log.warning(f"Task is being retried by Celery. Reason: {retry_exc}", exc_info=False)
+        # Status is already PROCESSING, no need to update for retry.
+        raise # Re-raise for Celery to handle the retry
     except MaxRetriesExceededError as mree:
-        log.error("Max retries exceeded for task.", exc_info=True)
+        log.error("Max retries exceeded for task.", exc_info=True, cause_type=type(mree.cause).__name__, cause_message=str(mree.cause))
         final_error = mree.cause if mree.cause else mree
         error_msg_mree = f"Max retries exceeded ({max_attempts}). Last error: {type(final_error).__name__} - {str(final_error)[:300]}"
         set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg_mree)
-        # Celery ya maneja esto y no lo reenvía, así que no necesitamos hacer Reject.
-        # Simplemente actualizamos el estado final y dejamos que Celery termine.
         self.update_state(state=states.FAILURE, meta={'exc_type': type(final_error).__name__, 'exc_message': str(final_error)})
-        # No se debe re-elevar mree si queremos que Celery la maneje como una falla final
-        # y no la intente procesar de nuevo. Simplemente retornamos o dejamos que termine.
-
-    except Exception as exc: # Captura errores generales que pueden ser retriables
-        log.exception(f"An unexpected error occurred, attempting retry if possible.")
+        # Do not re-raise MaxRetriesExceededError, Celery handles it.
+    except Exception as exc: 
+        log.exception(f"An unexpected error occurred, attempting Celery retry if possible.")
         error_msg_exc = f"Attempt {attempt} failed: {type(exc).__name__} - {str(exc)[:400]}"
-        # Actualizar a error temporalmente. Si el reintento tiene éxito, se cambiará a PROCESSED.
-        # Si todos los reintentos fallan, MaxRetriesExceededError se encargará del estado final.
+        # Set status to PROCESSING with error for visibility during retries.
         set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.PROCESSING, error_message=error_msg_exc)
-        raise self.retry(exc=exc, countdown=int(self.default_retry_delay * (self.request.retries + 1)))
-
-
-process_document_haystack_task = process_document_standalone
+        # Let Celery's autoretry_for handle it by re-raising the original exception.
+        raise

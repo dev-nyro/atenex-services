@@ -1,63 +1,47 @@
-# Usar imagen base Python
-FROM python:3.10-slim
+# query-service/Dockerfile
+# ---- Stage 1: Builder ----
+FROM python:3.10-slim as builder
 
-# Establecer variables de entorno como en ingest-service
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONFAULTHANDLER=1 \
-    POETRY_VERSION=1.7.1 \
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    POETRY_VERSION=1.8.2 \
     POETRY_HOME="/opt/poetry" \
-    POETRY_VIRTUALENVS_CREATE=false \
-    PORT=8001
+    PATH="/opt/poetry/bin:$PATH" \
+    POETRY_NO_INTERACTION=1 \
+    POETRY_VIRTUALENVS_CREATE=false
 
-# --- LLM_CORRECTION: Definir PATH en una directiva ENV separada para claridad y robustez ---
-ENV PATH="${POETRY_HOME}/bin:${PATH}"
-# --- END CORRECTION ---
-
-# Instalar dependencias del sistema (curl para instalar poetry)
-# --- LLM_CORRECTION: Añadir cmake a las dependencias del sistema ---
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl build-essential cmake && \
     rm -rf /var/lib/apt/lists/*
-# --- END CORRECTION ---
 
-# Instalar Poetry usando el script oficial
-RUN curl -sSL https://install.python-poetry.org | python3 -
+RUN curl -sSL https://install.python-poetry.org | python3 - --version ${POETRY_VERSION}
+RUN poetry --version
 
-# Establecer directorio de trabajo
-WORKDIR /app
+WORKDIR /build
 
-# Copiar solo pyproject.toml y poetry.lock primero
-# --- LLM_CORRECTION: Copiar también poetry.lock ---
-COPY pyproject.toml poetry.lock* ./
-# --- END CORRECTION ---
+COPY pyproject.toml poetry.lock ./
+RUN poetry install --no-root --only main -vvv
 
+RUN rm -rf /root/.cache/huggingface
 
-# Instalar dependencias del proyecto usando Poetry
-# --- LLM_CORRECTION: Añadir flag -vvv para máxima verbosidad ---
-RUN /opt/poetry/bin/poetry install --no-root --no-interaction --no-ansi -vvv
-# --- END CORRECTION ---
+# ---- Stage 2: Final Image ----
+FROM python:3.10-slim
 
-# --- LLM_CORRECTION: Verificar explícitamente la presencia de archivos bm25s ---
-# Este paso es útil para debug, puede comentarse o eliminarse una vez funcione
-RUN echo "Checking for bm25s installation files..." && \
-    ls -la /usr/local/lib/python3.10/site-packages/ | grep bm25s || echo "bm25s directory not found in site-packages" && \
-    ls -la /usr/local/lib/python3.10/site-packages/bm25s* || echo "bm25s files/directory details not found"
-# --- END CORRECTION ---
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    APP_HOME="/app" \
+    PORT=8001
 
-# --- LLM_CORRECTION: Añadir paso de verificación para bm2s usando poetry run ---
-RUN /opt/poetry/bin/poetry run python -c "import sys; print('Verifying bm25s import...'); import bm25s; print('bm25s imported successfully!')"
-# --- END CORRECTION ---
+WORKDIR ${APP_HOME}
 
+# Instalar dependencias de runtime del sistema si son necesarias (cmake no es necesario en runtime para bm2s)
+# RUN apt-get update && apt-get install -y --no-install-recommends some-runtime-lib && rm -rf /var/lib/apt/lists/*
 
-# Copiar el código de la aplicación al contenedor
-COPY app ./app
+COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Exponer el puerto en el que correrá la aplicación
+COPY ./app ${APP_HOME}/app
+
 EXPOSE ${PORT}
 
-# Comando para correr la aplicación con Gunicorn
-# Timeout ya está en 120s, especificado en el Deployment YAML
 CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "2", "-b", "0.0.0.0:${PORT}", "app.main:app"]
-
-# Comando alternativo para correr con Uvicorn directamente (útil para debug local)
-# CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "${PORT}", "--reload"]

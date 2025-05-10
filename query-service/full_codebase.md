@@ -51,7 +51,6 @@ app/
 │   │   └── postgres_repositories.py
 │   ├── rerankers
 │   │   ├── __init__.py
-│   │   ├── bge_reranker.py
 │   │   └── diversity_filter.py
 │   ├── retrievers
 │   │   ├── __init__.py
@@ -455,7 +454,7 @@ class HealthCheckResponse(BaseModel):
 from .llm_port import LLMPort
 from .vector_store_port import VectorStorePort
 from .repository_ports import ChatRepositoryPort, LogRepositoryPort, ChunkContentRepositoryPort
-from .retrieval_ports import SparseRetrieverPort, RerankerPort, DiversityFilterPort
+from .retrieval_ports import SparseRetrieverPort, RerankerPort, DiversityFilterPort # RerankerPort se mantiene si se quiere usar como interfaz para el cliente remoto, o se elimina si se usa httpx directamente en el use case. Por ahora lo dejo.
 from .embedding_port import EmbeddingPort
 
 __all__ = [
@@ -740,40 +739,35 @@ import uuid
 import re
 from typing import Dict, Any, List, Tuple, Optional, Type, Set
 from datetime import datetime, timezone, timedelta
+import httpx
 
 # Import Ports and Domain Models
 from app.application.ports import (
     ChatRepositoryPort, LogRepositoryPort, VectorStorePort, LLMPort,
-    SparseRetrieverPort, RerankerPort, DiversityFilterPort, ChunkContentRepositoryPort,
-    EmbeddingPort # NUEVA ADICIÓN
+    SparseRetrieverPort, DiversityFilterPort, ChunkContentRepositoryPort,
+    EmbeddingPort, RerankerPort # RerankerPort might be removed if not used as interface
 )
 from app.domain.models import RetrievedChunk, ChatMessage
 
 
-# LLM_FIX: Ensure bm2s is checked for availability here if sparse_retriever depends on it
 try:
     import bm2s
 except ImportError:
     bm2s = None
 
-# REMOVED: FastembedTextEmbedder ya no se usa aquí
-# from haystack_integrations.components.embedders.fastembed import FastembedTextEmbedder
 from haystack.components.builders.prompt_builder import PromptBuilder
-from haystack import Document # Still needed for PromptBuilder context
+from haystack import Document
 
 from app.core.config import settings
-from app.api.v1.schemas import RetrievedDocument as RetrievedDocumentSchema # For logging format
+from app.api.v1.schemas import RetrievedDocument as RetrievedDocumentSchema # For logging
 from app.utils.helpers import truncate_text
 from fastapi import HTTPException, status
 
 log = structlog.get_logger(__name__)
 
 GREETING_REGEX = re.compile(r"^\s*(hola|hello|hi|buenos días|buenas tardes|buenas noches|hey|qué tal|hi there)\s*[\.,!?]*\s*$", re.IGNORECASE)
-
-# RRF Constant
 RRF_K = 60
 
-# --- LLM_FEATURE: Helper function for simple time delta formatting ---
 def format_time_delta(dt: datetime) -> str:
     now = datetime.now(timezone.utc)
     delta = now - dt
@@ -791,39 +785,36 @@ def format_time_delta(dt: datetime) -> str:
 
 
 class AskQueryUseCase:
-    """
-    Caso de uso para procesar una consulta de usuario, manejar el chat y ejecutar el pipeline RAG completo.
-    """
     def __init__(self,
                  chat_repo: ChatRepositoryPort,
                  log_repo: LogRepositoryPort,
                  vector_store: VectorStorePort,
                  llm: LLMPort,
-                 embedding_adapter: EmbeddingPort, # NUEVA ADICIÓN: Inyectar el puerto de embedding
-                 # Optional components for advanced RAG
+                 embedding_adapter: EmbeddingPort,
+                 http_client: httpx.AsyncClient,
+                 # Optional components
                  sparse_retriever: Optional[SparseRetrieverPort] = None,
                  chunk_content_repo: Optional[ChunkContentRepositoryPort] = None,
-                 reranker: Optional[RerankerPort] = None,
                  diversity_filter: Optional[DiversityFilterPort] = None):
         self.chat_repo = chat_repo
         self.log_repo = log_repo
         self.vector_store = vector_store
         self.llm = llm
-        self.embedding_adapter = embedding_adapter # NUEVA ADICIÓN
+        self.embedding_adapter = embedding_adapter
+        self.http_client = http_client
+        self.settings = settings
         self.sparse_retriever = sparse_retriever if settings.BM25_ENABLED and bm2s is not None else None
         self.chunk_content_repo = chunk_content_repo
-        self.reranker = reranker if settings.RERANKER_ENABLED else None
         self.diversity_filter = diversity_filter if settings.DIVERSITY_FILTER_ENABLED else None
 
-        # REMOVED: _embedder ya no es FastembedTextEmbedder
-        # self._embedder = self._initialize_embedder()
         self._prompt_builder_rag = self._initialize_prompt_builder(settings.RAG_PROMPT_TEMPLATE)
         self._prompt_builder_general = self._initialize_prompt_builder(settings.GENERAL_PROMPT_TEMPLATE)
 
         log.info("AskQueryUseCase Initialized",
-                 embedding_adapter_type=type(self.embedding_adapter).__name__, # Log del nuevo adaptador
+                 embedding_adapter_type=type(self.embedding_adapter).__name__,
                  bm25_enabled=bool(self.sparse_retriever),
-                 reranker_enabled=bool(self.reranker),
+                 reranker_enabled=self.settings.RERANKER_ENABLED,
+                 reranker_service_url=str(self.settings.RERANKER_SERVICE_URL) if self.settings.RERANKER_ENABLED else "N/A",
                  diversity_filter_enabled=settings.DIVERSITY_FILTER_ENABLED,
                  diversity_filter_type=type(self.diversity_filter).__name__ if self.diversity_filter else "None"
                  )
@@ -831,42 +822,41 @@ class AskQueryUseCase:
              log.error("BM25_ENABLED is true in settings, but 'bm2s' library is not installed. Sparse retrieval will be skipped.")
         if self.sparse_retriever and not self.chunk_content_repo:
             log.error("SparseRetriever is enabled but ChunkContentRepositoryPort is missing!")
-        if settings.RERANKER_ENABLED and self.reranker and not getattr(self.reranker, 'model', None):
-             log.warning("RERANKER_ENABLED is true, but the reranker model failed to load during initialization.")
 
-    # REMOVED: _initialize_embedder() ya no es necesario aquí
-    # def _initialize_embedder(self) -> FastembedTextEmbedder: ...
 
     def _initialize_prompt_builder(self, template: str) -> PromptBuilder:
         log.debug("Initializing PromptBuilder...", template_start=template[:100]+"...")
         return PromptBuilder(template=template)
 
     async def _embed_query(self, query: str) -> List[float]:
-        embed_log = log.bind(action="embed_query_use_case")
+        embed_log = log.bind(action="_embed_query_use_case_call_remote")
         try:
-            # USA EL NUEVO ADAPTADOR DE EMBEDDING
             embedding = await self.embedding_adapter.embed_query(query)
-            if not embedding: raise ValueError("Embedding adapter returned no vector.")
-            # La validación de dimensión se hace dentro del adaptador
-            embed_log.debug("Query embedded successfully via adapter", vector_dim=len(embedding))
+            if not embedding or not isinstance(embedding, list) or not all(isinstance(f, float) for f in embedding):
+                embed_log.error("Invalid embedding received from adapter", received_embedding_type=type(embedding).__name__)
+                raise ValueError("Embedding adapter returned invalid or empty vector.")
+            embed_log.debug("Query embedded successfully via remote adapter", vector_dim=len(embedding))
             return embedding
-        except (ConnectionError, ValueError) as e: # Capturar errores específicos del adaptador
-            embed_log.error("Embedding failed via adapter", error=str(e), exc_info=True)
-            raise ConnectionError(f"Embedding service error: {e}") from e # Re-lanzar como ConnectionError genérico
-        except Exception as e:
+        except ConnectionError as e: # Specific error from adapter if service is down
+            embed_log.error("Embedding failed: Connection to embedding service failed.", error=str(e), exc_info=False)
+            raise ConnectionError(f"Embedding service error: {e}") from e
+        except ValueError as e: # Specific error from adapter for bad response
+            embed_log.error("Embedding failed: Invalid data from embedding service.", error=str(e), exc_info=False)
+            raise ValueError(f"Embedding service data error: {e}") from e
+        except Exception as e: # Catch-all for other unexpected issues
             embed_log.error("Unexpected error during query embedding via adapter", error=str(e), exc_info=True)
-            raise ConnectionError(f"Unexpected embedding service error: {e}") from e
+            raise ConnectionError(f"Unexpected error contacting embedding service: {e}") from e
 
 
     def _format_chat_history(self, messages: List[ChatMessage]) -> str:
         if not messages:
             return ""
         history_str = []
-        for msg in reversed(messages): # Show newest first in context? Or oldest? Let's try oldest first for chronology.
+        for msg in reversed(messages): # Show newest first in internal processing, then reverse for prompt
             role = "Usuario" if msg.role == 'user' else "Atenex"
             time_mark = format_time_delta(msg.created_at)
             history_str.append(f"{role} ({time_mark}): {msg.content}")
-        # Reverse back to chronological for the LLM
+        # The prompt template expects history oldest to newest
         return "\n".join(reversed(history_str))
 
     async def _build_prompt(self, query: str, documents: List[Document], chat_history: Optional[str] = None) -> str:
@@ -898,13 +888,12 @@ class AskQueryUseCase:
                                 dense_results: List[RetrievedChunk],
                                 sparse_results: List[Tuple[str, float]],
                                 k: int = RRF_K) -> Dict[str, float]:
-        """Combines dense and sparse results using Reciprocal Rank Fusion."""
         fused_scores: Dict[str, float] = {}
         for rank, chunk in enumerate(dense_results):
-            if chunk.id: # Ensure chunk has an ID
+            if chunk.id:
                 fused_scores[chunk.id] = fused_scores.get(chunk.id, 0.0) + 1.0 / (k + rank + 1)
         for rank, (chunk_id, _) in enumerate(sparse_results):
-            if chunk_id: # Ensure chunk_id is valid
+            if chunk_id:
                 fused_scores[chunk_id] = fused_scores.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
         return fused_scores
 
@@ -914,7 +903,6 @@ class AskQueryUseCase:
         dense_map: Dict[str, RetrievedChunk],
         top_n: int
         ) -> List[RetrievedChunk]:
-        """Gets the top_n chunks based on fused scores and fetches content."""
         fetch_log = log.bind(action="fetch_content_for_fused", top_n=top_n, fused_count=len(fused_scores))
         if not fused_scores: return []
 
@@ -928,175 +916,244 @@ class AskQueryUseCase:
         placeholder_map: Dict[str, RetrievedChunk] = {}
 
         for cid in top_ids:
-            if not cid: # Skip if ID is somehow invalid
+            if not cid:
                  fetch_log.warning("Skipping invalid chunk ID found during fusion processing.")
                  continue
             if cid in dense_map and dense_map[cid].content:
                 chunk = dense_map[cid]
-                chunk.score = final_scores[cid]
+                chunk.score = final_scores[cid] # Update score with fused score
                 chunks_with_content.append(chunk)
-            else:
-                # Create or retrieve placeholder
-                chunk_placeholder = dense_map.get(cid) or RetrievedChunk(id=cid, score=final_scores[cid], content=None, metadata={"retrieval_source": "sparse/fused" if cid not in dense_map else "dense_nocontent"})
-                chunk_placeholder.score = final_scores[cid]
+            else: # Chunk from sparse results or dense results missing content
+                # Create a placeholder, content will be fetched
+                # Preserve original metadata if available (e.g., from dense_map but content was None)
+                original_metadata = dense_map[cid].metadata if cid in dense_map and dense_map[cid].metadata else {"retrieval_source": "sparse/fused"}
+                document_id = dense_map[cid].document_id if cid in dense_map and dense_map[cid].document_id else None
+                file_name = dense_map[cid].file_name if cid in dense_map and dense_map[cid].file_name else None
+                company_id_val = dense_map[cid].company_id if cid in dense_map and dense_map[cid].company_id else None
+                
+                chunk_placeholder = RetrievedChunk(
+                    id=cid,
+                    score=final_scores[cid],
+                    content=None, # To be fetched
+                    metadata=original_metadata,
+                    document_id=document_id,
+                    file_name=file_name,
+                    company_id=company_id_val
+                )
                 chunks_with_content.append(chunk_placeholder)
-                placeholder_map[cid] = chunk_placeholder
+                placeholder_map[cid] = chunk_placeholder # Keep track for content update
                 ids_needing_content.append(cid)
+
 
         if ids_needing_content and self.chunk_content_repo:
              fetch_log.info("Fetching content for chunks missing content", count=len(ids_needing_content))
              try:
                  content_map = await self.chunk_content_repo.get_chunk_contents_by_ids(ids_needing_content)
-                 for cid, content in content_map.items():
-                     if cid in placeholder_map:
-                          placeholder_map[cid].content = content
-                          placeholder_map[cid].metadata["content_fetched"] = True
-                 missing_after_fetch = [cid for cid in ids_needing_content if cid not in content_map]
+                 for cid_item, content_val in content_map.items():
+                     if cid_item in placeholder_map:
+                          placeholder_map[cid_item].content = content_val
+                          placeholder_map[cid_item].metadata["content_fetched"] = True # Mark as fetched
+                 missing_after_fetch = [cid_item_check for cid_item_check in ids_needing_content if cid_item_check not in content_map or not content_map[cid_item_check]]
                  if missing_after_fetch:
-                      fetch_log.warning("Content not found for some chunks after fetch", missing_ids=missing_after_fetch)
-             except Exception as e:
-                 fetch_log.exception("Failed to fetch content for fused results", error=str(e))
-        elif ids_needing_content: fetch_log.warning("Cannot fetch content for sparse/fused results, ChunkContentRepository not available.")
+                      fetch_log.warning("Content not found or empty for some chunks after fetch", missing_ids=missing_after_fetch)
+             except Exception as e_content_fetch:
+                 fetch_log.exception("Failed to fetch content for fused results", error=str(e_content_fetch))
+        elif ids_needing_content:
+            fetch_log.warning("Cannot fetch content for sparse/fused results, ChunkContentRepository not available.")
 
-        # Filter out chunks that *still* don't have content and re-sort
-        final_chunks = [c for c in chunks_with_content if c.content]
-        fetch_log.debug("Chunks remaining after content check", count=len(final_chunks))
+        # Filter out any chunks that still don't have content after attempting fetch
+        final_chunks = [c for c in chunks_with_content if c.content and c.content.strip()]
+        fetch_log.debug("Chunks remaining after content check and fetch", count=len(final_chunks))
+        # Re-sort by score as the list might have been reordered during content fetching
         final_chunks.sort(key=lambda c: c.score or 0.0, reverse=True)
         return final_chunks
-
 
     async def execute(
         self, query: str, company_id: uuid.UUID, user_id: uuid.UUID,
         chat_id: Optional[uuid.UUID] = None, top_k: Optional[int] = None
     ) -> Tuple[str, List[RetrievedChunk], Optional[uuid.UUID], uuid.UUID]:
-        """ Orchestrates the full RAG pipeline """
         exec_log = log.bind(use_case="AskQueryUseCase", company_id=str(company_id), user_id=str(user_id), query=truncate_text(query, 50))
-        retriever_k = top_k if top_k is not None and 0 < top_k <= settings.RETRIEVER_TOP_K else settings.RETRIEVER_TOP_K
+        retriever_k = top_k if top_k is not None and 0 < top_k <= self.settings.RETRIEVER_TOP_K else self.settings.RETRIEVER_TOP_K
         exec_log = exec_log.bind(effective_retriever_k=retriever_k)
 
-        pipeline_stages_used = ["remote_embedding", "dense_retrieval", "llm_generation"] # Updated first stage
+        pipeline_stages_used = ["remote_embedding", "dense_retrieval", "llm_generation"]
         final_chat_id: uuid.UUID
         log_id: Optional[uuid.UUID] = None
         chat_history_str: Optional[str] = None
-        history_messages: List[ChatMessage] = [] # Keep track of messages retrieved
+        history_messages: List[ChatMessage] = []
 
         try:
-            # 1. Manage Chat State & Retrieve History
             if chat_id:
                 if not await self.chat_repo.check_chat_ownership(chat_id, user_id, company_id):
                     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Chat not found or access denied.")
                 final_chat_id = chat_id
-                if settings.MAX_CHAT_HISTORY_MESSAGES > 0:
+                if self.settings.MAX_CHAT_HISTORY_MESSAGES > 0:
                     try:
                         history_messages = await self.chat_repo.get_chat_messages(
                             chat_id=final_chat_id, user_id=user_id, company_id=company_id,
-                            limit=settings.MAX_CHAT_HISTORY_MESSAGES, offset=0
+                            limit=self.settings.MAX_CHAT_HISTORY_MESSAGES, offset=0
                         )
                         chat_history_str = self._format_chat_history(history_messages)
                         exec_log.info("Chat history retrieved and formatted", num_messages=len(history_messages))
                     except Exception as hist_err:
-                        exec_log.error("Failed to retrieve chat history", error=str(hist_err))
+                        exec_log.error("Failed to retrieve chat history", error=str(hist_err)) # Non-critical, proceed without history
             else:
                 initial_title = f"Chat: {truncate_text(query, 40)}"
                 final_chat_id = await self.chat_repo.create_chat(user_id=user_id, company_id=company_id, title=initial_title)
             exec_log = exec_log.bind(chat_id=str(final_chat_id))
             exec_log.info("Chat state managed", is_new=(not chat_id))
 
-            # 2. Save User Message
             await self.chat_repo.save_message(chat_id=final_chat_id, role='user', content=query)
 
-            # 3. Handle Greetings
             if GREETING_REGEX.match(query):
                 answer = "¡Hola! ¿En qué puedo ayudarte hoy con la información de tus documentos?"
                 await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=None)
                 exec_log.info("Use case finished (greeting).")
                 return answer, [], log_id, final_chat_id
 
-            # --- RAG Pipeline ---
             exec_log.info("Proceeding with RAG pipeline...")
+            query_embedding = await self._embed_query(query) # Uses remote embedding adapter
 
-            # 4. Embed Query (USANDO EL NUEVO ADAPTADOR)
-            query_embedding = await self._embed_query(query) # Este método ahora usa self.embedding_adapter
-
-            # 5. Coarse Retrieval (Dense + Optional Sparse)
             dense_task = self.vector_store.search(query_embedding, str(company_id), retriever_k)
-            sparse_task = asyncio.create_task(asyncio.sleep(0)) # Placeholder
+            sparse_task = asyncio.create_task(asyncio.sleep(0)) # Placeholder if sparse is disabled
             sparse_results: List[Tuple[str, float]] = []
 
             if self.sparse_retriever:
                  pipeline_stages_used.append("sparse_retrieval (bm2s)")
                  sparse_task = self.sparse_retriever.search(query, str(company_id), retriever_k)
-            elif settings.BM25_ENABLED:
-                 pipeline_stages_used.append("sparse_retrieval (skipped_no_lib)")
-                 exec_log.warning("BM25 enabled but retriever instance is not available (likely missing library).")
-            else:
-                 pipeline_stages_used.append("sparse_retrieval (disabled)")
+            elif self.settings.BM25_ENABLED: # Log if enabled but instance not available
+                 pipeline_stages_used.append("sparse_retrieval (skipped_no_lib_or_init_fail)")
+                 exec_log.warning("BM25 enabled in settings but sparse_retriever instance is not available.")
+            else: # Log if explicitly disabled
+                 pipeline_stages_used.append("sparse_retrieval (disabled_in_settings)")
 
-            # El resto del método `execute` permanece igual desde aquí...
-            # ... (dense_chunks, sparse_results_maybe = await asyncio.gather(dense_task, sparse_task))
-            # ... (hasta el final del método)
 
             dense_chunks, sparse_results_maybe = await asyncio.gather(dense_task, sparse_task)
-            if self.sparse_retriever and isinstance(sparse_results_maybe, list):
+            if self.sparse_retriever and isinstance(sparse_results_maybe, list): # Ensure sparse_results_maybe is the actual result
                 sparse_results = sparse_results_maybe
             exec_log.info("Retrieval phase completed", dense_count=len(dense_chunks), sparse_count=len(sparse_results), retriever_k=retriever_k)
 
-            # 6. Fusion & Content Fetch
+
             pipeline_stages_used.append("fusion (rrf)")
-            dense_map = {c.id: c for c in dense_chunks if c.id}
+            dense_map = {c.id: c for c in dense_chunks if c.id} # Map for easy lookup
             fused_scores = self._reciprocal_rank_fusion(dense_chunks, sparse_results)
-            fusion_fetch_k = settings.MAX_CONTEXT_CHUNKS + 10
+            fusion_fetch_k = self.settings.MAX_CONTEXT_CHUNKS + 10 # Fetch slightly more for reranking/filtering
             combined_chunks_with_content = await self._fetch_content_for_fused_results(fused_scores, dense_map, fusion_fetch_k)
             exec_log.info("Fusion & Content Fetch completed", initial_fused_count=len(fused_scores), chunks_with_content=len(combined_chunks_with_content), fetch_limit=fusion_fetch_k)
 
+
             if not combined_chunks_with_content:
-                 exec_log.warning("No chunks with content available after fusion/fetch.")
+                 exec_log.warning("No chunks with content available after fusion/fetch for RAG.")
+                 # Proceed to LLM without documents
                  final_prompt = await self._build_prompt(query, [], chat_history=chat_history_str)
                  answer = await self.llm.generate(final_prompt)
                  await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=None)
-                 try:
-                    log_id = await self.log_repo.log_query_interaction(company_id=company_id, user_id=user_id, query=query, answer=answer, retrieved_documents_data=[], chat_id=final_chat_id, metadata={"pipeline_stages": pipeline_stages_used, "result": "no_docs_found"})
-                 except Exception: exec_log.error("Failed to log interaction for no_docs case")
+                 try: # Best effort logging
+                    log_id = await self.log_repo.log_query_interaction(company_id=company_id, user_id=user_id, query=query, answer=answer, retrieved_documents_data=[], chat_id=final_chat_id, metadata={"pipeline_stages": pipeline_stages_used, "result": "no_docs_found_after_fusion"})
+                 except Exception as log_exc_no_docs: exec_log.error("Failed to log interaction for no_docs_after_fusion case", error=str(log_exc_no_docs))
                  return answer, [], log_id, final_chat_id
 
-            # 7. Reranking (Conditional)
             chunks_to_process_further = combined_chunks_with_content
-            if self.reranker and getattr(self.reranker, 'model', None):
-                pipeline_stages_used.append("reranking (bge)")
-                exec_log.debug("Performing reranking...", count=len(chunks_to_process_further))
-                chunks_to_process_further = await self.reranker.rerank(query, chunks_to_process_further)
-                exec_log.info("Reranking completed.", count=len(chunks_to_process_further))
-            elif self.reranker:
-                 pipeline_stages_used.append("reranking (skipped_model_load_failed)")
-                 exec_log.warning("Reranker enabled but model not loaded, skipping reranking step.")
-            else:
-                 pipeline_stages_used.append("reranking (disabled)")
 
-            # 8. Apply Diversity Filter / Final Limit
+            # --- Remote Reranking Step ---
+            if self.settings.RERANKER_ENABLED:
+                rerank_log = exec_log.bind(action="remote_rerank")
+                rerank_log.debug(f"Performing remote reranking with {self.settings.RERANKER_SERVICE_URL}...", count=len(chunks_to_process_further))
+                
+                # Prepare payload for reranker service
+                documents_to_rerank_payload = []
+                for doc_chunk in chunks_to_process_further:
+                    if doc_chunk.content and doc_chunk.id: # Ensure content and ID exist
+                        documents_to_rerank_payload.append(
+                            {"id": doc_chunk.id, "text": doc_chunk.content, "metadata": doc_chunk.metadata or {}}
+                        )
+                
+                if documents_to_rerank_payload:
+                    reranker_request_payload = {
+                        "query": query,
+                        "documents": documents_to_rerank_payload,
+                        "top_n": self.settings.MAX_CONTEXT_CHUNKS + 5 # Ask reranker for slightly more than needed for LLM
+                    }
+                    try:
+                        response = await self.http_client.post(
+                            str(self.settings.RERANKER_SERVICE_URL).rstrip('/') + "/api/v1/rerank",
+                            json=reranker_request_payload,
+                            timeout=self.settings.RERANKER_CLIENT_TIMEOUT
+                        )
+                        response.raise_for_status() # Raise HTTPStatusError for 4xx/5xx
+                        
+                        reranker_response_json = response.json()
+                        # The reranker-service wraps its response in a "data" key
+                        api_response_data = reranker_response_json.get("data", {})
+                        reranked_docs_data = api_response_data.get("reranked_documents", [])
+                        
+                        # Map response back to domain.RetrievedChunk, preserving original embeddings if any
+                        original_chunks_map = {chunk.id: chunk for chunk in chunks_to_process_further}
+                        reranked_domain_chunks = []
+                        for reranked_doc_item in reranked_docs_data:
+                            original_chunk = original_chunks_map.get(reranked_doc_item["id"])
+                            if original_chunk:
+                                # Create new RetrievedChunk instances with updated scores
+                                updated_chunk = RetrievedChunk(
+                                    id=original_chunk.id,
+                                    content=original_chunk.content, # Use original fetched content
+                                    score=reranked_doc_item["score"], # New score from reranker
+                                    metadata=reranked_doc_item.get("metadata", original_chunk.metadata), # Prefer reranker's metadata if returned, else original
+                                    embedding=original_chunk.embedding, # Preserve original embedding
+                                    document_id=original_chunk.document_id,
+                                    file_name=original_chunk.file_name,
+                                    company_id=original_chunk.company_id
+                                )
+                                reranked_domain_chunks.append(updated_chunk)
+                        
+                        chunks_to_process_further = reranked_domain_chunks
+                        model_name_from_reranker = api_response_data.get("model_info",{}).get("model_name","unknown_remote")
+                        pipeline_stages_used.append(f"reranking (remote:{model_name_from_reranker})")
+                        rerank_log.info("Remote reranking successful.", count=len(chunks_to_process_further), model_used=model_name_from_reranker)
+
+                    except httpx.HTTPStatusError as http_err:
+                        rerank_log.error("Reranker service request failed (HTTPStatusError)", status_code=http_err.response.status_code, response_text=http_err.response.text, exc_info=False)
+                        pipeline_stages_used.append("reranking (remote_http_error)")
+                        # Optionally, could raise ConnectionError here or proceed with non-reranked chunks
+                    except httpx.RequestError as req_err:
+                        rerank_log.error("Reranker service request failed (RequestError)", error=str(req_err), exc_info=False)
+                        pipeline_stages_used.append("reranking (remote_request_error)")
+                        # Raise ConnectionError to signal service unavailability
+                        raise ConnectionError(f"Reranker service connection error: {req_err}") from req_err
+                    except Exception as e_rerank: # Catch other errors like JSONDecodeError
+                        rerank_log.error("Error processing reranker service response", error_message=str(e_rerank), exc_info=True)
+                        pipeline_stages_used.append("reranking (remote_client_error)")
+                else:
+                    rerank_log.warning("No documents with content to send to reranker service.")
+                    pipeline_stages_used.append("reranking (skipped_no_content_for_remote)")
+            else:
+                 pipeline_stages_used.append("reranking (disabled_in_settings)")
+
+
             final_chunks_for_llm = chunks_to_process_further
             if self.diversity_filter:
-                 k_final = settings.MAX_CONTEXT_CHUNKS
+                 k_final_diversity = self.settings.MAX_CONTEXT_CHUNKS
                  filter_type = type(self.diversity_filter).__name__
                  pipeline_stages_used.append(f"diversity_filter ({filter_type})")
-                 exec_log.debug(f"Applying {filter_type} k={k_final}...", count=len(chunks_to_process_further))
-                 final_chunks_for_llm = await self.diversity_filter.filter(chunks_to_process_further, k_final)
+                 exec_log.debug(f"Applying {filter_type} k={k_final_diversity}...", count=len(chunks_to_process_further))
+                 final_chunks_for_llm = await self.diversity_filter.filter(chunks_to_process_further, k_final_diversity)
                  exec_log.info(f"{filter_type} applied.", final_count=len(final_chunks_for_llm))
-            else:
-                 final_chunks_for_llm = chunks_to_process_further[:settings.MAX_CONTEXT_CHUNKS]
-                 exec_log.info(f"Diversity filter disabled. Truncating to MAX_CONTEXT_CHUNKS.", final_count=len(final_chunks_for_llm), limit=settings.MAX_CONTEXT_CHUNKS)
+            else: # If diversity filter is not enabled, just truncate
+                 final_chunks_for_llm = chunks_to_process_further[:self.settings.MAX_CONTEXT_CHUNKS]
+                 exec_log.info(f"Diversity filter disabled. Truncating to MAX_CONTEXT_CHUNKS.", final_count=len(final_chunks_for_llm), limit=self.settings.MAX_CONTEXT_CHUNKS)
 
-            final_chunks_for_llm = [c for c in final_chunks_for_llm if c.content]
+            # Ensure chunks passed to LLM have content
+            final_chunks_for_llm = [c for c in final_chunks_for_llm if c.content and c.content.strip()]
             if not final_chunks_for_llm:
-                 exec_log.warning("No chunks with content remaining after final limiting/filtering.")
+                 exec_log.warning("No chunks with content remaining after final limiting/filtering for RAG.")
                  final_prompt = await self._build_prompt(query, [], chat_history=chat_history_str)
                  answer = await self.llm.generate(final_prompt)
                  await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=None)
                  try:
-                    log_id = await self.log_repo.log_query_interaction(company_id=company_id, user_id=user_id, query=query, answer=answer, retrieved_documents_data=[], chat_id=final_chat_id, metadata={"pipeline_stages": pipeline_stages_used, "result": "no_docs_after_limit"})
-                 except Exception: exec_log.error("Failed to log interaction for no_docs_after_limit case")
+                    log_id = await self.log_repo.log_query_interaction(company_id=company_id, user_id=user_id, query=query, answer=answer, retrieved_documents_data=[], chat_id=final_chat_id, metadata={"pipeline_stages": pipeline_stages_used, "result": "no_docs_after_final_processing"})
+                 except Exception as log_exc_final_no_docs: exec_log.error("Failed to log interaction for no_docs_after_final_processing case", error=str(log_exc_final_no_docs))
                  return answer, [], log_id, final_chat_id
 
-            # 9. Build Prompt (with history)
             haystack_docs_for_prompt = [
                 Document(id=c.id, content=c.content, meta=c.metadata, score=c.score)
                 for c in final_chunks_for_llm
@@ -1104,12 +1161,10 @@ class AskQueryUseCase:
             exec_log.info(f"Building RAG prompt with {len(haystack_docs_for_prompt)} final chunks and history.")
             final_prompt = await self._build_prompt(query, haystack_docs_for_prompt, chat_history=chat_history_str)
 
-            # 10. Generate Answer
             answer = await self.llm.generate(final_prompt)
             exec_log.info("LLM answer generated.", length=len(answer))
 
-            # 11. Save Assistant Message & Limit Sources Shown
-            sources_to_show_count = settings.NUM_SOURCES_TO_SHOW
+            sources_to_show_count = self.settings.NUM_SOURCES_TO_SHOW
             assistant_sources = [
                 {"chunk_id": c.id, "document_id": c.document_id, "file_name": c.file_name, "score": c.score, "preview": truncate_text(c.content, 150) if c.content else "Error: Contenido no disponible"}
                 for c in final_chunks_for_llm[:sources_to_show_count]
@@ -1117,51 +1172,53 @@ class AskQueryUseCase:
             await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=assistant_sources or None)
             exec_log.info(f"Assistant message saved with top {len(assistant_sources)} sources.")
 
-            # 12. Log Interaction
             try:
-                docs_for_log = [RetrievedDocumentSchema(**c.model_dump()).model_dump(exclude_none=True) for c in final_chunks_for_llm[:sources_to_show_count]]
-                log_metadata = {
+                docs_for_log_dump = [RetrievedDocumentSchema(**c.model_dump(exclude_none=True)).model_dump(exclude_none=True) for c in final_chunks_for_llm[:sources_to_show_count]]
+                log_metadata_details = {
                     "pipeline_stages": pipeline_stages_used,
-                    "retriever_k": retriever_k,
+                    "retriever_k_initial": retriever_k,
                     "fusion_fetch_k": fusion_fetch_k,
-                    "max_context_chunks_limit": settings.MAX_CONTEXT_CHUNKS,
-                    "num_chunks_after_rerank_or_fetch": len(chunks_to_process_further),
-                    "num_final_chunks_to_llm": len(final_chunks_for_llm),
-                    "num_sources_shown": len(assistant_sources),
-                    "chat_history_messages_included": len(history_messages),
-                    "diversity_filter_enabled": settings.DIVERSITY_FILTER_ENABLED,
-                    "reranker_enabled": settings.RERANKER_ENABLED,
-                    "bm25_enabled": settings.BM25_ENABLED,
+                    "max_context_chunks_limit_for_llm": self.settings.MAX_CONTEXT_CHUNKS,
+                    "num_chunks_after_rerank_or_fusion_content_fetch": len(chunks_to_process_further),
+                    "num_final_chunks_sent_to_llm": len(final_chunks_for_llm),
+                    "num_sources_shown_to_user": len(assistant_sources),
+                    "chat_history_messages_included_in_prompt": len(history_messages),
+                    "diversity_filter_enabled_in_settings": self.settings.DIVERSITY_FILTER_ENABLED,
+                    "reranker_enabled_in_settings": self.settings.RERANKER_ENABLED,
+                    "bm25_enabled_in_settings": self.settings.BM25_ENABLED,
                  }
                 log_id = await self.log_repo.log_query_interaction(
                     company_id=company_id, user_id=user_id, query=query, answer=answer,
-                    retrieved_documents_data=docs_for_log, chat_id=final_chat_id, metadata=log_metadata
+                    retrieved_documents_data=docs_for_log_dump, chat_id=final_chat_id, metadata=log_metadata_details
                 )
                 exec_log.info("Interaction logged successfully", db_log_id=str(log_id))
-            except Exception as log_err:
-                exec_log.error("Failed to log RAG interaction", error=str(log_err), exc_info=False)
+            except Exception as log_err_final:
+                exec_log.error("Failed to log RAG interaction", error=str(log_err_final), exc_info=False)
 
             exec_log.info("Use case execution finished successfully.")
             return answer, final_chunks_for_llm[:sources_to_show_count], log_id, final_chat_id
 
-        except ConnectionError as ce:
+        except ConnectionError as ce: # Catch specific ConnectionErrors from sub-components
             exec_log.error("Connection error during use case execution", error=str(ce), exc_info=True)
-            # Simplificar el detalle del error para el cliente
             detail_message = "A required external service is unavailable. Please try again later."
-            if "Embedding service" in str(ce):
+            # More specific messages based on error content
+            if "Embedding service" in str(ce) or "embedding service" in str(ce).lower():
                 detail_message = "The embedding service is currently unavailable. Please try again later."
-            elif "Gemini API" in str(ce):
+            elif "Reranker service" in str(ce) or "reranker service" in str(ce).lower():
+                detail_message = "The reranking service is currently unavailable. Please try again later."
+            elif "Gemini API" in str(ce) or "gemini" in str(ce).lower():
                 detail_message = "The language model service (Gemini) is currently unavailable. Please try again later."
-            elif "Vector DB" in str(ce) or "Milvus" in str(ce):
+            elif "Vector DB" in str(ce) or "Milvus" in str(ce).lower():
                 detail_message = "The vector database service is currently unavailable. Please try again later."
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=detail_message)
-        except ValueError as ve:
-            exec_log.error("Value error during use case execution", error=str(ve), exc_info=True)
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Data processing error: {ve}")
-        except HTTPException as http_exc: raise http_exc
-        except Exception as e:
-            exec_log.exception("Unexpected error during use case execution")
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An internal error occurred: {type(e).__name__}")
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=detail_message) from ce
+        except ValueError as ve: # Catch specific ValueErrors (e.g., from prompt building, bad embedding data)
+            exec_log.error("Value error during use case execution", error=str(ve), exc_info=True) # Log with traceback for ValueError
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Data processing error: {ve}") from ve
+        except HTTPException as http_exc: # Re-raise HTTPExceptions from chat ownership check etc.
+            raise http_exc
+        except Exception as e: # Catch-all for any other unhandled error
+            exec_log.exception("Unexpected error during use case execution") # Log with full traceback
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An internal error occurred: {type(e).__name__}") from e
 ```
 
 ## File: `app\core\__init__.py`
@@ -1199,8 +1256,10 @@ MILVUS_DEFAULT_GRPC_TIMEOUT = 15
 MILVUS_DEFAULT_SEARCH_PARAMS = {"metric_type": "IP", "params": {"nprobe": 10}}
 MILVUS_DEFAULT_METADATA_FIELDS = ["company_id", "document_id", "file_name", "page", "title"]
 
-# Embedding Service (NUEVO)
+# Embedding Service
 EMBEDDING_SERVICE_K8S_URL_DEFAULT = "http://embedding-service.nyro-develop.svc.cluster.local:8003"
+# Reranker Service
+RERANKER_SERVICE_K8S_URL_DEFAULT = "http://reranker-service.nyro-develop.svc.cluster.local:80"
 
 
 # ==========================================================================================
@@ -1277,11 +1336,8 @@ INSTRUCCIONES:
 RESPUESTA DE ATENEX (en español latino):
 """
 # Models
-# DEFAULT_FASTEMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2" # REMOVED - No longer local
-# DEFAULT_FASTEMBED_QUERY_PREFIX = "query: " # REMOVED
-DEFAULT_EMBEDDING_DIMENSION = 384 # Still needed for Milvus config and validation
+DEFAULT_EMBEDDING_DIMENSION = 384
 DEFAULT_GEMINI_MODEL = "gemini-1.5-flash-latest"
-DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-base"
 
 # RAG Pipeline Parameters
 DEFAULT_RETRIEVER_TOP_K = 100
@@ -1331,20 +1387,21 @@ class Settings(BaseSettings):
 
     # --- Embedding Settings (General) ---
     EMBEDDING_DIMENSION: int = Field(default=DEFAULT_EMBEDDING_DIMENSION, description="Dimension of embeddings, used for Milvus and validation.")
-    # QUERY_FASTEMBED_MODEL_NAME: str = Field(default=DEFAULT_FASTEMBED_MODEL) # REMOVED
-    # QUERY_FASTEMBED_QUERY_PREFIX: str = Field(default=DEFAULT_FASTEMBED_QUERY_PREFIX) # REMOVED
 
-    # --- External Embedding Service (NUEVO) ---
+    # --- External Embedding Service ---
     EMBEDDING_SERVICE_URL: AnyHttpUrl = Field(default=AnyHttpUrl(EMBEDDING_SERVICE_K8S_URL_DEFAULT), description="URL of the Atenex Embedding Service.")
+    EMBEDDING_CLIENT_TIMEOUT: int = Field(default=30, description="Timeout in seconds for calls to the Embedding Service.")
 
 
     # --- LLM (Google Gemini) ---
     GEMINI_API_KEY: SecretStr
     GEMINI_MODEL_NAME: str = Field(default=DEFAULT_GEMINI_MODEL)
 
-    # --- Reranker Model ---
+    # --- Reranker Settings ---
     RERANKER_ENABLED: bool = Field(default=DEFAULT_RERANKER_ENABLED)
-    RERANKER_MODEL_NAME: str = Field(default=DEFAULT_RERANKER_MODEL, description="Sentence Transformer model name/path for reranking.")
+    RERANKER_SERVICE_URL: AnyHttpUrl = Field(default=AnyHttpUrl(RERANKER_SERVICE_K8S_URL_DEFAULT), description="URL of the Atenex Reranker Service.")
+    RERANKER_CLIENT_TIMEOUT: int = Field(default=30, description="Timeout in seconds for calls to the Reranker Service.")
+
 
     # --- Sparse Retriever (BM25) ---
     BM25_ENABLED: bool = Field(default=DEFAULT_BM25_ENABLED)
@@ -1364,7 +1421,7 @@ class Settings(BaseSettings):
     NUM_SOURCES_TO_SHOW: int = Field(default=DEFAULT_NUM_SOURCES_TO_SHOW, ge=0)
 
     # --- Service Client Config ---
-    HTTP_CLIENT_TIMEOUT: int = Field(default=60)
+    HTTP_CLIENT_TIMEOUT: int = Field(default=60) # General timeout for httpx client
     HTTP_CLIENT_MAX_RETRIES: int = Field(default=2)
     HTTP_CLIENT_BACKOFF_FACTOR: float = Field(default=1.0)
 
@@ -1391,8 +1448,6 @@ class Settings(BaseSettings):
     def check_embedding_dimension(cls, v: int, info: ValidationInfo) -> int:
         if v <= 0:
             raise ValueError("EMBEDDING_DIMENSION must be a positive integer.")
-        # No longer checking against FASTEMBED_MODEL_NAME as it's external
-        # The RemoteEmbeddingAdapter will try to validate against the service's reported dimension
         logging.info(f"Configured EMBEDDING_DIMENSION: {v}. This will be used for Milvus and validated against the embedding service.")
         return v
 
@@ -1400,7 +1455,7 @@ class Settings(BaseSettings):
     @classmethod
     def check_max_context_chunks(cls, v: int, info: ValidationInfo) -> int:
         retriever_k = info.data.get('RETRIEVER_TOP_K', DEFAULT_RETRIEVER_TOP_K)
-        max_possible_after_fusion = retriever_k * 2 # Assuming dense + sparse
+        max_possible_after_fusion = retriever_k * 2
         if v > max_possible_after_fusion:
             logging.warning(f"MAX_CONTEXT_CHUNKS ({v}) is greater than the maximum possible chunks after fusion ({max_possible_after_fusion} based on RETRIEVER_TOP_K={retriever_k}). Effective limit will be {max_possible_after_fusion}.")
         if v <= 0:
@@ -1434,7 +1489,6 @@ try:
     temp_log.info("Query Service Settings Loaded Successfully:")
     log_data = settings.model_dump(exclude={'POSTGRES_PASSWORD', 'GEMINI_API_KEY'})
     for key, value in log_data.items():
-        # Truncate long prompt templates for cleaner logs
         if key.endswith('_PROMPT_TEMPLATE') and isinstance(value, str) and len(value) > 200:
              temp_log.info(f"  {key.upper()}: {value[:100]}... (truncated)")
         else:
@@ -2555,122 +2609,6 @@ class PostgresChunkContentRepository(ChunkContentRepositoryPort):
 # query-service/app/infrastructure/rerankers/__init__.py
 ```
 
-## File: `app\infrastructure\rerankers\bge_reranker.py`
-```py
-# query-service/app/infrastructure/rerankers/bge_reranker.py
-import structlog
-import asyncio
-from typing import List, Optional, Tuple
-import time
-
-# LLM_REFACTOR_STEP_2: Use sentence-transformers for reranking
-try:
-    from sentence_transformers.cross_encoder import CrossEncoder
-except ImportError:
-    CrossEncoder = None # Handle optional dependency
-
-from app.application.ports.retrieval_ports import RerankerPort
-from app.domain.models import RetrievedChunk
-from app.core.config import settings # To potentially get model name/path
-
-log = structlog.get_logger(__name__)
-
-# LLM_REFACTOR_STEP_4: Add config setting for reranker model
-DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-base" # Default BGE reranker
-
-class BGEReranker(RerankerPort):
-    """
-    Implementación de RerankerPort usando BAAI BGE Reranker
-    con sentence-transformers.
-    """
-    def __init__(self, model_name_or_path: Optional[str] = None, device: Optional[str] = None):
-        if CrossEncoder is None:
-            log.error("sentence-transformers library not installed. Reranking is disabled. "
-                      "Install with: poetry add sentence-transformers")
-            raise ImportError("sentence-transformers library is required for BGEReranker.")
-
-        self.model_name = model_name_or_path or settings.RERANKER_MODEL_NAME # Usa config o default
-        self.device = device # Auto-detect if None ('cuda', 'mps', 'cpu')
-        self.model: Optional[CrossEncoder] = None
-        self._load_model() # Cargar modelo en la inicialización
-
-    def _load_model(self):
-        """Carga el modelo CrossEncoder."""
-        init_log = log.bind(adapter="BGEReranker", action="load_model", model_name=self.model_name, device=self.device or "auto")
-        init_log.info("Initializing BGE Reranker model...")
-        start_time = time.time()
-        try:
-            # max_length puede necesitar ajuste basado en el modelo y longitud esperada de query+chunk
-            self.model = CrossEncoder(self.model_name, max_length=512, device=self.device)
-            load_time = time.time() - start_time
-            # --- LLM_FIX: Remove problematic .device access ---
-            # The CrossEncoder object itself might not have a simple public '.device' attribute after auto-detection.
-            # Log success without trying to access the device attribute directly from self.model here.
-            init_log.info("BGE Reranker model loaded successfully.", duration_ms=load_time * 1000)
-            # If you need to confirm the device later, you might need to inspect internal attributes or PyTorch state.
-        except Exception as e:
-            init_log.exception("Failed to load BGE Reranker model")
-            self.model = None # Ensure model is None if loading fails
-
-    async def rerank(self, query: str, chunks: List[RetrievedChunk]) -> List[RetrievedChunk]:
-        """Reordena chunks usando el modelo BGE CrossEncoder."""
-        rerank_log = log.bind(adapter="BGEReranker", action="rerank", num_chunks=len(chunks))
-
-        if not self.model:
-             rerank_log.error("Reranker model not loaded. Cannot rerank.")
-             # Devolver los chunks sin reordenar si el modelo no cargó
-             return chunks
-
-        if not chunks:
-            rerank_log.debug("No chunks provided to rerank.")
-            return []
-
-        # Crear pares (query, chunk_content) para el modelo
-        # Filtrar chunks sin contenido aquí por si acaso
-        sentence_pairs: List[Tuple[str, str]] = []
-        chunks_with_content: List[RetrievedChunk] = []
-        for chunk in chunks:
-            if chunk.content:
-                sentence_pairs.append((query, chunk.content))
-                chunks_with_content.append(chunk)
-            else:
-                rerank_log.warning("Skipping chunk during reranking due to missing content", chunk_id=chunk.id)
-
-        if not sentence_pairs:
-            rerank_log.warning("No chunks with content found to rerank.")
-            return []
-
-        rerank_log.debug(f"Reranking {len(sentence_pairs)} query-chunk pairs...")
-        start_time = time.time()
-
-        try:
-            # Ejecutar predicción en thread separado ya que puede ser intensivo en CPU/GPU
-            scores = await asyncio.to_thread(self.model.predict, sentence_pairs, show_progress_bar=False)
-            predict_time = time.time() - start_time
-            rerank_log.debug("Reranker prediction complete.", duration_ms=predict_time * 1000)
-
-            # Asociar scores con los chunks originales (que tenían contenido)
-            scored_chunks = list(zip(scores, chunks_with_content))
-
-            # Ordenar los chunks por score descendente
-            scored_chunks.sort(key=lambda x: x[0], reverse=True)
-
-            # Extraer los chunks reordenados
-            reranked_chunks = []
-            for score, chunk in scored_chunks:
-                chunk.score = float(score) # Sobrescribir score original con el del reranker
-                reranked_chunks.append(chunk)
-
-
-            rerank_log.info(f"Reranked {len(reranked_chunks)} chunks successfully.")
-            return reranked_chunks
-
-        except Exception as e:
-            rerank_log.exception("Error during BGE reranking")
-            # Devolver los chunks originales sin reordenar en caso de error
-            return chunks_with_content # Devolver los que tenían contenido
-```
-
 ## File: `app\infrastructure\rerankers\diversity_filter.py`
 ```py
 # query-service/app/infrastructure/filters/diversity_filter.py
@@ -3099,6 +3037,7 @@ import json
 import uuid
 from contextlib import asynccontextmanager
 from typing import Annotated, Optional
+import httpx
 
 # Configurar logging primero
 from app.core.config import settings
@@ -3113,8 +3052,8 @@ from app.api.v1.endpoints import chat as chat_router_module
 # Import Ports and Adapters/Repositories for Dependency Injection
 from app.application.ports import (
     ChatRepositoryPort, LogRepositoryPort, VectorStorePort, LLMPort,
-    SparseRetrieverPort, RerankerPort, DiversityFilterPort, ChunkContentRepositoryPort,
-    EmbeddingPort # NUEVA ADICIÓN
+    SparseRetrieverPort, DiversityFilterPort, ChunkContentRepositoryPort,
+    EmbeddingPort # RerankerPort not directly used here anymore for local reranker
 )
 from app.infrastructure.persistence.postgres_repositories import (
     PostgresChatRepository, PostgresLogRepository, PostgresChunkContentRepository
@@ -3122,18 +3061,14 @@ from app.infrastructure.persistence.postgres_repositories import (
 from app.infrastructure.vectorstores.milvus_adapter import MilvusAdapter
 from app.infrastructure.llms.gemini_adapter import GeminiAdapter
 from app.infrastructure.retrievers.bm25_retriever import BM25sRetriever
-from app.infrastructure.rerankers.bge_reranker import BGEReranker
 from app.infrastructure.filters.diversity_filter import MMRDiversityFilter, StubDiversityFilter
-# NUEVAS ADICIONES para Embedding Remoto
 from app.infrastructure.clients.embedding_service_client import EmbeddingServiceClient
 from app.infrastructure.embedding.remote_embedding_adapter import RemoteEmbeddingAdapter
 
 
-# Import AskQueryUseCase and dependency setter from dependencies.py
 from app.application.use_cases.ask_query_use_case import AskQueryUseCase
 from app.dependencies import set_ask_query_use_case_instance
 
-# Import DB Connector
 from app.infrastructure.persistence import postgres_connector
 
 # Global state
@@ -3145,26 +3080,38 @@ chunk_content_repo_instance: Optional[ChunkContentRepositoryPort] = None
 vector_store_instance: Optional[VectorStorePort] = None
 llm_instance: Optional[LLMPort] = None
 sparse_retriever_instance: Optional[SparseRetrieverPort] = None
-reranker_instance: Optional[RerankerPort] = None
 diversity_filter_instance: Optional[DiversityFilterPort] = None
-# NUEVAS ADICIONES para Embedding Remoto
 embedding_service_client_instance: Optional[EmbeddingServiceClient] = None
 embedding_adapter_instance: Optional[EmbeddingPort] = None
 ask_query_use_case_instance: Optional[AskQueryUseCase] = None
+http_client_instance: Optional[httpx.AsyncClient] = None
 
 
 # --- Lifespan Manager ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global SERVICE_READY, chat_repo_instance, log_repo_instance, chunk_content_repo_instance, \
-           vector_store_instance, llm_instance, sparse_retriever_instance, reranker_instance, \
+           vector_store_instance, llm_instance, sparse_retriever_instance, \
            diversity_filter_instance, ask_query_use_case_instance, \
-           embedding_service_client_instance, embedding_adapter_instance # NUEVAS ADICIONES
+           embedding_service_client_instance, embedding_adapter_instance, http_client_instance
 
     SERVICE_READY = False
     log.info(f"Starting up {settings.PROJECT_NAME}...")
     dependencies_ok = True
     critical_failure_message = ""
+
+    # 0. Initialize Global HTTP Client
+    try:
+        http_client_instance = httpx.AsyncClient(
+            timeout=settings.HTTP_CLIENT_TIMEOUT,
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20) # Sensible defaults
+        )
+        log.info("Global HTTP client initialized.")
+    except Exception as e_http_client:
+        critical_failure_message = "Failed to initialize global HTTP client."
+        log.critical(f"CRITICAL: {critical_failure_message}", error=str(e_http_client), exc_info=True)
+        dependencies_ok = False
+
 
     # 1. Initialize DB Pool
     if dependencies_ok:
@@ -3180,19 +3127,24 @@ async def lifespan(app: FastAPI):
                 critical_failure_message = "Failed PostgreSQL connection verification during startup."
                 log.critical(f"CRITICAL: {critical_failure_message}")
                 dependencies_ok = False
-        except Exception as e:
+        except Exception as e_pg:
             critical_failure_message = "Failed PostgreSQL pool initialization."
-            log.critical(f"CRITICAL: {critical_failure_message}", error=str(e), exc_info=True)
+            log.critical(f"CRITICAL: {critical_failure_message}", error=str(e_pg), exc_info=True)
             dependencies_ok = False
 
-    # 2. Initialize Embedding Service Client & Adapter (NUEVO PASO TEMPRANO)
+    # 2. Initialize Embedding Service Client & Adapter
     if dependencies_ok:
         try:
-            embedding_service_client_instance = EmbeddingServiceClient(base_url=str(settings.EMBEDDING_SERVICE_URL))
+            # EmbeddingServiceClient creates its own internal httpx.AsyncClient
+            # but we could pass the global one if we refactor EmbeddingServiceClient.
+            # For now, it's fine as is.
+            embedding_service_client_instance = EmbeddingServiceClient(
+                base_url=str(settings.EMBEDDING_SERVICE_URL),
+                timeout=settings.EMBEDDING_CLIENT_TIMEOUT # Specific timeout for embedding client
+            )
             embedding_adapter_instance = RemoteEmbeddingAdapter(client=embedding_service_client_instance)
-            await embedding_adapter_instance.initialize() # Intenta obtener dimensión del servicio
+            await embedding_adapter_instance.initialize() # Tries to get dimension
             
-            # Health check del servicio de embedding
             emb_service_healthy = await embedding_adapter_instance.health_check()
             if emb_service_healthy:
                 log.info("Embedding Service client and adapter initialized, health check passed.")
@@ -3200,9 +3152,9 @@ async def lifespan(app: FastAPI):
                 critical_failure_message = "Embedding Service health check failed during startup."
                 log.critical(f"CRITICAL: {critical_failure_message} URL: {settings.EMBEDDING_SERVICE_URL}")
                 dependencies_ok = False
-        except Exception as e:
+        except Exception as e_embed:
             critical_failure_message = "Failed to initialize Embedding Service client/adapter."
-            log.critical(f"CRITICAL: {critical_failure_message}", error=str(e), exc_info=True, url=settings.EMBEDDING_SERVICE_URL)
+            log.critical(f"CRITICAL: {critical_failure_message}", error=str(e_embed), exc_info=True, url=settings.EMBEDDING_SERVICE_URL)
             dependencies_ok = False
 
 
@@ -3210,13 +3162,13 @@ async def lifespan(app: FastAPI):
     if dependencies_ok:
         try:
             vector_store_instance = MilvusAdapter()
-            await vector_store_instance._get_collection()
+            await vector_store_instance.connect() # Explicitly connect and load collection
             log.info("Milvus Adapter initialized and collection checked/loaded.")
-        except Exception as e:
+        except Exception as e_milvus:
             critical_failure_message = "Failed to initialize Milvus Adapter or load collection."
             log.critical(
                 f"CRITICAL: {critical_failure_message} Ensure collection '{settings.MILVUS_COLLECTION_NAME}' exists and is accessible.",
-                error=str(e), exc_info=True, adapter_error=getattr(e, 'message', 'N/A')
+                error=str(e_milvus), exc_info=True, adapter_error=getattr(e_milvus, 'message', 'N/A')
             )
             dependencies_ok = False
 
@@ -3230,112 +3182,106 @@ async def lifespan(app: FastAPI):
                  dependencies_ok = False
             else:
                  log.info("Gemini Adapter initialized successfully.")
-        except Exception as e:
+        except Exception as e_llm:
             critical_failure_message = "Failed to initialize Gemini Adapter."
-            log.critical(f"CRITICAL: {critical_failure_message}", error=str(e), exc_info=True)
+            log.critical(f"CRITICAL: {critical_failure_message}", error=str(e_llm), exc_info=True)
             dependencies_ok = False
-
-    # Initialize optional components only if core dependencies are okay
+    
+    # Initialize optional components
     if dependencies_ok:
         if settings.BM25_ENABLED:
             try:
-                if chunk_content_repo_instance:
+                if chunk_content_repo_instance: # Make sure repo is available
                     sparse_retriever_instance = BM25sRetriever(chunk_content_repo_instance)
                     log.info("BM25s Retriever initialized.")
                 else:
-                    log.error("BM25 enabled but ChunkContentRepository failed to initialize. Disabling BM25.")
+                    log.error("BM25 enabled but ChunkContentRepository failed to initialize. Disabling BM25 for this session.")
                     sparse_retriever_instance = None # Ensure it's None
-            except ImportError: log.error("BM25sRetriever dependency (bm2s) not installed. BM25 disabled.")
-            except Exception as e: log.error("Failed to initialize BM25s Retriever.", error=str(e), exc_info=True)
+            except ImportError:
+                log.error("BM25sRetriever dependency (bm2s) not installed. BM25 disabled.")
+                sparse_retriever_instance = None
+            except Exception as e_bm25:
+                log.error("Failed to initialize BM25s Retriever. BM25 will be disabled.", error=str(e_bm25), exc_info=True)
+                sparse_retriever_instance = None
 
-        if settings.RERANKER_ENABLED:
-            try:
-                reranker_instance = BGEReranker()
-                if not reranker_instance.model: log.warning("BGE Reranker initialized but model loading failed.")
-                else: log.info("BGE Reranker initialized.")
-            except ImportError: log.error("BGEReranker dependency (sentence-transformers) not installed. Reranker disabled.")
-            except Exception as e: log.error("Failed to initialize BGE Reranker.", error=str(e), exc_info=True)
 
         if settings.DIVERSITY_FILTER_ENABLED:
             try:
-                # Solo usar MMR si el adaptador de embedding está disponible y puede dar embeddings
-                if embedding_adapter_instance:
+                if embedding_adapter_instance and embedding_adapter_instance.get_embedding_dimension() > 0 : # MMR needs embeddings
                     diversity_filter_instance = MMRDiversityFilter(lambda_mult=settings.QUERY_DIVERSITY_LAMBDA)
                     log.info("MMR Diversity Filter initialized.")
                 else:
-                    log.warning("MMR Diversity Filter requires embeddings, but embedding adapter is not available. Falling back to Stub.")
+                    log.warning("MMR Diversity Filter enabled but embedding adapter is not available or has no dimension. Falling back to StubDiversityFilter.")
                     diversity_filter_instance = StubDiversityFilter()
-            except Exception as e:
-                log.error("Failed to initialize MMR Diversity Filter. Falling back to Stub.", error=str(e), exc_info=True)
+            except Exception as e_diversity:
+                log.error("Failed to initialize MMR Diversity Filter. Falling back to StubDiversityFilter.", error=str(e_diversity), exc_info=True)
                 diversity_filter_instance = StubDiversityFilter()
-        else:
-            log.info("Diversity filter disabled, using StubDiversityFilter as placeholder.")
+        else: # If not enabled, use Stub
+            log.info("Diversity filter disabled in settings, using StubDiversityFilter as placeholder.")
             diversity_filter_instance = StubDiversityFilter()
 
-    # 5. Instantiate Use Case only if core dependencies are okay
+    # 5. Instantiate Use Case
     if dependencies_ok:
          try:
+             if not http_client_instance: # Should not happen if dependencies_ok is True
+                 raise RuntimeError("HTTP client instance is not available for AskQueryUseCase.")
+
              ask_query_use_case_instance = AskQueryUseCase(
                  chat_repo=chat_repo_instance,
                  log_repo=log_repo_instance,
                  vector_store=vector_store_instance,
                  llm=llm_instance,
-                 embedding_adapter=embedding_adapter_instance, # Inyectar el nuevo adaptador
+                 embedding_adapter=embedding_adapter_instance,
+                 http_client=http_client_instance, # Pass the global HTTP client
                  sparse_retriever=sparse_retriever_instance,
                  chunk_content_repo=chunk_content_repo_instance,
-                 reranker=reranker_instance,
                  diversity_filter=diversity_filter_instance
              )
              log.info("AskQueryUseCase instantiated successfully.")
-
-             # REMOVED: Warm up de FastEmbed ya no es necesario.
-             # El RemoteEmbeddingAdapter no tiene un método warm_up explícito,
-             # su inicialización ya intenta conectar y obtener info.
-
-             SERVICE_READY = True
+             SERVICE_READY = True # Mark service as ready only if all critical components are up
              set_ask_query_use_case_instance(ask_query_use_case_instance, SERVICE_READY)
              log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY.")
 
-         except Exception as e:
+         except Exception as e_usecase:
               critical_failure_message = "Failed to instantiate AskQueryUseCase."
-              log.critical(f"CRITICAL: {critical_failure_message}", error=str(e), exc_info=True)
+              log.critical(f"CRITICAL: {critical_failure_message}", error=str(e_usecase), exc_info=True)
               SERVICE_READY = False
-              set_ask_query_use_case_instance(None, False)
-    else:
+              set_ask_query_use_case_instance(None, False) # Ensure it's set to not ready
+    else: # If dependencies_ok was false earlier
         log.critical(f"{settings.PROJECT_NAME} startup sequence aborted due to critical failure: {critical_failure_message}")
         log.critical("SERVICE NOT READY.")
-        set_ask_query_use_case_instance(None, False) # Asegurar que el caso de uso no se setee
+        set_ask_query_use_case_instance(None, False)
 
-    # Final check - ensure service ready is false if dependencies failed at any point
-    if not dependencies_ok:
-        SERVICE_READY = False
-        if not critical_failure_message: critical_failure_message = "Unknown critical dependency failure."
+
+    if not SERVICE_READY: # Double check the flag before concluding startup
+        if not critical_failure_message: critical_failure_message = "Unknown critical dependency failure during startup."
         log.critical(f"Startup finished. Critical failure detected: {critical_failure_message}. SERVICE NOT READY.")
 
 
     yield # Application runs here
 
-    # --- Shutdown ---
+    # --- Shutdown Logic ---
     log.info(f"Shutting down {settings.PROJECT_NAME}...")
+    if http_client_instance:
+        await http_client_instance.aclose()
+        log.info("Global HTTP client closed.")
     await postgres_connector.close_db_pool()
     if vector_store_instance and hasattr(vector_store_instance, 'disconnect'):
         try: await vector_store_instance.disconnect()
-        except Exception as e: log.error("Error during Milvus disconnect", error=str(e), exc_info=True)
-    if embedding_service_client_instance: # NUEVO: cerrar cliente de embedding
+        except Exception as e_milvus_close: log.error("Error during Milvus disconnect", error=str(e_milvus_close), exc_info=True)
+    if embedding_service_client_instance: # This client has its own httpx client internally
         try: await embedding_service_client_instance.close()
-        except Exception as e: log.error("Error closing EmbeddingServiceClient", error=str(e), exc_info=True)
+        except Exception as e_emb_client_close: log.error("Error closing EmbeddingServiceClient", error=str(e_emb_client_close), exc_info=True)
     log.info("Shutdown complete.")
 
-# --- FastAPI App Initialization ---
 app = FastAPI(
     title=settings.PROJECT_NAME,
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
-    version="0.3.1", # Incremento de versión patch por refactor de embedding
-    description="Microservice to handle user queries using a refactored RAG pipeline, chat history, and remote embedding generation.",
+    version="0.3.2",
+    description="Microservice to handle user queries using RAG pipeline, chat history, remote embedding, and remote reranking.",
     lifespan=lifespan
 )
 
-# --- Middleware ---
 @app.middleware("http")
 async def add_request_id_timing_logging(request: Request, call_next):
     start_time = asyncio.get_event_loop().time()
@@ -3348,84 +3294,103 @@ async def add_request_id_timing_logging(request: Request, call_next):
         response = await call_next(request)
         process_time = (asyncio.get_event_loop().time() - start_time) * 1000
         resp_log = req_log.bind(status_code=response.status_code, duration_ms=round(process_time, 2))
-        log_level = "warning" if 400 <= response.status_code < 500 else "error" if response.status_code >= 500 else "info"
-        getattr(resp_log, log_level)("Request finished")
+        log_level_method = "warning" if 400 <= response.status_code < 500 else "error" if response.status_code >= 500 else "info"
+        getattr(resp_log, log_level_method)("Request finished")
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Process-Time-Ms"] = f"{process_time:.2f}"
-    except Exception as e:
+    except Exception as e_middleware:
         process_time = (asyncio.get_event_loop().time() - start_time) * 1000
         exc_log = req_log.bind(status_code=500, duration_ms=round(process_time, 2))
-        exc_log.exception("Unhandled exception during request processing")
+        exc_log.exception("Unhandled exception during request processing middleware") # Log with full traceback
         response = JSONResponse(status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR, content={"detail": "Internal Server Error"})
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Process-Time-Ms"] = f"{process_time:.2f}"
     finally: structlog.contextvars.clear_contextvars()
     return response
 
-# --- Exception Handlers ---
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    log_level = log.warning if exc.status_code < 500 else log.error
-    log_level("HTTP Exception caught", status_code=exc.status_code, detail=exc.detail)
+    log_level_method = log.warning if exc.status_code < 500 else log.error
+    log_level_method("HTTP Exception caught by handler", status_code=exc.status_code, detail=exc.detail)
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    error_details = []
-    try: error_details = exc.errors()
-    except Exception: error_details = [{"loc": [], "msg": "Failed to parse validation errors.", "type": "internal_parsing_error"}]
-    log.warning("Request Validation Error", errors=error_details)
-    return JSONResponse(status_code=fastapi_status.HTTP_422_UNPROCESSABLE_ENTITY, content={"detail": error_details})
+    error_details_val = []
+    try: error_details_val = exc.errors()
+    except Exception: error_details_val = [{"loc": [], "msg": "Failed to parse validation errors.", "type": "internal_parsing_error"}]
+    log.warning("Request Validation Error caught by handler", errors=error_details_val)
+    return JSONResponse(status_code=fastapi_status.HTTP_422_UNPROCESSABLE_ENTITY, content={"detail": error_details_val})
 
 @app.exception_handler(ResponseValidationError)
 async def response_validation_exception_handler(request: Request, exc: ResponseValidationError):
-    log.error("Response Validation Error", errors=exc.errors(), exc_info=True)
+    log.error("Response Validation Error caught by handler", errors=exc.errors(), exc_info=True)
     return JSONResponse(status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR, content={"detail": "Internal Server Error: Failed to serialize response."})
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    log.exception("Unhandled Exception caught by generic handler")
+    log.exception("Unhandled Exception caught by generic handler") # Log with full traceback
     return JSONResponse(status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR, content={"detail": "Internal Server Error"})
 
 
-# --- Simplified Dependency Injection Functions ---
 def get_chat_repository() -> ChatRepositoryPort:
     if not chat_repo_instance:
         log.error("Dependency Injection Failed: ChatRepository requested but not initialized.")
         raise HTTPException(status_code=503, detail="Chat service component not available.")
     return chat_repo_instance
 
-# get_ask_query_use_case is now provided by app/dependencies.py
-
-# --- Routers ---
 app.include_router(query_router_module.router, prefix=settings.API_V1_STR, tags=["Query Interaction"])
 app.include_router(chat_router_module.router, prefix=settings.API_V1_STR, tags=["Chat Management"])
 log.info("Routers included", prefix=settings.API_V1_STR)
 
-# --- Root Endpoint / Health Check ---
 @app.get("/", tags=["Health Check"], summary="Service Liveness/Readiness Check")
 async def read_root():
-    health_log = log.bind(check="liveness_readiness")
+    health_log = log.bind(check="liveness_readiness_root")
     if not SERVICE_READY:
-        health_log.warning("Health check failed: Service not ready.", service_ready_flag=SERVICE_READY)
+        health_log.warning("Health check (root) failed: Service not ready.", service_ready_flag=SERVICE_READY)
         raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service Not Ready")
 
-    # Adicionalmente, verificar la salud del embedding adapter si es posible
+    # Check Embedding Service Health
     if embedding_adapter_instance:
         emb_adapter_healthy = await embedding_adapter_instance.health_check()
         if not emb_adapter_healthy:
-            health_log.error("Health check failed: Embedding Adapter reports unhealthy dependency (Embedding Service).")
+            health_log.error("Health check (root) failed: Embedding Adapter reports unhealthy dependency (Embedding Service).")
             raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Critical dependency (Embedding Service) is unhealthy.")
-    else: # Si el adaptador ni siquiera se inicializó, el servicio no debería estar READY
-        health_log.error("Health check warning: Embedding Adapter instance not available (should not happen if SERVICE_READY is true).")
+    else: # Should not happen if SERVICE_READY is true
+        health_log.error("Health check (root) warning: Embedding Adapter instance not available, inconsistent with SERVICE_READY state.")
+        raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service inconsistency: Embedding adapter missing.")
+
+    # Check Reranker Service Health (if enabled)
+    if settings.RERANKER_ENABLED:
+        if not http_client_instance: # Should not happen if SERVICE_READY and http_client is critical
+            health_log.error("Health check (root) warning: HTTP client instance not available for Reranker health check.")
+            raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service inconsistency: HTTP client missing.")
+        try:
+            reranker_health_url = str(settings.RERANKER_SERVICE_URL).rstrip('/') + "/health"
+            response = await http_client_instance.get(reranker_health_url, timeout=5) # Short timeout for health
+            if response.status_code == 200:
+                 reranker_data = response.json()
+                 if reranker_data.get("status") == "ok" and reranker_data.get("model_status") == "loaded":
+                     health_log.debug("Reranker service health check successful via root.")
+                 else:
+                     health_log.error("Health check (root) failed: Reranker service reported unhealthy.", status=response.status_code, details=reranker_data)
+                     raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Critical dependency (Reranker Service) is unhealthy.")
+            else:
+                 health_log.error("Health check (root) failed: Reranker service unresponsive.", status=response.status_code, response_text=response.text)
+                 raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Critical dependency (Reranker Service) is unresponsive.")
+        except httpx.RequestError as e_rerank_health:
+             health_log.error("Health check (root) failed: Error connecting to Reranker service.", error=str(e_rerank_health))
+             raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Critical dependency (Reranker Service) connection failed.")
+        except Exception as e_rerank_health_generic: # Catch JSONDecodeError or other issues
+            health_log.error("Health check (root) failed: Error processing Reranker service health response.", error=str(e_rerank_health_generic))
+            raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Critical dependency (Reranker Service) health check processing error.")
 
 
-    health_log.debug("Health check passed.")
+    health_log.debug("Health check (root) passed.")
     return PlainTextResponse("OK", status_code=fastapi_status.HTTP_200_OK)
 
-# --- Main execution ---
 if __name__ == "__main__":
-    port = 8001
+    port = int(os.getenv("PORT", "8001")) # Gunicorn/Cloud Run might set PORT
     log_level_str = settings.LOG_LEVEL.lower()
     print(f"----- Starting {settings.PROJECT_NAME} locally on port {port} -----")
     uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True, log_level=log_level_str)
@@ -3468,9 +3433,8 @@ def truncate_text(text: str, max_length: int) -> str:
 ```toml
 [tool.poetry]
 name = "query-service"
-# LLM_REFACTOR_FINAL: Set final version number
-version = "0.3.1" # Incrementado por refactor de embedding
-description = "Query service for SaaS B2B using Clean Architecture, PyMilvus, Haystack & Advanced RAG with remote embeddings"
+version = "0.3.2"
+description = "Query service for SaaS B2B using Clean Architecture, PyMilvus, Haystack & Advanced RAG with remote embeddings and reranking"
 authors = ["Nyro <dev@nyro.com>"]
 readme = "README.md"
 
@@ -3481,35 +3445,26 @@ uvicorn = {extras = ["standard"], version = "^0.28.0"}
 gunicorn = "^21.2.0"
 pydantic = {extras = ["email"], version = "^2.6.4"}
 pydantic-settings = "^2.2.1"
-httpx = "^0.27.0" # Ya estaba, ahora usado explícitamente por EmbeddingServiceClient
+httpx = "^0.27.0"
 asyncpg = "^0.29.0"
 python-jose = {extras = ["cryptography"], version = "^3.3.0"}
 tenacity = "^8.2.3"
 structlog = "^24.1.0"
 
 # --- Haystack Dependencies ---
-haystack-ai = "^2.0.1" # Core Haystack (Document, PromptBuilder)
-pymilvus = "^2.4.1"    # Milvus client
-
-# --- REMOVED: FastEmbed y fastembed-haystack ya no son dependencias directas ---
-# fastembed-haystack = { version = "1.3.0", python = ">=3.10,<3.13" }
-# fastembed = { version = "0.3.6", python = ">=3.10,<3.13" }
-
+# haystack-ai is kept for Document, PromptBuilder, etc.
+haystack-ai = "^2.0.1"
+pymilvus = "^2.4.1"
 
 # --- LLM Dependency ---
-google-generativeai = "^0.5.4" # Gemini client
+google-generativeai = "^0.5.4"
 
 # --- RAG Component Dependencies ---
-sentence-transformers = "^2.7.0" # For BGE Reranker adapter
+# sentence-transformers is REMOVED as reranking is now external
 bm2s = "0.1.3"
-numpy = "1.26.4" # Probablemente aún necesitado por sentence-transformers o bm2s
+numpy = "1.26.4" # Kept, as bm2s or other parts might need it. Haystack might also use it.
+# fastembed and fastembed-haystack are REMOVED as embedding is now external
 
-
-# Optional for performance
-# onnxruntime = { version = "^1.17.1", optional = true } # Si alguna otra dependencia lo necesita explícitamente
-
-[tool.poetry.extras]
-# onnx = ["onnxruntime"] # Si onnxruntime se mantiene opcional
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"

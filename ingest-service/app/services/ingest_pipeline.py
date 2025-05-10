@@ -7,11 +7,9 @@ import hashlib
 import structlog
 from typing import List, Dict, Any, Optional, Tuple, Union
 
-# --- EARLY IMPORTS ---
-from app.core.config import settings # IMPORT SETTINGS FIRST
-log = structlog.get_logger(__name__) # GET LOGGER AFTER STRUCTLOG IMPORT
+from app.core.config import settings
+log = structlog.get_logger(__name__)
 
-# Tokenizer for metadata (Try importing AFTER settings and log are available)
 try:
     import tiktoken
     tiktoken_enc = tiktoken.get_encoding(settings.TIKTOKEN_ENCODING_NAME)
@@ -23,41 +21,16 @@ except Exception as e:
     log.warning(f"Failed to load tiktoken encoder '{settings.TIKTOKEN_ENCODING_NAME}', token count metadata will be unavailable.", error=str(e))
     tiktoken_enc = None
 
-# Direct library imports
 from pymilvus import (
     Collection, CollectionSchema, FieldSchema, DataType, connections,
     utility, MilvusException
 )
 
-# Local application imports
-from .extractors.pdf_extractor import extract_text_from_pdf, PdfExtractionError
-from .extractors.docx_extractor import extract_text_from_docx, DocxExtractionError
-from .extractors.txt_extractor import extract_text_from_txt, TxtExtractionError
-from .extractors.md_extractor import extract_text_from_md, MdExtractionError
-from .extractors.html_extractor import extract_text_from_html, HtmlExtractionError
-from .text_splitter import split_text
-# from .embedder import embed_chunks # Eliminado
-from app.services.clients.embedding_service_client import EmbeddingServiceClient, EmbeddingServiceClientError # Nuevo
 from app.models.domain import DocumentChunkMetadata, DocumentChunkData, ChunkVectorStatus
 
-
-# --- Mapeo de Content-Type a Funciones Extractoras ---
-EXTRACTORS = {
-    "application/pdf": extract_text_from_pdf,
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": extract_text_from_docx,
-    "application/msword": extract_text_from_docx,
-    "text/plain": extract_text_from_txt,
-    "text/markdown": extract_text_from_md,
-    "text/html": extract_text_from_html,
-}
-EXTRACTION_ERRORS = (
-    PdfExtractionError, DocxExtractionError, TxtExtractionError,
-    MdExtractionError, HtmlExtractionError, ValueError
-)
-
-# --- Constantes Milvus (Incluye nuevos campos) ---
+# --- Constantes Milvus ---
 MILVUS_COLLECTION_NAME = settings.MILVUS_COLLECTION_NAME
-MILVUS_EMBEDDING_DIM = settings.EMBEDDING_DIMENSION # Esta dimensión DEBE coincidir con la del embedding_service
+MILVUS_EMBEDDING_DIM = settings.EMBEDDING_DIMENSION
 MILVUS_PK_FIELD = "pk_id"
 MILVUS_VECTOR_FIELD = settings.MILVUS_EMBEDDING_FIELD
 MILVUS_CONTENT_FIELD = settings.MILVUS_CONTENT_FIELD
@@ -69,74 +42,75 @@ MILVUS_TITLE_FIELD = "title"
 MILVUS_TOKENS_FIELD = "tokens"
 MILVUS_CONTENT_HASH_FIELD = "content_hash"
 
-_milvus_collection: Optional[Collection] = None
-_milvus_connected = False
+_milvus_collection_pipeline: Optional[Collection] = None
 
-def _ensure_milvus_connection_and_collection() -> Collection:
-    global _milvus_collection, _milvus_connected
-    alias = "pipeline_worker"
-    connect_log = log.bind(milvus_alias=alias)
+def _ensure_milvus_connection_and_collection_for_pipeline(alias: str = "pipeline_worker_indexing") -> Collection:
+    global _milvus_collection_pipeline
+    connect_log = log.bind(milvus_alias=alias, component="MilvusPipelineOps")
 
     connection_exists = alias in connections.list_connections()
-    is_connected = False
+    
+    # Re-evaluate connection and collection state more robustly
     if connection_exists:
         try:
-             if utility.has_collection(MILVUS_COLLECTION_NAME, using=alias):
-                 is_connected = True
-             else:
-                 is_connected = False
-                 connect_log.warning("Connection alias exists but collection check failed, may reconnect.")
+            # Test existing connection
+            utility.get_connection_addr(alias) # This can raise if connection is stale
+            connect_log.debug("Milvus connection alias exists and seems active.", alias=alias)
+            if _milvus_collection_pipeline and _milvus_collection_pipeline.name == MILVUS_COLLECTION_NAME:
+                 # Basic check, might not guarantee collection is loaded in this specific alias
+                pass # Use existing _milvus_collection_pipeline if set
+            else: # Collection not set or different, reset flag to force re-initialization
+                connection_exists = False # Force re-init logic for collection
         except Exception as conn_check_err:
             connect_log.warning("Error checking existing Milvus connection status, will attempt reconnect.", error=str(conn_check_err))
-            is_connected = False
             try: connections.disconnect(alias)
             except: pass
+            connection_exists = False # Force re-init
 
-    if not is_connected:
+    if not connection_exists:
         uri = settings.MILVUS_URI
-        connect_log.info("Connecting to Milvus for pipeline worker...", uri=uri, timeout=settings.MILVUS_GRPC_TIMEOUT)
+        connect_log.info("Connecting to Milvus for pipeline worker indexing...", uri=uri)
         try:
             connections.connect(alias=alias, uri=uri, timeout=settings.MILVUS_GRPC_TIMEOUT)
-            _milvus_connected = True
-            connect_log.info("Connected to Milvus for pipeline worker.")
+            connect_log.info("Connected to Milvus for pipeline worker indexing.")
         except MilvusException as e:
-            connect_log.error("Failed to connect to Milvus for pipeline worker.", error=str(e))
-            _milvus_connected = False
+            connect_log.error("Failed to connect to Milvus for pipeline worker indexing.", error=str(e))
             raise ConnectionError(f"Milvus connection failed: {e}") from e
         except Exception as e:
-            connect_log.error("Unexpected error connecting to Milvus for pipeline worker.", error=str(e))
-            _milvus_connected = False
+            connect_log.error("Unexpected error connecting to Milvus for pipeline worker indexing.", error=str(e))
             raise ConnectionError(f"Unexpected Milvus connection error: {e}") from e
 
-    if _milvus_collection is None:
+    # Check and initialize collection if needed
+    if _milvus_collection_pipeline is None or _milvus_collection_pipeline.name != MILVUS_COLLECTION_NAME:
         try:
             if not utility.has_collection(MILVUS_COLLECTION_NAME, using=alias):
                 connect_log.warning(f"Milvus collection '{MILVUS_COLLECTION_NAME}' not found. Attempting to create.")
-                collection = _create_milvus_collection(alias)
+                collection_obj = _create_milvus_collection_for_pipeline(alias)
             else:
-                collection = Collection(name=MILVUS_COLLECTION_NAME, using=alias)
+                collection_obj = Collection(name=MILVUS_COLLECTION_NAME, using=alias)
                 connect_log.debug(f"Using existing Milvus collection '{MILVUS_COLLECTION_NAME}'.")
-                _check_and_create_indexes(collection)
+                _check_and_create_indexes_for_pipeline(collection_obj)
 
-            connect_log.info("Loading Milvus collection into memory...", collection_name=collection.name)
-            collection.load()
-            connect_log.info("Milvus collection loaded into memory.")
-            _milvus_collection = collection
+            connect_log.info("Loading Milvus collection into memory for indexing...", collection_name=collection_obj.name)
+            collection_obj.load()
+            connect_log.info("Milvus collection loaded into memory for indexing.")
+            _milvus_collection_pipeline = collection_obj
         except MilvusException as coll_err:
-             connect_log.error("Failed during Milvus collection access/load", error=str(coll_err), exc_info=True)
-             raise RuntimeError(f"Milvus collection access error: {coll_err}") from coll_err
+             connect_log.error("Failed during Milvus collection access/load for indexing", error=str(coll_err), exc_info=True)
+             raise RuntimeError(f"Milvus collection access error for indexing: {coll_err}") from coll_err
         except Exception as e:
-             connect_log.error("Unexpected error during Milvus collection access", error=str(e), exc_info=True)
-             raise RuntimeError(f"Unexpected Milvus collection error: {e}") from e
+             connect_log.error("Unexpected error during Milvus collection access for indexing", error=str(e), exc_info=True)
+             raise RuntimeError(f"Unexpected Milvus collection error for indexing: {e}") from e
+    
+    if not isinstance(_milvus_collection_pipeline, Collection):
+        connect_log.critical("Milvus collection object is unexpectedly None or invalid type after initialization for indexing.")
+        raise RuntimeError("Failed to obtain a valid Milvus collection object for indexing.")
+    return _milvus_collection_pipeline
 
-    if not isinstance(_milvus_collection, Collection):
-        connect_log.critical("Milvus collection object is unexpectedly None or invalid type after initialization attempt.")
-        raise RuntimeError("Failed to obtain a valid Milvus collection object.")
-    return _milvus_collection
 
-def _create_milvus_collection(alias: str) -> Collection:
-    create_log = log.bind(collection_name=MILVUS_COLLECTION_NAME, embedding_dim=MILVUS_EMBEDDING_DIM)
-    create_log.info("Defining schema for new Milvus collection.")
+def _create_milvus_collection_for_pipeline(alias: str) -> Collection:
+    create_log = log.bind(collection_name=MILVUS_COLLECTION_NAME, embedding_dim=MILVUS_EMBEDDING_DIM, component="MilvusPipelineOps")
+    create_log.info("Defining schema for new Milvus collection (pipeline).")
     fields = [
         FieldSchema(name=MILVUS_PK_FIELD, dtype=DataType.VARCHAR, max_length=255, is_primary=True),
         FieldSchema(name=MILVUS_VECTOR_FIELD, dtype=DataType.FLOAT_VECTOR, dim=MILVUS_EMBEDDING_DIM),
@@ -152,192 +126,184 @@ def _create_milvus_collection(alias: str) -> Collection:
     schema = CollectionSchema(
         fields, description="Atenex Document Chunks with Enhanced Metadata", enable_dynamic_field=False
     )
-    create_log.info("Schema defined. Creating collection...")
+    create_log.info("Schema defined. Creating collection (pipeline)...")
     try:
         collection = Collection(
             name=MILVUS_COLLECTION_NAME, schema=schema, using=alias, consistency_level="Strong"
         )
-        create_log.info(f"Collection '{MILVUS_COLLECTION_NAME}' created. Creating indexes...")
+        create_log.info(f"Collection '{MILVUS_COLLECTION_NAME}' created (pipeline). Creating indexes...")
         index_params = settings.MILVUS_INDEX_PARAMS
-        create_log.info("Creating HNSW index for vector field", field_name=MILVUS_VECTOR_FIELD, index_params=index_params)
+        create_log.info("Creating HNSW index for vector field (pipeline)", field_name=MILVUS_VECTOR_FIELD, index_params=index_params)
         collection.create_index(field_name=MILVUS_VECTOR_FIELD, index_params=index_params, index_name=f"{MILVUS_VECTOR_FIELD}_hnsw_idx")
-        create_log.info("Creating scalar index for company_id field...")
-        collection.create_index(field_name=MILVUS_COMPANY_ID_FIELD, index_name=f"{MILVUS_COMPANY_ID_FIELD}_idx")
-        create_log.info("Creating scalar index for document_id field...")
-        collection.create_index(field_name=MILVUS_DOCUMENT_ID_FIELD, index_name=f"{MILVUS_DOCUMENT_ID_FIELD}_idx")
-        create_log.info("Creating scalar index for content_hash field...")
-        collection.create_index(field_name=MILVUS_CONTENT_HASH_FIELD, index_name=f"{MILVUS_CONTENT_HASH_FIELD}_idx")
-        create_log.info("All required indexes created successfully.")
+        
+        scalar_fields_to_index = [
+            MILVUS_COMPANY_ID_FIELD, MILVUS_DOCUMENT_ID_FIELD, MILVUS_CONTENT_HASH_FIELD
+        ]
+        for field_name in scalar_fields_to_index:
+            create_log.info(f"Creating scalar index for {field_name} field (pipeline)...")
+            collection.create_index(field_name=field_name, index_name=f"{field_name}_idx")
+
+        create_log.info("All required indexes created successfully (pipeline).")
         return collection
     except MilvusException as e:
-        create_log.error("Failed to create Milvus collection or index", error=str(e), exc_info=True)
-        raise RuntimeError(f"Milvus collection/index creation failed: {e}") from e
+        create_log.error("Failed to create Milvus collection or index (pipeline)", error=str(e), exc_info=True)
+        raise RuntimeError(f"Milvus collection/index creation failed (pipeline): {e}") from e
 
-def _check_and_create_indexes(collection: Collection):
-    check_log = log.bind(collection_name=collection.name)
+
+def _check_and_create_indexes_for_pipeline(collection: Collection):
+    check_log = log.bind(collection_name=collection.name, component="MilvusPipelineOps")
     try:
         existing_indexes = collection.indexes
         existing_index_fields = {idx.field_name for idx in existing_indexes}
-        required_indexes = {
+        required_indexes_map = {
             MILVUS_VECTOR_FIELD: (settings.MILVUS_INDEX_PARAMS, f"{MILVUS_VECTOR_FIELD}_hnsw_idx"),
             MILVUS_COMPANY_ID_FIELD: (None, f"{MILVUS_COMPANY_ID_FIELD}_idx"),
             MILVUS_DOCUMENT_ID_FIELD: (None, f"{MILVUS_DOCUMENT_ID_FIELD}_idx"),
             MILVUS_CONTENT_HASH_FIELD: (None, f"{MILVUS_CONTENT_HASH_FIELD}_idx"),
         }
-        for field_name, (index_params, index_name) in required_indexes.items():
+        for field_name, (index_params, index_name) in required_indexes_map.items():
             if field_name not in existing_index_fields:
-                check_log.warning(f"Index missing for field '{field_name}'. Creating '{index_name}'...")
+                check_log.warning(f"Index missing for field '{field_name}' (pipeline). Creating '{index_name}'...")
                 collection.create_index(field_name=field_name, index_params=index_params, index_name=index_name)
-                check_log.info(f"Index '{index_name}' created for field '{field_name}'.")
+                check_log.info(f"Index '{index_name}' created for field '{field_name}' (pipeline).")
             else:
-                check_log.debug(f"Index already exists for field '{field_name}'.")
+                check_log.debug(f"Index already exists for field '{field_name}' (pipeline).")
     except MilvusException as e:
-        check_log.error("Failed during index check/creation on existing collection", error=str(e))
+        check_log.error("Failed during index check/creation on existing collection (pipeline)", error=str(e))
+        # Do not re-raise, allow processing to continue if some indexes exist.
+
 
 def delete_milvus_chunks(company_id: str, document_id: str) -> int:
-    del_log = log.bind(company_id=company_id, document_id=document_id)
+    del_log = log.bind(company_id=company_id, document_id=document_id, component="MilvusPipelineOps")
     expr = f'{MILVUS_COMPANY_ID_FIELD} == "{company_id}" and {MILVUS_DOCUMENT_ID_FIELD} == "{document_id}"'
     pks_to_delete: List[str] = []
     deleted_count = 0
     try:
-        collection = _ensure_milvus_connection_and_collection()
-        del_log.info("Querying Milvus for PKs to delete...", filter_expr=expr)
+        collection = _ensure_milvus_connection_and_collection_for_pipeline()
+        del_log.info("Querying Milvus for PKs to delete (pipeline)...", filter_expr=expr)
         query_res = collection.query(expr=expr, output_fields=[MILVUS_PK_FIELD])
         pks_to_delete = [item[MILVUS_PK_FIELD] for item in query_res if MILVUS_PK_FIELD in item]
         if not pks_to_delete:
-            del_log.info("No matching primary keys found in Milvus for deletion.")
+            del_log.info("No matching primary keys found in Milvus for deletion (pipeline).")
             return 0
-        del_log.info(f"Found {len(pks_to_delete)} primary keys to delete.")
-        delete_expr = f'{MILVUS_PK_FIELD} in {pks_to_delete}'
-        del_log.info("Attempting to delete chunks from Milvus using PK list expression.", filter_expr=delete_expr)
+        
+        del_log.info(f"Found {len(pks_to_delete)} primary keys to delete (pipeline).")
+        delete_expr = f'{MILVUS_PK_FIELD} in {json.dumps(pks_to_delete)}'
+        del_log.info("Attempting to delete chunks from Milvus using PK list expression (pipeline).", filter_expr=delete_expr)
         delete_result = collection.delete(expr=delete_expr)
         deleted_count = delete_result.delete_count
-        del_log.info("Milvus delete operation by PK list executed.", deleted_count=deleted_count)
+        del_log.info("Milvus delete operation by PK list executed (pipeline).", deleted_count=deleted_count)
+        
         if deleted_count != len(pks_to_delete):
-             del_log.warning("Milvus delete count mismatch.", expected=len(pks_to_delete), reported=deleted_count)
+             del_log.warning("Milvus delete count mismatch (pipeline).", expected=len(pks_to_delete), reported=deleted_count)
         return deleted_count
     except MilvusException as e:
-        del_log.error("Milvus delete error (query or delete phase)", error=str(e), exc_info=True)
+        del_log.error("Milvus delete error (query or delete phase) (pipeline)", error=str(e), exc_info=True)
         return 0
     except Exception as e:
-        del_log.exception("Unexpected error during Milvus chunk deletion")
+        del_log.exception("Unexpected error during Milvus chunk deletion (pipeline)")
         return 0
 
-async def ingest_document_pipeline( # Marcado como async para usar el cliente async
-    file_bytes: bytes,
+
+def index_chunks_in_milvus_and_prepare_for_pg(
+    processed_chunks_from_docproc: List[Dict[str, Any]],
+    embeddings: List[List[float]],
     filename: str,
-    company_id: str,
-    document_id: str,
-    content_type: str,
-    # embedding_model: SentenceTransformer, # Eliminado
-    embedding_service_client: EmbeddingServiceClient, # Nuevo
-    delete_existing: bool = True
-) -> Tuple[int, List[str], List[DocumentChunkData]]:
-    ingest_log = log.bind(
-        company_id=company_id, document_id=document_id, filename=filename, content_type=content_type
+    company_id_str: str,
+    document_id_str: str,
+    delete_existing_milvus_chunks: bool = True
+) -> Tuple[int, List[str], List[Dict[str, Any]]]:
+    """
+    Takes chunks from docproc-service and embeddings, indexes them in Milvus,
+    and prepares data for PostgreSQL insertion.
+    """
+    index_log = log.bind(
+        company_id=company_id_str, document_id=document_id_str, filename=filename,
+        num_input_chunks=len(processed_chunks_from_docproc), num_embeddings=len(embeddings),
+        component="MilvusPGPipeline"
     )
-    ingest_log.info("Starting ingestion pipeline (using Embedding Service)")
+    index_log.info("Starting Milvus indexing and PG data preparation")
 
-    extractor = EXTRACTORS.get(content_type)
-    if not extractor:
-        ingest_log.error("Unsupported content type for extraction.")
-        raise ValueError(f"Unsupported content type: {content_type}")
+    if len(processed_chunks_from_docproc) != len(embeddings):
+        index_log.error("Mismatch between number of processed chunks and embeddings.",
+                        chunks_count=len(processed_chunks_from_docproc), embeddings_count=len(embeddings))
+        raise ValueError("Number of chunks and embeddings must match.")
 
-    ingest_log.debug("Extracting text content...")
-    extracted_content: Union[str, List[Tuple[int, str]]]
-    try:
-        extracted_content = extractor(file_bytes, filename=filename)
-        if not extracted_content:
-            ingest_log.warning("No text content extracted from the document. Skipping.")
-            return 0, [], []
-        if isinstance(extracted_content, str):
-            ingest_log.info(f"Text extracted successfully (no pages), length: {len(extracted_content)} chars.")
-        else:
-            ingest_log.info(f"Text extracted successfully from {len(extracted_content)} pages.")
-    except EXTRACTION_ERRORS as ve:
-        ingest_log.error("Text extraction failed.", error=str(ve), exc_info=True)
-        raise ValueError(f"Extraction failed for {filename}: {ve}") from ve
-    except Exception as e:
-        ingest_log.exception("Unexpected error during text extraction")
-        raise RuntimeError(f"Unexpected extraction error: {e}") from e
-
-    ingest_log.debug("Chunking text and generating metadata...")
-    processed_chunks: List[DocumentChunkData] = []
-    chunk_index_counter = 0
-
-    def _process_text_block(text_block: str, page_num: Optional[int]):
-        nonlocal chunk_index_counter
-        try:
-            text_chunks = split_text(text_block)
-            for chunk_text in text_chunks:
-                if not chunk_text or chunk_text.isspace(): continue
-                tokens = len(tiktoken_enc.encode(chunk_text)) if tiktoken_enc else -1
-                content_hash = hashlib.sha256(chunk_text.encode('utf-8', errors='ignore')).hexdigest()
-                title = f"{filename[:30]}... (Page {page_num or 'N/A'}, Chunk {chunk_index_counter+1})"
-                metadata_obj = DocumentChunkMetadata(
-                    page=page_num, title=title[:500], tokens=tokens, content_hash=content_hash
-                )
-                chunk_data = DocumentChunkData(
-                    document_id=uuid.UUID(document_id), company_id=uuid.UUID(company_id),
-                    chunk_index=chunk_index_counter, content=chunk_text, metadata=metadata_obj
-                )
-                processed_chunks.append(chunk_data)
-                chunk_index_counter += 1
-        except Exception as chunking_err:
-            ingest_log.error("Error processing text block during chunking/metadata", page=page_num, error=str(chunking_err), exc_info=True)
-
-    if isinstance(extracted_content, str):
-         _process_text_block(extracted_content, page_num=None)
-    else:
-         for page_number, page_text in extracted_content:
-             _process_text_block(page_text, page_num=page_number)
-
-    if not processed_chunks:
-        ingest_log.warning("Text content resulted in zero processable chunks. Skipping.")
+    if not processed_chunks_from_docproc:
+        index_log.warning("No chunks to process for Milvus/PG indexing.")
         return 0, [], []
-    ingest_log.info(f"Text processed into {len(processed_chunks)} chunks with metadata.")
 
-    chunk_contents = [chunk.content for chunk in processed_chunks]
-    ingest_log.debug(f"Requesting embeddings for {len(chunk_contents)} chunks from Embedding Service...")
-    embeddings: List[List[float]] = []
-    try:
-        # Llamada al EmbeddingServiceClient
-        embeddings, model_info = await embedding_service_client.get_embeddings(chunk_contents)
-        ingest_log.info(f"Embeddings received from service for {len(embeddings)} chunks. Model: {model_info}")
+    chunks_for_milvus_pg: List[DocumentChunkData] = []
+    milvus_data_content: List[str] = []
+    milvus_data_company_ids: List[str] = []
+    milvus_data_document_ids: List[str] = []
+    milvus_data_filenames: List[str] = []
+    milvus_data_pages: List[int] = []
+    milvus_data_titles: List[str] = []
+    milvus_data_tokens: List[int] = []
+    milvus_data_content_hashes: List[str] = []
+    milvus_pk_ids: List[str] = []
+    
+    # Filter out empty texts from embeddings list to match content
+    valid_embeddings: List[List[float]] = []
+    valid_chunk_indices_from_docproc: List[int] = []
 
-        if len(embeddings) != len(processed_chunks):
-            # Esto podría ocurrir si el servicio de embedding omite algunos textos (ej. vacíos)
-            # Deberíamos manejar esta discrepancia. Por ahora, error.
-            ingest_log.error("Embedding count mismatch from service.", expected=len(processed_chunks), received=len(embeddings))
-            raise RuntimeError(f"Embedding count mismatch. Expected {len(processed_chunks)}, got {len(embeddings)}.")
 
-        # Validar dimensión de los embeddings recibidos
-        expected_dim_from_service = model_info.get("dimension", 0)
-        if MILVUS_EMBEDDING_DIM != expected_dim_from_service:
-            ingest_log.warning(
-                f"Milvus schema dimension ({MILVUS_EMBEDDING_DIM}) "
-                f"differs from embedding service model dimension ({expected_dim_from_service}). "
-                f"Using Milvus schema dimension. Ensure this is intended."
-            )
-            # Nota: Si las dimensiones no coinciden, Milvus fallará la inserción.
-            # El `ingest-service` está configurado con `EMBEDDING_DIMENSION` para su esquema Milvus.
-            # Es crucial que esta configuración coincida con la dimensión real que entrega el `embedding-service`.
-            # El `embedding-service` informa su dimensión, así que podríamos usarla para una validación más estricta aquí.
+    for i, chunk_from_docproc in enumerate(processed_chunks_from_docproc):
+        chunk_text = chunk_from_docproc.get('text', '')
+        if not chunk_text or chunk_text.isspace():
+            index_log.warning("Skipping empty chunk from docproc during Milvus/PG prep.", original_chunk_index=i)
+            continue # Skip this chunk if it has no text
+        
+        # If chunk is valid, add its embedding and note its original index
+        valid_embeddings.append(embeddings[i])
+        valid_chunk_indices_from_docproc.append(i)
 
-        if embeddings and len(embeddings[0]) != MILVUS_EMBEDDING_DIM:
-             # Si la dimensión real de los embeddings recibidos no coincide con la esperada para Milvus.
-             ingest_log.error(
-                 f"Received embedding dimension ({len(embeddings[0])}) from service "
-                 f"does not match configured Milvus dimension ({MILVUS_EMBEDDING_DIM})."
-             )
-             raise RuntimeError(f"Embedding dimension mismatch error from service. Expected {MILVUS_EMBEDDING_DIM}, got {len(embeddings[0])}")
+        source_metadata = chunk_from_docproc.get('source_metadata', {})
+        
+        tokens = len(tiktoken_enc.encode(chunk_text)) if tiktoken_enc else -1
+        content_hash = hashlib.sha256(chunk_text.encode('utf-8', errors='ignore')).hexdigest()
+        page_number_from_source = source_metadata.get('page_number')
+        
+        current_sequential_chunk_index = len(chunks_for_milvus_pg)
+        title_for_chunk = f"{filename[:30]}... (Page {page_number_from_source or 'N/A'}, Chunk {current_sequential_chunk_index + 1})"
 
-    except EmbeddingServiceClientError as esce:
-        ingest_log.error("Failed to get embeddings from Embedding Service", error=str(esce), details=esce.detail, exc_info=True)
-        raise RuntimeError(f"Embedding Service client error: {esce}") from esce
-    except Exception as e:
-        ingest_log.error("Failed to generate/retrieve embeddings", error=str(e), exc_info=True)
-        raise RuntimeError(f"Embedding generation/retrieval failed: {e}") from e
+        pg_metadata = DocumentChunkMetadata(
+            page=page_number_from_source,
+            title=title_for_chunk[:500],
+            tokens=tokens,
+            content_hash=content_hash
+        )
+
+        chunk_data_obj = DocumentChunkData(
+            document_id=uuid.UUID(document_id_str),
+            company_id=uuid.UUID(company_id_str),
+            chunk_index=current_sequential_chunk_index,
+            content=chunk_text,
+            metadata=pg_metadata
+        )
+        chunks_for_milvus_pg.append(chunk_data_obj)
+
+        milvus_pk_id = f"{document_id_str}_{chunk_data_obj.chunk_index}"
+        milvus_pk_ids.append(milvus_pk_id)
+        
+        milvus_data_content.append(chunk_text)
+        milvus_data_company_ids.append(company_id_str)
+        milvus_data_document_ids.append(document_id_str)
+        milvus_data_filenames.append(filename)
+        milvus_data_pages.append(page_number_from_source if page_number_from_source is not None else -1)
+        milvus_data_titles.append(title_for_chunk[:512])
+        milvus_data_tokens.append(tokens)
+        milvus_data_content_hashes.append(content_hash)
+
+    if not chunks_for_milvus_pg:
+        index_log.warning("No valid (non-empty) chunks remained after initial processing for Milvus/PG.")
+        return 0, [], []
+    
+    if len(valid_embeddings) != len(milvus_data_content):
+        index_log.error("Critical mismatch: Valid embeddings count differs from valid content count for Milvus.",
+                        num_valid_embeddings=len(valid_embeddings), num_valid_content=len(milvus_data_content))
+        raise ValueError("Internal error: Embedding count does not match valid chunk content count.")
 
     max_content_len = settings.MILVUS_CONTENT_FIELD_MAX_LENGTH
     def truncate_utf8_bytes(s, max_bytes):
@@ -345,79 +311,64 @@ async def ingest_document_pipeline( # Marcado como async para usar el cliente as
         if len(b) <= max_bytes: return s
         return b[:max_bytes].decode('utf-8', errors='ignore')
 
-    milvus_pks = [f"{document_id}_{i}" for i in range(len(processed_chunks))]
-    data_to_insert = [
-        milvus_pks,
-        embeddings,
-        [truncate_utf8_bytes(c.content, max_content_len) for c in processed_chunks],
-        [company_id] * len(processed_chunks),
-        [document_id] * len(processed_chunks),
-        [filename] * len(processed_chunks),
-        [c.metadata.page if c.metadata.page is not None else -1 for c in processed_chunks],
-        [c.metadata.title if c.metadata.title else "" for c in processed_chunks],
-        [c.metadata.tokens if c.metadata.tokens is not None else -1 for c in processed_chunks],
-        [c.metadata.content_hash if c.metadata.content_hash else "" for c in processed_chunks]
+    data_to_insert_milvus = [
+        milvus_pk_ids,
+        valid_embeddings, # Use the filtered list of embeddings
+        [truncate_utf8_bytes(text, max_content_len) for text in milvus_data_content],
+        milvus_data_company_ids,
+        milvus_data_document_ids,
+        milvus_data_filenames,
+        milvus_data_pages,
+        milvus_data_titles,
+        milvus_data_tokens,
+        milvus_data_content_hashes
     ]
-    ingest_log.debug(f"Prepared {len(processed_chunks)} entities for Milvus insertion with custom PKs.")
+    index_log.debug(f"Prepared {len(milvus_pk_ids)} valid entities for Milvus insertion.")
 
-    if delete_existing:
-        ingest_log.info("Attempting to delete existing chunks before insertion...")
+    if delete_existing_milvus_chunks:
+        index_log.info("Attempting to delete existing Milvus chunks before insertion...")
         try:
-            deleted_count = delete_milvus_chunks(company_id, document_id)
-            ingest_log.info(f"Deleted {deleted_count} existing chunks.")
+            deleted_count = delete_milvus_chunks(company_id_str, document_id_str)
+            index_log.info(f"Deleted {deleted_count} existing Milvus chunks.")
         except Exception as del_err:
-            ingest_log.error("Failed to delete existing chunks, proceeding with insert anyway.", error=str(del_err))
+            index_log.error("Failed to delete existing Milvus chunks, proceeding with insert anyway.", error=str(del_err))
 
-    ingest_log.debug(f"Inserting {len(processed_chunks)} chunks into Milvus collection '{MILVUS_COLLECTION_NAME}'...")
+    index_log.debug(f"Inserting {len(milvus_pk_ids)} chunks into Milvus collection '{MILVUS_COLLECTION_NAME}'...")
+    inserted_milvus_count = 0
+    returned_milvus_pks: List[str] = []
+    
     try:
-        collection = _ensure_milvus_connection_and_collection()
-        mutation_result = collection.insert(data_to_insert)
-        inserted_count = mutation_result.insert_count
+        collection = _ensure_milvus_connection_and_collection_for_pipeline()
+        mutation_result = collection.insert(data_to_insert_milvus)
+        inserted_milvus_count = mutation_result.insert_count
 
-        if inserted_count != len(processed_chunks):
-             ingest_log.error("Milvus insert count mismatch!", expected=len(processed_chunks), inserted=inserted_count, errors=mutation_result.err_indices)
+        if inserted_milvus_count != len(milvus_pk_ids):
+             index_log.error("Milvus insert count mismatch!", expected=len(milvus_pk_ids), inserted=inserted_milvus_count, errors=mutation_result.err_indices)
         else:
-             ingest_log.info(f"Successfully inserted {inserted_count} chunks into Milvus.")
+             index_log.info(f"Successfully inserted {inserted_milvus_count} chunks into Milvus.")
 
-        returned_pks = mutation_result.primary_keys
-        if len(returned_pks) != inserted_count:
-             ingest_log.error("Milvus returned PK count mismatch!", returned_count=len(returned_pks), inserted_count=inserted_count)
-             successfully_inserted_chunks_data = []
+        returned_milvus_pks = [str(pk) for pk in mutation_result.primary_keys]
+        chunks_for_pg_prepared: List[Dict[str, Any]] = []
+
+        if len(returned_milvus_pks) != inserted_milvus_count:
+             index_log.error("Milvus returned PK count mismatch!", returned_count=len(returned_milvus_pks), inserted_count=inserted_milvus_count)
+             # Do not proceed with PG prep if PKs are unreliable
         else:
-             ingest_log.info("Milvus returned PKs match inserted count.")
-             successfully_inserted_chunks_data = []
-             for i in range(inserted_count):
-                 # Assuming returned_pks are in the same order as inserted data
-                 # Map back to original_chunk based on the Milvus PK we generated
-                 # Note: Milvus SDK >2.2.9 might return custom PKs directly.
-                 # Our generated PK was `milvus_pks[i]`
-                 chunk_milvus_pk = milvus_pks[i] # The PK we intended to insert
-                 original_chunk = next((c for c in processed_chunks if f"{c.document_id}_{c.chunk_index}" == chunk_milvus_pk), None)
-                 
-                 if original_chunk:
-                    # We assume the `returned_pks[i]` from Milvus *is* our `chunk_milvus_pk` if insertion was by our PK.
-                    # If Milvus auto-generates PKs (auto_id=True on PK field), then `returned_pks[i]` would be different.
-                    # Our schema has `is_primary=True` on `MILVUS_PK_FIELD` which is `pk_id` (VARCHAR).
-                    # Milvus `insert` expects the PKs to be provided in the data if `is_primary=True` and `auto_id=False` (default for VARCHAR PK).
-                    # So, `returned_pks[i]` should be equal to `milvus_pks[i]`.
-                    original_chunk.embedding_id = str(returned_pks[i]) # Store the PK confirmed by Milvus
-                    original_chunk.vector_status = ChunkVectorStatus.CREATED
-                    successfully_inserted_chunks_data.append(original_chunk)
-                 else:
-                     log.warning("Could not find original chunk data for returned PK", pk=returned_pks[i])
+            index_log.info("Milvus returned PKs match inserted count.")
+            for i in range(inserted_milvus_count):
+                chunks_for_milvus_pg[i].embedding_id = returned_milvus_pks[i]
+                chunks_for_milvus_pg[i].vector_status = ChunkVectorStatus.CREATED
+                chunks_for_pg_prepared.append(chunks_for_milvus_pg[i].model_dump(mode='json'))
 
-             if len(successfully_inserted_chunks_data) != inserted_count:
-                  log.warning("Mismatch between Milvus inserted count and successfully mapped chunks for PG.")
-
-        ingest_log.debug("Flushing Milvus collection...")
+        index_log.debug("Flushing Milvus collection...")
         collection.flush()
-        ingest_log.info("Milvus collection flushed.")
+        index_log.info("Milvus collection flushed.")
 
-        return inserted_count, [str(pk) for pk in returned_pks], successfully_inserted_chunks_data
+        return inserted_milvus_count, returned_milvus_pks, chunks_for_pg_prepared
 
     except MilvusException as e:
-        ingest_log.error("Failed to insert data into Milvus", error=str(e), exc_info=True)
+        index_log.error("Failed to insert data into Milvus", error=str(e), exc_info=True)
         raise RuntimeError(f"Milvus insertion failed: {e}") from e
     except Exception as e:
-        ingest_log.exception("Unexpected error during Milvus insertion")
+        index_log.exception("Unexpected error during Milvus insertion")
         raise RuntimeError(f"Unexpected Milvus insertion error: {e}") from e

@@ -1,8 +1,7 @@
 [tool.poetry]
 name = "query-service"
-# LLM_REFACTOR_FINAL: Set final version number
-version = "0.3.1" # Incrementado por refactor de embedding
-description = "Query service for SaaS B2B using Clean Architecture, PyMilvus, Haystack & Advanced RAG with remote embeddings"
+version = "0.3.2"
+description = "Query service for SaaS B2B using Clean Architecture, PyMilvus, Haystack & Advanced RAG with remote embeddings and reranking"
 authors = ["Nyro <dev@nyro.com>"]
 readme = "README.md"
 
@@ -13,35 +12,26 @@ uvicorn = {extras = ["standard"], version = "^0.28.0"}
 gunicorn = "^21.2.0"
 pydantic = {extras = ["email"], version = "^2.6.4"}
 pydantic-settings = "^2.2.1"
-httpx = "^0.27.0" # Ya estaba, ahora usado explícitamente por EmbeddingServiceClient
+httpx = "^0.27.0"
 asyncpg = "^0.29.0"
 python-jose = {extras = ["cryptography"], version = "^3.3.0"}
 tenacity = "^8.2.3"
 structlog = "^24.1.0"
 
 # --- Haystack Dependencies ---
-haystack-ai = "^2.0.1" # Core Haystack (Document, PromptBuilder)
-pymilvus = "^2.4.1"    # Milvus client
-
-# --- REMOVED: FastEmbed y fastembed-haystack ya no son dependencias directas ---
-# fastembed-haystack = { version = "1.3.0", python = ">=3.10,<3.13" }
-# fastembed = { version = "0.3.6", python = ">=3.10,<3.13" }
-
+# haystack-ai is kept for Document, PromptBuilder, etc.
+haystack-ai = "^2.0.1"
+pymilvus = "^2.4.1"
 
 # --- LLM Dependency ---
-google-generativeai = "^0.5.4" # Gemini client
+google-generativeai = "^0.5.4"
 
 # --- RAG Component Dependencies ---
-sentence-transformers = "^2.7.0" # For BGE Reranker adapter
+# sentence-transformers is REMOVED as reranking is now external
 bm2s = "0.1.3"
-numpy = "1.26.4" # Probablemente aún necesitado por sentence-transformers o bm2s
+numpy = "1.26.4" # Kept, as bm2s or other parts might need it. Haystack might also use it.
+# fastembed and fastembed-haystack are REMOVED as embedding is now external
 
-
-# Optional for performance
-# onnxruntime = { version = "^1.17.1", optional = true } # Si alguna otra dependencia lo necesita explícitamente
-
-[tool.poetry.extras]
-# onnx = ["onnxruntime"] # Si onnxruntime se mantiene opcional
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"

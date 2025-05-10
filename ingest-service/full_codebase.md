@@ -26,17 +26,10 @@ app/
 │   ├── __init__.py
 │   ├── base_client.py
 │   ├── clients
+│   │   ├── docproc_service_client.py
 │   │   └── embedding_service_client.py
-│   ├── extractors
-│   │   ├── __init__.py
-│   │   ├── docx_extractor.py
-│   │   ├── html_extractor.py
-│   │   ├── md_extractor.py
-│   │   ├── pdf_extractor.py
-│   │   └── txt_extractor.py
 │   ├── gcs_client.py
-│   ├── ingest_pipeline.py
-│   └── text_splitter.py
+│   └── ingest_pipeline.py
 └── tasks
     ├── __init__.py
     ├── celery_app.py
@@ -1180,22 +1173,22 @@ import json
 POSTGRES_K8S_SVC = "postgresql-service.nyro-develop.svc.cluster.local"
 MILVUS_K8S_SVC = "milvus-standalone.nyro-develop.svc.cluster.local"
 REDIS_K8S_SVC = "redis-service-master.nyro-develop.svc.cluster.local"
-EMBEDDING_SERVICE_K8S_SVC = "embedding-service.nyro-develop.svc.cluster.local" # Nuevo
+EMBEDDING_SERVICE_K8S_SVC = "embedding-service.nyro-develop.svc.cluster.local"
+DOCPROC_SERVICE_K8S_SVC = "docproc-service.nyro-develop.svc.cluster.local"
 
 # --- Defaults ---
 POSTGRES_K8S_PORT_DEFAULT = 5432
 POSTGRES_K8S_DB_DEFAULT = "atenex"
 POSTGRES_K8S_USER_DEFAULT = "postgres"
 MILVUS_K8S_PORT_DEFAULT = 19530
-MILVUS_DEFAULT_COLLECTION = "document_chunks_minilm" # Coincide con all-MiniLM-L6-v2
+MILVUS_DEFAULT_COLLECTION = "document_chunks_minilm"
 MILVUS_DEFAULT_INDEX_PARAMS = '{"metric_type": "IP", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}}'
 MILVUS_DEFAULT_SEARCH_PARAMS = '{"metric_type": "IP", "params": {"ef": 128}}'
-# DEFAULT_EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2" # Eliminado
-DEFAULT_EMBEDDING_DIM = 384 # Mantenido para esquema Milvus
+DEFAULT_EMBEDDING_DIM = 384
 DEFAULT_TIKTOKEN_ENCODING = "cl100k_base"
 
-# Default Embedding Service URL
 DEFAULT_EMBEDDING_SERVICE_URL = f"http://{EMBEDDING_SERVICE_K8S_SVC}:8003/api/v1/embed"
+DEFAULT_DOCPROC_SERVICE_URL = f"http://{DOCPROC_SERVICE_K8S_SVC}:8005/api/v1/process"
 
 
 class Settings(BaseSettings):
@@ -1204,23 +1197,19 @@ class Settings(BaseSettings):
         case_sensitive=False, extra='ignore'
     )
 
-    # --- General ---
     PROJECT_NAME: str = "Atenex Ingest Service"
     API_V1_STR: str = "/api/v1/ingest"
     LOG_LEVEL: str = "INFO"
 
-    # --- Celery ---
     CELERY_BROKER_URL: RedisDsn = Field(default_factory=lambda: RedisDsn(f"redis://{REDIS_K8S_SVC}:6379/0"))
     CELERY_RESULT_BACKEND: RedisDsn = Field(default_factory=lambda: RedisDsn(f"redis://{REDIS_K8S_SVC}:6379/1"))
 
-    # --- Database ---
     POSTGRES_USER: str = POSTGRES_K8S_USER_DEFAULT
     POSTGRES_PASSWORD: SecretStr
     POSTGRES_SERVER: str = POSTGRES_K8S_SVC
     POSTGRES_PORT: int = POSTGRES_K8S_PORT_DEFAULT
     POSTGRES_DB: str = POSTGRES_K8S_DB_DEFAULT
 
-    # --- Milvus ---
     MILVUS_URI: str = Field(default=f"http://{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}")
     MILVUS_COLLECTION_NAME: str = MILVUS_DEFAULT_COLLECTION
     MILVUS_GRPC_TIMEOUT: int = 10
@@ -1230,36 +1219,27 @@ class Settings(BaseSettings):
     MILVUS_INDEX_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_INDEX_PARAMS))
     MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default_factory=lambda: json.loads(MILVUS_DEFAULT_SEARCH_PARAMS))
 
-    # --- Google Cloud Storage (GCS) ---
     GCS_BUCKET_NAME: str = Field(default="atenex", description="Name of the Google Cloud Storage bucket for storing original files.")
 
-    # --- Embeddings (ACTUALIZADO) ---
-    # EMBEDDING_MODEL_ID: str = Field(default=DEFAULT_EMBEDDING_MODEL_ID) # Eliminado
     EMBEDDING_DIMENSION: int = Field(default=DEFAULT_EMBEDDING_DIM, description="Dimension of embeddings expected from the embedding service, used for Milvus schema.")
     INGEST_EMBEDDING_SERVICE_URL: AnyHttpUrl = Field(default=DEFAULT_EMBEDDING_SERVICE_URL, description="URL of the external embedding service.")
+    INGEST_DOCPROC_SERVICE_URL: AnyHttpUrl = Field(default=DEFAULT_DOCPROC_SERVICE_URL, description="URL of the external document processing service.")
 
-
-    # --- Tokenizer ---
     TIKTOKEN_ENCODING_NAME: str = Field(default=DEFAULT_TIKTOKEN_ENCODING, description="Name of the tiktoken encoding to use for token counting.")
 
-    # --- Clients ---
     HTTP_CLIENT_TIMEOUT: int = 60
-    HTTP_CLIENT_MAX_RETRIES: int = 3 # Aumentado para mayor resiliencia con el nuevo servicio
+    HTTP_CLIENT_MAX_RETRIES: int = 3
     HTTP_CLIENT_BACKOFF_FACTOR: float = 1.0
 
-    # --- Processing ---
     SUPPORTED_CONTENT_TYPES: List[str] = Field(default=[
         "application/pdf",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document", # DOCX
-        "application/msword", # DOC
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/msword",
         "text/plain",
         "text/markdown",
         "text/html"
     ])
-    SPLITTER_CHUNK_SIZE: int = Field(default=1000)
-    SPLITTER_CHUNK_OVERLAP: int = Field(default=200)
 
-    # --- Validators ---
     @field_validator("LOG_LEVEL")
     @classmethod
     def check_log_level(cls, v: str) -> str:
@@ -1272,8 +1252,6 @@ class Settings(BaseSettings):
     @classmethod
     def check_embedding_dimension(cls, v: int, info: ValidationInfo) -> int:
         if v <= 0: raise ValueError("EMBEDDING_DIMENSION must be a positive integer.")
-        # No se valida contra model_id localmente ya que el modelo es externo.
-        # Solo se asegura que sea positivo.
         logging.debug(f"Using EMBEDDING_DIMENSION for Milvus schema: {v}")
         return v
 
@@ -1289,20 +1267,30 @@ class Settings(BaseSettings):
     @classmethod
     def validate_milvus_uri(cls, v: str) -> str:
         if not v.startswith("http://") and not v.startswith("https://"):
-             if "." not in v: # Assume k8s service name
+             if "." not in v: # Assume it's a K8s service name without scheme
                  return f"http://{v}"
+             # If it has a dot but no scheme, it's likely an invalid format
              raise ValueError(f"Invalid MILVUS_URI format: '{v}'. Must start with 'http://' or 'https://' or be a valid service name.")
         return v
 
-    @field_validator('INGEST_EMBEDDING_SERVICE_URL', mode='before')
+    @field_validator('INGEST_EMBEDDING_SERVICE_URL', 'INGEST_DOCPROC_SERVICE_URL', mode='before')
     @classmethod
-    def assemble_embedding_service_url(cls, v: Optional[str]) -> str:
-        if v:
-            return str(AnyHttpUrl(v)) # Validar y castear
-        return str(AnyHttpUrl(DEFAULT_EMBEDDING_SERVICE_URL))
+    def assemble_service_url(cls, v: Optional[str], info: ValidationInfo) -> str:
+        default_map = {
+            "INGEST_EMBEDDING_SERVICE_URL": DEFAULT_EMBEDDING_SERVICE_URL,
+            "INGEST_DOCPROC_SERVICE_URL": DEFAULT_DOCPROC_SERVICE_URL
+        }
+        # Ensure info.field_name is not None before using it as a key
+        default_url_key = str(info.field_name) if info.field_name else ""
+        default_url = default_map.get(default_url_key, "")
+        
+        url_to_validate = v or default_url
+        if not url_to_validate: # Should not happen if defaults are correctly set
+            raise ValueError(f"URL for {default_url_key} cannot be empty.")
+            
+        return str(AnyHttpUrl(url_to_validate))
 
 
-# --- Instancia Global ---
 temp_log = logging.getLogger("ingest_service.config.loader")
 if not temp_log.handlers:
     handler = logging.StreamHandler(sys.stdout)
@@ -1323,18 +1311,15 @@ try:
     temp_log.info(f"  POSTGRES_SERVER:              {settings.POSTGRES_SERVER}:{settings.POSTGRES_PORT}")
     temp_log.info(f"  POSTGRES_DB:                  {settings.POSTGRES_DB}")
     temp_log.info(f"  POSTGRES_USER:                {settings.POSTGRES_USER}")
-    temp_log.info(f"  POSTGRES_PASSWORD:            {'*** SET ***' if settings.POSTGRES_PASSWORD else '!!! NOT SET !!!'}")
+    temp_log.info(f"  POSTGRES_PASSWORD:            {'*** SET ***' if settings.POSTGRES_PASSWORD and settings.POSTGRES_PASSWORD.get_secret_value() else '!!! NOT SET !!!'}")
     temp_log.info(f"  MILVUS_URI:                   {settings.MILVUS_URI}")
     temp_log.info(f"  MILVUS_COLLECTION_NAME:       {settings.MILVUS_COLLECTION_NAME}")
-    temp_log.info(f"  MILVUS_GRPC_TIMEOUT:          {settings.MILVUS_GRPC_TIMEOUT}s")
     temp_log.info(f"  GCS_BUCKET_NAME:              {settings.GCS_BUCKET_NAME}")
-    # temp_log.info(f"  EMBEDDING_MODEL_ID:           {settings.EMBEDDING_MODEL_ID}") # Eliminado
     temp_log.info(f"  EMBEDDING_DIMENSION (Milvus): {settings.EMBEDDING_DIMENSION}")
-    temp_log.info(f"  INGEST_EMBEDDING_SERVICE_URL: {settings.INGEST_EMBEDDING_SERVICE_URL}") # Nuevo
+    temp_log.info(f"  INGEST_EMBEDDING_SERVICE_URL: {settings.INGEST_EMBEDDING_SERVICE_URL}")
+    temp_log.info(f"  INGEST_DOCPROC_SERVICE_URL:   {settings.INGEST_DOCPROC_SERVICE_URL}")
     temp_log.info(f"  TIKTOKEN_ENCODING_NAME:       {settings.TIKTOKEN_ENCODING_NAME}")
     temp_log.info(f"  SUPPORTED_CONTENT_TYPES:      {settings.SUPPORTED_CONTENT_TYPES}")
-    temp_log.info(f"  SPLITTER_CHUNK_SIZE:          {settings.SPLITTER_CHUNK_SIZE}")
-    temp_log.info(f"  SPLITTER_CHUNK_OVERLAP:       {settings.SPLITTER_CHUNK_OVERLAP}")
     temp_log.info(f"------------------------------------")
 
 except (ValidationError, ValueError) as e:
@@ -1342,10 +1327,12 @@ except (ValidationError, ValueError) as e:
     if isinstance(e, ValidationError):
         try: error_details = f"\nValidation Errors:\n{e.json(indent=2)}"
         except Exception: error_details = f"\nRaw Errors: {e.errors()}"
+    else: # ValueError
+        error_details = f"\nError: {str(e)}"
     temp_log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     temp_log.critical(f"! FATAL: Ingest Service configuration validation failed:{error_details}")
     temp_log.critical(f"! Check environment variables (prefixed with INGEST_) or .env file.")
-    temp_log.critical(f"! Original Error: {e}")
+    temp_log.critical(f"! Original Error Type: {type(e).__name__}")
     temp_log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     sys.exit(1)
 except Exception as e:
@@ -2186,6 +2173,161 @@ class BaseServiceClient:
             raise
 ```
 
+## File: `app\services\clients\docproc_service_client.py`
+```py
+# ingest-service/app/services/clients/docproc_service_client.py
+from typing import List, Dict, Any, Tuple, Optional
+import httpx
+import structlog
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
+import logging
+
+from app.core.config import settings
+from app.services.base_client import BaseServiceClient
+
+log = structlog.get_logger(__name__)
+
+class DocProcServiceClientError(Exception):
+    """Custom exception for Document Processing Service client errors."""
+    def __init__(self, message: str, status_code: int = None, detail: Any = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.detail = detail
+
+class DocProcServiceClient(BaseServiceClient):
+    """
+    Client for interacting with the Atenex Document Processing Service.
+    """
+    def __init__(self, base_url: str = None):
+        effective_base_url = base_url or str(settings.INGEST_DOCPROC_SERVICE_URL).rstrip('/')
+        
+        parsed_url = httpx.URL(effective_base_url)
+        self.service_endpoint_path = parsed_url.path
+        client_base_url = f"{parsed_url.scheme}://{parsed_url.host}:{parsed_url.port}" if parsed_url.port else f"{parsed_url.scheme}://{parsed_url.host}"
+
+        super().__init__(base_url=client_base_url, service_name="DocProcService")
+        self.log = log.bind(service_client="DocProcServiceClient", service_url=effective_base_url)
+
+    @retry(
+        stop=stop_after_attempt(settings.HTTP_CLIENT_MAX_RETRIES),
+        wait=wait_exponential(multiplier=settings.HTTP_CLIENT_BACKOFF_FACTOR, min=1, max=10),
+        retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError)),
+        before_sleep=before_sleep_log(log, logging.WARNING)
+    )
+    async def process_document(
+        self,
+        file_bytes: bytes,
+        original_filename: str,
+        content_type: str,
+        document_id: Optional[str] = None,
+        company_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Sends a document file to the DocProc Service for text extraction and chunking.
+        """
+        if not file_bytes:
+            self.log.error("process_document called with empty file_bytes.")
+            raise DocProcServiceClientError("File content cannot be empty.")
+
+        files = {'file': (original_filename, file_bytes, content_type)}
+        data: Dict[str, Any] = {
+            'original_filename': original_filename,
+            'content_type': content_type
+        }
+        if document_id:
+            data['document_id'] = document_id
+        if company_id:
+            data['company_id'] = company_id
+        
+        self.log.debug(f"Requesting document processing from {self.service_endpoint_path}", 
+                       filename=original_filename, content_type=content_type, size_len=len(file_bytes))
+        
+        try:
+            response = await self._request(
+                method="POST",
+                endpoint=self.service_endpoint_path,
+                files=files,
+                data=data
+            )
+            response_data = response.json()
+            
+            if "data" not in response_data or \
+               "document_metadata" not in response_data["data"] or \
+               "chunks" not in response_data["data"]:
+                self.log.error("Invalid response format from DocProc Service", response_data_preview=str(response_data)[:200])
+                raise DocProcServiceClientError(
+                    message="Invalid response format from DocProc Service.",
+                    status_code=response.status_code,
+                    detail=response_data
+                )
+            
+            self.log.info("Successfully processed document via DocProc Service.", 
+                          filename=original_filename, 
+                          num_chunks=len(response_data["data"]["chunks"]))
+            return response_data
+
+        except httpx.HTTPStatusError as e:
+            self.log.error(
+                "HTTP error from DocProc Service",
+                status_code=e.response.status_code,
+                response_text=e.response.text,
+                filename=original_filename
+            )
+            error_detail = e.response.text
+            try:
+                error_detail_json = e.response.json()
+                if isinstance(error_detail_json, dict) and "detail" in error_detail_json:
+                    error_detail = error_detail_json["detail"]
+            except:
+                pass
+            
+            raise DocProcServiceClientError(
+                message=f"DocProc Service returned HTTP error: {e.response.status_code}",
+                status_code=e.response.status_code,
+                detail=error_detail
+            ) from e
+        except httpx.RequestError as e:
+            self.log.error("Request error calling DocProc Service", error_msg=str(e), filename=original_filename)
+            raise DocProcServiceClientError(
+                message=f"Request to DocProc Service failed: {type(e).__name__}",
+                detail=str(e)
+            ) from e
+        except Exception as e:
+            self.log.exception("Unexpected error in DocProcServiceClient", filename=original_filename)
+            raise DocProcServiceClientError(message=f"Unexpected error: {e}") from e
+
+    async def health_check(self) -> bool:
+        """
+        Checks the health of the Document Processing Service.
+        """
+        health_log = self.log.bind(action="docproc_health_check")
+        try:
+            parsed_service_url = httpx.URL(str(settings.INGEST_DOCPROC_SERVICE_URL))
+            health_endpoint_url_base = f"{parsed_service_url.scheme}://{parsed_service_url.host}"
+            if parsed_service_url.port:
+                health_endpoint_url_base += f":{parsed_service_url.port}"
+            
+            async with httpx.AsyncClient(base_url=health_endpoint_url_base, timeout=5) as client:
+                response = await client.get("/health")
+            response.raise_for_status()
+            health_data = response.json()
+            if health_data.get("status") == "ok":
+                health_log.info("DocProc Service is healthy.")
+                return True
+            else:
+                health_log.warning("DocProc Service reported unhealthy.", health_data=health_data)
+                return False
+        except httpx.HTTPStatusError as e:
+            health_log.error("DocProc Service health check failed (HTTP error)", status_code=e.response.status_code, response_text=e.response.text)
+            return False
+        except httpx.RequestError as e:
+            health_log.error("DocProc Service health check failed (Request error)", error_msg=str(e))
+            return False
+        except Exception as e:
+            health_log.exception("Unexpected error during DocProc Service health check")
+            return False
+```
+
 ## File: `app\services\clients\embedding_service_client.py`
 ```py
 # ingest-service/app/services/clients/embedding_service_client.py
@@ -2338,156 +2480,6 @@ class EmbeddingServiceClient(BaseServiceClient):
         except Exception as e:
             health_log.exception("Unexpected error during Embedding Service health check")
             return False
-```
-
-## File: `app\services\extractors\__init__.py`
-```py
-
-```
-
-## File: `app\services\extractors\docx_extractor.py`
-```py
-import io
-import docx  # python-docx
-import structlog
-
-log = structlog.get_logger(__name__)
-
-class DocxExtractionError(Exception):
-    pass
-
-def extract_text_from_docx(file_bytes: bytes, filename: str = "unknown.docx") -> str:
-    """Extrae texto de los bytes de un DOCX preservando saltos de párrafo."""
-    log.debug("Extracting text from DOCX bytes", filename=filename)
-    try:
-        doc = docx.Document(io.BytesIO(file_bytes))
-        text = "\n".join([p.text for p in doc.paragraphs])
-        log.info("DOCX extraction successful", filename=filename, num_paragraphs=len(doc.paragraphs))
-        return text
-    except Exception as e:
-        log.error("DOCX extraction failed", filename=filename, error=str(e))
-        raise DocxExtractionError(f"Error extracting DOCX: {filename}") from e
-
-```
-
-## File: `app\services\extractors\html_extractor.py`
-```py
-from bs4 import BeautifulSoup
-import structlog
-
-log = structlog.get_logger(__name__)
-
-class HtmlExtractionError(Exception):
-    pass
-
-def extract_text_from_html(file_bytes: bytes, filename: str = "unknown.html", encoding: str = "utf-8") -> str:
-    """Extrae texto de los bytes de un archivo HTML."""
-    log.debug("Extracting text from HTML bytes", filename=filename)
-    try:
-        html = file_bytes.decode(encoding)
-        soup = BeautifulSoup(html, "html.parser")
-        text = soup.get_text(separator="\n")
-        log.info("HTML extraction successful", filename=filename, length=len(text))
-        return text
-    except Exception as e:
-        log.error("HTML extraction failed", filename=filename, error=str(e))
-        raise HtmlExtractionError(f"Error extracting HTML: {filename}") from e
-
-```
-
-## File: `app\services\extractors\md_extractor.py`
-```py
-import markdown
-import html2text
-import structlog
-
-log = structlog.get_logger(__name__)
-
-class MdExtractionError(Exception):
-    pass
-
-def extract_text_from_md(file_bytes: bytes, filename: str = "unknown.md", encoding: str = "utf-8") -> str:
-    """Extrae texto de los bytes de un archivo Markdown."""
-    log.debug("Extracting text from MD bytes", filename=filename)
-    try:
-        md_text = file_bytes.decode(encoding)
-        html = markdown.markdown(md_text)
-        text = html2text.html2text(html)
-        log.info("MD extraction successful", filename=filename, length=len(text))
-        return text
-    except Exception as e:
-        log.error("MD extraction failed", filename=filename, error=str(e))
-        raise MdExtractionError(f"Error extracting MD: {filename}") from e
-
-```
-
-## File: `app\services\extractors\pdf_extractor.py`
-```py
-# ingest-service/app/services/extractors/pdf_extractor.py
-import fitz  # PyMuPDF
-import structlog
-from typing import List, Tuple, Union # Added Tuple and Union
-
-log = structlog.get_logger(__name__)
-
-class PdfExtractionError(Exception):
-    pass
-
-def extract_text_from_pdf(file_bytes: bytes, filename: str = "unknown.pdf") -> List[Tuple[int, str]]:
-    """
-    Extrae texto plano de los bytes de un PDF usando PyMuPDF,
-    devolviendo una lista de tuplas (page_number, page_text).
-    """
-    log.debug("Extracting text and pages from PDF bytes", filename=filename)
-    pages_content: List[Tuple[int, str]] = []
-    try:
-        with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-            log.info("Processing PDF document", filename=filename, num_pages=len(doc))
-            for page_num_zero_based, page in enumerate(doc):
-                page_num_one_based = page_num_zero_based + 1
-                try:
-                    page_text = page.get_text("text")
-                    if page_text and not page_text.isspace():
-                         pages_content.append((page_num_one_based, page_text))
-                         log.debug("Extracted text from page", page=page_num_one_based, length=len(page_text))
-                    else:
-                         log.debug("Skipping empty or whitespace-only page", page=page_num_one_based)
-
-                except Exception as page_err:
-                    log.warning("Error extracting text from PDF page", filename=filename, page=page_num_one_based, error=str(page_err))
-            log.info("PDF extraction successful", filename=filename, num_pages_processed=len(pages_content))
-            return pages_content
-    except Exception as e:
-        log.error("PDF extraction failed", filename=filename, error=str(e))
-        raise PdfExtractionError(f"Error extracting PDF: {filename}") from e
-
-# Keep original function signature for compatibility if needed elsewhere,
-# but adapt its use or mark as deprecated if only page-aware version is used now.
-# def extract_text_from_pdf_combined(file_bytes: bytes, filename: str = "unknown.pdf") -> str:
-#     pages_data = extract_text_from_pdf(file_bytes, filename)
-#     return "\n".join([text for _, text in pages_data])
-```
-
-## File: `app\services\extractors\txt_extractor.py`
-```py
-import structlog
-
-log = structlog.get_logger(__name__)
-
-class TxtExtractionError(Exception):
-    pass
-
-def extract_text_from_txt(file_bytes: bytes, filename: str = "unknown.txt", encoding: str = "utf-8") -> str:
-    """Extrae texto de los bytes de un archivo TXT."""
-    log.debug("Extracting text from TXT bytes", filename=filename)
-    try:
-        text = file_bytes.decode(encoding)
-        log.info("TXT extraction successful", filename=filename, length=len(text))
-        return text
-    except Exception as e:
-        log.error("TXT extraction failed", filename=filename, error=str(e))
-        raise TxtExtractionError(f"Error extracting TXT: {filename}") from e
-
 ```
 
 ## File: `app\services\gcs_client.py`
@@ -2646,11 +2638,9 @@ import hashlib
 import structlog
 from typing import List, Dict, Any, Optional, Tuple, Union
 
-# --- EARLY IMPORTS ---
-from app.core.config import settings # IMPORT SETTINGS FIRST
-log = structlog.get_logger(__name__) # GET LOGGER AFTER STRUCTLOG IMPORT
+from app.core.config import settings
+log = structlog.get_logger(__name__)
 
-# Tokenizer for metadata (Try importing AFTER settings and log are available)
 try:
     import tiktoken
     tiktoken_enc = tiktoken.get_encoding(settings.TIKTOKEN_ENCODING_NAME)
@@ -2662,41 +2652,16 @@ except Exception as e:
     log.warning(f"Failed to load tiktoken encoder '{settings.TIKTOKEN_ENCODING_NAME}', token count metadata will be unavailable.", error=str(e))
     tiktoken_enc = None
 
-# Direct library imports
 from pymilvus import (
     Collection, CollectionSchema, FieldSchema, DataType, connections,
     utility, MilvusException
 )
 
-# Local application imports
-from .extractors.pdf_extractor import extract_text_from_pdf, PdfExtractionError
-from .extractors.docx_extractor import extract_text_from_docx, DocxExtractionError
-from .extractors.txt_extractor import extract_text_from_txt, TxtExtractionError
-from .extractors.md_extractor import extract_text_from_md, MdExtractionError
-from .extractors.html_extractor import extract_text_from_html, HtmlExtractionError
-from .text_splitter import split_text
-# from .embedder import embed_chunks # Eliminado
-from app.services.clients.embedding_service_client import EmbeddingServiceClient, EmbeddingServiceClientError # Nuevo
 from app.models.domain import DocumentChunkMetadata, DocumentChunkData, ChunkVectorStatus
 
-
-# --- Mapeo de Content-Type a Funciones Extractoras ---
-EXTRACTORS = {
-    "application/pdf": extract_text_from_pdf,
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": extract_text_from_docx,
-    "application/msword": extract_text_from_docx,
-    "text/plain": extract_text_from_txt,
-    "text/markdown": extract_text_from_md,
-    "text/html": extract_text_from_html,
-}
-EXTRACTION_ERRORS = (
-    PdfExtractionError, DocxExtractionError, TxtExtractionError,
-    MdExtractionError, HtmlExtractionError, ValueError
-)
-
-# --- Constantes Milvus (Incluye nuevos campos) ---
+# --- Constantes Milvus ---
 MILVUS_COLLECTION_NAME = settings.MILVUS_COLLECTION_NAME
-MILVUS_EMBEDDING_DIM = settings.EMBEDDING_DIMENSION # Esta dimensión DEBE coincidir con la del embedding_service
+MILVUS_EMBEDDING_DIM = settings.EMBEDDING_DIMENSION
 MILVUS_PK_FIELD = "pk_id"
 MILVUS_VECTOR_FIELD = settings.MILVUS_EMBEDDING_FIELD
 MILVUS_CONTENT_FIELD = settings.MILVUS_CONTENT_FIELD
@@ -2708,74 +2673,75 @@ MILVUS_TITLE_FIELD = "title"
 MILVUS_TOKENS_FIELD = "tokens"
 MILVUS_CONTENT_HASH_FIELD = "content_hash"
 
-_milvus_collection: Optional[Collection] = None
-_milvus_connected = False
+_milvus_collection_pipeline: Optional[Collection] = None
 
-def _ensure_milvus_connection_and_collection() -> Collection:
-    global _milvus_collection, _milvus_connected
-    alias = "pipeline_worker"
-    connect_log = log.bind(milvus_alias=alias)
+def _ensure_milvus_connection_and_collection_for_pipeline(alias: str = "pipeline_worker_indexing") -> Collection:
+    global _milvus_collection_pipeline
+    connect_log = log.bind(milvus_alias=alias, component="MilvusPipelineOps")
 
     connection_exists = alias in connections.list_connections()
-    is_connected = False
+    
+    # Re-evaluate connection and collection state more robustly
     if connection_exists:
         try:
-             if utility.has_collection(MILVUS_COLLECTION_NAME, using=alias):
-                 is_connected = True
-             else:
-                 is_connected = False
-                 connect_log.warning("Connection alias exists but collection check failed, may reconnect.")
+            # Test existing connection
+            utility.get_connection_addr(alias) # This can raise if connection is stale
+            connect_log.debug("Milvus connection alias exists and seems active.", alias=alias)
+            if _milvus_collection_pipeline and _milvus_collection_pipeline.name == MILVUS_COLLECTION_NAME:
+                 # Basic check, might not guarantee collection is loaded in this specific alias
+                pass # Use existing _milvus_collection_pipeline if set
+            else: # Collection not set or different, reset flag to force re-initialization
+                connection_exists = False # Force re-init logic for collection
         except Exception as conn_check_err:
             connect_log.warning("Error checking existing Milvus connection status, will attempt reconnect.", error=str(conn_check_err))
-            is_connected = False
             try: connections.disconnect(alias)
             except: pass
+            connection_exists = False # Force re-init
 
-    if not is_connected:
+    if not connection_exists:
         uri = settings.MILVUS_URI
-        connect_log.info("Connecting to Milvus for pipeline worker...", uri=uri, timeout=settings.MILVUS_GRPC_TIMEOUT)
+        connect_log.info("Connecting to Milvus for pipeline worker indexing...", uri=uri)
         try:
             connections.connect(alias=alias, uri=uri, timeout=settings.MILVUS_GRPC_TIMEOUT)
-            _milvus_connected = True
-            connect_log.info("Connected to Milvus for pipeline worker.")
+            connect_log.info("Connected to Milvus for pipeline worker indexing.")
         except MilvusException as e:
-            connect_log.error("Failed to connect to Milvus for pipeline worker.", error=str(e))
-            _milvus_connected = False
+            connect_log.error("Failed to connect to Milvus for pipeline worker indexing.", error=str(e))
             raise ConnectionError(f"Milvus connection failed: {e}") from e
         except Exception as e:
-            connect_log.error("Unexpected error connecting to Milvus for pipeline worker.", error=str(e))
-            _milvus_connected = False
+            connect_log.error("Unexpected error connecting to Milvus for pipeline worker indexing.", error=str(e))
             raise ConnectionError(f"Unexpected Milvus connection error: {e}") from e
 
-    if _milvus_collection is None:
+    # Check and initialize collection if needed
+    if _milvus_collection_pipeline is None or _milvus_collection_pipeline.name != MILVUS_COLLECTION_NAME:
         try:
             if not utility.has_collection(MILVUS_COLLECTION_NAME, using=alias):
                 connect_log.warning(f"Milvus collection '{MILVUS_COLLECTION_NAME}' not found. Attempting to create.")
-                collection = _create_milvus_collection(alias)
+                collection_obj = _create_milvus_collection_for_pipeline(alias)
             else:
-                collection = Collection(name=MILVUS_COLLECTION_NAME, using=alias)
+                collection_obj = Collection(name=MILVUS_COLLECTION_NAME, using=alias)
                 connect_log.debug(f"Using existing Milvus collection '{MILVUS_COLLECTION_NAME}'.")
-                _check_and_create_indexes(collection)
+                _check_and_create_indexes_for_pipeline(collection_obj)
 
-            connect_log.info("Loading Milvus collection into memory...", collection_name=collection.name)
-            collection.load()
-            connect_log.info("Milvus collection loaded into memory.")
-            _milvus_collection = collection
+            connect_log.info("Loading Milvus collection into memory for indexing...", collection_name=collection_obj.name)
+            collection_obj.load()
+            connect_log.info("Milvus collection loaded into memory for indexing.")
+            _milvus_collection_pipeline = collection_obj
         except MilvusException as coll_err:
-             connect_log.error("Failed during Milvus collection access/load", error=str(coll_err), exc_info=True)
-             raise RuntimeError(f"Milvus collection access error: {coll_err}") from coll_err
+             connect_log.error("Failed during Milvus collection access/load for indexing", error=str(coll_err), exc_info=True)
+             raise RuntimeError(f"Milvus collection access error for indexing: {coll_err}") from coll_err
         except Exception as e:
-             connect_log.error("Unexpected error during Milvus collection access", error=str(e), exc_info=True)
-             raise RuntimeError(f"Unexpected Milvus collection error: {e}") from e
+             connect_log.error("Unexpected error during Milvus collection access for indexing", error=str(e), exc_info=True)
+             raise RuntimeError(f"Unexpected Milvus collection error for indexing: {e}") from e
+    
+    if not isinstance(_milvus_collection_pipeline, Collection):
+        connect_log.critical("Milvus collection object is unexpectedly None or invalid type after initialization for indexing.")
+        raise RuntimeError("Failed to obtain a valid Milvus collection object for indexing.")
+    return _milvus_collection_pipeline
 
-    if not isinstance(_milvus_collection, Collection):
-        connect_log.critical("Milvus collection object is unexpectedly None or invalid type after initialization attempt.")
-        raise RuntimeError("Failed to obtain a valid Milvus collection object.")
-    return _milvus_collection
 
-def _create_milvus_collection(alias: str) -> Collection:
-    create_log = log.bind(collection_name=MILVUS_COLLECTION_NAME, embedding_dim=MILVUS_EMBEDDING_DIM)
-    create_log.info("Defining schema for new Milvus collection.")
+def _create_milvus_collection_for_pipeline(alias: str) -> Collection:
+    create_log = log.bind(collection_name=MILVUS_COLLECTION_NAME, embedding_dim=MILVUS_EMBEDDING_DIM, component="MilvusPipelineOps")
+    create_log.info("Defining schema for new Milvus collection (pipeline).")
     fields = [
         FieldSchema(name=MILVUS_PK_FIELD, dtype=DataType.VARCHAR, max_length=255, is_primary=True),
         FieldSchema(name=MILVUS_VECTOR_FIELD, dtype=DataType.FLOAT_VECTOR, dim=MILVUS_EMBEDDING_DIM),
@@ -2791,192 +2757,184 @@ def _create_milvus_collection(alias: str) -> Collection:
     schema = CollectionSchema(
         fields, description="Atenex Document Chunks with Enhanced Metadata", enable_dynamic_field=False
     )
-    create_log.info("Schema defined. Creating collection...")
+    create_log.info("Schema defined. Creating collection (pipeline)...")
     try:
         collection = Collection(
             name=MILVUS_COLLECTION_NAME, schema=schema, using=alias, consistency_level="Strong"
         )
-        create_log.info(f"Collection '{MILVUS_COLLECTION_NAME}' created. Creating indexes...")
+        create_log.info(f"Collection '{MILVUS_COLLECTION_NAME}' created (pipeline). Creating indexes...")
         index_params = settings.MILVUS_INDEX_PARAMS
-        create_log.info("Creating HNSW index for vector field", field_name=MILVUS_VECTOR_FIELD, index_params=index_params)
+        create_log.info("Creating HNSW index for vector field (pipeline)", field_name=MILVUS_VECTOR_FIELD, index_params=index_params)
         collection.create_index(field_name=MILVUS_VECTOR_FIELD, index_params=index_params, index_name=f"{MILVUS_VECTOR_FIELD}_hnsw_idx")
-        create_log.info("Creating scalar index for company_id field...")
-        collection.create_index(field_name=MILVUS_COMPANY_ID_FIELD, index_name=f"{MILVUS_COMPANY_ID_FIELD}_idx")
-        create_log.info("Creating scalar index for document_id field...")
-        collection.create_index(field_name=MILVUS_DOCUMENT_ID_FIELD, index_name=f"{MILVUS_DOCUMENT_ID_FIELD}_idx")
-        create_log.info("Creating scalar index for content_hash field...")
-        collection.create_index(field_name=MILVUS_CONTENT_HASH_FIELD, index_name=f"{MILVUS_CONTENT_HASH_FIELD}_idx")
-        create_log.info("All required indexes created successfully.")
+        
+        scalar_fields_to_index = [
+            MILVUS_COMPANY_ID_FIELD, MILVUS_DOCUMENT_ID_FIELD, MILVUS_CONTENT_HASH_FIELD
+        ]
+        for field_name in scalar_fields_to_index:
+            create_log.info(f"Creating scalar index for {field_name} field (pipeline)...")
+            collection.create_index(field_name=field_name, index_name=f"{field_name}_idx")
+
+        create_log.info("All required indexes created successfully (pipeline).")
         return collection
     except MilvusException as e:
-        create_log.error("Failed to create Milvus collection or index", error=str(e), exc_info=True)
-        raise RuntimeError(f"Milvus collection/index creation failed: {e}") from e
+        create_log.error("Failed to create Milvus collection or index (pipeline)", error=str(e), exc_info=True)
+        raise RuntimeError(f"Milvus collection/index creation failed (pipeline): {e}") from e
 
-def _check_and_create_indexes(collection: Collection):
-    check_log = log.bind(collection_name=collection.name)
+
+def _check_and_create_indexes_for_pipeline(collection: Collection):
+    check_log = log.bind(collection_name=collection.name, component="MilvusPipelineOps")
     try:
         existing_indexes = collection.indexes
         existing_index_fields = {idx.field_name for idx in existing_indexes}
-        required_indexes = {
+        required_indexes_map = {
             MILVUS_VECTOR_FIELD: (settings.MILVUS_INDEX_PARAMS, f"{MILVUS_VECTOR_FIELD}_hnsw_idx"),
             MILVUS_COMPANY_ID_FIELD: (None, f"{MILVUS_COMPANY_ID_FIELD}_idx"),
             MILVUS_DOCUMENT_ID_FIELD: (None, f"{MILVUS_DOCUMENT_ID_FIELD}_idx"),
             MILVUS_CONTENT_HASH_FIELD: (None, f"{MILVUS_CONTENT_HASH_FIELD}_idx"),
         }
-        for field_name, (index_params, index_name) in required_indexes.items():
+        for field_name, (index_params, index_name) in required_indexes_map.items():
             if field_name not in existing_index_fields:
-                check_log.warning(f"Index missing for field '{field_name}'. Creating '{index_name}'...")
+                check_log.warning(f"Index missing for field '{field_name}' (pipeline). Creating '{index_name}'...")
                 collection.create_index(field_name=field_name, index_params=index_params, index_name=index_name)
-                check_log.info(f"Index '{index_name}' created for field '{field_name}'.")
+                check_log.info(f"Index '{index_name}' created for field '{field_name}' (pipeline).")
             else:
-                check_log.debug(f"Index already exists for field '{field_name}'.")
+                check_log.debug(f"Index already exists for field '{field_name}' (pipeline).")
     except MilvusException as e:
-        check_log.error("Failed during index check/creation on existing collection", error=str(e))
+        check_log.error("Failed during index check/creation on existing collection (pipeline)", error=str(e))
+        # Do not re-raise, allow processing to continue if some indexes exist.
+
 
 def delete_milvus_chunks(company_id: str, document_id: str) -> int:
-    del_log = log.bind(company_id=company_id, document_id=document_id)
+    del_log = log.bind(company_id=company_id, document_id=document_id, component="MilvusPipelineOps")
     expr = f'{MILVUS_COMPANY_ID_FIELD} == "{company_id}" and {MILVUS_DOCUMENT_ID_FIELD} == "{document_id}"'
     pks_to_delete: List[str] = []
     deleted_count = 0
     try:
-        collection = _ensure_milvus_connection_and_collection()
-        del_log.info("Querying Milvus for PKs to delete...", filter_expr=expr)
+        collection = _ensure_milvus_connection_and_collection_for_pipeline()
+        del_log.info("Querying Milvus for PKs to delete (pipeline)...", filter_expr=expr)
         query_res = collection.query(expr=expr, output_fields=[MILVUS_PK_FIELD])
         pks_to_delete = [item[MILVUS_PK_FIELD] for item in query_res if MILVUS_PK_FIELD in item]
         if not pks_to_delete:
-            del_log.info("No matching primary keys found in Milvus for deletion.")
+            del_log.info("No matching primary keys found in Milvus for deletion (pipeline).")
             return 0
-        del_log.info(f"Found {len(pks_to_delete)} primary keys to delete.")
-        delete_expr = f'{MILVUS_PK_FIELD} in {pks_to_delete}'
-        del_log.info("Attempting to delete chunks from Milvus using PK list expression.", filter_expr=delete_expr)
+        
+        del_log.info(f"Found {len(pks_to_delete)} primary keys to delete (pipeline).")
+        delete_expr = f'{MILVUS_PK_FIELD} in {json.dumps(pks_to_delete)}'
+        del_log.info("Attempting to delete chunks from Milvus using PK list expression (pipeline).", filter_expr=delete_expr)
         delete_result = collection.delete(expr=delete_expr)
         deleted_count = delete_result.delete_count
-        del_log.info("Milvus delete operation by PK list executed.", deleted_count=deleted_count)
+        del_log.info("Milvus delete operation by PK list executed (pipeline).", deleted_count=deleted_count)
+        
         if deleted_count != len(pks_to_delete):
-             del_log.warning("Milvus delete count mismatch.", expected=len(pks_to_delete), reported=deleted_count)
+             del_log.warning("Milvus delete count mismatch (pipeline).", expected=len(pks_to_delete), reported=deleted_count)
         return deleted_count
     except MilvusException as e:
-        del_log.error("Milvus delete error (query or delete phase)", error=str(e), exc_info=True)
+        del_log.error("Milvus delete error (query or delete phase) (pipeline)", error=str(e), exc_info=True)
         return 0
     except Exception as e:
-        del_log.exception("Unexpected error during Milvus chunk deletion")
+        del_log.exception("Unexpected error during Milvus chunk deletion (pipeline)")
         return 0
 
-async def ingest_document_pipeline( # Marcado como async para usar el cliente async
-    file_bytes: bytes,
+
+def index_chunks_in_milvus_and_prepare_for_pg(
+    processed_chunks_from_docproc: List[Dict[str, Any]],
+    embeddings: List[List[float]],
     filename: str,
-    company_id: str,
-    document_id: str,
-    content_type: str,
-    # embedding_model: SentenceTransformer, # Eliminado
-    embedding_service_client: EmbeddingServiceClient, # Nuevo
-    delete_existing: bool = True
-) -> Tuple[int, List[str], List[DocumentChunkData]]:
-    ingest_log = log.bind(
-        company_id=company_id, document_id=document_id, filename=filename, content_type=content_type
+    company_id_str: str,
+    document_id_str: str,
+    delete_existing_milvus_chunks: bool = True
+) -> Tuple[int, List[str], List[Dict[str, Any]]]:
+    """
+    Takes chunks from docproc-service and embeddings, indexes them in Milvus,
+    and prepares data for PostgreSQL insertion.
+    """
+    index_log = log.bind(
+        company_id=company_id_str, document_id=document_id_str, filename=filename,
+        num_input_chunks=len(processed_chunks_from_docproc), num_embeddings=len(embeddings),
+        component="MilvusPGPipeline"
     )
-    ingest_log.info("Starting ingestion pipeline (using Embedding Service)")
+    index_log.info("Starting Milvus indexing and PG data preparation")
 
-    extractor = EXTRACTORS.get(content_type)
-    if not extractor:
-        ingest_log.error("Unsupported content type for extraction.")
-        raise ValueError(f"Unsupported content type: {content_type}")
+    if len(processed_chunks_from_docproc) != len(embeddings):
+        index_log.error("Mismatch between number of processed chunks and embeddings.",
+                        chunks_count=len(processed_chunks_from_docproc), embeddings_count=len(embeddings))
+        raise ValueError("Number of chunks and embeddings must match.")
 
-    ingest_log.debug("Extracting text content...")
-    extracted_content: Union[str, List[Tuple[int, str]]]
-    try:
-        extracted_content = extractor(file_bytes, filename=filename)
-        if not extracted_content:
-            ingest_log.warning("No text content extracted from the document. Skipping.")
-            return 0, [], []
-        if isinstance(extracted_content, str):
-            ingest_log.info(f"Text extracted successfully (no pages), length: {len(extracted_content)} chars.")
-        else:
-            ingest_log.info(f"Text extracted successfully from {len(extracted_content)} pages.")
-    except EXTRACTION_ERRORS as ve:
-        ingest_log.error("Text extraction failed.", error=str(ve), exc_info=True)
-        raise ValueError(f"Extraction failed for {filename}: {ve}") from ve
-    except Exception as e:
-        ingest_log.exception("Unexpected error during text extraction")
-        raise RuntimeError(f"Unexpected extraction error: {e}") from e
-
-    ingest_log.debug("Chunking text and generating metadata...")
-    processed_chunks: List[DocumentChunkData] = []
-    chunk_index_counter = 0
-
-    def _process_text_block(text_block: str, page_num: Optional[int]):
-        nonlocal chunk_index_counter
-        try:
-            text_chunks = split_text(text_block)
-            for chunk_text in text_chunks:
-                if not chunk_text or chunk_text.isspace(): continue
-                tokens = len(tiktoken_enc.encode(chunk_text)) if tiktoken_enc else -1
-                content_hash = hashlib.sha256(chunk_text.encode('utf-8', errors='ignore')).hexdigest()
-                title = f"{filename[:30]}... (Page {page_num or 'N/A'}, Chunk {chunk_index_counter+1})"
-                metadata_obj = DocumentChunkMetadata(
-                    page=page_num, title=title[:500], tokens=tokens, content_hash=content_hash
-                )
-                chunk_data = DocumentChunkData(
-                    document_id=uuid.UUID(document_id), company_id=uuid.UUID(company_id),
-                    chunk_index=chunk_index_counter, content=chunk_text, metadata=metadata_obj
-                )
-                processed_chunks.append(chunk_data)
-                chunk_index_counter += 1
-        except Exception as chunking_err:
-            ingest_log.error("Error processing text block during chunking/metadata", page=page_num, error=str(chunking_err), exc_info=True)
-
-    if isinstance(extracted_content, str):
-         _process_text_block(extracted_content, page_num=None)
-    else:
-         for page_number, page_text in extracted_content:
-             _process_text_block(page_text, page_num=page_number)
-
-    if not processed_chunks:
-        ingest_log.warning("Text content resulted in zero processable chunks. Skipping.")
+    if not processed_chunks_from_docproc:
+        index_log.warning("No chunks to process for Milvus/PG indexing.")
         return 0, [], []
-    ingest_log.info(f"Text processed into {len(processed_chunks)} chunks with metadata.")
 
-    chunk_contents = [chunk.content for chunk in processed_chunks]
-    ingest_log.debug(f"Requesting embeddings for {len(chunk_contents)} chunks from Embedding Service...")
-    embeddings: List[List[float]] = []
-    try:
-        # Llamada al EmbeddingServiceClient
-        embeddings, model_info = await embedding_service_client.get_embeddings(chunk_contents)
-        ingest_log.info(f"Embeddings received from service for {len(embeddings)} chunks. Model: {model_info}")
+    chunks_for_milvus_pg: List[DocumentChunkData] = []
+    milvus_data_content: List[str] = []
+    milvus_data_company_ids: List[str] = []
+    milvus_data_document_ids: List[str] = []
+    milvus_data_filenames: List[str] = []
+    milvus_data_pages: List[int] = []
+    milvus_data_titles: List[str] = []
+    milvus_data_tokens: List[int] = []
+    milvus_data_content_hashes: List[str] = []
+    milvus_pk_ids: List[str] = []
+    
+    # Filter out empty texts from embeddings list to match content
+    valid_embeddings: List[List[float]] = []
+    valid_chunk_indices_from_docproc: List[int] = []
 
-        if len(embeddings) != len(processed_chunks):
-            # Esto podría ocurrir si el servicio de embedding omite algunos textos (ej. vacíos)
-            # Deberíamos manejar esta discrepancia. Por ahora, error.
-            ingest_log.error("Embedding count mismatch from service.", expected=len(processed_chunks), received=len(embeddings))
-            raise RuntimeError(f"Embedding count mismatch. Expected {len(processed_chunks)}, got {len(embeddings)}.")
 
-        # Validar dimensión de los embeddings recibidos
-        expected_dim_from_service = model_info.get("dimension", 0)
-        if MILVUS_EMBEDDING_DIM != expected_dim_from_service:
-            ingest_log.warning(
-                f"Milvus schema dimension ({MILVUS_EMBEDDING_DIM}) "
-                f"differs from embedding service model dimension ({expected_dim_from_service}). "
-                f"Using Milvus schema dimension. Ensure this is intended."
-            )
-            # Nota: Si las dimensiones no coinciden, Milvus fallará la inserción.
-            # El `ingest-service` está configurado con `EMBEDDING_DIMENSION` para su esquema Milvus.
-            # Es crucial que esta configuración coincida con la dimensión real que entrega el `embedding-service`.
-            # El `embedding-service` informa su dimensión, así que podríamos usarla para una validación más estricta aquí.
+    for i, chunk_from_docproc in enumerate(processed_chunks_from_docproc):
+        chunk_text = chunk_from_docproc.get('text', '')
+        if not chunk_text or chunk_text.isspace():
+            index_log.warning("Skipping empty chunk from docproc during Milvus/PG prep.", original_chunk_index=i)
+            continue # Skip this chunk if it has no text
+        
+        # If chunk is valid, add its embedding and note its original index
+        valid_embeddings.append(embeddings[i])
+        valid_chunk_indices_from_docproc.append(i)
 
-        if embeddings and len(embeddings[0]) != MILVUS_EMBEDDING_DIM:
-             # Si la dimensión real de los embeddings recibidos no coincide con la esperada para Milvus.
-             ingest_log.error(
-                 f"Received embedding dimension ({len(embeddings[0])}) from service "
-                 f"does not match configured Milvus dimension ({MILVUS_EMBEDDING_DIM})."
-             )
-             raise RuntimeError(f"Embedding dimension mismatch error from service. Expected {MILVUS_EMBEDDING_DIM}, got {len(embeddings[0])}")
+        source_metadata = chunk_from_docproc.get('source_metadata', {})
+        
+        tokens = len(tiktoken_enc.encode(chunk_text)) if tiktoken_enc else -1
+        content_hash = hashlib.sha256(chunk_text.encode('utf-8', errors='ignore')).hexdigest()
+        page_number_from_source = source_metadata.get('page_number')
+        
+        current_sequential_chunk_index = len(chunks_for_milvus_pg)
+        title_for_chunk = f"{filename[:30]}... (Page {page_number_from_source or 'N/A'}, Chunk {current_sequential_chunk_index + 1})"
 
-    except EmbeddingServiceClientError as esce:
-        ingest_log.error("Failed to get embeddings from Embedding Service", error=str(esce), details=esce.detail, exc_info=True)
-        raise RuntimeError(f"Embedding Service client error: {esce}") from esce
-    except Exception as e:
-        ingest_log.error("Failed to generate/retrieve embeddings", error=str(e), exc_info=True)
-        raise RuntimeError(f"Embedding generation/retrieval failed: {e}") from e
+        pg_metadata = DocumentChunkMetadata(
+            page=page_number_from_source,
+            title=title_for_chunk[:500],
+            tokens=tokens,
+            content_hash=content_hash
+        )
+
+        chunk_data_obj = DocumentChunkData(
+            document_id=uuid.UUID(document_id_str),
+            company_id=uuid.UUID(company_id_str),
+            chunk_index=current_sequential_chunk_index,
+            content=chunk_text,
+            metadata=pg_metadata
+        )
+        chunks_for_milvus_pg.append(chunk_data_obj)
+
+        milvus_pk_id = f"{document_id_str}_{chunk_data_obj.chunk_index}"
+        milvus_pk_ids.append(milvus_pk_id)
+        
+        milvus_data_content.append(chunk_text)
+        milvus_data_company_ids.append(company_id_str)
+        milvus_data_document_ids.append(document_id_str)
+        milvus_data_filenames.append(filename)
+        milvus_data_pages.append(page_number_from_source if page_number_from_source is not None else -1)
+        milvus_data_titles.append(title_for_chunk[:512])
+        milvus_data_tokens.append(tokens)
+        milvus_data_content_hashes.append(content_hash)
+
+    if not chunks_for_milvus_pg:
+        index_log.warning("No valid (non-empty) chunks remained after initial processing for Milvus/PG.")
+        return 0, [], []
+    
+    if len(valid_embeddings) != len(milvus_data_content):
+        index_log.error("Critical mismatch: Valid embeddings count differs from valid content count for Milvus.",
+                        num_valid_embeddings=len(valid_embeddings), num_valid_content=len(milvus_data_content))
+        raise ValueError("Internal error: Embedding count does not match valid chunk content count.")
 
     max_content_len = settings.MILVUS_CONTENT_FIELD_MAX_LENGTH
     def truncate_utf8_bytes(s, max_bytes):
@@ -2984,114 +2942,67 @@ async def ingest_document_pipeline( # Marcado como async para usar el cliente as
         if len(b) <= max_bytes: return s
         return b[:max_bytes].decode('utf-8', errors='ignore')
 
-    milvus_pks = [f"{document_id}_{i}" for i in range(len(processed_chunks))]
-    data_to_insert = [
-        milvus_pks,
-        embeddings,
-        [truncate_utf8_bytes(c.content, max_content_len) for c in processed_chunks],
-        [company_id] * len(processed_chunks),
-        [document_id] * len(processed_chunks),
-        [filename] * len(processed_chunks),
-        [c.metadata.page if c.metadata.page is not None else -1 for c in processed_chunks],
-        [c.metadata.title if c.metadata.title else "" for c in processed_chunks],
-        [c.metadata.tokens if c.metadata.tokens is not None else -1 for c in processed_chunks],
-        [c.metadata.content_hash if c.metadata.content_hash else "" for c in processed_chunks]
+    data_to_insert_milvus = [
+        milvus_pk_ids,
+        valid_embeddings, # Use the filtered list of embeddings
+        [truncate_utf8_bytes(text, max_content_len) for text in milvus_data_content],
+        milvus_data_company_ids,
+        milvus_data_document_ids,
+        milvus_data_filenames,
+        milvus_data_pages,
+        milvus_data_titles,
+        milvus_data_tokens,
+        milvus_data_content_hashes
     ]
-    ingest_log.debug(f"Prepared {len(processed_chunks)} entities for Milvus insertion with custom PKs.")
+    index_log.debug(f"Prepared {len(milvus_pk_ids)} valid entities for Milvus insertion.")
 
-    if delete_existing:
-        ingest_log.info("Attempting to delete existing chunks before insertion...")
+    if delete_existing_milvus_chunks:
+        index_log.info("Attempting to delete existing Milvus chunks before insertion...")
         try:
-            deleted_count = delete_milvus_chunks(company_id, document_id)
-            ingest_log.info(f"Deleted {deleted_count} existing chunks.")
+            deleted_count = delete_milvus_chunks(company_id_str, document_id_str)
+            index_log.info(f"Deleted {deleted_count} existing Milvus chunks.")
         except Exception as del_err:
-            ingest_log.error("Failed to delete existing chunks, proceeding with insert anyway.", error=str(del_err))
+            index_log.error("Failed to delete existing Milvus chunks, proceeding with insert anyway.", error=str(del_err))
 
-    ingest_log.debug(f"Inserting {len(processed_chunks)} chunks into Milvus collection '{MILVUS_COLLECTION_NAME}'...")
+    index_log.debug(f"Inserting {len(milvus_pk_ids)} chunks into Milvus collection '{MILVUS_COLLECTION_NAME}'...")
+    inserted_milvus_count = 0
+    returned_milvus_pks: List[str] = []
+    
     try:
-        collection = _ensure_milvus_connection_and_collection()
-        mutation_result = collection.insert(data_to_insert)
-        inserted_count = mutation_result.insert_count
+        collection = _ensure_milvus_connection_and_collection_for_pipeline()
+        mutation_result = collection.insert(data_to_insert_milvus)
+        inserted_milvus_count = mutation_result.insert_count
 
-        if inserted_count != len(processed_chunks):
-             ingest_log.error("Milvus insert count mismatch!", expected=len(processed_chunks), inserted=inserted_count, errors=mutation_result.err_indices)
+        if inserted_milvus_count != len(milvus_pk_ids):
+             index_log.error("Milvus insert count mismatch!", expected=len(milvus_pk_ids), inserted=inserted_milvus_count, errors=mutation_result.err_indices)
         else:
-             ingest_log.info(f"Successfully inserted {inserted_count} chunks into Milvus.")
+             index_log.info(f"Successfully inserted {inserted_milvus_count} chunks into Milvus.")
 
-        returned_pks = mutation_result.primary_keys
-        if len(returned_pks) != inserted_count:
-             ingest_log.error("Milvus returned PK count mismatch!", returned_count=len(returned_pks), inserted_count=inserted_count)
-             successfully_inserted_chunks_data = []
+        returned_milvus_pks = [str(pk) for pk in mutation_result.primary_keys]
+        chunks_for_pg_prepared: List[Dict[str, Any]] = []
+
+        if len(returned_milvus_pks) != inserted_milvus_count:
+             index_log.error("Milvus returned PK count mismatch!", returned_count=len(returned_milvus_pks), inserted_count=inserted_milvus_count)
+             # Do not proceed with PG prep if PKs are unreliable
         else:
-             ingest_log.info("Milvus returned PKs match inserted count.")
-             successfully_inserted_chunks_data = []
-             for i in range(inserted_count):
-                 # Assuming returned_pks are in the same order as inserted data
-                 # Map back to original_chunk based on the Milvus PK we generated
-                 # Note: Milvus SDK >2.2.9 might return custom PKs directly.
-                 # Our generated PK was `milvus_pks[i]`
-                 chunk_milvus_pk = milvus_pks[i] # The PK we intended to insert
-                 original_chunk = next((c for c in processed_chunks if f"{c.document_id}_{c.chunk_index}" == chunk_milvus_pk), None)
-                 
-                 if original_chunk:
-                    # We assume the `returned_pks[i]` from Milvus *is* our `chunk_milvus_pk` if insertion was by our PK.
-                    # If Milvus auto-generates PKs (auto_id=True on PK field), then `returned_pks[i]` would be different.
-                    # Our schema has `is_primary=True` on `MILVUS_PK_FIELD` which is `pk_id` (VARCHAR).
-                    # Milvus `insert` expects the PKs to be provided in the data if `is_primary=True` and `auto_id=False` (default for VARCHAR PK).
-                    # So, `returned_pks[i]` should be equal to `milvus_pks[i]`.
-                    original_chunk.embedding_id = str(returned_pks[i]) # Store the PK confirmed by Milvus
-                    original_chunk.vector_status = ChunkVectorStatus.CREATED
-                    successfully_inserted_chunks_data.append(original_chunk)
-                 else:
-                     log.warning("Could not find original chunk data for returned PK", pk=returned_pks[i])
+            index_log.info("Milvus returned PKs match inserted count.")
+            for i in range(inserted_milvus_count):
+                chunks_for_milvus_pg[i].embedding_id = returned_milvus_pks[i]
+                chunks_for_milvus_pg[i].vector_status = ChunkVectorStatus.CREATED
+                chunks_for_pg_prepared.append(chunks_for_milvus_pg[i].model_dump(mode='json'))
 
-             if len(successfully_inserted_chunks_data) != inserted_count:
-                  log.warning("Mismatch between Milvus inserted count and successfully mapped chunks for PG.")
-
-        ingest_log.debug("Flushing Milvus collection...")
+        index_log.debug("Flushing Milvus collection...")
         collection.flush()
-        ingest_log.info("Milvus collection flushed.")
+        index_log.info("Milvus collection flushed.")
 
-        return inserted_count, [str(pk) for pk in returned_pks], successfully_inserted_chunks_data
+        return inserted_milvus_count, returned_milvus_pks, chunks_for_pg_prepared
 
     except MilvusException as e:
-        ingest_log.error("Failed to insert data into Milvus", error=str(e), exc_info=True)
+        index_log.error("Failed to insert data into Milvus", error=str(e), exc_info=True)
         raise RuntimeError(f"Milvus insertion failed: {e}") from e
     except Exception as e:
-        ingest_log.exception("Unexpected error during Milvus insertion")
+        index_log.exception("Unexpected error during Milvus insertion")
         raise RuntimeError(f"Unexpected Milvus insertion error: {e}") from e
-```
-
-## File: `app\services\text_splitter.py`
-```py
-import re
-from typing import List
-import structlog
-from app.core.config import settings
-
-log = structlog.get_logger(__name__)
-
-CHUNK_SIZE = getattr(settings, 'SPLITTER_CHUNK_SIZE', 1000)
-CHUNK_OVERLAP = getattr(settings, 'SPLITTER_CHUNK_OVERLAP', 250)
-
-def split_text(text: str) -> List[str]:
-    """
-    Divide el texto en chunks de tamaño CHUNK_SIZE con solapamiento CHUNK_OVERLAP.
-    """
-    log.debug("Splitting text into chunks", chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-    words = text.split()
-    chunks = []
-    start = 0
-    while start < len(words):
-        end = min(start + CHUNK_SIZE, len(words))
-        chunk = " ".join(words[start:end])
-        chunks.append(chunk)
-        if end == len(words):
-            break
-        start += CHUNK_SIZE - CHUNK_OVERLAP
-    log.info("Text split into chunks", num_chunks=len(chunks))
-    return chunks
-
 ```
 
 ## File: `app\tasks\__init__.py`
@@ -3149,108 +3060,121 @@ import json
 from typing import Optional, Dict, Any, List
 
 import structlog
+import httpx
 from celery import Task, states
 from celery.exceptions import Ignore, Reject, MaxRetriesExceededError, Retry
 from celery.signals import worker_process_init
 from sqlalchemy import Engine
 
-# Embedding components - CLIENT
 from app.services.clients.embedding_service_client import EmbeddingServiceClient, EmbeddingServiceClientError
+from app.services.clients.docproc_service_client import DocProcServiceClient, DocProcServiceClientError
 
-# Custom Application Imports
 from app.core.config import settings
 from app.db.postgres_client import get_sync_engine, set_status_sync, bulk_insert_chunks_sync
-from app.models.domain import DocumentStatus, DocumentChunkData, ChunkVectorStatus
+from app.models.domain import DocumentStatus
 from app.services.gcs_client import GCSClient, GCSClientError
 from app.services.ingest_pipeline import (
-    ingest_document_pipeline,
-    EXTRACTORS,
-    EXTRACTION_ERRORS,
+    index_chunks_in_milvus_and_prepare_for_pg,
     delete_milvus_chunks
 )
 from app.tasks.celery_app import celery_app
-import asyncio # Para ejecutar funciones async desde sync
+import asyncio
 
 task_struct_log = structlog.get_logger(__name__)
 IS_WORKER = "worker" in sys.argv
 
 # --- Global Resources for Worker Process ---
 sync_engine: Optional[Engine] = None
-gcs_client: Optional[GCSClient] = None
-# worker_embedding_model: Optional[SentenceTransformer] = None # Eliminado
-embedding_service_client_global: Optional[EmbeddingServiceClient] = None # Nuevo
+gcs_client_global: Optional[GCSClient] = None # Renamed to avoid conflict
+embedding_service_client_global: Optional[EmbeddingServiceClient] = None
+docproc_service_client_global: Optional[DocProcServiceClient] = None
 
 
 @worker_process_init.connect(weak=False)
 def init_worker_resources(**kwargs):
-    global sync_engine, gcs_client, embedding_service_client_global # Modificado
+    global sync_engine, gcs_client_global, embedding_service_client_global, docproc_service_client_global
     log = task_struct_log.bind(signal="worker_process_init")
     log.info("Worker process initializing resources...")
     try:
         if sync_engine is None:
             sync_engine = get_sync_engine()
-            log.info("Synchronous DB engine initialized.")
+            log.info("Synchronous DB engine initialized for worker.")
         else:
-             log.info("Synchronous DB engine already initialized.")
+             log.info("Synchronous DB engine already initialized for worker.")
 
-        if gcs_client is None:
-            gcs_client = GCSClient()
-            log.info("GCS client initialized.")
+        if gcs_client_global is None:
+            gcs_client_global = GCSClient()
+            log.info("GCS client initialized for worker.")
         else:
-            log.info("GCS client already initialized.")
+            log.info("GCS client already initialized for worker.")
 
-        # if worker_embedding_model is None: # Eliminado
-        #     log.info("Preloading embedding model...")
-        #     worker_embedding_model = get_embedding_model()
-        #     log.info("Embedding model preloaded.")
-        # else:
-        #     log.info("Embedding model already preloaded.")
-
-        if embedding_service_client_global is None: # Nuevo
-            log.info("Initializing Embedding Service client...")
-            # La URL se toma de settings directamente en el cliente
+        if embedding_service_client_global is None:
+            log.info("Initializing Embedding Service client for worker...")
             embedding_service_client_global = EmbeddingServiceClient()
-            # Realizar un health check inicial al servicio de embedding
-            # loop = asyncio.get_event_loop() # No se puede usar get_event_loop en un hilo no principal de asyncio
-            # if not loop.run_until_complete(embedding_service_client_global.health_check()):
-            #    log.critical("Embedding Service health check FAILED during worker init. Client may not function.")
-            # else:
-            #    log.info("Embedding Service client initialized and health check successful.")
-            # Simplificado: No hacer health check aquí para evitar problemas con event loop en worker init.
-            # Se hará un health check implícito al primer uso o se confía en la resiliencia.
-            log.info("Embedding Service client initialized (health check deferred to first use or task).")
-
+            log.info("Embedding Service client initialized for worker.")
         else:
-            log.info("Embedding Service client already initialized.")
-
+            log.info("Embedding Service client already initialized for worker.")
+        
+        if docproc_service_client_global is None:
+            log.info("Initializing Document Processing Service client for worker...")
+            docproc_service_client_global = DocProcServiceClient()
+            log.info("Document Processing Service client initialized for worker.")
+        else:
+            log.info("Document Processing Service client already initialized for worker.")
 
     except Exception as e:
         log.critical("CRITICAL FAILURE during worker resource initialization!", error=str(e), exc_info=True)
         sync_engine = None
-        gcs_client = None
-        # worker_embedding_model = None # Eliminado
-        embedding_service_client_global = None # Nuevo
+        gcs_client_global = None
+        embedding_service_client_global = None
+        docproc_service_client_global = None
 
 
 def run_async_from_sync(awaitable):
-    """Ejecuta una corutina desde código síncrono (Celery task)."""
     try:
         loop = asyncio.get_event_loop()
+        if loop.is_running(): # Check if a loop is already running in this thread
+             # If so, create a new loop for this task execution to avoid interference
+             # This is a common pattern for sync Celery workers calling async code
+             temp_loop = asyncio.new_event_loop()
+             asyncio.set_event_loop(temp_loop)
+             result = temp_loop.run_until_complete(awaitable)
+             temp_loop.close() # Close the temporary loop
+             asyncio.set_event_loop(loop) # Restore original loop if it was running
+             return result
     except RuntimeError: # No current event loop in thread
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-    return loop.run_until_complete(awaitable)
+        try:
+            return loop.run_until_complete(awaitable)
+        finally:
+            loop.close() # Ensure the new loop is closed
+            # No need to restore if there wasn't one before
 
 
 @celery_app.task(
     bind=True,
     name="ingest.process_document",
-    autoretry_for=(EmbeddingServiceClientError, httpx.RequestError, httpx.HTTPStatusError, Exception), # Añadir errores de cliente
-    exclude=(Reject, Ignore, ValueError, ConnectionError, RuntimeError, TypeError, *EXTRACTION_ERRORS),
+    autoretry_for=(
+        EmbeddingServiceClientError, 
+        DocProcServiceClientError,
+        httpx.RequestError, 
+        httpx.HTTPStatusError,
+        GCSClientError,
+        ConnectionRefusedError, # For network issues to dependent services
+        asyncio.TimeoutError, # For timeouts in async calls
+        Exception
+    ),
+    exclude=(
+        Reject, Ignore, ValueError, ConnectionError, RuntimeError, TypeError,
+        # Errors from client-side validation (4xx from services) should not be retried by Celery default
+        # but EmbeddingServiceClientError/DocProcServiceClientError might wrap them.
+        # Custom logic handles retry for 5xx within the task.
+    ),
     retry_backoff=True,
-    retry_backoff_max=600, # 10 minutos
+    retry_backoff_max=600,
     retry_jitter=True,
-    max_retries=5, # Aumentado para el servicio externo
+    max_retries=5, 
     acks_late=True
 )
 def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
@@ -3262,11 +3186,12 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
     task_id = self.request.id or "unknown_task_id"
     attempt = self.request.retries + 1
     max_attempts = (self.max_retries or 0) + 1
-    log = task_struct_log.bind(
-        task_id=task_id, attempt=f"{attempt}/{max_attempts}", doc_id=document_id_str,
-        company_id=company_id_str, filename=filename, content_type=content_type
-    )
-    log.info("Starting document processing task (uses Embedding Service)")
+    log_context = {
+        "task_id": task_id, "attempt": f"{attempt}/{max_attempts}", "doc_id": document_id_str,
+        "company_id": company_id_str, "filename": filename, "content_type": content_type
+    }
+    log = task_struct_log.bind(**log_context)
+    log.info("Starting document processing task")
 
     if not IS_WORKER:
          log.critical("Task function called outside of a worker context! Rejecting.")
@@ -3276,35 +3201,23 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
         log.error("Missing required arguments in task payload.", payload_kwargs=kwargs)
         raise Reject("Missing required arguments (doc_id, company_id, filename, content_type)", requeue=False)
 
-    # --- Validar recursos globales del worker ---
-    if not sync_engine:
-         log.critical("Worker Sync DB Engine is not initialized. Task cannot proceed.")
-         raise Reject("Worker sync DB engine initialization failed.", requeue=False) # No reintentar
-    # if not worker_embedding_model: # Eliminado
-    #      log.critical("Worker Embedding Model is not available/loaded. Task cannot proceed.")
-    #      # ...
-    #      raise Reject(error_msg, requeue=False)
-    if not embedding_service_client_global: # Nuevo
-        log.critical("Worker Embedding Service Client is not initialized. Task cannot proceed.")
-        error_msg = "Worker Embedding Service Client init failed."
-        doc_uuid_err_esc = None
-        try: doc_uuid_err_esc = uuid.UUID(document_id_str)
-        except ValueError: pass
-        if doc_uuid_err_esc and sync_engine:
-            try: set_status_sync(engine=sync_engine, document_id=doc_uuid_err_esc, status=DocumentStatus.ERROR, error_message=error_msg)
-            except Exception as db_err: log.critical("Failed to update status after ESC client check failure!", error=str(db_err))
-        raise Reject(error_msg, requeue=False) # No reintentar este error de infraestructura
+    global_resources = {
+        "Sync DB Engine": sync_engine, "GCS Client": gcs_client_global,
+        "Embedding Service Client": embedding_service_client_global,
+        "DocProc Service Client": docproc_service_client_global
+    }
+    for name, resource in global_resources.items():
+        if not resource:
+            log.critical(f"Worker resource '{name}' is not initialized. Task cannot proceed.")
+            error_msg = f"Worker resource '{name}' initialization failed."
+            # Attempt to update DB status only if engine is available
+            if name != "Sync DB Engine" and sync_engine:
+                try: 
+                    doc_uuid_for_error_res = uuid.UUID(document_id_str)
+                    set_status_sync(engine=sync_engine, document_id=doc_uuid_for_error_res, status=DocumentStatus.ERROR, error_message=error_msg)
+                except Exception as db_err_res: log.critical(f"Failed to update status after {name} check failure!", error=str(db_err_res))
+            raise Reject(error_msg, requeue=False)
 
-    if not gcs_client:
-         log.critical("Worker GCS Client is not initialized. Task cannot proceed.")
-         error_msg = "Worker GCS client init failed."
-         doc_uuid_err_gcs = None
-         try: doc_uuid_err_gcs = uuid.UUID(document_id_str)
-         except ValueError: pass
-         if doc_uuid_err_gcs and sync_engine:
-              try: set_status_sync(engine=sync_engine, document_id=doc_uuid_err_gcs, status=DocumentStatus.ERROR, error_message=error_msg)
-              except Exception as db_err: log.critical("Failed to update status after GCS client check failure!", error=str(db_err))
-         raise Reject(error_msg, requeue=False) # No reintentar
 
     try:
         doc_uuid = uuid.UUID(document_id_str)
@@ -3312,20 +3225,18 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
          log.error("Invalid document_id format received.")
          raise Reject("Invalid document_id format.", requeue=False)
 
-    if content_type not in EXTRACTORS:
-        log.error(f"Unsupported content type provided: {content_type}")
-        error_msg = f"Unsupported content type: {content_type}"
-        try: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg)
-        except Exception as db_err: log.critical("Failed to update status to ERROR for unsupported type!", error=str(db_err))
+    if content_type not in settings.SUPPORTED_CONTENT_TYPES:
+        log.error(f"Unsupported content type: {content_type}")
+        error_msg = f"Unsupported content type by ingest-service: {content_type}"
+        set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg)
         raise Reject(error_msg, requeue=False)
+
 
     normalized_filename = normalize_filename(filename) if filename else filename
     object_name = f"{company_id_str}/{document_id_str}/{normalized_filename}"
     file_bytes: Optional[bytes] = None
-    inserted_milvus_count = 0
-    inserted_pg_count = 0
-    milvus_pks: List[str] = []
-    processed_chunks_data: List[DocumentChunkData] = []
+    
+    processed_chunks_from_docproc: List[Dict[str, Any]] = []
 
     try:
         log.debug("Setting status to PROCESSING in DB.")
@@ -3337,21 +3248,26 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
             raise Ignore()
         log.info("Status set to PROCESSING.")
 
+        # 1. Descargar archivo de GCS
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_dir_path = pathlib.Path(temp_dir)
             temp_file_path_obj = temp_dir_path / normalized_filename
             log.info(f"Downloading GCS object: {object_name} -> {str(temp_file_path_obj)}")
-            max_gcs_retries = 2; gcs_delay = 2; download_success = False
+            
+            max_gcs_retries = 3; gcs_delay = 2; download_success = False
             for attempt_num in range(1, max_gcs_retries + 1):
                 try:
-                    gcs_client.download_file_sync(object_name, str(temp_file_path_obj))
+                    gcs_client_global.download_file_sync(object_name, str(temp_file_path_obj))
                     log.info("File downloaded successfully from GCS.")
                     file_bytes = temp_file_path_obj.read_bytes()
                     log.info(f"File content read into memory ({len(file_bytes)} bytes).")
                     download_success = True; break
                 except GCSClientError as gce_dl:
-                    if "Object not found" in str(gce_dl) or (hasattr(gce_dl, 'original_exception') and isinstance(gce_dl.original_exception, FileNotFoundError)):
-                        log.warning(f"GCS object not found on download attempt {attempt_num}/{max_gcs_retries}. Retrying in {gcs_delay}s...", error=str(gce_dl))
+                    is_not_found = "Object not found" in str(gce_dl) or \
+                                   (hasattr(gce_dl, 'original_exception') and \
+                                    isinstance(gce_dl.original_exception, FileNotFoundError))
+                    if is_not_found:
+                        log.warning(f"GCS object not found on download attempt {attempt_num}/{max_gcs_retries}. Retrying in {gcs_delay}s...", error_short=str(gce_dl).splitlines()[0])
                         if attempt_num == max_gcs_retries: log.error(f"File still not found in GCS after {max_gcs_retries} attempts. Aborting."); raise
                         time.sleep(gcs_delay); gcs_delay *= 2
                     else: log.error("Non-retriable GCS error during download", error=str(gce_dl)); raise
@@ -3361,55 +3277,89 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
             if not download_success or file_bytes is None:
                  raise RuntimeError("File download or read failed, bytes not available.")
 
-        log.info("Executing ingest pipeline (extract, chunk, metadata, embed via service, Milvus insert)...")
-        # Ejecutar la función async del pipeline desde el contexto sync de Celery
-        inserted_milvus_count, milvus_pks, processed_chunks_data = run_async_from_sync(
-            ingest_document_pipeline(
-                file_bytes=file_bytes,
-                filename=normalized_filename,
-                company_id=company_id_str,
-                document_id=document_id_str,
-                content_type=content_type,
-                embedding_service_client=embedding_service_client_global, # Pasamos el cliente
-                delete_existing=True
-            )
-        )
-        log.info(f"Ingestion pipeline finished. Milvus insert count: {inserted_milvus_count}, PKs returned: {len(milvus_pks)}")
-
-        if inserted_milvus_count == 0 or not processed_chunks_data:
-             log.warning("Ingestion pipeline reported zero inserted chunks or no data. Assuming processing complete with 0 chunks.")
-             final_status_updated_zero = set_status_sync(
-                 engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.PROCESSED,
-                 chunk_count=0, error_message=None
-             )
-             return {"status": DocumentStatus.PROCESSED.value, "chunks_inserted": 0, "document_id": document_id_str}
-
-        log.info(f"Preparing {len(processed_chunks_data)} chunks for PostgreSQL bulk insert...")
-        chunks_for_pg = []
-        for chunk_obj in processed_chunks_data:
-            if chunk_obj.embedding_id is None:
-                log.warning("Chunk missing embedding_id after Milvus insert, skipping PG insert for this chunk.", chunk_index=chunk_obj.chunk_index)
-                continue
-            chunk_dict = {
-                'document_id': chunk_obj.document_id, 'company_id': chunk_obj.company_id,
-                'chunk_index': chunk_obj.chunk_index, 'content': chunk_obj.content,
-                'metadata': chunk_obj.metadata.model_dump(mode='json'),
-                'embedding_id': chunk_obj.embedding_id, 'vector_status': chunk_obj.vector_status.value
-            }
-            chunks_for_pg.append(chunk_dict)
-
-        if not chunks_for_pg:
-             log.error("No valid chunks prepared for PostgreSQL insertion after Milvus step. Marking document as error.")
-             error_msg_pg_prep = "Milvus insertion succeeded but no valid data for PG."
-             set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg_pg_prep)
-             raise Reject(error_msg_pg_prep, requeue=False)
-
-        log.debug(f"Attempting bulk insert of {len(chunks_for_pg)} chunks into PostgreSQL.")
+        # 2. Llamar al DocProc Service
+        log.info("Calling Document Processing Service...")
         try:
-            inserted_pg_count = bulk_insert_chunks_sync(engine=sync_engine, chunks_data=chunks_for_pg)
+            docproc_response = run_async_from_sync(
+                docproc_service_client_global.process_document(
+                    file_bytes=file_bytes,
+                    original_filename=normalized_filename,
+                    content_type=content_type,
+                    document_id=document_id_str,
+                    company_id=company_id_str
+                )
+            )
+            processed_chunks_from_docproc = docproc_response.get("data", {}).get("chunks", [])
+            log.info(f"Received {len(processed_chunks_from_docproc)} chunks from DocProc Service.")
+        except DocProcServiceClientError as dpce:
+            log.error("DocProc Service Client Error", error_msg=str(dpce), status_code=dpce.status_code, details_preview=str(dpce.detail)[:200], exc_info=True)
+            error_msg_dpce = f"DocProc Error: {str(dpce.detail or dpce.message)[:350]}"
+            set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg_dpce)
+            if dpce.status_code and 500 <= dpce.status_code < 600: # Server-side errors on docproc
+                raise self.retry(exc=dpce, countdown=int(self.default_retry_delay * (self.request.retries + 1)))
+            else: # Client-side errors (4xx) or connection issues
+                raise Reject(f"DocProc Service critical error: {error_msg_dpce}", requeue=False) from dpce
+        
+        if not processed_chunks_from_docproc:
+            log.warning("DocProc Service returned no chunks. Document processing considered complete with 0 chunks.")
+            set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.PROCESSED, chunk_count=0, error_message=None)
+            return {"status": DocumentStatus.PROCESSED.value, "chunks_inserted": 0, "document_id": document_id_str}
+
+        # 3. Preparar textos para Embedding Service
+        chunk_texts_for_embedding = [chunk['text'] for chunk in processed_chunks_from_docproc if chunk.get('text','').strip()]
+        if not chunk_texts_for_embedding:
+            log.warning("No non-empty text found in chunks received from DocProc. Finishing with 0 chunks.")
+            set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.PROCESSED, chunk_count=0, error_message=None)
+            return {"status": DocumentStatus.PROCESSED.value, "chunks_inserted": 0, "document_id": document_id_str}
+
+        # 4. Llamar al Embedding Service
+        log.info(f"Calling Embedding Service for {len(chunk_texts_for_embedding)} texts...")
+        embeddings: List[List[float]] = []
+        try:
+            embeddings, model_info = run_async_from_sync(
+                embedding_service_client_global.get_embeddings(chunk_texts_for_embedding)
+            )
+            log.info(f"Embeddings received from service for {len(embeddings)} chunks. Model: {model_info}")
+            if len(embeddings) != len(chunk_texts_for_embedding):
+                log.error("Embedding count mismatch from Embedding Service.", expected=len(chunk_texts_for_embedding), received=len(embeddings))
+                raise RuntimeError(f"Embedding count mismatch. Expected {len(chunk_texts_for_embedding)}, got {len(embeddings)}.")
+            if embeddings and len(embeddings[0]) != settings.EMBEDDING_DIMENSION:
+                 log.error(f"Received embedding dimension ({len(embeddings[0])}) from service does not match configured Milvus dimension ({settings.EMBEDDING_DIMENSION}).")
+                 raise RuntimeError(f"Embedding dimension mismatch. Expected {settings.EMBEDDING_DIMENSION}, got {len(embeddings[0])}")
+        except EmbeddingServiceClientError as esce:
+            log.error("Embedding Service Client Error", error_msg=str(esce), status_code=esce.status_code, details_preview=str(esce.detail)[:200], exc_info=True)
+            error_msg_esc = f"Embedding Service Error: {str(esce.detail or esce.message)[:350]}"
+            set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg_esc)
+            if esce.status_code and 500 <= esce.status_code < 600: # Server-side errors on embedding service
+                raise self.retry(exc=esce, countdown=int(self.default_retry_delay * (self.request.retries + 1)))
+            else: # Client-side errors (4xx) or connection issues
+                raise Reject(f"Embedding Service critical error: {error_msg_esc}", requeue=False) from esce
+
+        # 5. Indexar en Milvus y preparar para PostgreSQL
+        log.info("Preparing chunks for Milvus and PostgreSQL indexing...")
+        inserted_milvus_count, milvus_pks, chunks_for_pg_insert = index_chunks_in_milvus_and_prepare_for_pg(
+            processed_chunks_from_docproc=[chunk for chunk in processed_chunks_from_docproc if chunk.get('text','').strip()], # Pass only non-empty chunks
+            embeddings=embeddings, # Embeddings match non-empty chunks
+            filename=normalized_filename,
+            company_id_str=company_id_str,
+            document_id_str=document_id_str,
+            delete_existing_milvus_chunks=True
+        )
+        log.info(f"Milvus indexing complete. Inserted: {inserted_milvus_count}, PKs: {len(milvus_pks)}")
+
+        if inserted_milvus_count == 0 or not chunks_for_pg_insert:
+            log.warning("Milvus indexing resulted in zero inserted chunks or no data for PG. Assuming processing complete with 0 chunks.")
+            set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.PROCESSED, chunk_count=0, error_message=None)
+            return {"status": DocumentStatus.PROCESSED.value, "chunks_inserted": 0, "document_id": document_id_str}
+
+        # 6. Indexar en PostgreSQL
+        log.debug(f"Attempting bulk insert of {len(chunks_for_pg_insert)} chunks into PostgreSQL.")
+        inserted_pg_count = 0
+        try:
+            inserted_pg_count = bulk_insert_chunks_sync(engine=sync_engine, chunks_data=chunks_for_pg_insert)
             log.info(f"Successfully bulk inserted {inserted_pg_count} chunks into PostgreSQL.")
-            if inserted_pg_count != len(chunks_for_pg):
-                 log.warning("Mismatch between prepared PG chunks and inserted PG count.", prepared=len(chunks_for_pg), inserted=inserted_pg_count)
+            if inserted_pg_count != len(chunks_for_pg_insert):
+                 log.warning("Mismatch between prepared PG chunks and inserted PG count.", prepared=len(chunks_for_pg_insert), inserted=inserted_pg_count)
         except Exception as pg_insert_err:
              log.critical("CRITICAL: Failed to bulk insert chunks into PostgreSQL after successful Milvus insert!", error=str(pg_insert_err), exc_info=True)
              log.warning("Attempting to clean up Milvus chunks due to PG insert failure.")
@@ -3419,87 +3369,61 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
              set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg_pg_fail[:500])
              raise Reject(f"PostgreSQL bulk insert failed: {pg_insert_err}", requeue=False) from pg_insert_err
 
+        # 7. Actualización de Estado Final
         log.debug("Setting final status to PROCESSED in DB.")
-        final_status_updated_ok = set_status_sync(
-            engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.PROCESSED,
-            chunk_count=inserted_pg_count, error_message=None
-        )
-        if not final_status_updated_ok:
-             log.warning("Failed to update final status to PROCESSED (document possibly deleted?).")
-
+        set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.PROCESSED, chunk_count=inserted_pg_count, error_message=None)
         log.info(f"Document processing finished successfully. Final chunk count (PG): {inserted_pg_count}")
         return {"status": DocumentStatus.PROCESSED.value, "chunks_inserted": inserted_pg_count, "document_id": document_id_str}
 
     except GCSClientError as gce:
-        log.error(f"GCS Error during processing", error=str(gce), exc_info=True)
+        log.error(f"GCS Error during processing", error_msg=str(gce), exc_info=True)
         error_msg_gcs = f"GCS Error: {str(gce)[:400]}"
         set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg_gcs)
-        if "Object not found" in str(gce): # No reintentar si el objeto no existe
+        if "Object not found" in str(gce): # Non-retriable if object not found after initial upload
             raise Reject(f"GCS Error: Object not found: {object_name}", requeue=False) from gce
-        # Dejar que Celery reintente otros errores de GCS según la configuración de la tarea
-        raise self.retry(exc=gce, countdown=int(self.default_retry_delay * (self.request.retries + 1)))
+        # For other GCS errors, let Celery's autoretry_for handle it.
+        raise # Re-raise for Celery to catch for retry
 
-    except EmbeddingServiceClientError as esce: # Capturar errores del cliente de embedding
-        log.error("Embedding Service Client Error", error=str(esce), status_code=esce.status_code, details=esce.detail, exc_info=True)
-        error_msg_esc = f"Embedding Service Error: {str(esce)[:350]}"
-        set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg_esc)
-        # Reintentar si es un error de servidor (5xx) o de red, no si es un error de cliente (4xx)
-        if esce.status_code and 500 <= esce.status_code < 600:
-            raise self.retry(exc=esce, countdown=int(self.default_retry_delay * (self.request.retries + 1)))
-        else: # Errores 4xx o sin status_code (errores de conexión) no suelen ser recuperables con reintentos simples
-            raise Reject(f"Embedding Service critical error: {error_msg_esc}", requeue=False) from esce
-
-    except (*EXTRACTION_ERRORS, ValueError, RuntimeError, TypeError) as pipeline_err:
-         log.error(f"Non-retriable Pipeline/Data Error: {pipeline_err}", exc_info=True)
-         error_msg_pipe = f"Pipeline Error: {type(pipeline_err).__name__} - {str(pipeline_err)[:400]}"
+    except (ValueError, RuntimeError, TypeError) as non_retriable_err:
+         log.error(f"Non-retriable Error: {non_retriable_err}", exc_info=True)
+         error_msg_pipe = f"Pipeline/Data Error: {type(non_retriable_err).__name__} - {str(non_retriable_err)[:400]}"
          set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg_pipe)
-         raise Reject(f"Pipeline failed: {error_msg_pipe}", requeue=False) from pipeline_err
+         raise Reject(f"Pipeline failed: {error_msg_pipe}", requeue=False) from non_retriable_err
 
     except Reject as r:
          log.error(f"Task rejected permanently: {r.reason}")
-         if sync_engine and doc_uuid and r.reason: # Asegurarse que reason no sea None
+         if sync_engine and doc_uuid and r.reason: # Ensure sync_engine and doc_uuid are valid
              set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=f"Rejected: {str(r.reason)[:500]}")
-         raise # Propagate Reject
-
+         raise 
     except Ignore:
          log.info("Task ignored.")
-         raise # Propagate Ignore
-
-    except Retry as retry_exc: # Captura explícita de la excepción Retry
-        log.warning(f"Task is being retried. Reason: {retry_exc}", exc_info=True)
-        # No actualizar el estado a ERROR aquí, ya que Celery lo está reintentando.
-        # El estado 'processing' es apropiado durante los reintentos.
-        raise # Re-elevar para que Celery maneje el reintento
-
+         raise 
+    except Retry as retry_exc: # Specific catch for Celery's Retry exception
+        log.warning(f"Task is being retried by Celery. Reason: {retry_exc}", exc_info=False)
+        # Status is already PROCESSING, no need to update for retry.
+        raise # Re-raise for Celery to handle the retry
     except MaxRetriesExceededError as mree:
-        log.error("Max retries exceeded for task.", exc_info=True)
+        log.error("Max retries exceeded for task.", exc_info=True, cause_type=type(mree.cause).__name__, cause_message=str(mree.cause))
         final_error = mree.cause if mree.cause else mree
         error_msg_mree = f"Max retries exceeded ({max_attempts}). Last error: {type(final_error).__name__} - {str(final_error)[:300]}"
         set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=error_msg_mree)
-        # Celery ya maneja esto y no lo reenvía, así que no necesitamos hacer Reject.
-        # Simplemente actualizamos el estado final y dejamos que Celery termine.
         self.update_state(state=states.FAILURE, meta={'exc_type': type(final_error).__name__, 'exc_message': str(final_error)})
-        # No se debe re-elevar mree si queremos que Celery la maneje como una falla final
-        # y no la intente procesar de nuevo. Simplemente retornamos o dejamos que termine.
-
-    except Exception as exc: # Captura errores generales que pueden ser retriables
-        log.exception(f"An unexpected error occurred, attempting retry if possible.")
+        # Do not re-raise MaxRetriesExceededError, Celery handles it.
+    except Exception as exc: 
+        log.exception(f"An unexpected error occurred, attempting Celery retry if possible.")
         error_msg_exc = f"Attempt {attempt} failed: {type(exc).__name__} - {str(exc)[:400]}"
-        # Actualizar a error temporalmente. Si el reintento tiene éxito, se cambiará a PROCESSED.
-        # Si todos los reintentos fallan, MaxRetriesExceededError se encargará del estado final.
+        # Set status to PROCESSING with error for visibility during retries.
         set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.PROCESSING, error_message=error_msg_exc)
-        raise self.retry(exc=exc, countdown=int(self.default_retry_delay * (self.request.retries + 1)))
-
-
-process_document_haystack_task = process_document_standalone
+        # Let Celery's autoretry_for handle it by re-raising the original exception.
+        raise
 ```
 
 ## File: `pyproject.toml`
 ```toml
 [tool.poetry]
 name = "ingest-service"
-version = "0.3.1" # Version incrementada
-description = "Ingest service for Atenex B2B SaaS (Postgres/GCS/Milvus/Remote Embedding Service - CPU - Prefork)" # Descripción actualizada
+version = "0.3.2"
+description = "Ingest service for Atenex B2B SaaS (Postgres/GCS/Milvus/Remote Embedding & DocProc Services - CPU - Prefork)"
 authors = ["Atenex Team <dev@atenex.com>"]
 readme = "README.md"
 
@@ -3518,23 +3442,13 @@ structlog = "^24.1.0"
 
 google-cloud-storage = "^2.16.0"
 
-# --- ONNX Runtime ---
-# onnxruntime = "^1.18.0" # Eliminado, ya no se usa directamente en ingest-service
-
-# --- Core Processing Dependencies (v0.3.1) ---
-pymupdf = "^1.25.0"
-# sentence-transformers = "^2.7" # Eliminado, se usa el servicio externo
+# --- Core Processing Dependencies (v0.3.2) ---
 pymilvus = ">=2.4.1,<2.5.0"
 tiktoken = "^0.7.0"
 
-# --- Converter Dependencies (Standalone - Keep) ---
-python-docx = ">=1.1.0,<2.0.0"
-markdown = ">=3.5.1,<4.0.0"
-beautifulsoup4 = ">=4.12.3,<5.0.0"
-html2text = ">=2024.1.0,<2025.0.0"
 
 # --- HTTP Client (API & Service Client - Keep) ---
-httpx = {extras = ["http2"], version = "^0.27.0"} # Usado por EmbeddingServiceClient
+httpx = {extras = ["http2"], version = "^0.27.0"}
 h2 = "^4.1.0"
 
 # --- Synchronous DB Dependencies (Worker - Keep) ---

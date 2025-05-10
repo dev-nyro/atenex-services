@@ -26,8 +26,10 @@ MILVUS_DEFAULT_GRPC_TIMEOUT = 15
 MILVUS_DEFAULT_SEARCH_PARAMS = {"metric_type": "IP", "params": {"nprobe": 10}}
 MILVUS_DEFAULT_METADATA_FIELDS = ["company_id", "document_id", "file_name", "page", "title"]
 
-# Embedding Service (NUEVO)
+# Embedding Service
 EMBEDDING_SERVICE_K8S_URL_DEFAULT = "http://embedding-service.nyro-develop.svc.cluster.local:8003"
+# Reranker Service
+RERANKER_SERVICE_K8S_URL_DEFAULT = "http://reranker-service.nyro-develop.svc.cluster.local:80"
 
 
 # ==========================================================================================
@@ -104,11 +106,8 @@ INSTRUCCIONES:
 RESPUESTA DE ATENEX (en español latino):
 """
 # Models
-# DEFAULT_FASTEMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2" # REMOVED - No longer local
-# DEFAULT_FASTEMBED_QUERY_PREFIX = "query: " # REMOVED
-DEFAULT_EMBEDDING_DIMENSION = 384 # Still needed for Milvus config and validation
+DEFAULT_EMBEDDING_DIMENSION = 384
 DEFAULT_GEMINI_MODEL = "gemini-1.5-flash-latest"
-DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-base"
 
 # RAG Pipeline Parameters
 DEFAULT_RETRIEVER_TOP_K = 100
@@ -158,20 +157,21 @@ class Settings(BaseSettings):
 
     # --- Embedding Settings (General) ---
     EMBEDDING_DIMENSION: int = Field(default=DEFAULT_EMBEDDING_DIMENSION, description="Dimension of embeddings, used for Milvus and validation.")
-    # QUERY_FASTEMBED_MODEL_NAME: str = Field(default=DEFAULT_FASTEMBED_MODEL) # REMOVED
-    # QUERY_FASTEMBED_QUERY_PREFIX: str = Field(default=DEFAULT_FASTEMBED_QUERY_PREFIX) # REMOVED
 
-    # --- External Embedding Service (NUEVO) ---
+    # --- External Embedding Service ---
     EMBEDDING_SERVICE_URL: AnyHttpUrl = Field(default=AnyHttpUrl(EMBEDDING_SERVICE_K8S_URL_DEFAULT), description="URL of the Atenex Embedding Service.")
+    EMBEDDING_CLIENT_TIMEOUT: int = Field(default=30, description="Timeout in seconds for calls to the Embedding Service.")
 
 
     # --- LLM (Google Gemini) ---
     GEMINI_API_KEY: SecretStr
     GEMINI_MODEL_NAME: str = Field(default=DEFAULT_GEMINI_MODEL)
 
-    # --- Reranker Model ---
+    # --- Reranker Settings ---
     RERANKER_ENABLED: bool = Field(default=DEFAULT_RERANKER_ENABLED)
-    RERANKER_MODEL_NAME: str = Field(default=DEFAULT_RERANKER_MODEL, description="Sentence Transformer model name/path for reranking.")
+    RERANKER_SERVICE_URL: AnyHttpUrl = Field(default=AnyHttpUrl(RERANKER_SERVICE_K8S_URL_DEFAULT), description="URL of the Atenex Reranker Service.")
+    RERANKER_CLIENT_TIMEOUT: int = Field(default=30, description="Timeout in seconds for calls to the Reranker Service.")
+
 
     # --- Sparse Retriever (BM25) ---
     BM25_ENABLED: bool = Field(default=DEFAULT_BM25_ENABLED)
@@ -191,7 +191,7 @@ class Settings(BaseSettings):
     NUM_SOURCES_TO_SHOW: int = Field(default=DEFAULT_NUM_SOURCES_TO_SHOW, ge=0)
 
     # --- Service Client Config ---
-    HTTP_CLIENT_TIMEOUT: int = Field(default=60)
+    HTTP_CLIENT_TIMEOUT: int = Field(default=60) # General timeout for httpx client
     HTTP_CLIENT_MAX_RETRIES: int = Field(default=2)
     HTTP_CLIENT_BACKOFF_FACTOR: float = Field(default=1.0)
 
@@ -218,8 +218,6 @@ class Settings(BaseSettings):
     def check_embedding_dimension(cls, v: int, info: ValidationInfo) -> int:
         if v <= 0:
             raise ValueError("EMBEDDING_DIMENSION must be a positive integer.")
-        # No longer checking against FASTEMBED_MODEL_NAME as it's external
-        # The RemoteEmbeddingAdapter will try to validate against the service's reported dimension
         logging.info(f"Configured EMBEDDING_DIMENSION: {v}. This will be used for Milvus and validated against the embedding service.")
         return v
 
@@ -227,7 +225,7 @@ class Settings(BaseSettings):
     @classmethod
     def check_max_context_chunks(cls, v: int, info: ValidationInfo) -> int:
         retriever_k = info.data.get('RETRIEVER_TOP_K', DEFAULT_RETRIEVER_TOP_K)
-        max_possible_after_fusion = retriever_k * 2 # Assuming dense + sparse
+        max_possible_after_fusion = retriever_k * 2
         if v > max_possible_after_fusion:
             logging.warning(f"MAX_CONTEXT_CHUNKS ({v}) is greater than the maximum possible chunks after fusion ({max_possible_after_fusion} based on RETRIEVER_TOP_K={retriever_k}). Effective limit will be {max_possible_after_fusion}.")
         if v <= 0:
@@ -261,7 +259,6 @@ try:
     temp_log.info("Query Service Settings Loaded Successfully:")
     log_data = settings.model_dump(exclude={'POSTGRES_PASSWORD', 'GEMINI_API_KEY'})
     for key, value in log_data.items():
-        # Truncate long prompt templates for cleaner logs
         if key.endswith('_PROMPT_TEMPLATE') and isinstance(value, str) and len(value) > 200:
              temp_log.info(f"  {key.upper()}: {value[:100]}... (truncated)")
         else:

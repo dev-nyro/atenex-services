@@ -1,41 +1,39 @@
 # reranker-service/app/dependencies.py
-from fastapi import HTTPException, status, Request
+from fastapi import HTTPException, status as fastapi_status, Request
+from typing import Optional, Annotated
+
 from app.application.use_cases.rerank_documents_use_case import RerankDocumentsUseCase
-from app.infrastructure.rerankers.sentence_transformer_adapter import SentenceTransformerRerankerAdapter
 from app.application.ports.reranker_model_port import RerankerModelPort
+# The actual adapter instance will be set during app lifespan.
 
-# This approach uses global-like instances set up during lifespan.
-# For more complex apps, a proper DI container (e.g., dependency-injector) is better.
-
-_reranker_model_adapter_instance: RerankerModelPort = None
-_rerank_use_case_instance: RerankDocumentsUseCase = None
+# Globals to hold instances, set by lifespan. This is a simple DI approach.
+_reranker_model_adapter_instance: Optional[RerankerModelPort] = None
+_rerank_use_case_instance: Optional[RerankDocumentsUseCase] = None
 
 def set_dependencies(
     model_adapter: RerankerModelPort,
     use_case: RerankDocumentsUseCase
 ):
+    """
+    Called during application startup (lifespan) to set the shared instances.
+    """
     global _reranker_model_adapter_instance, _rerank_use_case_instance
     _reranker_model_adapter_instance = model_adapter
     _rerank_use_case_instance = use_case
+    # Add logging here if needed to confirm dependencies are set.
 
 def get_rerank_use_case() -> RerankDocumentsUseCase:
+    """
+    FastAPI dependency getter for RerankDocumentsUseCase.
+    Ensures the use case and its underlying model adapter are ready.
+    """
     if _rerank_use_case_instance is None or \
        _reranker_model_adapter_instance is None or \
        not _reranker_model_adapter_instance.is_ready():
+        # This detailed check helps pinpoint if the adapter or use case itself wasn't set,
+        # or if the adapter is set but not ready (model load failed).
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Reranker service is not ready or dependencies not initialized."
+            status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Reranker service is not ready. Dependencies (model or use case) not initialized or model failed to load."
         )
     return _rerank_use_case_instance
-
-# Alternative: Get adapter from app.state if set in lifespan
-# async def get_reranker_adapter_from_state(request: Request) -> RerankerModelPort:
-#     if not hasattr(request.app.state, "reranker_adapter") or \
-#        not request.app.state.reranker_adapter.is_ready():
-#         raise HTTPException(status_code=503, detail="Reranker model adapter not ready.")
-#     return request.app.state.reranker_adapter
-
-# async def get_use_case_from_adapter_in_state(
-#     adapter: RerankerModelPort = Depends(get_reranker_adapter_from_state)
-# ) -> RerankDocumentsUseCase:
-#     return RerankDocumentsUseCase(adapter)

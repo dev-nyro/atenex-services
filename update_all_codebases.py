@@ -9,6 +9,7 @@ MICROSERVICES = [
     "ingest-service",
     "query-service",
     "reranker-service",
+    "docproc-service",
 ]
 
 ROOT = Path(__file__).parent.resolve()

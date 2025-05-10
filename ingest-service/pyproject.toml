@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "ingest-service"
-version = "0.3.1" # Version incrementada
-description = "Ingest service for Atenex B2B SaaS (Postgres/GCS/Milvus/Remote Embedding Service - CPU - Prefork)" # Descripción actualizada
+version = "0.3.2"
+description = "Ingest service for Atenex B2B SaaS (Postgres/GCS/Milvus/Remote Embedding & DocProc Services - CPU - Prefork)"
 authors = ["Atenex Team <dev@atenex.com>"]
 readme = "README.md"
 
@@ -20,23 +20,13 @@ structlog = "^24.1.0"
 
 google-cloud-storage = "^2.16.0"
 
-# --- ONNX Runtime ---
-# onnxruntime = "^1.18.0" # Eliminado, ya no se usa directamente en ingest-service
-
-# --- Core Processing Dependencies (v0.3.1) ---
-pymupdf = "^1.25.0"
-# sentence-transformers = "^2.7" # Eliminado, se usa el servicio externo
+# --- Core Processing Dependencies (v0.3.2) ---
 pymilvus = ">=2.4.1,<2.5.0"
 tiktoken = "^0.7.0"
 
-# --- Converter Dependencies (Standalone - Keep) ---
-python-docx = ">=1.1.0,<2.0.0"
-markdown = ">=3.5.1,<4.0.0"
-beautifulsoup4 = ">=4.12.3,<5.0.0"
-html2text = ">=2024.1.0,<2025.0.0"
 
 # --- HTTP Client (API & Service Client - Keep) ---
-httpx = {extras = ["http2"], version = "^0.27.0"} # Usado por EmbeddingServiceClient
+httpx = {extras = ["http2"], version = "^0.27.0"}
 h2 = "^4.1.0"
 
 # --- Synchronous DB Dependencies (Worker - Keep) ---
