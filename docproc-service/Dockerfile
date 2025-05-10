@@ -1,4 +1,3 @@
-# ---- Stage 1: Builder ----
 FROM python:3.10-slim AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -24,7 +23,6 @@ WORKDIR /build
 COPY pyproject.toml poetry.lock ./
 RUN poetry install --no-root --only main
 
-# ---- Stage 2: Final Image ----
 FROM python:3.10-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -36,7 +34,7 @@ WORKDIR ${APP_HOME}
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      libmupdf3 && \        # corregido: libmupdf0 → libmupdf3
+      libmupdf3 && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
