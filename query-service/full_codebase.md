@@ -3063,7 +3063,7 @@ async def read_root():
     health_log.debug("Health check passed.")
     return PlainTextResponse("OK", status_code=fastapi_status.HTTP_200_OK)
 
-# --- Main execution ---
+# --- Main execution --- .
 if __name__ == "__main__":
     port = 8002
     log_level_str = settings.LOG_LEVEL.lower()
@@ -3115,7 +3115,7 @@ authors = ["Nyro <dev@nyro.com>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.10"
+python = "^3.10" # Project requires Python 3.10 or higher, but less than 4.0
 fastapi = "^0.110.0"
 uvicorn = {extras = ["standard"], version = "^0.28.0"}
 gunicorn = "^21.2.0"
@@ -3130,17 +3130,23 @@ structlog = "^24.1.0"
 # --- Haystack Dependencies ---
 haystack-ai = "^2.0.1" # Core Haystack (Document, PromptBuilder)
 pymilvus = "^2.4.1"    # Milvus client
-# FastEmbed integration for Haystack (still used for embedding)
-fastembed-haystack = "^1.4.1"
+# --- LLM_CORRECTION: Pin version and add Python marker ---
+fastembed-haystack = { version = "1.3.0", python = ">=3.10,<3.13" } # Pin to 1.3.0, explicit Python range
+# --- END CORRECTION ---
+# --- LLM_CORRECTION: Pin version and add Python marker ---
+fastembed = { version = "0.3.6", python = ">=3.10,<3.13" } # Pin to 0.3.6, explicit Python range
+# --- END CORRECTION ---
 
 # --- LLM Dependency ---
 google-generativeai = "^0.5.4" # Gemini client
 
 # --- RAG Component Dependencies ---
 sentence-transformers = "^2.7.0" # For BGE Reranker adapter
-bm25s = "^0.1.3"                # For BM25s sparse retriever adapter
-# --- LLM_CORRECTION: Updated numpy version constraint for compatibility with bm25s ---
-numpy = "^1.26.4"              # bm25s 0.1.x requires numpy <1.27. Adjusted from ^2.1.0
+# --- LLM_CORRECTION: Pin version ---
+bm25s = "0.1.3"                # Pin to 0.1.3
+# --- END CORRECTION ---
+# --- LLM_CORRECTION: Pin version ---
+numpy = "1.26.4"              # Pin to 1.26.4 (compatible with bm25s and fastembed 0.3.x)
 # --- END CORRECTION ---
 
 

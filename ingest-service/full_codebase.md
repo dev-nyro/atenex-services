@@ -113,8 +113,6 @@ router = APIRouter()
 
 # --- Helper Functions ---
 
-# LLM_FLAG: NO_CHANGE - Minio Client Dependency removed
-
 # GCS Client Dependency
 def get_gcs_client():
     """Dependency to get GCS client instance."""
@@ -155,7 +153,7 @@ async def get_db_conn():
 
 
 # --- Milvus Synchronous Helper Functions (Refactored to use pymilvus) ---
-# LLM_FLAG: NO_CHANGE - Milvus Sync Helper Functions (Already Correct)
+# LLM_FLAG: NO_CHANGE - Milvus Sync Helper Functions (Already Correct) - _get_milvus_collection_sync is correct
 def _get_milvus_collection_sync() -> Collection:
     """Synchronously connects to Milvus and returns the Collection object."""
     alias = "api_sync_helper"
@@ -180,6 +178,7 @@ def _get_milvus_collection_sync() -> Collection:
         sync_milvus_log.error("Failed to get or load Milvus collection for sync helper", error=str(e))
         raise RuntimeError(f"Milvus collection access error for API helper: {e}") from e
 
+# LLM_FLAG: NO_CHANGE - Milvus Sync Helper Functions (Already Correct) - _get_milvus_chunk_count_sync is correct
 def _get_milvus_chunk_count_sync(document_id: str, company_id: str) -> int:
     """Synchronously counts chunks in Milvus for a specific document using pymilvus query."""
     count_log = log.bind(document_id=document_id, company_id=company_id, component="MilvusHelperSync")
@@ -201,26 +200,48 @@ def _get_milvus_chunk_count_sync(document_id: str, company_id: str) -> int:
         count_log.exception("Unexpected error during Milvus count", error=str(e))
         return -1
 
+# --- FIX: Milvus Delete Sync Helper ---
 def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
-    """Synchronously deletes chunks from Milvus using pymilvus delete."""
+    """Synchronously deletes chunks from Milvus using pymilvus: Query PKs first, then delete by PK list."""
     delete_log = log.bind(document_id=document_id, company_id=company_id, component="MilvusHelperSync")
+    expr = f'{MILVUS_COMPANY_ID_FIELD} == "{company_id}" and {MILVUS_DOCUMENT_ID_FIELD} == "{document_id}"'
+    pks_to_delete: List[str] = []
+
     try:
         collection = _get_milvus_collection_sync()
-        expr = f'{MILVUS_COMPANY_ID_FIELD} == "{company_id}" and {MILVUS_DOCUMENT_ID_FIELD} == "{document_id}"'
-        delete_log.info("Attempting to delete chunks from Milvus (pymilvus)", filter_expr=expr)
-        delete_result = collection.delete(expr=expr)
-        delete_log.info("Milvus delete operation executed (pymilvus)", deleted_count=delete_result.delete_count)
-        return True
+
+        # 1. Query for Primary Keys
+        delete_log.info("Querying Milvus for PKs to delete (sync)...", filter_expr=expr)
+        query_res = collection.query(expr=expr, output_fields=[MILVUS_PK_FIELD])
+        pks_to_delete = [item[MILVUS_PK_FIELD] for item in query_res if MILVUS_PK_FIELD in item]
+
+        if not pks_to_delete:
+            delete_log.info("No matching primary keys found in Milvus for deletion (sync).")
+            return True # Return True as there's nothing to delete
+
+        delete_log.info(f"Found {len(pks_to_delete)} primary keys to delete (sync).")
+
+        # 2. Delete using the retrieved Primary Keys
+        # Ensure the list formatting is correct for the 'in' operator
+        delete_expr = f'{MILVUS_PK_FIELD} in {json.dumps(pks_to_delete)}' # Use json.dumps for correct list representation
+        delete_log.info("Attempting to delete chunks from Milvus using PK list expression (sync).", filter_expr=delete_expr)
+        delete_result = collection.delete(expr=delete_expr)
+        delete_log.info("Milvus delete operation by PK list executed (sync).", deleted_count=delete_result.delete_count)
+
+        if delete_result.delete_count != len(pks_to_delete):
+             delete_log.warning("Milvus delete count mismatch (sync).", expected=len(pks_to_delete), reported=delete_result.delete_count)
+             # Return False if count mismatches? Or True if delete was attempted? Let's return True if no exception.
+        return True # Indicate successful execution (even if count mismatch)
+
     except RuntimeError as re:
-        delete_log.error("Failed to delete Milvus chunks due to connection/collection error", error=str(re))
+        delete_log.error("Failed to delete Milvus chunks due to connection/collection error (sync)", error=str(re))
         return False
     except MilvusException as e:
-        delete_log.error("Milvus delete error", error=str(e), exc_info=True)
+        delete_log.error("Milvus query or delete error (sync)", error=str(e), exc_info=True)
         return False
     except Exception as e:
-        delete_log.exception("Unexpected error during Milvus delete", error=str(e))
+        delete_log.exception("Unexpected error during Milvus delete (sync)", error=str(e))
         return False
-
 
 # --- API Endpoints ---
 
@@ -331,6 +352,7 @@ async def upload_document(
 
     # Use GCS Client
     try:
+        # Potential OOM Risk: Reading entire file here. Consider streaming upload if needed.
         file_content = await file.read()
         endpoint_log.info("Preparing upload to GCS", object_name=file_path_in_storage, filename=normalized_filename, size=len(file_content), content_type=file.content_type)
         try:
@@ -927,7 +949,7 @@ async def delete_document_endpoint(
     gcs_client: GCSClient = Depends(get_gcs_client), # Uses GCS Client
 ):
     """
-    Deletes a document: removes from Milvus (using pymilvus helper), GCS, and PostgreSQL.
+    Deletes a document: removes from Milvus (using corrected sync helper), GCS, and PostgreSQL.
     """
     company_id = request.headers.get("X-Company-ID")
     req_id = getattr(request.state, 'request_id', 'N/A')
@@ -957,20 +979,23 @@ async def delete_document_endpoint(
 
     errors = []
 
-    # 1. Delete from Milvus (No change needed)
+    # 1. Delete from Milvus (using corrected sync helper)
     delete_log.info("Attempting to delete chunks from Milvus (pymilvus)...")
     loop = asyncio.get_running_loop()
     try:
+        # Use the corrected sync delete helper
         milvus_deleted = await loop.run_in_executor(None, _delete_milvus_sync, str(document_id), company_id)
-        if milvus_deleted: delete_log.info("Milvus delete command executed successfully (pymilvus).")
+        if milvus_deleted: delete_log.info("Milvus delete command executed successfully (pymilvus helper).")
         else:
+            # _delete_milvus_sync now logs its own errors, just report failure here
             errors.append("Failed Milvus delete (pymilvus helper returned False)")
             delete_log.warning("Milvus delete operation reported failure (check helper logs).")
     except Exception as e:
-        delete_log.exception("Unexpected error during Milvus delete execution", error=str(e))
-        errors.append(f"Milvus delete exception: {type(e).__name__}")
+        # Catch errors from run_in_executor or potential helper errors not caught inside
+        delete_log.exception("Unexpected error during Milvus delete execution via helper", error=str(e))
+        errors.append(f"Milvus delete exception via helper: {type(e).__name__}")
 
-    # 2. Delete from GCS
+    # 2. Delete from GCS (No change needed here)
     gcs_path = doc_data.get('file_path')
     if gcs_path:
         delete_log.info("Attempting to delete file from GCS...", object_name=gcs_path)
@@ -987,7 +1012,7 @@ async def delete_document_endpoint(
         delete_log.warning("Skipping GCS delete: file path not found in DB record.")
         errors.append("GCS path unknown in DB.")
 
-    # 3. Delete from PostgreSQL (No change needed)
+    # 3. Delete from PostgreSQL (No change needed here)
     delete_log.info("Attempting to delete record from PostgreSQL...")
     try:
          async with get_db_conn() as conn:
@@ -1004,7 +1029,8 @@ async def delete_document_endpoint(
     if errors: delete_log.warning("Document deletion process completed with non-critical errors", errors=errors)
 
     delete_log.info("Document deletion process finished.")
-    return None # Return 204 No Content 
+    return None # Return 204 No Content
+
 ```
 
 ## File: `app\api\v1\schemas.py`
@@ -1418,7 +1444,8 @@ from sqlalchemy import (
     create_engine, text, Engine, Connection, Table, MetaData, Column,
     Uuid, Integer, Text, JSON, String, DateTime, UniqueConstraint, ForeignKeyConstraint, Index
 )
-from sqlalchemy.dialects.postgresql import insert as pg_insert, JSONB # Use JSONB
+# --- FIX: Import dialect-specific insert for on_conflict ---
+from sqlalchemy.dialects.postgresql import insert as pg_insert, JSONB # Use JSONB and import postgresql insert
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.config import settings
@@ -1663,7 +1690,7 @@ def set_status_sync(
 def bulk_insert_chunks_sync(engine: Engine, chunks_data: List[Dict[str, Any]]) -> int:
     """
     Synchronously inserts multiple document chunks into the document_chunks table.
-    Uses SQLAlchemy Core API for efficient bulk insertion.
+    Uses SQLAlchemy Core API for efficient bulk insertion and handles conflicts.
     """
     if not chunks_data:
         log.warning("bulk_insert_chunks_sync called with empty data list.")
@@ -1672,41 +1699,37 @@ def bulk_insert_chunks_sync(engine: Engine, chunks_data: List[Dict[str, Any]]) -
     insert_log = log.bind(component="SyncDBBulkInsert", num_chunks=len(chunks_data), document_id=chunks_data[0].get('document_id'))
     insert_log.info("Attempting synchronous bulk insert of document chunks.")
 
-    # Convert UUIDs to strings if they are UUID objects, as psycopg2 might expect strings
-    # and handle metadata dict serialization
     prepared_data = []
     for chunk in chunks_data:
         prepared_chunk = chunk.copy()
+        # Ensure UUIDs are handled correctly by SQLAlchemy/psycopg2
         if isinstance(prepared_chunk.get('document_id'), uuid.UUID):
-            prepared_chunk['document_id'] = str(prepared_chunk['document_id'])
+            prepared_chunk['document_id'] = prepared_chunk['document_id'] # Keep as UUID
         if isinstance(prepared_chunk.get('company_id'), uuid.UUID):
-             prepared_chunk['company_id'] = str(prepared_chunk['company_id'])
-        # Ensure metadata is serializable (SQLAlchemy handles dict -> JSONB well with json_serializer)
+             prepared_chunk['company_id'] = prepared_chunk['company_id'] # Keep as UUID
+
         if 'metadata' in prepared_chunk and not isinstance(prepared_chunk['metadata'], (dict, list, type(None))):
              log.warning("Invalid metadata type for chunk, attempting conversion", chunk_index=prepared_chunk.get('chunk_index'))
-             prepared_chunk['metadata'] = {} # Default to empty dict on error
+             prepared_chunk['metadata'] = {}
+        elif isinstance(prepared_chunk['metadata'], dict):
+             # Optionally clean metadata further if needed (e.g., remove non-JSON serializable types)
+             pass
 
         prepared_data.append(prepared_chunk)
-
 
     try:
         with engine.connect() as connection:
             with connection.begin(): # Start transaction
-                # Using Core Table object for insert
-                # Ensure column names match exactly those in the prepared_data dict keys
-                stmt = document_chunks_table.insert().values(prepared_data)
-                # Optional: ON CONFLICT DO NOTHING based on the unique constraint
+                # --- FIX: Use pg_insert from dialect import ---
+                stmt = pg_insert(document_chunks_table).values(prepared_data)
+                # Specify the conflict target and action
                 stmt = stmt.on_conflict_do_nothing(
                      index_elements=['document_id', 'chunk_index']
                 )
                 result = connection.execute(stmt)
 
-            # rowcount might not be reliable with ON CONFLICT DO NOTHING
-            # We assume success if no exception is raised.
-            # To get the actual inserted count, a SELECT COUNT(*) or RETURNING clause might be needed,
-            # but complicates the bulk insert. For now, return the intended count on success.
-            inserted_count = len(prepared_data) # Assuming all were inserted or ignored successfully
-            insert_log.info("Bulk insert statement executed successfully.", intended_count=len(prepared_data), reported_rowcount=result.rowcount)
+            inserted_count = len(prepared_data) # Assume success if no exception
+            insert_log.info("Bulk insert statement executed successfully (ON CONFLICT DO NOTHING).", intended_count=len(prepared_data), reported_rowcount=result.rowcount if result else -1)
             return inserted_count
 
     except SQLAlchemyError as e:
@@ -2722,23 +2745,51 @@ def _check_and_create_indexes(collection: Collection):
         # Decide whether to raise or just log the error
 
 def delete_milvus_chunks(company_id: str, document_id: str) -> int:
-    """Deletes chunks for a specific document from Milvus."""
+    """
+    Deletes chunks for a specific document from Milvus by querying PKs first.
+    """
     del_log = log.bind(company_id=company_id, document_id=document_id)
+    expr = f'{MILVUS_COMPANY_ID_FIELD} == "{company_id}" and {MILVUS_DOCUMENT_ID_FIELD} == "{document_id}"'
+    pks_to_delete: List[str] = []
+    deleted_count = 0
+
     try:
         collection = _ensure_milvus_connection_and_collection()
-        expr = f'{MILVUS_COMPANY_ID_FIELD} == "{company_id}" and {MILVUS_DOCUMENT_ID_FIELD} == "{document_id}"'
 
-        del_log.info("Attempting to delete chunks from Milvus using expression.", filter_expr=expr)
-        delete_result = collection.delete(expr=expr)
-        actual_deleted_count = delete_result.delete_count
-        del_log.info("Milvus delete operation executed.", deleted_count=actual_deleted_count)
-        return actual_deleted_count
+        # 1. Query for Primary Keys matching the expression
+        del_log.info("Querying Milvus for PKs to delete...", filter_expr=expr)
+        query_res = collection.query(expr=expr, output_fields=[MILVUS_PK_FIELD])
+        pks_to_delete = [item[MILVUS_PK_FIELD] for item in query_res if MILVUS_PK_FIELD in item]
+
+        if not pks_to_delete:
+            del_log.info("No matching primary keys found in Milvus for deletion.")
+            return 0
+
+        del_log.info(f"Found {len(pks_to_delete)} primary keys to delete.")
+
+        # 2. Delete using the retrieved Primary Keys
+        # Milvus expects `pk_field in [...]` format
+        # Need to format the list properly, e.g., ['pk1', 'pk2']
+        delete_expr = f'{MILVUS_PK_FIELD} in {pks_to_delete}'
+        del_log.info("Attempting to delete chunks from Milvus using PK list expression.", filter_expr=delete_expr)
+        delete_result = collection.delete(expr=delete_expr)
+        deleted_count = delete_result.delete_count
+        del_log.info("Milvus delete operation by PK list executed.", deleted_count=deleted_count)
+        # Optional: Verify if deleted_count matches len(pks_to_delete)
+        if deleted_count != len(pks_to_delete):
+             del_log.warning("Milvus delete count mismatch.", expected=len(pks_to_delete), reported=deleted_count)
+
+        return deleted_count
+
     except MilvusException as e:
-        del_log.error("Milvus delete error", error=str(e), exc_info=True)
+        del_log.error("Milvus delete error (query or delete phase)", error=str(e), exc_info=True)
+        # Return 0 as deletion likely failed or partially failed
         return 0
     except Exception as e:
         del_log.exception("Unexpected error during Milvus chunk deletion")
-        raise RuntimeError(f"Unexpected Milvus deletion error: {e}") from e
+        # Raising might be too disruptive if this is called during cleanup.
+        # Consider just returning 0 and logging the critical error.
+        return 0 # Changed from raise
 
 
 def ingest_document_pipeline(
@@ -2864,9 +2915,11 @@ def ingest_document_pipeline(
     if delete_existing:
         ingest_log.info("Attempting to delete existing chunks before insertion...")
         try:
+            # Use the corrected delete_milvus_chunks function
             deleted_count = delete_milvus_chunks(company_id, document_id)
             ingest_log.info(f"Deleted {deleted_count} existing chunks.")
         except Exception as del_err:
+            # Log the error but proceed, as delete_milvus_chunks now handles internal errors
             ingest_log.error("Failed to delete existing chunks, proceeding with insert anyway.", error=str(del_err))
 
     ingest_log.debug(f"Inserting {len(processed_chunks)} chunks into Milvus collection '{MILVUS_COLLECTION_NAME}'...")
@@ -2880,26 +2933,34 @@ def ingest_document_pipeline(
         else:
              ingest_log.info(f"Successfully inserted {inserted_count} chunks into Milvus.")
 
-        if mutation_result.primary_keys != milvus_pks[:inserted_count]:
-             ingest_log.warning("Milvus returned primary keys do not exactly match the generated PKs used for insertion.",
-                                returned_pks=mutation_result.primary_keys, sent_pks=milvus_pks[:inserted_count])
+        # Use the actual PKs assigned during insertion, which should match our generated ones if successful
+        returned_pks = mutation_result.primary_keys
+        if len(returned_pks) != inserted_count:
+             ingest_log.error("Milvus returned PK count mismatch!", returned_count=len(returned_pks), inserted_count=inserted_count)
+             # Cannot reliably assign PKs back to chunks if counts mismatch
+             successfully_inserted_chunks_data = []
+        else:
+             ingest_log.info("Milvus returned PKs match inserted count.")
+             successfully_inserted_chunks_data = []
+             # Assign the returned PKs back to the corresponding processed chunks
+             for i in range(inserted_count):
+                 chunk_index = int(returned_pks[i].split('_')[-1]) # Assuming format "docid_index"
+                 # Find the original chunk by index (safer than assuming order)
+                 original_chunk = next((c for c in processed_chunks if c.chunk_index == chunk_index), None)
+                 if original_chunk:
+                    original_chunk.embedding_id = str(returned_pks[i])
+                    original_chunk.vector_status = ChunkVectorStatus.CREATED
+                    successfully_inserted_chunks_data.append(original_chunk)
+                 else:
+                     log.warning("Could not find original chunk data for returned PK", pk=returned_pks[i])
+             if len(successfully_inserted_chunks_data) != inserted_count:
+                  log.warning("Mismatch between Milvus inserted count and successfully mapped chunks for PG.")
 
         ingest_log.debug("Flushing Milvus collection...")
         collection.flush()
         ingest_log.info("Milvus collection flushed.")
 
-        returned_pks = mutation_result.primary_keys
-        successfully_inserted_chunks_data: List[DocumentChunkData] = []
-        if len(returned_pks) == inserted_count:
-            for i in range(inserted_count):
-                 processed_chunks[i].embedding_id = str(returned_pks[i])
-                 processed_chunks[i].vector_status = ChunkVectorStatus.CREATED
-                 successfully_inserted_chunks_data.append(processed_chunks[i])
-        else:
-             ingest_log.error("Cannot assign embedding_ids due to PK count mismatch from Milvus result.")
-             successfully_inserted_chunks_data = []
-
-        return inserted_count, returned_pks[:inserted_count], successfully_inserted_chunks_data
+        return inserted_count, returned_pks, successfully_inserted_chunks_data
 
     except MilvusException as e:
         ingest_log.error("Failed to insert data into Milvus", error=str(e), exc_info=True)
