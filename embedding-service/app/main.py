@@ -199,7 +199,7 @@ async def health_check():
         model_dimension=model_dim_int
     )
 
-# --- Root Endpoint (Simple Ack) ---
+# --- Root Endpoint (Simple Ack)  ---
 @app.get("/", tags=["Root"], response_class=PlainTextResponse, include_in_schema=False)
 async def root():
     return f"{settings.PROJECT_NAME} is running."
