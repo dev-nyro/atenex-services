@@ -1,6 +1,5 @@
-# docproc-service/Dockerfile
 # ---- Stage 1: Builder ----
-FROM python:3.10-slim as builder
+FROM python:3.10-slim AS builder   # 'as' → 'AS'
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -12,10 +11,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    curl \
-    build-essential \
-    libmupdf-dev \
-    swig && \
+      curl \
+      build-essential \
+      libmupdf-dev \
+      swig && \
     rm -rf /var/lib/apt/lists/*
 
 RUN curl -sSL https://install.python-poetry.org | python3 - --version ${POETRY_VERSION}
@@ -26,7 +25,7 @@ COPY pyproject.toml poetry.lock ./
 RUN poetry install --no-root --only main
 
 # ---- Stage 2: Final Image ----
-FROM python:3.10-slim
+FROM python:3.10-slim AS runtime   # añade 'AS runtime' para simetría
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -36,7 +35,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR ${APP_HOME}
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends libmupdf0 && \
+    apt-get install -y --no-install-recommends \
+      libmupdf3 && \        # corregido: libmupdf0 → libmupdf3
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
