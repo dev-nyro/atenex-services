@@ -25,7 +25,7 @@ RUN poetry install --no-root --only main -vvv
 RUN rm -rf /root/.cache/huggingface
 
 # ---- Stage 2: Final Image ----
-FROM python:3.10-slim
+FROM python:3.10-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -34,9 +34,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR ${APP_HOME}
 
-# Instalar dependencias de runtime del sistema si son necesarias (cmake no es necesario en runtime para bm2s)
-# RUN apt-get update && apt-get install -y --no-install-recommends some-runtime-lib && rm -rf /var/lib/apt/lists/*
-
 COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
@@ -44,4 +41,4 @@ COPY ./app ${APP_HOME}/app
 
 EXPOSE ${PORT}
 
-CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "2", "-b", "0.0.0.0:${PORT}", "app.main:app"]
+CMD sh -c "gunicorn -k uvicorn.workers.UvicornWorker -w 2 -b 0.0.0.0:${PORT} app.main:app"

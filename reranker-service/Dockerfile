@@ -11,7 +11,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     POETRY_VIRTUALENVS_CREATE=false
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl build-essential && \
+    apt-get install -y --no-install-recommends curl gcc build-essential && \
+    apt-get purge -y --auto-remove curl gcc build-essential && \
     rm -rf /var/lib/apt/lists/*
 
 RUN curl -sSL https://install.python-poetry.org | python3 - --version ${POETRY_VERSION}
@@ -23,7 +24,7 @@ COPY pyproject.toml poetry.lock ./
 RUN poetry install --no-root --only main
 
 # ---- Stage 2: Final Image ----
-FROM python:3.10-slim
+FROM python:3.10-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -34,9 +35,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TRANSFORMERS_CACHE="/app/.cache/huggingface"
 
 WORKDIR ${APP_HOME}
-
-# Sentence-transformers y PyTorch usualmente no necesitan dependencias de sistema en runtime
-# si se usan los wheels precompilados.
 
 COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
@@ -49,4 +47,4 @@ RUN mkdir -p ${HF_HOME} && \
 
 EXPOSE ${RERANKER_PORT}
 
-CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "app.main:app", "--bind", "0.0.0.0:${RERANKER_PORT}", "--workers", "${RERANKER_WORKERS}", "--timeout", "120"]
+CMD sh -c "gunicorn -k uvicorn.workers.UvicornWorker app.main:app --bind 0.0.0.0:${RERANKER_PORT} --workers ${RERANKER_WORKERS} --timeout 120"

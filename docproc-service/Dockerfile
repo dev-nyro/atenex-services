@@ -1,3 +1,4 @@
+# docproc-service/Dockerfile
 FROM python:3.10-slim AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -34,7 +35,7 @@ WORKDIR ${APP_HOME}
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      libmupdf-dev && \
+      libmupdf0 && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
@@ -44,4 +45,4 @@ COPY ./app ${APP_HOME}/app
 
 EXPOSE ${DOCPROC_PORT}
 
-CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "4", "-b", "0.0.0.0:${DOCPROC_PORT}", "app.main:app", "--timeout", "300"]
+CMD sh -c "gunicorn -k uvicorn.workers.UvicornWorker -w 4 -b 0.0.0.0:${DOCPROC_PORT} app.main:app --timeout 300"

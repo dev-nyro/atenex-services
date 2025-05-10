@@ -3461,7 +3461,6 @@ google-generativeai = "^0.5.4"
 
 # --- RAG Component Dependencies ---
 # sentence-transformers is REMOVED as reranking is now external
-bm2s = "0.1.3"
 numpy = "1.26.4" # Kept, as bm2s or other parts might need it. Haystack might also use it.
 # fastembed and fastembed-haystack are REMOVED as embedding is now external
 
