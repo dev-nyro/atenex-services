@@ -10,7 +10,7 @@ import asyncio
 import json
 import uuid
 from contextlib import asynccontextmanager
-from typing import Annotated, Optional # Explicit type hint for Optionals
+from typing import Annotated, Optional
 
 # Configurar logging primero
 from app.core.config import settings
@@ -25,7 +25,8 @@ from app.api.v1.endpoints import chat as chat_router_module
 # Import Ports and Adapters/Repositories for Dependency Injection
 from app.application.ports import (
     ChatRepositoryPort, LogRepositoryPort, VectorStorePort, LLMPort,
-    SparseRetrieverPort, RerankerPort, DiversityFilterPort, ChunkContentRepositoryPort
+    SparseRetrieverPort, RerankerPort, DiversityFilterPort, ChunkContentRepositoryPort,
+    EmbeddingPort # NUEVA ADICIÓN
 )
 from app.infrastructure.persistence.postgres_repositories import (
     PostgresChatRepository, PostgresLogRepository, PostgresChunkContentRepository
@@ -35,8 +36,10 @@ from app.infrastructure.llms.gemini_adapter import GeminiAdapter
 from app.infrastructure.retrievers.bm25_retriever import BM25sRetriever
 from app.infrastructure.rerankers.bge_reranker import BGEReranker
 from app.infrastructure.filters.diversity_filter import MMRDiversityFilter, StubDiversityFilter
+# NUEVAS ADICIONES para Embedding Remoto
+from app.infrastructure.clients.embedding_service_client import EmbeddingServiceClient
+from app.infrastructure.embedding.remote_embedding_adapter import RemoteEmbeddingAdapter
 
-# Import Use Case
 
 # Import AskQueryUseCase and dependency setter from dependencies.py
 from app.application.use_cases.ask_query_use_case import AskQueryUseCase
@@ -47,7 +50,7 @@ from app.infrastructure.persistence import postgres_connector
 
 # Global state
 SERVICE_READY = False
-# Global instances for simplified DI (replace with proper container if needed)
+# Global instances for simplified DI
 chat_repo_instance: Optional[ChatRepositoryPort] = None
 log_repo_instance: Optional[LogRepositoryPort] = None
 chunk_content_repo_instance: Optional[ChunkContentRepositoryPort] = None
@@ -55,7 +58,10 @@ vector_store_instance: Optional[VectorStorePort] = None
 llm_instance: Optional[LLMPort] = None
 sparse_retriever_instance: Optional[SparseRetrieverPort] = None
 reranker_instance: Optional[RerankerPort] = None
-diversity_filter_instance: Optional[DiversityFilterPort] = None # Will hold either MMR or Stub
+diversity_filter_instance: Optional[DiversityFilterPort] = None
+# NUEVAS ADICIONES para Embedding Remoto
+embedding_service_client_instance: Optional[EmbeddingServiceClient] = None
+embedding_adapter_instance: Optional[EmbeddingPort] = None
 ask_query_use_case_instance: Optional[AskQueryUseCase] = None
 
 
@@ -64,9 +70,10 @@ ask_query_use_case_instance: Optional[AskQueryUseCase] = None
 async def lifespan(app: FastAPI):
     global SERVICE_READY, chat_repo_instance, log_repo_instance, chunk_content_repo_instance, \
            vector_store_instance, llm_instance, sparse_retriever_instance, reranker_instance, \
-           diversity_filter_instance, ask_query_use_case_instance
+           diversity_filter_instance, ask_query_use_case_instance, \
+           embedding_service_client_instance, embedding_adapter_instance # NUEVAS ADICIONES
 
-    SERVICE_READY = False # Ensure service starts as not ready
+    SERVICE_READY = False
     log.info(f"Starting up {settings.PROJECT_NAME}...")
     dependencies_ok = True
     critical_failure_message = ""
@@ -90,11 +97,32 @@ async def lifespan(app: FastAPI):
             log.critical(f"CRITICAL: {critical_failure_message}", error=str(e), exc_info=True)
             dependencies_ok = False
 
-    # 2. Initialize Milvus Adapter
+    # 2. Initialize Embedding Service Client & Adapter (NUEVO PASO TEMPRANO)
+    if dependencies_ok:
+        try:
+            embedding_service_client_instance = EmbeddingServiceClient(base_url=str(settings.EMBEDDING_SERVICE_URL))
+            embedding_adapter_instance = RemoteEmbeddingAdapter(client=embedding_service_client_instance)
+            await embedding_adapter_instance.initialize() # Intenta obtener dimensión del servicio
+            
+            # Health check del servicio de embedding
+            emb_service_healthy = await embedding_adapter_instance.health_check()
+            if emb_service_healthy:
+                log.info("Embedding Service client and adapter initialized, health check passed.")
+            else:
+                critical_failure_message = "Embedding Service health check failed during startup."
+                log.critical(f"CRITICAL: {critical_failure_message} URL: {settings.EMBEDDING_SERVICE_URL}")
+                dependencies_ok = False
+        except Exception as e:
+            critical_failure_message = "Failed to initialize Embedding Service client/adapter."
+            log.critical(f"CRITICAL: {critical_failure_message}", error=str(e), exc_info=True, url=settings.EMBEDDING_SERVICE_URL)
+            dependencies_ok = False
+
+
+    # 3. Initialize Milvus Adapter
     if dependencies_ok:
         try:
             vector_store_instance = MilvusAdapter()
-            await vector_store_instance._get_collection() # This tries connection + load
+            await vector_store_instance._get_collection()
             log.info("Milvus Adapter initialized and collection checked/loaded.")
         except Exception as e:
             critical_failure_message = "Failed to initialize Milvus Adapter or load collection."
@@ -104,7 +132,7 @@ async def lifespan(app: FastAPI):
             )
             dependencies_ok = False
 
-    # 3. Initialize LLM Adapter
+    # 4. Initialize LLM Adapter
     if dependencies_ok:
         try:
             llm_instance = GeminiAdapter()
@@ -128,7 +156,7 @@ async def lifespan(app: FastAPI):
                     log.info("BM25s Retriever initialized.")
                 else:
                     log.error("BM25 enabled but ChunkContentRepository failed to initialize. Disabling BM25.")
-                    sparse_retriever_instance = None
+                    sparse_retriever_instance = None # Ensure it's None
             except ImportError: log.error("BM25sRetriever dependency (bm2s) not installed. BM25 disabled.")
             except Exception as e: log.error("Failed to initialize BM25s Retriever.", error=str(e), exc_info=True)
 
@@ -142,8 +170,13 @@ async def lifespan(app: FastAPI):
 
         if settings.DIVERSITY_FILTER_ENABLED:
             try:
-                diversity_filter_instance = MMRDiversityFilter(lambda_mult=settings.QUERY_DIVERSITY_LAMBDA)
-                log.info("MMR Diversity Filter initialized.")
+                # Solo usar MMR si el adaptador de embedding está disponible y puede dar embeddings
+                if embedding_adapter_instance:
+                    diversity_filter_instance = MMRDiversityFilter(lambda_mult=settings.QUERY_DIVERSITY_LAMBDA)
+                    log.info("MMR Diversity Filter initialized.")
+                else:
+                    log.warning("MMR Diversity Filter requires embeddings, but embedding adapter is not available. Falling back to Stub.")
+                    diversity_filter_instance = StubDiversityFilter()
             except Exception as e:
                 log.error("Failed to initialize MMR Diversity Filter. Falling back to Stub.", error=str(e), exc_info=True)
                 diversity_filter_instance = StubDiversityFilter()
@@ -151,7 +184,7 @@ async def lifespan(app: FastAPI):
             log.info("Diversity filter disabled, using StubDiversityFilter as placeholder.")
             diversity_filter_instance = StubDiversityFilter()
 
-    # 4. Instantiate Use Case only if core dependencies are okay
+    # 5. Instantiate Use Case only if core dependencies are okay
     if dependencies_ok:
          try:
              ask_query_use_case_instance = AskQueryUseCase(
@@ -159,6 +192,7 @@ async def lifespan(app: FastAPI):
                  log_repo=log_repo_instance,
                  vector_store=vector_store_instance,
                  llm=llm_instance,
+                 embedding_adapter=embedding_adapter_instance, # Inyectar el nuevo adaptador
                  sparse_retriever=sparse_retriever_instance,
                  chunk_content_repo=chunk_content_repo_instance,
                  reranker=reranker_instance,
@@ -166,21 +200,13 @@ async def lifespan(app: FastAPI):
              )
              log.info("AskQueryUseCase instantiated successfully.")
 
-             # 5. Warm up embedder only if use case is ready
-             log.info("Warming up embedding model...")
-             try:
-                 await asyncio.to_thread(ask_query_use_case_instance._embedder.warm_up)
-                 log.info("Embedding model warmed up successfully.")
-                 # Only set ready if ALL critical steps succeeded
-                 SERVICE_READY = True
-                 # Set the singleton in dependencies.py for use in endpoints
-                 set_ask_query_use_case_instance(ask_query_use_case_instance, SERVICE_READY)
-                 log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY.")
-             except Exception as embed_err:
-                 critical_failure_message = "Failed to warm up embedding model."
-                 log.critical(f"CRITICAL: {critical_failure_message}", error=str(embed_err), exc_info=True)
-                 SERVICE_READY = False # Ensure service is not ready
-                 set_ask_query_use_case_instance(None, False)
+             # REMOVED: Warm up de FastEmbed ya no es necesario.
+             # El RemoteEmbeddingAdapter no tiene un método warm_up explícito,
+             # su inicialización ya intenta conectar y obtener info.
+
+             SERVICE_READY = True
+             set_ask_query_use_case_instance(ask_query_use_case_instance, SERVICE_READY)
+             log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY.")
 
          except Exception as e:
               critical_failure_message = "Failed to instantiate AskQueryUseCase."
@@ -188,9 +214,9 @@ async def lifespan(app: FastAPI):
               SERVICE_READY = False
               set_ask_query_use_case_instance(None, False)
     else:
-        # Log final status if dependencies failed earlier
         log.critical(f"{settings.PROJECT_NAME} startup sequence aborted due to critical failure: {critical_failure_message}")
         log.critical("SERVICE NOT READY.")
+        set_ask_query_use_case_instance(None, False) # Asegurar que el caso de uso no se setee
 
     # Final check - ensure service ready is false if dependencies failed at any point
     if not dependencies_ok:
@@ -205,18 +231,19 @@ async def lifespan(app: FastAPI):
     log.info(f"Shutting down {settings.PROJECT_NAME}...")
     await postgres_connector.close_db_pool()
     if vector_store_instance and hasattr(vector_store_instance, 'disconnect'):
-        try:
-            await vector_store_instance.disconnect()
-        except Exception as e:
-            log.error("Error during Milvus disconnect", error=str(e), exc_info=True)
+        try: await vector_store_instance.disconnect()
+        except Exception as e: log.error("Error during Milvus disconnect", error=str(e), exc_info=True)
+    if embedding_service_client_instance: # NUEVO: cerrar cliente de embedding
+        try: await embedding_service_client_instance.close()
+        except Exception as e: log.error("Error closing EmbeddingServiceClient", error=str(e), exc_info=True)
     log.info("Shutdown complete.")
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
     title=settings.PROJECT_NAME,
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
-    version="0.3.0", # Final Version
-    description="Microservice to handle user queries using a refactored RAG pipeline and chat history.",
+    version="0.3.1", # Incremento de versión patch por refactor de embedding
+    description="Microservice to handle user queries using a refactored RAG pipeline, chat history, and remote embedding generation.",
     lifespan=lifespan
 )
 
@@ -275,7 +302,6 @@ async def generic_exception_handler(request: Request, exc: Exception):
 
 # --- Simplified Dependency Injection Functions ---
 def get_chat_repository() -> ChatRepositoryPort:
-    # Check instance directly, rely on lifespan to initialize it
     if not chat_repo_instance:
         log.error("Dependency Injection Failed: ChatRepository requested but not initialized.")
         raise HTTPException(status_code=503, detail="Chat service component not available.")
@@ -292,17 +318,26 @@ log.info("Routers included", prefix=settings.API_V1_STR)
 @app.get("/", tags=["Health Check"], summary="Service Liveness/Readiness Check")
 async def read_root():
     health_log = log.bind(check="liveness_readiness")
-    # Use the global SERVICE_READY flag set by the lifespan manager
     if not SERVICE_READY:
         health_log.warning("Health check failed: Service not ready.", service_ready_flag=SERVICE_READY)
         raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service Not Ready")
 
+    # Adicionalmente, verificar la salud del embedding adapter si es posible
+    if embedding_adapter_instance:
+        emb_adapter_healthy = await embedding_adapter_instance.health_check()
+        if not emb_adapter_healthy:
+            health_log.error("Health check failed: Embedding Adapter reports unhealthy dependency (Embedding Service).")
+            raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Critical dependency (Embedding Service) is unhealthy.")
+    else: # Si el adaptador ni siquiera se inicializó, el servicio no debería estar READY
+        health_log.error("Health check warning: Embedding Adapter instance not available (should not happen if SERVICE_READY is true).")
+
+
     health_log.debug("Health check passed.")
     return PlainTextResponse("OK", status_code=fastapi_status.HTTP_200_OK)
 
-# --- Main execution --- .
+# --- Main execution ---
 if __name__ == "__main__":
-    port = 8002
+    port = 8001
     log_level_str = settings.LOG_LEVEL.lower()
     print(f"----- Starting {settings.PROJECT_NAME} locally on port {port} -----")
     uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True, log_level=log_level_str)

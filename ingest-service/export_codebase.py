@@ -27,7 +27,7 @@ def generate_codebase_markdown(base_path: str = ".", output_file: str = "full_co
     app_dir = base / "app"
 
     if not app_dir.exists():
-        print(f"❌ La carpeta 'app' no existe en {base}")
+        print(f"[ERROR] La carpeta 'app' no existe en {base}")
         return
 
     lines = []
@@ -89,9 +89,9 @@ def generate_codebase_markdown(base_path: str = ".", output_file: str = "full_co
     output_path = base / output_file
     try:
         output_path.write_text("\n".join(lines), encoding='utf-8')
-        print(f"✅ Código exportado a Markdown en: {output_path}")
+        print(f"[OK] Código exportado a Markdown en: {output_path}")
     except Exception as e:
-        print(f"❌ Error al escribir el archivo de salida: {e}")
+        print(f"[ERROR] Error al escribir el archivo de salida: {e}")
 
 # Si se corre el script directamente
 if __name__ == "__main__":

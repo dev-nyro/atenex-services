@@ -70,41 +70,32 @@ embedding-service/
 
 ### 3.1. Eliminación de Componentes de Embedding
 
-*   Quitar `app/services/embedder.py`.
-*   Eliminar `sentence-transformers` y `onnxruntime` de `pyproject.toml` (si solo eran para embeddings).
-*   Worker Celery no inicializará `worker_embedding_model`.
+*   Se eliminó `app/services/embedder.py`.
+*   Se eliminaron `sentence-transformers` y `onnxruntime` de `pyproject.toml` del `ingest-service`.
+*   El Worker Celery (`app/tasks/process_document.py`) ya no inicializa `worker_embedding_model` localmente.
 
 ### 3.2. Modificación del Pipeline de Ingesta
 
-*   `ingest_document_pipeline` no recibirá `embedding_model`.
-*   Llamará vía HTTP al `embedding-service` para obtener embeddings.
+*   `app/services/ingest_pipeline.py` ya no recibe una instancia de `SentenceTransformer` local.
+*   Ahora es una función `async` y llama vía HTTP al `embedding-service` para obtener embeddings utilizando un `EmbeddingServiceClient`.
 
 ### 3.3. Cliente HTTP para `embedding-service`
 
-*   Crear `app/services/clients/embedding_service_client.py`.
+*   Se creó `app/services/clients/embedding_service_client.py` para encapsular la comunicación con el `embedding-service`.
 
 ### 3.4. Configuración
 
-*   Añadir `INGEST_EMBEDDING_SERVICE_URL` en `app/core/config.py`.
+*   Se añadió `INGEST_EMBEDDING_SERVICE_URL` en `app/core/config.py` del `ingest-service`.
+*   Se eliminó `EMBEDDING_MODEL_ID` de la configuración del `ingest-service`.
+*   Se mantuvo `EMBEDDING_DIMENSION` en la configuración del `ingest-service` para definir el esquema de Milvus y como referencia para la dimensión esperada del `embedding-service`.
 
-## 4. Refactorización del `query-service`
+## 4. Refactorización del `query-service` (Futuro)
 
+*Se mantiene como referencia, pero esta fase se centra en `embedding-service` e `ingest-service`.*
 ### 4.1. Eliminación de Componentes de Embedding
-
-*   Eliminar `FastembedTextEmbedder` de `AskQueryUseCase` y `main.py`.
-*   Eliminar `fastembed-haystack`, `fastembed`, `onnxruntime` de `pyproject.toml` (si solo eran para embeddings).
-
 ### 4.2. Modificación de `AskQueryUseCase`
-
-*   Método `_embed_query` llamará vía HTTP al `embedding-service`.
-
 ### 4.3. Cliente HTTP para `embedding-service`
-
-*   Crear `app/infrastructure/clients/embedding_service_client.py`.
-
 ### 4.4. Configuración
-
-*   Añadir `QUERY_EMBEDDING_SERVICE_URL` en `app/core/config.py`.
 
 ## 5. Checklist de Implementación
 
@@ -113,43 +104,45 @@ embedding-service/
 *   [x] Definir estructura de directorios.
 *   [x] Crear `app/core/config.py` con `EMBEDDING_MODEL_NAME`, `EMBEDDING_DIMENSION`, `LOG_LEVEL`, `PORT`, `FASTEMBED_CACHE_DIR`, `FASTEMBED_THREADS`, `FASTEMBED_MAX_LENGTH`.
 *   [x] Crear `app/core/logging_config.py`.
-*   [x] Definir `app/domain/models.py` (actualmente placeholder).
+*   [x] Definir `app/domain/models.py` (placeholder actual).
 *   [x] Crear `app/application/ports/embedding_model_port.py`.
-*   [x] Implementar `app/infrastructure/embedding_models/fastembed_adapter.py` (usando `FastEmbed` con `all-MiniLM-L6-v2`).
+*   [x] Implementar `app/infrastructure/embedding_models/fastembed_adapter.py`.
 *   [x] Crear `app/application/use_cases/embed_texts_use_case.py`.
 *   [x] Definir `app/api/v1/schemas.py` (`EmbedRequest`, `EmbedResponse`, `ModelInfo`, `HealthCheckResponse`).
 *   [x] Implementar `app/api/v1/endpoints/embedding_endpoint.py` con ruta `/embed`.
 *   [x] Crear `app/dependencies.py` para la inyección de dependencias del caso de uso.
 *   [x] Implementar `app/main.py` con FastAPI, lifespan para cargar modelo y endpoint `/health`, e inyección de dependencias.
 *   [x] Crear `pyproject.toml` con dependencias: `fastapi`, `uvicorn`, `gunicorn`, `structlog`, `pydantic`, `pydantic-settings`, `fastembed`, `onnxruntime`.
-*   [ ] Crear `README.md` para el servicio.
-*   [ ] Crear `Dockerfile` para el servicio.
-*   [ ] Crear `.env.example`.
-*   [ ] Crear manifiestos de Kubernetes (`deployment.yaml`, `service.yaml`, `configmap.yaml`) en `k8s/`.
-*   [ ] Actualizar pipeline CI/CD (`cicd.yml`) para construir y desplegar `embedding-service`.
+*   [x] Crear `README.md` para el servicio.
+*   [x] Crear `Dockerfile` para el servicio.
+*   [x] Crear `.env.example`.
+*   [x] Crear manifiestos de Kubernetes (`deployment.yaml`, `service.yaml`, `configmap.yaml`) en `k8s/`.
+*   [x] Actualizar pipeline CI/CD (`cicd.yml`) para construir y desplegar `embedding-service`.
 
-### 5.2. `ingest-service` (Refactorización)
+### 5.2. `ingest-service` (Refactorización - **Completado**)
 
-*   [ ] Eliminar `app/services/embedder.py`.
-*   [ ] Actualizar `pyproject.toml` eliminando `sentence-transformers` y `onnxruntime` (si no son necesarios para otra cosa).
-*   [ ] Modificar `app/tasks/process_document.py` para no inicializar `worker_embedding_model`.
-*   [ ] Añadir cliente HTTP para `embedding-service` (ej. `app/services/clients/embedding_service_client.py`).
-*   [ ] Modificar `app/services/ingest_pipeline.py` para llamar al `embedding-service` vía HTTP.
-*   [ ] Añadir `INGEST_EMBEDDING_SERVICE_URL` a la configuración.
-*   [ ] Actualizar `Dockerfile` si es necesario.
+*   [x] Eliminar `app/services/embedder.py`.
+*   [x] Actualizar `pyproject.toml` eliminando `sentence-transformers` y `onnxruntime`.
+*   [x] Modificar `app/tasks/process_document.py` para no inicializar `worker_embedding_model` y para llamar al nuevo cliente HTTP (`EmbeddingServiceClient`), utilizando un helper `run_async_from_sync` para la llamada al pipeline asíncrono.
+*   [x] Añadir cliente HTTP para `embedding-service` en `app/services/clients/embedding_service_client.py`.
+*   [x] Modificar `app/services/ingest_pipeline.py` para que sea `async` y use el `EmbeddingServiceClient` en lugar de `embed_chunks` local.
+*   [x] Añadir `INGEST_EMBEDDING_SERVICE_URL` a `app/core/config.py`.
+*   [x] Actualizar `Dockerfile` del `ingest-service` para reflejar cambios de dependencias (implícito al cambiar `pyproject.toml`).
+*   [x] Actualizar `README.md` del `ingest-service` para reflejar la nueva arquitectura y la dependencia del `embedding-service`.
 
-### 5.3. `query-service` (Refactorización)
+### 5.3. `query-service` (Refactorización - Pendiente)
 
 *   [ ] Eliminar la lógica de `FastembedTextEmbedder` de `AskQueryUseCase` y del `lifespan` en `main.py`.
-*   [ ] Actualizar `pyproject.toml` eliminando `fastembed-haystack`, `fastembed`, `onnxruntime` (si no son necesarios para otra cosa).
+*   [ ] Actualizar `pyproject.toml` eliminando `fastembed-haystack`, `fastembed` y `onnxruntime` (si no son necesarios para otros componentes).
 *   [ ] Añadir cliente HTTP para `embedding-service` (ej. `app/infrastructure/clients/embedding_service_client.py`).
 *   [ ] Modificar `app/application/use_cases/ask_query_use_case.py` método `_embed_query` para llamar al `embedding-service` vía HTTP.
 *   [ ] Añadir `QUERY_EMBEDDING_SERVICE_URL` a la configuración.
-*   [ ] Actualizar `Dockerfile` si es necesario.
+*   [ ] Actualizar `Dockerfile` del `query-service`.
+*   [ ] Actualizar `README.md` del `query-service`.
 
 ### 5.4. General
 
-*   [ ] Actualizar diagramas de arquitectura.
+*   [x] Actualizar diagramas de arquitectura.
 *   [ ] Asegurar que las NetworkPolicies permitan la comunicación entre los servicios.
-*   [ ] Planificar y ejecutar pruebas de integración y E2E.
+*   [ ] Planificar y ejecutar pruebas de integración y E2E después de cada fase de refactorización.
 *   [ ] Actualizar la documentación general del sistema.

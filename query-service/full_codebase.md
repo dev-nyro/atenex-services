@@ -15,6 +15,7 @@ app/
 │   ├── __init__.py
 │   ├── ports
 │   │   ├── __init__.py
+│   │   ├── embedding_port.py
 │   │   ├── llm_port.py
 │   │   ├── repository_ports.py
 │   │   ├── retrieval_ports.py
@@ -32,6 +33,12 @@ app/
 │   └── models.py
 ├── infrastructure
 │   ├── __init__.py
+│   ├── clients
+│   │   ├── __init__.py
+│   │   └── embedding_service_client.py
+│   ├── embedding
+│   │   ├── __init__.py
+│   │   └── remote_embedding_adapter.py
 │   ├── filters
 │   │   ├── __init__.py
 │   │   └── diversity_filter.py
@@ -448,8 +455,8 @@ class HealthCheckResponse(BaseModel):
 from .llm_port import LLMPort
 from .vector_store_port import VectorStorePort
 from .repository_ports import ChatRepositoryPort, LogRepositoryPort, ChunkContentRepositoryPort
-# LLM_REFACTOR_STEP_3: Exportar nuevos puertos
 from .retrieval_ports import SparseRetrieverPort, RerankerPort, DiversityFilterPort
+from .embedding_port import EmbeddingPort
 
 __all__ = [
     "LLMPort",
@@ -460,7 +467,68 @@ __all__ = [
     "SparseRetrieverPort",
     "RerankerPort",
     "DiversityFilterPort",
+    "EmbeddingPort",
 ]
+```
+
+## File: `app\application\ports\embedding_port.py`
+```py
+# query-service/app/application/ports/embedding_port.py
+import abc
+from typing import List
+
+class EmbeddingPort(abc.ABC):
+    """
+    Puerto abstracto para la generación de embeddings.
+    """
+
+    @abc.abstractmethod
+    async def embed_query(self, query_text: str) -> List[float]:
+        """
+        Genera el embedding para un único texto de consulta.
+
+        Args:
+            query_text: El texto de la consulta.
+
+        Returns:
+            Una lista de floats representando el embedding.
+
+        Raises:
+            ConnectionError: Si hay problemas de comunicación con el servicio de embedding.
+            ValueError: Si la respuesta del servicio de embedding es inválida.
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    async def embed_texts(self, texts: List[str]) -> List[List[float]]:
+        """
+        Genera embeddings para una lista de textos.
+
+        Args:
+            texts: Una lista de textos.
+
+        Returns:
+            Una lista de embeddings, donde cada embedding es una lista de floats.
+
+        Raises:
+            ConnectionError: Si hay problemas de comunicación con el servicio de embedding.
+            ValueError: Si la respuesta del servicio de embedding es inválida.
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    async def get_embedding_dimension(self) -> int:
+        """
+        Devuelve la dimensión de los embeddings generados por el modelo subyacente.
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    async def health_check(self) -> bool:
+        """
+        Verifica la salud del servicio de embedding subyacente.
+        """
+        raise NotImplementedError
 ```
 
 ## File: `app\application\ports\llm_port.py`
@@ -676,19 +744,20 @@ from datetime import datetime, timezone, timedelta
 # Import Ports and Domain Models
 from app.application.ports import (
     ChatRepositoryPort, LogRepositoryPort, VectorStorePort, LLMPort,
-    SparseRetrieverPort, RerankerPort, DiversityFilterPort, ChunkContentRepositoryPort
+    SparseRetrieverPort, RerankerPort, DiversityFilterPort, ChunkContentRepositoryPort,
+    EmbeddingPort # NUEVA ADICIÓN
 )
 from app.domain.models import RetrievedChunk, ChatMessage
 
 
-# Keep necessary components (Embedder, PromptBuilder)
 # LLM_FIX: Ensure bm2s is checked for availability here if sparse_retriever depends on it
 try:
     import bm2s
 except ImportError:
     bm2s = None
 
-from haystack_integrations.components.embedders.fastembed import FastembedTextEmbedder
+# REMOVED: FastembedTextEmbedder ya no se usa aquí
+# from haystack_integrations.components.embedders.fastembed import FastembedTextEmbedder
 from haystack.components.builders.prompt_builder import PromptBuilder
 from haystack import Document # Still needed for PromptBuilder context
 
@@ -730,6 +799,7 @@ class AskQueryUseCase:
                  log_repo: LogRepositoryPort,
                  vector_store: VectorStorePort,
                  llm: LLMPort,
+                 embedding_adapter: EmbeddingPort, # NUEVA ADICIÓN: Inyectar el puerto de embedding
                  # Optional components for advanced RAG
                  sparse_retriever: Optional[SparseRetrieverPort] = None,
                  chunk_content_repo: Optional[ChunkContentRepositoryPort] = None,
@@ -739,18 +809,20 @@ class AskQueryUseCase:
         self.log_repo = log_repo
         self.vector_store = vector_store
         self.llm = llm
-        # LLM_FIX: Only assign sparse_retriever if bm2s is available AND it's enabled
+        self.embedding_adapter = embedding_adapter # NUEVA ADICIÓN
         self.sparse_retriever = sparse_retriever if settings.BM25_ENABLED and bm2s is not None else None
         self.chunk_content_repo = chunk_content_repo
         self.reranker = reranker if settings.RERANKER_ENABLED else None
         self.diversity_filter = diversity_filter if settings.DIVERSITY_FILTER_ENABLED else None
 
-        self._embedder = self._initialize_embedder()
+        # REMOVED: _embedder ya no es FastembedTextEmbedder
+        # self._embedder = self._initialize_embedder()
         self._prompt_builder_rag = self._initialize_prompt_builder(settings.RAG_PROMPT_TEMPLATE)
         self._prompt_builder_general = self._initialize_prompt_builder(settings.GENERAL_PROMPT_TEMPLATE)
 
         log.info("AskQueryUseCase Initialized",
-                 bm25_enabled=bool(self.sparse_retriever), # Reflects actual state now
+                 embedding_adapter_type=type(self.embedding_adapter).__name__, # Log del nuevo adaptador
+                 bm25_enabled=bool(self.sparse_retriever),
                  reranker_enabled=bool(self.reranker),
                  diversity_filter_enabled=settings.DIVERSITY_FILTER_ENABLED,
                  diversity_filter_type=type(self.diversity_filter).__name__ if self.diversity_filter else "None"
@@ -762,20 +834,8 @@ class AskQueryUseCase:
         if settings.RERANKER_ENABLED and self.reranker and not getattr(self.reranker, 'model', None):
              log.warning("RERANKER_ENABLED is true, but the reranker model failed to load during initialization.")
 
-
-    def _initialize_embedder(self) -> FastembedTextEmbedder:
-        embedder_log = log.bind(component="FastembedTextEmbedder", model=settings.FASTEMBED_MODEL_NAME)
-        embedder_log.debug("Initializing FastEmbed Embedder...")
-        try:
-            embedder = FastembedTextEmbedder(
-                model=settings.FASTEMBED_MODEL_NAME,
-                prefix=settings.FASTEMBED_QUERY_PREFIX
-            )
-            embedder_log.info("FastEmbed Embedder initialized.")
-            return embedder
-        except Exception as e:
-            embedder_log.exception("Failed to initialize FastEmbed Embedder")
-            raise RuntimeError(f"Could not initialize embedding model: {e}") from e
+    # REMOVED: _initialize_embedder() ya no es necesario aquí
+    # def _initialize_embedder(self) -> FastembedTextEmbedder: ...
 
     def _initialize_prompt_builder(self, template: str) -> PromptBuilder:
         log.debug("Initializing PromptBuilder...", template_start=template[:100]+"...")
@@ -784,15 +844,19 @@ class AskQueryUseCase:
     async def _embed_query(self, query: str) -> List[float]:
         embed_log = log.bind(action="embed_query_use_case")
         try:
-            result = await asyncio.to_thread(self._embedder.run, text=query)
-            embedding = result.get("embedding")
-            if not embedding: raise ValueError("Embedding returned no vector.")
-            if len(embedding) != settings.EMBEDDING_DIMENSION: raise ValueError("Embedding dimension mismatch.")
-            embed_log.debug("Query embedded successfully", vector_dim=len(embedding))
+            # USA EL NUEVO ADAPTADOR DE EMBEDDING
+            embedding = await self.embedding_adapter.embed_query(query)
+            if not embedding: raise ValueError("Embedding adapter returned no vector.")
+            # La validación de dimensión se hace dentro del adaptador
+            embed_log.debug("Query embedded successfully via adapter", vector_dim=len(embedding))
             return embedding
+        except (ConnectionError, ValueError) as e: # Capturar errores específicos del adaptador
+            embed_log.error("Embedding failed via adapter", error=str(e), exc_info=True)
+            raise ConnectionError(f"Embedding service error: {e}") from e # Re-lanzar como ConnectionError genérico
         except Exception as e:
-            embed_log.error("Embedding failed", error=str(e), exc_info=True)
-            raise ConnectionError(f"Embedding service error: {e}") from e
+            embed_log.error("Unexpected error during query embedding via adapter", error=str(e), exc_info=True)
+            raise ConnectionError(f"Unexpected embedding service error: {e}") from e
+
 
     def _format_chat_history(self, messages: List[ChatMessage]) -> str:
         if not messages:
@@ -910,7 +974,7 @@ class AskQueryUseCase:
         retriever_k = top_k if top_k is not None and 0 < top_k <= settings.RETRIEVER_TOP_K else settings.RETRIEVER_TOP_K
         exec_log = exec_log.bind(effective_retriever_k=retriever_k)
 
-        pipeline_stages_used = ["dense_retrieval", "llm_generation"]
+        pipeline_stages_used = ["remote_embedding", "dense_retrieval", "llm_generation"] # Updated first stage
         final_chat_id: uuid.UUID
         log_id: Optional[uuid.UUID] = None
         chat_history_str: Optional[str] = None
@@ -951,34 +1015,37 @@ class AskQueryUseCase:
             # --- RAG Pipeline ---
             exec_log.info("Proceeding with RAG pipeline...")
 
-            # 4. Embed Query
-            query_embedding = await self._embed_query(query)
+            # 4. Embed Query (USANDO EL NUEVO ADAPTADOR)
+            query_embedding = await self._embed_query(query) # Este método ahora usa self.embedding_adapter
 
             # 5. Coarse Retrieval (Dense + Optional Sparse)
             dense_task = self.vector_store.search(query_embedding, str(company_id), retriever_k)
-            sparse_task = asyncio.create_task(asyncio.sleep(0))
+            sparse_task = asyncio.create_task(asyncio.sleep(0)) # Placeholder
             sparse_results: List[Tuple[str, float]] = []
-            # LLM_FIX: Use self.sparse_retriever which is already checked for None in __init__
+
             if self.sparse_retriever:
                  pipeline_stages_used.append("sparse_retrieval (bm2s)")
                  sparse_task = self.sparse_retriever.search(query, str(company_id), retriever_k)
-            elif settings.BM25_ENABLED: # Log if enabled but instance failed
+            elif settings.BM25_ENABLED:
                  pipeline_stages_used.append("sparse_retrieval (skipped_no_lib)")
                  exec_log.warning("BM25 enabled but retriever instance is not available (likely missing library).")
             else:
                  pipeline_stages_used.append("sparse_retrieval (disabled)")
 
+            # El resto del método `execute` permanece igual desde aquí...
+            # ... (dense_chunks, sparse_results_maybe = await asyncio.gather(dense_task, sparse_task))
+            # ... (hasta el final del método)
+
             dense_chunks, sparse_results_maybe = await asyncio.gather(dense_task, sparse_task)
-            # Only assign if the task actually ran and returned a list
             if self.sparse_retriever and isinstance(sparse_results_maybe, list):
                 sparse_results = sparse_results_maybe
             exec_log.info("Retrieval phase completed", dense_count=len(dense_chunks), sparse_count=len(sparse_results), retriever_k=retriever_k)
 
             # 6. Fusion & Content Fetch
             pipeline_stages_used.append("fusion (rrf)")
-            dense_map = {c.id: c for c in dense_chunks if c.id} # Map dense chunks by ID for easy lookup, skip if id is missing
+            dense_map = {c.id: c for c in dense_chunks if c.id}
             fused_scores = self._reciprocal_rank_fusion(dense_chunks, sparse_results)
-            fusion_fetch_k = settings.MAX_CONTEXT_CHUNKS + 10 # Fetch slightly more
+            fusion_fetch_k = settings.MAX_CONTEXT_CHUNKS + 10
             combined_chunks_with_content = await self._fetch_content_for_fused_results(fused_scores, dense_map, fusion_fetch_k)
             exec_log.info("Fusion & Content Fetch completed", initial_fused_count=len(fused_scores), chunks_with_content=len(combined_chunks_with_content), fetch_limit=fusion_fetch_k)
 
@@ -994,13 +1061,12 @@ class AskQueryUseCase:
 
             # 7. Reranking (Conditional)
             chunks_to_process_further = combined_chunks_with_content
-            # LLM_FIX: Check if reranker *model* loaded successfully, not just the instance
             if self.reranker and getattr(self.reranker, 'model', None):
                 pipeline_stages_used.append("reranking (bge)")
                 exec_log.debug("Performing reranking...", count=len(chunks_to_process_further))
                 chunks_to_process_further = await self.reranker.rerank(query, chunks_to_process_further)
                 exec_log.info("Reranking completed.", count=len(chunks_to_process_further))
-            elif self.reranker: # Instance exists but model failed
+            elif self.reranker:
                  pipeline_stages_used.append("reranking (skipped_model_load_failed)")
                  exec_log.warning("Reranker enabled but model not loaded, skipping reranking step.")
             else:
@@ -1016,14 +1082,11 @@ class AskQueryUseCase:
                  final_chunks_for_llm = await self.diversity_filter.filter(chunks_to_process_further, k_final)
                  exec_log.info(f"{filter_type} applied.", final_count=len(final_chunks_for_llm))
             else:
-                 # Apply manual limit if diversity filter is disabled
                  final_chunks_for_llm = chunks_to_process_further[:settings.MAX_CONTEXT_CHUNKS]
                  exec_log.info(f"Diversity filter disabled. Truncating to MAX_CONTEXT_CHUNKS.", final_count=len(final_chunks_for_llm), limit=settings.MAX_CONTEXT_CHUNKS)
 
-            # Ensure content exists for final chunks going to prompt builder
             final_chunks_for_llm = [c for c in final_chunks_for_llm if c.content]
             if not final_chunks_for_llm:
-                 # This could happen if MAX_CONTEXT_CHUNKS is small and top ones lack content
                  exec_log.warning("No chunks with content remaining after final limiting/filtering.")
                  final_prompt = await self._build_prompt(query, [], chat_history=chat_history_str)
                  answer = await self.llm.generate(final_prompt)
@@ -1032,7 +1095,6 @@ class AskQueryUseCase:
                     log_id = await self.log_repo.log_query_interaction(company_id=company_id, user_id=user_id, query=query, answer=answer, retrieved_documents_data=[], chat_id=final_chat_id, metadata={"pipeline_stages": pipeline_stages_used, "result": "no_docs_after_limit"})
                  except Exception: exec_log.error("Failed to log interaction for no_docs_after_limit case")
                  return answer, [], log_id, final_chat_id
-
 
             # 9. Build Prompt (with history)
             haystack_docs_for_prompt = [
@@ -1048,8 +1110,6 @@ class AskQueryUseCase:
 
             # 11. Save Assistant Message & Limit Sources Shown
             sources_to_show_count = settings.NUM_SOURCES_TO_SHOW
-            # Ensure we use the final list that went to the LLM (final_chunks_for_llm)
-            # And only take up to NUM_SOURCES_TO_SHOW from that list
             assistant_sources = [
                 {"chunk_id": c.id, "document_id": c.document_id, "file_name": c.file_name, "score": c.score, "preview": truncate_text(c.content, 150) if c.content else "Error: Contenido no disponible"}
                 for c in final_chunks_for_llm[:sources_to_show_count]
@@ -1057,10 +1117,8 @@ class AskQueryUseCase:
             await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=assistant_sources or None)
             exec_log.info(f"Assistant message saved with top {len(assistant_sources)} sources.")
 
-
             # 12. Log Interaction
             try:
-                # Log the sources actually shown
                 docs_for_log = [RetrievedDocumentSchema(**c.model_dump()).model_dump(exclude_none=True) for c in final_chunks_for_llm[:sources_to_show_count]]
                 log_metadata = {
                     "pipeline_stages": pipeline_stages_used,
@@ -1084,12 +1142,19 @@ class AskQueryUseCase:
                 exec_log.error("Failed to log RAG interaction", error=str(log_err), exc_info=False)
 
             exec_log.info("Use case execution finished successfully.")
-            # Return the sources actually shown/saved
             return answer, final_chunks_for_llm[:sources_to_show_count], log_id, final_chat_id
 
         except ConnectionError as ce:
             exec_log.error("Connection error during use case execution", error=str(ce), exc_info=True)
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"A dependency is unavailable: {ce}")
+            # Simplificar el detalle del error para el cliente
+            detail_message = "A required external service is unavailable. Please try again later."
+            if "Embedding service" in str(ce):
+                detail_message = "The embedding service is currently unavailable. Please try again later."
+            elif "Gemini API" in str(ce):
+                detail_message = "The language model service (Gemini) is currently unavailable. Please try again later."
+            elif "Vector DB" in str(ce) or "Milvus" in str(ce):
+                detail_message = "The vector database service is currently unavailable. Please try again later."
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=detail_message)
         except ValueError as ve:
             exec_log.error("Value error during use case execution", error=str(ve), exc_info=True)
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Data processing error: {ve}")
@@ -1133,6 +1198,9 @@ MILVUS_DEFAULT_FILENAME_FIELD = "file_name"
 MILVUS_DEFAULT_GRPC_TIMEOUT = 15
 MILVUS_DEFAULT_SEARCH_PARAMS = {"metric_type": "IP", "params": {"nprobe": 10}}
 MILVUS_DEFAULT_METADATA_FIELDS = ["company_id", "document_id", "file_name", "page", "title"]
+
+# Embedding Service (NUEVO)
+EMBEDDING_SERVICE_K8S_URL_DEFAULT = "http://embedding-service.nyro-develop.svc.cluster.local:8003"
 
 
 # ==========================================================================================
@@ -1209,15 +1277,15 @@ INSTRUCCIONES:
 RESPUESTA DE ATENEX (en español latino):
 """
 # Models
-DEFAULT_FASTEMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-DEFAULT_FASTEMBED_QUERY_PREFIX = "query: "
-DEFAULT_EMBEDDING_DIMENSION = 384
-DEFAULT_GEMINI_MODEL = "gemini-1.5-flash-latest" # Ensure flash model is used
+# DEFAULT_FASTEMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2" # REMOVED - No longer local
+# DEFAULT_FASTEMBED_QUERY_PREFIX = "query: " # REMOVED
+DEFAULT_EMBEDDING_DIMENSION = 384 # Still needed for Milvus config and validation
+DEFAULT_GEMINI_MODEL = "gemini-1.5-flash-latest"
 DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-base"
 
 # RAG Pipeline Parameters
 DEFAULT_RETRIEVER_TOP_K = 100
-DEFAULT_BM25_ENABLED: bool = True # User must ensure bm2s is installed
+DEFAULT_BM25_ENABLED: bool = True
 DEFAULT_RERANKER_ENABLED: bool = True
 DEFAULT_DIVERSITY_FILTER_ENABLED: bool = False
 DEFAULT_MAX_CONTEXT_CHUNKS: int = 75
@@ -1225,7 +1293,7 @@ DEFAULT_HYBRID_ALPHA: float = 0.5
 DEFAULT_DIVERSITY_LAMBDA: float = 0.5
 DEFAULT_MAX_PROMPT_TOKENS: int = 500000
 DEFAULT_MAX_CHAT_HISTORY_MESSAGES = 10
-DEFAULT_NUM_SOURCES_TO_SHOW = 7 # Keep this lower than MAX_CONTEXT_CHUNKS
+DEFAULT_NUM_SOURCES_TO_SHOW = 7
 
 
 class Settings(BaseSettings):
@@ -1261,10 +1329,14 @@ class Settings(BaseSettings):
     MILVUS_GRPC_TIMEOUT: int = Field(default=MILVUS_DEFAULT_GRPC_TIMEOUT)
     MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default=MILVUS_DEFAULT_SEARCH_PARAMS)
 
-    # --- Embedding Model (FastEmbed) ---
-    FASTEMBED_MODEL_NAME: str = Field(default=DEFAULT_FASTEMBED_MODEL)
-    EMBEDDING_DIMENSION: int = Field(default=DEFAULT_EMBEDDING_DIMENSION)
-    FASTEMBED_QUERY_PREFIX: str = Field(default=DEFAULT_FASTEMBED_QUERY_PREFIX)
+    # --- Embedding Settings (General) ---
+    EMBEDDING_DIMENSION: int = Field(default=DEFAULT_EMBEDDING_DIMENSION, description="Dimension of embeddings, used for Milvus and validation.")
+    # QUERY_FASTEMBED_MODEL_NAME: str = Field(default=DEFAULT_FASTEMBED_MODEL) # REMOVED
+    # QUERY_FASTEMBED_QUERY_PREFIX: str = Field(default=DEFAULT_FASTEMBED_QUERY_PREFIX) # REMOVED
+
+    # --- External Embedding Service (NUEVO) ---
+    EMBEDDING_SERVICE_URL: AnyHttpUrl = Field(default=AnyHttpUrl(EMBEDDING_SERVICE_K8S_URL_DEFAULT), description="URL of the Atenex Embedding Service.")
+
 
     # --- LLM (Google Gemini) ---
     GEMINI_API_KEY: SecretStr
@@ -1319,24 +1391,16 @@ class Settings(BaseSettings):
     def check_embedding_dimension(cls, v: int, info: ValidationInfo) -> int:
         if v <= 0:
             raise ValueError("EMBEDDING_DIMENSION must be a positive integer.")
-        model_name = info.data.get('FASTEMBED_MODEL_NAME', DEFAULT_FASTEMBED_MODEL)
-        expected_dim = -1
-        if 'all-MiniLM-L6-v2' in model_name: expected_dim = 384
-        elif 'bge-small-en-v1.5' in model_name: expected_dim = 384
-        elif 'bge-large-en-v1.5' in model_name: expected_dim = 1024
-
-        if expected_dim != -1 and v != expected_dim:
-            logging.warning(f"Configured EMBEDDING_DIMENSION ({v}) differs from standard dimension ({expected_dim}) for model '{model_name}'. Ensure this is intentional.")
-        elif expected_dim == -1:
-            logging.warning(f"Unknown standard embedding dimension for model '{model_name}'. Using configured dimension {v}. Verify this matches the actual model output.")
-        logging.debug(f"Using EMBEDDING_DIMENSION: {v} for model: {model_name}")
+        # No longer checking against FASTEMBED_MODEL_NAME as it's external
+        # The RemoteEmbeddingAdapter will try to validate against the service's reported dimension
+        logging.info(f"Configured EMBEDDING_DIMENSION: {v}. This will be used for Milvus and validated against the embedding service.")
         return v
 
     @field_validator('MAX_CONTEXT_CHUNKS')
     @classmethod
     def check_max_context_chunks(cls, v: int, info: ValidationInfo) -> int:
         retriever_k = info.data.get('RETRIEVER_TOP_K', DEFAULT_RETRIEVER_TOP_K)
-        max_possible_after_fusion = retriever_k * 2
+        max_possible_after_fusion = retriever_k * 2 # Assuming dense + sparse
         if v > max_possible_after_fusion:
             logging.warning(f"MAX_CONTEXT_CHUNKS ({v}) is greater than the maximum possible chunks after fusion ({max_possible_after_fusion} based on RETRIEVER_TOP_K={retriever_k}). Effective limit will be {max_possible_after_fusion}.")
         if v <= 0:
@@ -1372,9 +1436,9 @@ try:
     for key, value in log_data.items():
         # Truncate long prompt templates for cleaner logs
         if key.endswith('_PROMPT_TEMPLATE') and isinstance(value, str) and len(value) > 200:
-             temp_log.info(f"  {key}: {value[:100]}... (truncated)")
+             temp_log.info(f"  {key.upper()}: {value[:100]}... (truncated)")
         else:
-             temp_log.info(f"  {key}: {value}")
+             temp_log.info(f"  {key.upper()}: {value}")
     temp_log.info(f"  POSTGRES_PASSWORD: *** SET ***")
     temp_log.info(f"  GEMINI_API_KEY: *** SET ***")
 
@@ -1600,6 +1664,267 @@ class QueryLog(BaseModel):
 ## File: `app\infrastructure\__init__.py`
 ```py
 # query-service/app/infrastructure/__init__.py# query-service/app/infrastructure/vectorstores/__init__.py
+```
+
+## File: `app\infrastructure\clients\__init__.py`
+```py
+# query-service/app/infrastructure/clients/__init__.py
+from .embedding_service_client import EmbeddingServiceClient
+
+__all__ = ["EmbeddingServiceClient"]
+```
+
+## File: `app\infrastructure\clients\embedding_service_client.py`
+```py
+# query-service/app/infrastructure/clients/embedding_service_client.py
+import httpx
+import structlog
+from typing import List, Dict, Any, Optional
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+from app.core.config import settings
+
+log = structlog.get_logger(__name__)
+
+class EmbeddingServiceClient:
+    """
+    Cliente HTTP para interactuar con el Atenex Embedding Service.
+    """
+    def __init__(self, base_url: str, timeout: int = settings.HTTP_CLIENT_TIMEOUT):
+        self.base_url = base_url.rstrip('/')
+        self.embed_endpoint = f"{self.base_url}/api/v1/embed" # Asumiendo que la URL base ya tiene /api/v1
+        self.health_endpoint = f"{self.base_url}/health"
+
+        # Ajuste para no incluir /api/v1 dos veces si ya está en base_url
+        if "/api/v1" in self.base_url.split('/')[-2:]: # si base_url es .../api/v1
+             self.embed_endpoint = f"{self.base_url}/embed"
+        else: # si base_url es ...embedding-service:8003
+             self.embed_endpoint = f"{self.base_url}/api/v1/embed"
+
+
+        self._client = httpx.AsyncClient(timeout=timeout)
+        log.info("EmbeddingServiceClient initialized", base_url=self.base_url, embed_endpoint=self.embed_endpoint)
+
+    @retry(
+        stop=stop_after_attempt(settings.HTTP_CLIENT_MAX_RETRIES + 1),
+        wait=wait_exponential(multiplier=settings.HTTP_CLIENT_BACKOFF_FACTOR, min=1, max=10),
+        retry=retry_if_exception_type((httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError)),
+        reraise=True # Re-raise la excepción original después de los reintentos
+    )
+    async def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """
+        Solicita embeddings para una lista de textos al servicio de embedding.
+        """
+        client_log = log.bind(action="generate_embeddings", num_texts=len(texts), target_service="embedding-service")
+        if not texts:
+            client_log.warning("No texts provided to generate_embeddings.")
+            return []
+
+        payload = {"texts": texts}
+        try:
+            client_log.debug("Sending request to embedding service")
+            response = await self._client.post(self.embed_endpoint, json=payload)
+            response.raise_for_status() # Lanza HTTPStatusError para 4xx/5xx
+
+            data = response.json()
+            if "embeddings" not in data or not isinstance(data["embeddings"], list):
+                client_log.error("Invalid response format from embedding service: 'embeddings' field missing or not a list.", response_data=data)
+                raise ValueError("Invalid response format from embedding service: 'embeddings' field.")
+
+            # Opcional: Validar que cada embedding sea una lista de floats y tenga la dimensión esperada
+            # Esto se podría hacer en el adaptador.
+            client_log.info("Embeddings received successfully from service", num_embeddings=len(data["embeddings"]))
+            return data["embeddings"]
+
+        except httpx.HTTPStatusError as e:
+            client_log.error("HTTP error from embedding service", status_code=e.response.status_code, response_body=e.response.text)
+            raise ConnectionError(f"Embedding service returned error {e.response.status_code}: {e.response.text}") from e
+        except httpx.RequestError as e:
+            client_log.error("Request error while contacting embedding service", error=str(e))
+            raise ConnectionError(f"Could not connect to embedding service: {e}") from e
+        except (ValueError, TypeError) as e: # Errores de parsing JSON o validación
+            client_log.error("Error processing response from embedding service", error=str(e))
+            raise ValueError(f"Invalid response from embedding service: {e}") from e
+
+
+    async def get_model_info(self) -> Optional[Dict[str, Any]]:
+        """
+        Intenta obtener información del modelo desde la respuesta del endpoint /embed.
+        Nota: El embedding-service actual no tiene un endpoint /info,
+        pero el /embed response incluye model_info. Esta función es una forma
+        de inferirlo si se necesita, aunque es mejor tener un health check más completo.
+        """
+        client_log = log.bind(action="get_model_info_via_embed", target_service="embedding-service")
+        try:
+            # Enviamos un texto de prueba para obtener la respuesta que incluye model_info
+            response = await self._client.post(self.embed_endpoint, json={"texts": ["test"]})
+            response.raise_for_status()
+            data = response.json()
+            if "model_info" in data and isinstance(data["model_info"], dict):
+                client_log.info("Model info retrieved from embedding service", model_info=data["model_info"])
+                return data["model_info"]
+            client_log.warning("Model info not found in embedding service response.", response_data=data)
+            return None
+        except Exception as e:
+            client_log.error("Failed to get model_info from embedding service via /embed", error=str(e))
+            return None
+
+    async def check_health(self) -> bool:
+        """
+        Verifica la salud del embedding service llamando a su endpoint /health.
+        """
+        client_log = log.bind(action="check_health", target_service="embedding-service")
+        try:
+            response = await self._client.get(self.health_endpoint)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("status") == "ok" and data.get("model_status") == "loaded":
+                    client_log.info("Embedding service health check successful.", health_data=data)
+                    return True
+                else:
+                    client_log.warning("Embedding service health check returned ok status but model not ready.", health_data=data)
+                    return False
+            else:
+                client_log.warning("Embedding service health check failed.", status_code=response.status_code, response_text=response.text)
+                return False
+        except httpx.RequestError as e:
+            client_log.error("Error connecting to embedding service for health check.", error=str(e))
+            return False
+        except Exception as e: # Para errores de JSON parsing u otros
+            client_log.error("Unexpected error during embedding service health check.", error=str(e))
+            return False
+
+    async def close(self):
+        """Cierra el cliente HTTP."""
+        await self._client.aclose()
+        log.info("EmbeddingServiceClient closed.")
+```
+
+## File: `app\infrastructure\embedding\__init__.py`
+```py
+# query-service/app/infrastructure/embedding/__init__.py
+from .remote_embedding_adapter import RemoteEmbeddingAdapter
+
+__all__ = ["RemoteEmbeddingAdapter"]
+```
+
+## File: `app\infrastructure\embedding\remote_embedding_adapter.py`
+```py
+# query-service/app/infrastructure/embedding/remote_embedding_adapter.py
+import structlog
+from typing import List, Optional
+
+from app.application.ports.embedding_port import EmbeddingPort
+from app.infrastructure.clients.embedding_service_client import EmbeddingServiceClient
+from app.core.config import settings # Para EMBEDDING_DIMENSION
+
+log = structlog.get_logger(__name__)
+
+class RemoteEmbeddingAdapter(EmbeddingPort):
+    """
+    Adaptador que utiliza EmbeddingServiceClient para generar embeddings
+    llamando al servicio de embedding externo.
+    """
+    def __init__(self, client: EmbeddingServiceClient):
+        self.client = client
+        self._embedding_dimension: Optional[int] = None # Se intentará obtener del servicio
+        self._expected_dimension = settings.EMBEDDING_DIMENSION # Dimensión configurada/esperada
+        log.info("RemoteEmbeddingAdapter initialized", expected_dimension=self._expected_dimension)
+
+    async def initialize(self):
+        """
+        Intenta obtener la dimensión del embedding desde el servicio al iniciar.
+        """
+        init_log = log.bind(adapter="RemoteEmbeddingAdapter", action="initialize")
+        try:
+            model_info = await self.client.get_model_info()
+            if model_info and "dimension" in model_info:
+                self._embedding_dimension = model_info["dimension"]
+                init_log.info("Successfully retrieved embedding dimension from service.",
+                              service_dimension=self._embedding_dimension,
+                              service_model_name=model_info.get("model_name"))
+                if self._embedding_dimension != self._expected_dimension:
+                    init_log.warning("Embedding dimension mismatch!",
+                                     configured_dimension=self._expected_dimension,
+                                     service_dimension=self._embedding_dimension,
+                                     message="Query service configured dimension does not match dimension reported by embedding service. "
+                                             "This may cause issues with Milvus or other components. Ensure configurations are aligned.")
+            else:
+                init_log.warning("Could not retrieve embedding dimension from service. Will use configured dimension.",
+                                 configured_dimension=self._expected_dimension)
+        except Exception as e:
+            init_log.error("Failed to retrieve embedding dimension during initialization.", error=str(e))
+
+    async def embed_query(self, query_text: str) -> List[float]:
+        adapter_log = log.bind(adapter="RemoteEmbeddingAdapter", action="embed_query")
+        if not query_text:
+            adapter_log.warning("Empty query text provided.")
+            raise ValueError("Query text cannot be empty.")
+        try:
+            embeddings = await self.client.generate_embeddings([query_text])
+            if not embeddings or len(embeddings) != 1:
+                adapter_log.error("Embedding service did not return a valid embedding for the query.", received_embeddings=embeddings)
+                raise ValueError("Failed to get a valid embedding for the query.")
+
+            embedding_vector = embeddings[0]
+            # Validar dimensión
+            if len(embedding_vector) != self.get_embedding_dimension(): # Usa el getter que prioriza servicio
+                adapter_log.error("Embedding dimension mismatch for query embedding.",
+                                  expected_dim=self.get_embedding_dimension(),
+                                  received_dim=len(embedding_vector))
+                raise ValueError(f"Embedding dimension mismatch: expected {self.get_embedding_dimension()}, got {len(embedding_vector)}")
+
+            adapter_log.debug("Query embedded successfully via remote service.")
+            return embedding_vector
+        except ConnectionError as e:
+            adapter_log.error("Connection error while embedding query.", error=str(e))
+            raise # Re-raise para que el use case lo maneje
+        except ValueError as e:
+            adapter_log.error("Value error while embedding query.", error=str(e))
+            raise # Re-raise
+
+    async def embed_texts(self, texts: List[str]) -> List[List[float]]:
+        adapter_log = log.bind(adapter="RemoteEmbeddingAdapter", action="embed_texts")
+        if not texts:
+            adapter_log.warning("No texts provided to embed_texts.")
+            return []
+        try:
+            embeddings = await self.client.generate_embeddings(texts)
+            if len(embeddings) != len(texts):
+                adapter_log.error("Number of embeddings received does not match number of texts sent.",
+                                  num_texts=len(texts), num_embeddings=len(embeddings))
+                raise ValueError("Mismatch in number of embeddings received from service.")
+
+            # Validar dimensión del primer embedding como muestra
+            if embeddings and len(embeddings[0]) != self.get_embedding_dimension():
+                 adapter_log.error("Embedding dimension mismatch for batch texts.",
+                                   expected_dim=self.get_embedding_dimension(),
+                                   received_dim=len(embeddings[0]))
+                 raise ValueError(f"Embedding dimension mismatch: expected {self.get_embedding_dimension()}, got {len(embeddings[0])}")
+
+            adapter_log.debug(f"Successfully embedded {len(texts)} texts via remote service.")
+            return embeddings
+        except ConnectionError as e:
+            adapter_log.error("Connection error while embedding texts.", error=str(e))
+            raise
+        except ValueError as e:
+            adapter_log.error("Value error while embedding texts.", error=str(e))
+            raise
+
+    def get_embedding_dimension(self) -> int:
+        """
+        Devuelve la dimensión del embedding, priorizando la obtenida del servicio,
+        o la configurada como fallback.
+        """
+        if self._embedding_dimension is not None:
+            return self._embedding_dimension
+        return self._expected_dimension
+
+    async def health_check(self) -> bool:
+        """
+        Delega la verificación de salud al cliente del servicio de embedding.
+        """
+        return await self.client.check_health()
 ```
 
 ## File: `app\infrastructure\filters\__init__.py`
@@ -2773,7 +3098,7 @@ import asyncio
 import json
 import uuid
 from contextlib import asynccontextmanager
-from typing import Annotated, Optional # Explicit type hint for Optionals
+from typing import Annotated, Optional
 
 # Configurar logging primero
 from app.core.config import settings
@@ -2788,7 +3113,8 @@ from app.api.v1.endpoints import chat as chat_router_module
 # Import Ports and Adapters/Repositories for Dependency Injection
 from app.application.ports import (
     ChatRepositoryPort, LogRepositoryPort, VectorStorePort, LLMPort,
-    SparseRetrieverPort, RerankerPort, DiversityFilterPort, ChunkContentRepositoryPort
+    SparseRetrieverPort, RerankerPort, DiversityFilterPort, ChunkContentRepositoryPort,
+    EmbeddingPort # NUEVA ADICIÓN
 )
 from app.infrastructure.persistence.postgres_repositories import (
     PostgresChatRepository, PostgresLogRepository, PostgresChunkContentRepository
@@ -2798,8 +3124,10 @@ from app.infrastructure.llms.gemini_adapter import GeminiAdapter
 from app.infrastructure.retrievers.bm25_retriever import BM25sRetriever
 from app.infrastructure.rerankers.bge_reranker import BGEReranker
 from app.infrastructure.filters.diversity_filter import MMRDiversityFilter, StubDiversityFilter
+# NUEVAS ADICIONES para Embedding Remoto
+from app.infrastructure.clients.embedding_service_client import EmbeddingServiceClient
+from app.infrastructure.embedding.remote_embedding_adapter import RemoteEmbeddingAdapter
 
-# Import Use Case
 
 # Import AskQueryUseCase and dependency setter from dependencies.py
 from app.application.use_cases.ask_query_use_case import AskQueryUseCase
@@ -2810,7 +3138,7 @@ from app.infrastructure.persistence import postgres_connector
 
 # Global state
 SERVICE_READY = False
-# Global instances for simplified DI (replace with proper container if needed)
+# Global instances for simplified DI
 chat_repo_instance: Optional[ChatRepositoryPort] = None
 log_repo_instance: Optional[LogRepositoryPort] = None
 chunk_content_repo_instance: Optional[ChunkContentRepositoryPort] = None
@@ -2818,7 +3146,10 @@ vector_store_instance: Optional[VectorStorePort] = None
 llm_instance: Optional[LLMPort] = None
 sparse_retriever_instance: Optional[SparseRetrieverPort] = None
 reranker_instance: Optional[RerankerPort] = None
-diversity_filter_instance: Optional[DiversityFilterPort] = None # Will hold either MMR or Stub
+diversity_filter_instance: Optional[DiversityFilterPort] = None
+# NUEVAS ADICIONES para Embedding Remoto
+embedding_service_client_instance: Optional[EmbeddingServiceClient] = None
+embedding_adapter_instance: Optional[EmbeddingPort] = None
 ask_query_use_case_instance: Optional[AskQueryUseCase] = None
 
 
@@ -2827,9 +3158,10 @@ ask_query_use_case_instance: Optional[AskQueryUseCase] = None
 async def lifespan(app: FastAPI):
     global SERVICE_READY, chat_repo_instance, log_repo_instance, chunk_content_repo_instance, \
            vector_store_instance, llm_instance, sparse_retriever_instance, reranker_instance, \
-           diversity_filter_instance, ask_query_use_case_instance
+           diversity_filter_instance, ask_query_use_case_instance, \
+           embedding_service_client_instance, embedding_adapter_instance # NUEVAS ADICIONES
 
-    SERVICE_READY = False # Ensure service starts as not ready
+    SERVICE_READY = False
     log.info(f"Starting up {settings.PROJECT_NAME}...")
     dependencies_ok = True
     critical_failure_message = ""
@@ -2853,11 +3185,32 @@ async def lifespan(app: FastAPI):
             log.critical(f"CRITICAL: {critical_failure_message}", error=str(e), exc_info=True)
             dependencies_ok = False
 
-    # 2. Initialize Milvus Adapter
+    # 2. Initialize Embedding Service Client & Adapter (NUEVO PASO TEMPRANO)
+    if dependencies_ok:
+        try:
+            embedding_service_client_instance = EmbeddingServiceClient(base_url=str(settings.EMBEDDING_SERVICE_URL))
+            embedding_adapter_instance = RemoteEmbeddingAdapter(client=embedding_service_client_instance)
+            await embedding_adapter_instance.initialize() # Intenta obtener dimensión del servicio
+            
+            # Health check del servicio de embedding
+            emb_service_healthy = await embedding_adapter_instance.health_check()
+            if emb_service_healthy:
+                log.info("Embedding Service client and adapter initialized, health check passed.")
+            else:
+                critical_failure_message = "Embedding Service health check failed during startup."
+                log.critical(f"CRITICAL: {critical_failure_message} URL: {settings.EMBEDDING_SERVICE_URL}")
+                dependencies_ok = False
+        except Exception as e:
+            critical_failure_message = "Failed to initialize Embedding Service client/adapter."
+            log.critical(f"CRITICAL: {critical_failure_message}", error=str(e), exc_info=True, url=settings.EMBEDDING_SERVICE_URL)
+            dependencies_ok = False
+
+
+    # 3. Initialize Milvus Adapter
     if dependencies_ok:
         try:
             vector_store_instance = MilvusAdapter()
-            await vector_store_instance._get_collection() # This tries connection + load
+            await vector_store_instance._get_collection()
             log.info("Milvus Adapter initialized and collection checked/loaded.")
         except Exception as e:
             critical_failure_message = "Failed to initialize Milvus Adapter or load collection."
@@ -2867,7 +3220,7 @@ async def lifespan(app: FastAPI):
             )
             dependencies_ok = False
 
-    # 3. Initialize LLM Adapter
+    # 4. Initialize LLM Adapter
     if dependencies_ok:
         try:
             llm_instance = GeminiAdapter()
@@ -2891,7 +3244,7 @@ async def lifespan(app: FastAPI):
                     log.info("BM25s Retriever initialized.")
                 else:
                     log.error("BM25 enabled but ChunkContentRepository failed to initialize. Disabling BM25.")
-                    sparse_retriever_instance = None
+                    sparse_retriever_instance = None # Ensure it's None
             except ImportError: log.error("BM25sRetriever dependency (bm2s) not installed. BM25 disabled.")
             except Exception as e: log.error("Failed to initialize BM25s Retriever.", error=str(e), exc_info=True)
 
@@ -2905,8 +3258,13 @@ async def lifespan(app: FastAPI):
 
         if settings.DIVERSITY_FILTER_ENABLED:
             try:
-                diversity_filter_instance = MMRDiversityFilter(lambda_mult=settings.QUERY_DIVERSITY_LAMBDA)
-                log.info("MMR Diversity Filter initialized.")
+                # Solo usar MMR si el adaptador de embedding está disponible y puede dar embeddings
+                if embedding_adapter_instance:
+                    diversity_filter_instance = MMRDiversityFilter(lambda_mult=settings.QUERY_DIVERSITY_LAMBDA)
+                    log.info("MMR Diversity Filter initialized.")
+                else:
+                    log.warning("MMR Diversity Filter requires embeddings, but embedding adapter is not available. Falling back to Stub.")
+                    diversity_filter_instance = StubDiversityFilter()
             except Exception as e:
                 log.error("Failed to initialize MMR Diversity Filter. Falling back to Stub.", error=str(e), exc_info=True)
                 diversity_filter_instance = StubDiversityFilter()
@@ -2914,7 +3272,7 @@ async def lifespan(app: FastAPI):
             log.info("Diversity filter disabled, using StubDiversityFilter as placeholder.")
             diversity_filter_instance = StubDiversityFilter()
 
-    # 4. Instantiate Use Case only if core dependencies are okay
+    # 5. Instantiate Use Case only if core dependencies are okay
     if dependencies_ok:
          try:
              ask_query_use_case_instance = AskQueryUseCase(
@@ -2922,6 +3280,7 @@ async def lifespan(app: FastAPI):
                  log_repo=log_repo_instance,
                  vector_store=vector_store_instance,
                  llm=llm_instance,
+                 embedding_adapter=embedding_adapter_instance, # Inyectar el nuevo adaptador
                  sparse_retriever=sparse_retriever_instance,
                  chunk_content_repo=chunk_content_repo_instance,
                  reranker=reranker_instance,
@@ -2929,21 +3288,13 @@ async def lifespan(app: FastAPI):
              )
              log.info("AskQueryUseCase instantiated successfully.")
 
-             # 5. Warm up embedder only if use case is ready
-             log.info("Warming up embedding model...")
-             try:
-                 await asyncio.to_thread(ask_query_use_case_instance._embedder.warm_up)
-                 log.info("Embedding model warmed up successfully.")
-                 # Only set ready if ALL critical steps succeeded
-                 SERVICE_READY = True
-                 # Set the singleton in dependencies.py for use in endpoints
-                 set_ask_query_use_case_instance(ask_query_use_case_instance, SERVICE_READY)
-                 log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY.")
-             except Exception as embed_err:
-                 critical_failure_message = "Failed to warm up embedding model."
-                 log.critical(f"CRITICAL: {critical_failure_message}", error=str(embed_err), exc_info=True)
-                 SERVICE_READY = False # Ensure service is not ready
-                 set_ask_query_use_case_instance(None, False)
+             # REMOVED: Warm up de FastEmbed ya no es necesario.
+             # El RemoteEmbeddingAdapter no tiene un método warm_up explícito,
+             # su inicialización ya intenta conectar y obtener info.
+
+             SERVICE_READY = True
+             set_ask_query_use_case_instance(ask_query_use_case_instance, SERVICE_READY)
+             log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY.")
 
          except Exception as e:
               critical_failure_message = "Failed to instantiate AskQueryUseCase."
@@ -2951,9 +3302,9 @@ async def lifespan(app: FastAPI):
               SERVICE_READY = False
               set_ask_query_use_case_instance(None, False)
     else:
-        # Log final status if dependencies failed earlier
         log.critical(f"{settings.PROJECT_NAME} startup sequence aborted due to critical failure: {critical_failure_message}")
         log.critical("SERVICE NOT READY.")
+        set_ask_query_use_case_instance(None, False) # Asegurar que el caso de uso no se setee
 
     # Final check - ensure service ready is false if dependencies failed at any point
     if not dependencies_ok:
@@ -2968,18 +3319,19 @@ async def lifespan(app: FastAPI):
     log.info(f"Shutting down {settings.PROJECT_NAME}...")
     await postgres_connector.close_db_pool()
     if vector_store_instance and hasattr(vector_store_instance, 'disconnect'):
-        try:
-            await vector_store_instance.disconnect()
-        except Exception as e:
-            log.error("Error during Milvus disconnect", error=str(e), exc_info=True)
+        try: await vector_store_instance.disconnect()
+        except Exception as e: log.error("Error during Milvus disconnect", error=str(e), exc_info=True)
+    if embedding_service_client_instance: # NUEVO: cerrar cliente de embedding
+        try: await embedding_service_client_instance.close()
+        except Exception as e: log.error("Error closing EmbeddingServiceClient", error=str(e), exc_info=True)
     log.info("Shutdown complete.")
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
     title=settings.PROJECT_NAME,
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
-    version="0.3.0", # Final Version
-    description="Microservice to handle user queries using a refactored RAG pipeline and chat history.",
+    version="0.3.1", # Incremento de versión patch por refactor de embedding
+    description="Microservice to handle user queries using a refactored RAG pipeline, chat history, and remote embedding generation.",
     lifespan=lifespan
 )
 
@@ -3038,7 +3390,6 @@ async def generic_exception_handler(request: Request, exc: Exception):
 
 # --- Simplified Dependency Injection Functions ---
 def get_chat_repository() -> ChatRepositoryPort:
-    # Check instance directly, rely on lifespan to initialize it
     if not chat_repo_instance:
         log.error("Dependency Injection Failed: ChatRepository requested but not initialized.")
         raise HTTPException(status_code=503, detail="Chat service component not available.")
@@ -3055,17 +3406,26 @@ log.info("Routers included", prefix=settings.API_V1_STR)
 @app.get("/", tags=["Health Check"], summary="Service Liveness/Readiness Check")
 async def read_root():
     health_log = log.bind(check="liveness_readiness")
-    # Use the global SERVICE_READY flag set by the lifespan manager
     if not SERVICE_READY:
         health_log.warning("Health check failed: Service not ready.", service_ready_flag=SERVICE_READY)
         raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service Not Ready")
 
+    # Adicionalmente, verificar la salud del embedding adapter si es posible
+    if embedding_adapter_instance:
+        emb_adapter_healthy = await embedding_adapter_instance.health_check()
+        if not emb_adapter_healthy:
+            health_log.error("Health check failed: Embedding Adapter reports unhealthy dependency (Embedding Service).")
+            raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Critical dependency (Embedding Service) is unhealthy.")
+    else: # Si el adaptador ni siquiera se inicializó, el servicio no debería estar READY
+        health_log.error("Health check warning: Embedding Adapter instance not available (should not happen if SERVICE_READY is true).")
+
+
     health_log.debug("Health check passed.")
     return PlainTextResponse("OK", status_code=fastapi_status.HTTP_200_OK)
 
-# --- Main execution --- .
+# --- Main execution ---
 if __name__ == "__main__":
-    port = 8002
+    port = 8001
     log_level_str = settings.LOG_LEVEL.lower()
     print(f"----- Starting {settings.PROJECT_NAME} locally on port {port} -----")
     uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True, log_level=log_level_str)
@@ -3109,19 +3469,19 @@ def truncate_text(text: str, max_length: int) -> str:
 [tool.poetry]
 name = "query-service"
 # LLM_REFACTOR_FINAL: Set final version number
-version = "0.3.0"
-description = "Query service for SaaS B2B using Clean Architecture, PyMilvus, Haystack & Advanced RAG"
+version = "0.3.1" # Incrementado por refactor de embedding
+description = "Query service for SaaS B2B using Clean Architecture, PyMilvus, Haystack & Advanced RAG with remote embeddings"
 authors = ["Nyro <dev@nyro.com>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.10" # Project requires Python 3.10 or higher, but less than 4.0
+python = "^3.10"
 fastapi = "^0.110.0"
 uvicorn = {extras = ["standard"], version = "^0.28.0"}
 gunicorn = "^21.2.0"
 pydantic = {extras = ["email"], version = "^2.6.4"}
 pydantic-settings = "^2.2.1"
-httpx = "^0.27.0"
+httpx = "^0.27.0" # Ya estaba, ahora usado explícitamente por EmbeddingServiceClient
 asyncpg = "^0.29.0"
 python-jose = {extras = ["cryptography"], version = "^3.3.0"}
 tenacity = "^8.2.3"
@@ -3130,31 +3490,26 @@ structlog = "^24.1.0"
 # --- Haystack Dependencies ---
 haystack-ai = "^2.0.1" # Core Haystack (Document, PromptBuilder)
 pymilvus = "^2.4.1"    # Milvus client
-# --- LLM_CORRECTION: Pin version and add Python marker ---
-fastembed-haystack = { version = "1.3.0", python = ">=3.10,<3.13" } # Pin to 1.3.0, explicit Python range
-# --- END CORRECTION ---
-# --- LLM_CORRECTION: Pin version and add Python marker ---
-fastembed = { version = "0.3.6", python = ">=3.10,<3.13" } # Pin to 0.3.6, explicit Python range
-# --- END CORRECTION ---
+
+# --- REMOVED: FastEmbed y fastembed-haystack ya no son dependencias directas ---
+# fastembed-haystack = { version = "1.3.0", python = ">=3.10,<3.13" }
+# fastembed = { version = "0.3.6", python = ">=3.10,<3.13" }
+
 
 # --- LLM Dependency ---
 google-generativeai = "^0.5.4" # Gemini client
 
 # --- RAG Component Dependencies ---
 sentence-transformers = "^2.7.0" # For BGE Reranker adapter
-# --- LLM_CORRECTION: Pin version ---
-bm25s = "0.1.3"                # Pin to 0.1.3
-# --- END CORRECTION ---
-# --- LLM_CORRECTION: Pin version ---
-numpy = "1.26.4"              # Pin to 1.26.4 (compatible with bm25s and fastembed 0.3.x)
-# --- END CORRECTION ---
+bm2s = "0.1.3"
+numpy = "1.26.4" # Probablemente aún necesitado por sentence-transformers o bm2s
 
 
 # Optional for performance
-# onnxruntime = { version = "^1.17.1", optional = true }
+# onnxruntime = { version = "^1.17.1", optional = true } # Si alguna otra dependencia lo necesita explícitamente
 
 [tool.poetry.extras]
-onnx = ["onnxruntime"]
+# onnx = ["onnxruntime"] # Si onnxruntime se mantiene opcional
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"

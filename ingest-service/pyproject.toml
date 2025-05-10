@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "ingest-service"
-version = "0.3.0" # Version incrementada para reflejar cambios
-description = "Ingest service for Atenex B2B SaaS (Postgres/GCS/Milvus/SentenceTransformers - CPU - Prefork)"
+version = "0.3.1" # Version incrementada
+description = "Ingest service for Atenex B2B SaaS (Postgres/GCS/Milvus/Remote Embedding Service - CPU - Prefork)" # Descripción actualizada
 authors = ["Atenex Team <dev@atenex.com>"]
 readme = "README.md"
 
@@ -13,7 +13,7 @@ gunicorn = "^21.2.0"
 pydantic = {extras = ["email"], version = "^2.6.4"}
 pydantic-settings = "^2.2.1"
 celery = {extras = ["redis"], version = "^5.3.6"}
-asyncpg = "^0.29.0" # Keep for API
+asyncpg = "^0.29.0"
 tenacity = "^8.2.3"
 python-multipart = "^0.0.9"
 structlog = "^24.1.0"
@@ -21,13 +21,13 @@ structlog = "^24.1.0"
 google-cloud-storage = "^2.16.0"
 
 # --- ONNX Runtime ---
-onnxruntime = "^1.18.0" # Check compatibility if needed
+# onnxruntime = "^1.18.0" # Eliminado, ya no se usa directamente en ingest-service
 
-# --- Core Processing Dependencies (v0.3.0) ---
-pymupdf = "^1.25.0"                # PyMuPDF for PDF extraction
-sentence-transformers = "^2.7"     # For MiniLM embeddings
-pymilvus = ">=2.4.1,<2.5.0"         # Official Milvus client
-tiktoken = "^0.7.0"                # For token counting metadata
+# --- Core Processing Dependencies (v0.3.1) ---
+pymupdf = "^1.25.0"
+# sentence-transformers = "^2.7" # Eliminado, se usa el servicio externo
+pymilvus = ">=2.4.1,<2.5.0"
+tiktoken = "^0.7.0"
 
 # --- Converter Dependencies (Standalone - Keep) ---
 python-docx = ">=1.1.0,<2.0.0"
@@ -35,17 +35,14 @@ markdown = ">=3.5.1,<4.0.0"
 beautifulsoup4 = ">=4.12.3,<5.0.0"
 html2text = ">=2024.1.0,<2025.0.0"
 
-# --- HTTP Client (API - Keep) ---
-httpx = {extras = ["http2"], version = "^0.27.0"}
+# --- HTTP Client (API & Service Client - Keep) ---
+httpx = {extras = ["http2"], version = "^0.27.0"} # Usado por EmbeddingServiceClient
 h2 = "^4.1.0"
 
 # --- Synchronous DB Dependencies (Worker - Keep) ---
 sqlalchemy = "^2.0.28"
-psycopg2-binary = "^2.9.9" # Use psycopg2-binary for ease of install
+psycopg2-binary = "^2.9.9"
 
-# --- REMOVED Dependencies ---
-# fastembed = ">=0.2.1,<0.3.0"
-# pypdf = ">=4.0.1,<5.0.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"

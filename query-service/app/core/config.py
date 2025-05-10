@@ -26,6 +26,9 @@ MILVUS_DEFAULT_GRPC_TIMEOUT = 15
 MILVUS_DEFAULT_SEARCH_PARAMS = {"metric_type": "IP", "params": {"nprobe": 10}}
 MILVUS_DEFAULT_METADATA_FIELDS = ["company_id", "document_id", "file_name", "page", "title"]
 
+# Embedding Service (NUEVO)
+EMBEDDING_SERVICE_K8S_URL_DEFAULT = "http://embedding-service.nyro-develop.svc.cluster.local:8003"
+
 
 # ==========================================================================================
 #  ATENEX SYSTEM PROMPT ADAPTADO - v1.3 (Mayo 2025)
@@ -101,15 +104,15 @@ INSTRUCCIONES:
 RESPUESTA DE ATENEX (en español latino):
 """
 # Models
-DEFAULT_FASTEMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-DEFAULT_FASTEMBED_QUERY_PREFIX = "query: "
-DEFAULT_EMBEDDING_DIMENSION = 384
-DEFAULT_GEMINI_MODEL = "gemini-1.5-flash-latest" # Ensure flash model is used
+# DEFAULT_FASTEMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2" # REMOVED - No longer local
+# DEFAULT_FASTEMBED_QUERY_PREFIX = "query: " # REMOVED
+DEFAULT_EMBEDDING_DIMENSION = 384 # Still needed for Milvus config and validation
+DEFAULT_GEMINI_MODEL = "gemini-1.5-flash-latest"
 DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-base"
 
 # RAG Pipeline Parameters
 DEFAULT_RETRIEVER_TOP_K = 100
-DEFAULT_BM25_ENABLED: bool = True # User must ensure bm2s is installed
+DEFAULT_BM25_ENABLED: bool = True
 DEFAULT_RERANKER_ENABLED: bool = True
 DEFAULT_DIVERSITY_FILTER_ENABLED: bool = False
 DEFAULT_MAX_CONTEXT_CHUNKS: int = 75
@@ -117,7 +120,7 @@ DEFAULT_HYBRID_ALPHA: float = 0.5
 DEFAULT_DIVERSITY_LAMBDA: float = 0.5
 DEFAULT_MAX_PROMPT_TOKENS: int = 500000
 DEFAULT_MAX_CHAT_HISTORY_MESSAGES = 10
-DEFAULT_NUM_SOURCES_TO_SHOW = 7 # Keep this lower than MAX_CONTEXT_CHUNKS
+DEFAULT_NUM_SOURCES_TO_SHOW = 7
 
 
 class Settings(BaseSettings):
@@ -153,10 +156,14 @@ class Settings(BaseSettings):
     MILVUS_GRPC_TIMEOUT: int = Field(default=MILVUS_DEFAULT_GRPC_TIMEOUT)
     MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default=MILVUS_DEFAULT_SEARCH_PARAMS)
 
-    # --- Embedding Model (FastEmbed) ---
-    FASTEMBED_MODEL_NAME: str = Field(default=DEFAULT_FASTEMBED_MODEL)
-    EMBEDDING_DIMENSION: int = Field(default=DEFAULT_EMBEDDING_DIMENSION)
-    FASTEMBED_QUERY_PREFIX: str = Field(default=DEFAULT_FASTEMBED_QUERY_PREFIX)
+    # --- Embedding Settings (General) ---
+    EMBEDDING_DIMENSION: int = Field(default=DEFAULT_EMBEDDING_DIMENSION, description="Dimension of embeddings, used for Milvus and validation.")
+    # QUERY_FASTEMBED_MODEL_NAME: str = Field(default=DEFAULT_FASTEMBED_MODEL) # REMOVED
+    # QUERY_FASTEMBED_QUERY_PREFIX: str = Field(default=DEFAULT_FASTEMBED_QUERY_PREFIX) # REMOVED
+
+    # --- External Embedding Service (NUEVO) ---
+    EMBEDDING_SERVICE_URL: AnyHttpUrl = Field(default=AnyHttpUrl(EMBEDDING_SERVICE_K8S_URL_DEFAULT), description="URL of the Atenex Embedding Service.")
+
 
     # --- LLM (Google Gemini) ---
     GEMINI_API_KEY: SecretStr
@@ -211,24 +218,16 @@ class Settings(BaseSettings):
     def check_embedding_dimension(cls, v: int, info: ValidationInfo) -> int:
         if v <= 0:
             raise ValueError("EMBEDDING_DIMENSION must be a positive integer.")
-        model_name = info.data.get('FASTEMBED_MODEL_NAME', DEFAULT_FASTEMBED_MODEL)
-        expected_dim = -1
-        if 'all-MiniLM-L6-v2' in model_name: expected_dim = 384
-        elif 'bge-small-en-v1.5' in model_name: expected_dim = 384
-        elif 'bge-large-en-v1.5' in model_name: expected_dim = 1024
-
-        if expected_dim != -1 and v != expected_dim:
-            logging.warning(f"Configured EMBEDDING_DIMENSION ({v}) differs from standard dimension ({expected_dim}) for model '{model_name}'. Ensure this is intentional.")
-        elif expected_dim == -1:
-            logging.warning(f"Unknown standard embedding dimension for model '{model_name}'. Using configured dimension {v}. Verify this matches the actual model output.")
-        logging.debug(f"Using EMBEDDING_DIMENSION: {v} for model: {model_name}")
+        # No longer checking against FASTEMBED_MODEL_NAME as it's external
+        # The RemoteEmbeddingAdapter will try to validate against the service's reported dimension
+        logging.info(f"Configured EMBEDDING_DIMENSION: {v}. This will be used for Milvus and validated against the embedding service.")
         return v
 
     @field_validator('MAX_CONTEXT_CHUNKS')
     @classmethod
     def check_max_context_chunks(cls, v: int, info: ValidationInfo) -> int:
         retriever_k = info.data.get('RETRIEVER_TOP_K', DEFAULT_RETRIEVER_TOP_K)
-        max_possible_after_fusion = retriever_k * 2
+        max_possible_after_fusion = retriever_k * 2 # Assuming dense + sparse
         if v > max_possible_after_fusion:
             logging.warning(f"MAX_CONTEXT_CHUNKS ({v}) is greater than the maximum possible chunks after fusion ({max_possible_after_fusion} based on RETRIEVER_TOP_K={retriever_k}). Effective limit will be {max_possible_after_fusion}.")
         if v <= 0:
@@ -264,9 +263,9 @@ try:
     for key, value in log_data.items():
         # Truncate long prompt templates for cleaner logs
         if key.endswith('_PROMPT_TEMPLATE') and isinstance(value, str) and len(value) > 200:
-             temp_log.info(f"  {key}: {value[:100]}... (truncated)")
+             temp_log.info(f"  {key.upper()}: {value[:100]}... (truncated)")
         else:
-             temp_log.info(f"  {key}: {value}")
+             temp_log.info(f"  {key.upper()}: {value}")
     temp_log.info(f"  POSTGRES_PASSWORD: *** SET ***")
     temp_log.info(f"  GEMINI_API_KEY: *** SET ***")
 
