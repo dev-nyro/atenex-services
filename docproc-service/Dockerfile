@@ -25,7 +25,7 @@ COPY pyproject.toml poetry.lock ./
 RUN poetry install --no-root --only main
 
 # ---- Stage 2: Final Image ----
-FROM python:3.10-slim AS runtime   # añade 'AS runtime' para simetría
+FROM python:3.10-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
