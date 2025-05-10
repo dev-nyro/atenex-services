@@ -94,6 +94,7 @@ jobs:
       - name: Build and push Ingest Service Docker image
         id: build_ingest
         if: steps.changed_files.outputs.ingest_any_changed == 'true'
+        continue-on-error: true
         uses: docker/build-push-action@v5
         with:
           context: ./${{ env.INGEST_SERVICE_DIR }}
@@ -107,6 +108,7 @@ jobs:
       - name: Build and push Query Service Docker image
         id: build_query
         if: steps.changed_files.outputs.query_any_changed == 'true'
+        continue-on-error: true
         uses: docker/build-push-action@v5
         with:
           context: ./${{ env.QUERY_SERVICE_DIR }}
@@ -120,6 +122,7 @@ jobs:
       - name: Build and push API Gateway Docker image
         id: build_gateway
         if: steps.changed_files.outputs.gateway_any_changed == 'true'
+        continue-on-error: true
         uses: docker/build-push-action@v5
         with:
           context: ./${{ env.GATEWAY_SERVICE_DIR }}
@@ -133,6 +136,7 @@ jobs:
       - name: Build and push Embedding Service Docker image
         id: build_embedding
         if: steps.changed_files.outputs.embedding_any_changed == 'true'
+        continue-on-error: true
         uses: docker/build-push-action@v5
         with:
           context: ./${{ env.EMBEDDING_SERVICE_DIR }}
@@ -146,6 +150,7 @@ jobs:
       - name: Build and push DocProc Service Docker image # NEW
         id: build_docproc
         if: steps.changed_files.outputs.docproc_any_changed == 'true'
+        continue-on-error: true
         uses: docker/build-push-action@v5
         with:
           context: ./${{ env.DOCPROC_SERVICE_DIR }}
@@ -159,6 +164,7 @@ jobs:
       - name: Build and push Reranker Service Docker image # NEW
         id: build_reranker
         if: steps.changed_files.outputs.reranker_any_changed == 'true'
+        continue-on-error: true
         uses: docker/build-push-action@v5
         with:
           context: ./${{ env.RERANKER_SERVICE_DIR }}

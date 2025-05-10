@@ -164,4 +164,4 @@ if __name__ == "__main__":
     print(f"----- Starting {settings.PROJECT_NAME} locally on port {port} -----")
     uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True, log_level=log_level_str)
 
-# 0.3.1
+# 0.3.1 version
