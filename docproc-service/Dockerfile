@@ -1,5 +1,5 @@
 # ---- Stage 1: Builder ----
-FROM python:3.10-slim AS builder   # 'as' → 'AS'
+FROM python:3.10-slim AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
