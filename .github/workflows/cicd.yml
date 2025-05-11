@@ -247,6 +247,10 @@ jobs:
     if: github.event_name == 'push' && (needs.build-push.outputs.ingest_built == 'true' || needs.build-push.outputs.query_built == 'true' || needs.build-push.outputs.gateway_built == 'true' || needs.build-push.outputs.embedding_built == 'true' || needs.build-push.outputs.docproc_built == 'true' || needs.build-push.outputs.reranker_built == 'true')
 
     steps:
+      - name: Install yq
+        run: |
+          sudo wget -O /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64"
+          sudo chmod +x /usr/local/bin/yq
       - name: Debug Update Manifests Job Trigger
         run: |
           echo "::group::Debug Information for update-manifests job trigger"
@@ -314,7 +318,9 @@ jobs:
               echo "Attempting to update $SERVICE_NAME image to: $TARGET_IMAGE in $MANIFEST_PATH_REL"
               if [ -f "$MANIFEST_PATH_REL" ]; then
                 # Reemplaza la línea de imagen aunque tenga comentarios o espacios
-                sed -i "s|^[[:space:]]*image:.*|image: $TARGET_IMAGE|" "$MANIFEST_PATH_REL"
+                # Usar yq para actualizar la imagen de forma robusta
+                yq -i '(.spec.template.spec.containers[] | select(.name == "'${SERVICE_NAME,,// /-}'") ).image = "'$TARGET_IMAGE'"' "$MANIFEST_PATH_REL" || \
+                yq -i '(.spec.template.spec.containers[0].image) = "'$TARGET_IMAGE'"' "$MANIFEST_PATH_REL"
                 echo "Updated $MANIFEST_PATH_REL for $SERVICE_NAME"
               else
                 echo "::error::$SERVICE_NAME manifest file '$MANIFEST_PATH_REL' not found!"
