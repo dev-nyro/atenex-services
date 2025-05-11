@@ -4,8 +4,10 @@ from typing import List, Tuple, Dict, Any, Optional
 import asyncio
 import time
 
-from fastembed import TextEmbedding, DefaultEmbedding, EmbeddingModel # Qdrant/FastEmbed
-# from sentence_transformers import SentenceTransformer # Alternative if not using FastEmbed directly
+# CORREGIDO: Importar solo TextEmbedding o lo que sea necesario de la API actual de fastembed
+from fastembed import TextEmbedding # Qdrant/FastEmbed
+# DefaultEmbedding y EmbeddingModel ya no parecen ser parte de la API pública
+# de las versiones recientes de fastembed (>=0.3.0)
 
 from app.application.ports.embedding_model_port import EmbeddingModelPort
 from app.core.config import settings
@@ -40,21 +42,19 @@ class FastEmbedAdapter(EmbeddingModelPort):
         init_log.info("Initializing FastEmbed model...")
         start_time = time.perf_counter()
         try:
-            # FastEmbed's TextEmbedding can take kwargs for specific models
-            # For sentence-transformers models, it usually handles them well.
-            # cache_dir can be specified to save models locally.
-            # threads for tokenization, max_length for sequence truncation.
             self._model = await asyncio.to_thread(
-                TextEmbedding,
+                TextEmbedding, # Usar la clase principal TextEmbedding
                 model_name=self._model_name,
                 cache_dir=settings.FASTEMBED_CACHE_DIR,
                 threads=settings.FASTEMBED_THREADS,
                 max_length=settings.FASTEMBED_MAX_LENGTH,
-                # Add other relevant parameters if needed, e.g., onnx_providers
             )
             # Perform a test embedding to confirm dimension and successful loading
-            test_embeddings = list(self._model.embed(["test vector"]))
-            if not test_embeddings or not test_embeddings[0].any():
+            # FastEmbed.embed() devuelve un generador de numpy arrays
+            test_embeddings_generator = self._model.embed(["test vector"])
+            test_embeddings = list(test_embeddings_generator) # Convertir el generador a lista
+
+            if not test_embeddings or not test_embeddings[0].any(): # .any() para numpy array
                 raise ValueError("Test embedding failed or returned empty result.")
 
             actual_dim = len(test_embeddings[0])
@@ -77,25 +77,19 @@ class FastEmbedAdapter(EmbeddingModelPort):
             init_log.critical(self._model_load_error, exc_info=True)
             self._model = None
             self._model_loaded = False
-            # Re-raise as a ConnectionError or specific custom error if startup should fail hard
             raise ConnectionError(self._model_load_error) from e
 
 
     async def embed_texts(self, texts: List[str]) -> List[List[float]]:
         if not self._model_loaded or not self._model:
             log.error("FastEmbed model not loaded. Cannot generate embeddings.", model_error=self._model_load_error)
-            # Depending on policy, could raise an exception or return empty/error state
             raise ConnectionError("Embedding model is not available.")
 
         embed_log = log.bind(adapter="FastEmbedAdapter", action="embed_texts", num_texts=len(texts))
         embed_log.debug("Generating embeddings...")
         try:
-            # FastEmbed's embed method is synchronous, so run in a thread
-            # It returns a generator of numpy arrays.
-            # Convert to list of lists of floats.
-            # Ensure batch_size is appropriate if embedding many texts at once.
-            embeddings_generator = await asyncio.to_thread(self._model.embed, texts, batch_size=128) # Example batch_size
-            embeddings_list = [emb.tolist() for emb in embeddings_generator]
+            embeddings_generator = await asyncio.to_thread(self._model.embed, texts, batch_size=128)
+            embeddings_list = [emb.tolist() for emb in embeddings_generator] # Convertir numpy arrays a listas
 
             embed_log.debug("Embeddings generated successfully.")
             return embeddings_list
@@ -107,14 +101,12 @@ class FastEmbedAdapter(EmbeddingModelPort):
         return {
             "model_name": self._model_name,
             "dimension": self._model_dimension,
-            # "prefix": settings.FASTEMBED_QUERY_PREFIX # If applicable
         }
 
     async def health_check(self) -> Tuple[bool, str]:
         if self._model_loaded and self._model:
-            # Quick check to see if model responds (optional, could be too much for simple health)
             try:
-                _ = list(self._model.embed(["health check"], batch_size=1))
+                _ = list(self._model.embed(["health check"], batch_size=1)) # Convertir generador a lista
                 return True, "Model loaded and responsive."
             except Exception as e:
                 log.error("Model health check failed during test embedding", error=str(e))
