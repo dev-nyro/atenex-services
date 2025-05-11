@@ -43,16 +43,24 @@ jobs:
       - name: Checkout Application Code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0 # Necesario para que changed-files pueda comparar commits arbitrarios
 
-      - name: Get changed files
-        id: changed_files
+      - name: Debug Before/After SHAs
+        run: |
+          echo "github.event.before: ${{ github.event.before }}"
+          echo "github.sha: ${{ github.sha }}"
+
+      - name: Get changed files if commits differ or new branch
+        id: changed_files_action # ID temporal para este paso
+        # Ejecutar la acción si:
+        # 1. Es una nueva rama (github.event.before es el SHA nulo '000...000')
+        # 2. O si el SHA 'before' es diferente del SHA actual (hubo commits en el push)
+        if: github.event.before == '0000000000000000000000000000000000000000' || github.event.before != github.sha
         uses: tj-actions/changed-files@v44
         with:
-          # Si github.event.before es el mismo que github.sha (y no es el SHA '000..00' de nueva rama),
-          # pasa una cadena vacía a 'sha'. La acción usará su lógica por defecto para push.
-          # De lo contrario, usa github.event.before.
-          sha: ${{ (github.event.before == github.sha && github.event.before != '0000000000000000000000000000000000000000') && '' || github.event.before }}
+          # Para una nueva rama, github.event.before es '000...'. La acción debería listar todos los archivos.
+          # Para una rama existente con nuevos commits, compara el SHA actual con el SHA antes del push.
+          sha: ${{ github.event.before }}
           files_yaml: |
             ingest:
               - '${{ env.INGEST_SERVICE_DIR }}/**'
@@ -66,6 +74,38 @@ jobs:
               - '${{ env.DOCPROC_SERVICE_DIR }}/**'
             reranker:
               - '${{ env.RERANKER_SERVICE_DIR }}/**'
+
+      # Este paso consolida las salidas bajo el ID 'changed_files' que los pasos posteriores esperan.
+      - name: Set changed files outputs
+        id: changed_files # Este es el ID que usarán los pasos siguientes
+        shell: bash
+        run: |
+          # Determinar si la acción changed_files_action debería haberse ejecutado
+          SHOULD_RUN_TJ_ACTION=false
+          if [[ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" || "${{ github.event.before }}" != "${{ github.sha }}" ]]; then
+            SHOULD_RUN_TJ_ACTION=true
+          fi
+
+          if [[ "$SHOULD_RUN_TJ_ACTION" == "true" ]]; then
+            echo "Using outputs from tj-actions/changed-files (new branch or different commits)"
+            # Usar fallback 'false' si una salida específica no está presente (aunque no debería pasar si la acción se ejecutó)
+            echo "ingest_any_changed=${{ steps.changed_files_action.outputs.ingest_any_changed || 'false' }}" >> $GITHUB_OUTPUT
+            echo "query_any_changed=${{ steps.changed_files_action.outputs.query_any_changed || 'false' }}" >> $GITHUB_OUTPUT
+            echo "gateway_any_changed=${{ steps.changed_files_action.outputs.gateway_any_changed || 'false' }}" >> $GITHUB_OUTPUT
+            echo "embedding_any_changed=${{ steps.changed_files_action.outputs.embedding_any_changed || 'false' }}" >> $GITHUB_OUTPUT
+            echo "docproc_any_changed=${{ steps.changed_files_action.outputs.docproc_any_changed || 'false' }}" >> $GITHUB_OUTPUT
+            echo "reranker_any_changed=${{ steps.changed_files_action.outputs.reranker_any_changed || 'false' }}" >> $GITHUB_OUTPUT
+          else
+            # Este caso es cuando github.event.before == github.sha (y no es una nueva rama)
+            # El paso changed_files_action no se ejecutó. Establecer todas las banderas a false.
+            echo "No new commits in this push (github.event.before == github.sha, and not a new branch). Setting all changed flags to false."
+            echo "ingest_any_changed=false" >> $GITHUB_OUTPUT
+            echo "query_any_changed=false" >> $GITHUB_OUTPUT
+            echo "gateway_any_changed=false" >> $GITHUB_OUTPUT
+            echo "embedding_any_changed=false" >> $GITHUB_OUTPUT
+            echo "docproc_any_changed=false" >> $GITHUB_OUTPUT
+            echo "reranker_any_changed=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Set up Docker Buildx
         if: steps.changed_files.outputs.ingest_any_changed == 'true' || steps.changed_files.outputs.query_any_changed == 'true' || steps.changed_files.outputs.gateway_any_changed == 'true' || steps.changed_files.outputs.embedding_any_changed == 'true' || steps.changed_files.outputs.docproc_any_changed == 'true' || steps.changed_files.outputs.reranker_any_changed == 'true'
@@ -179,10 +219,9 @@ jobs:
           echo "::group::Debug Information from build-push job"
           echo "Event Name: ${{ github.event_name }}"
           echo "Commit SHA before push (github.event.before): ${{ github.event.before }}"
-          echo "Current Commit SHA (GITHUB_SHA): ${GITHUB_SHA}" # o github.sha
-          echo "Passed to tj-actions/changed-files 'sha' input: ${{ (github.event.before == github.sha && github.event.before != '0000000000000000000000000000000000000000') && '' || github.event.before }}"
+          echo "Current Commit SHA (github.sha): ${{ github.sha }}"
           echo "Common Image Tag Generated (steps.image_tag_common.outputs.image_tag): ${{ steps.image_tag_common.outputs.image_tag }}"
-          echo "--- Changed Files Outputs ---"
+          echo "--- Changed Files Outputs (from step 'changed_files') ---"
           echo "Ingest any_changed: ${{ steps.changed_files.outputs.ingest_any_changed }}"
           echo "Query any_changed: ${{ steps.changed_files.outputs.query_any_changed }}"
           echo "Gateway any_changed: ${{ steps.changed_files.outputs.gateway_any_changed }}"
@@ -265,7 +304,7 @@ jobs:
             local BUILT_FLAG="$2"
             local IMAGE_BASE_NAME_VAR="$3" 
             local MANIFEST_PATH_REL="$4"
-            local IMAGE_BASE_NAME="${!IMAGE_BASE_NAME_VAR}" 
+            local IMAGE_BASE_NAME="${!IMAGE_BASE_NAME_VAR}" # Indirect expansion to get value of env var
 
             if [ "$BUILT_FLAG" = "true" ]; then
               TARGET_IMAGE="${IMAGE_BASE_NAME}:$COMMON_TAG"
@@ -282,10 +321,12 @@ jobs:
           }
 
           update_single_manifest "Ingest API" "$INGEST_BUILT" "INGEST_IMAGE_NAME" "$INGEST_MANIFEST_PATH_API_REL"
-          if [ -n "$INGEST_MANIFEST_PATH_WORKER_REL" ] && [ -f "$INGEST_MANIFEST_PATH_WORKER_REL" ]; then # Check if path is defined and file exists
-            update_single_manifest "Ingest Worker" "$INGEST_BUILT" "INGEST_IMAGE_NAME" "$INGEST_MANIFEST_PATH_WORKER_REL"
-          elif [ -n "$INGEST_MANIFEST_PATH_WORKER_REL" ]; then # Path defined but file not found
-             echo "::warning::Ingest Worker manifest path defined ($INGEST_MANIFEST_PATH_WORKER_REL) but file not found. Skipping."
+          if [ -n "$INGEST_MANIFEST_PATH_WORKER_REL" ]; then
+            if [ -f "$INGEST_MANIFEST_PATH_WORKER_REL" ]; then
+              update_single_manifest "Ingest Worker" "$INGEST_BUILT" "INGEST_IMAGE_NAME" "$INGEST_MANIFEST_PATH_WORKER_REL"
+            else
+              echo "::warning::Ingest Worker manifest path defined ($INGEST_MANIFEST_PATH_WORKER_REL) but file not found. Skipping."
+            fi
           fi
           update_single_manifest "Query Service" "$QUERY_BUILT" "QUERY_IMAGE_NAME" "$QUERY_MANIFEST_PATH_REL"
           update_single_manifest "API Gateway" "$GATEWAY_BUILT" "GATEWAY_IMAGE_NAME" "$GATEWAY_MANIFEST_PATH_REL"
@@ -296,7 +337,7 @@ jobs:
           echo "--- Checking Git Status Before Commit ---"
           git status
           
-          git add .
+          git add . # Stage all potential changes
           if git diff --staged --quiet; then
             echo "manifest_actually_changed=false" >> $GITHUB_OUTPUT
             echo "No actual manifest changes were detected by git after sed commands."
