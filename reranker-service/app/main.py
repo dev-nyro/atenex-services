@@ -239,3 +239,5 @@ if __name__ == "__main__":
         log_level=settings.LOG_LEVEL.lower(), # Uvicorn's own log level
         reload=True # Enable auto-reload for development
     )
+
+# jfu
