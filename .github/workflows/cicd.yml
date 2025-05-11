@@ -58,9 +58,6 @@ jobs:
         if: github.event.before == '0000000000000000000000000000000000000000' || github.event.before != github.sha
         uses: tj-actions/changed-files@v44
         with:
-          # Para una nueva rama, github.event.before es '000...'. La acción debería listar todos los archivos.
-          # Para una rama existente con nuevos commits, compara el SHA actual con el SHA antes del push.
-          sha: ${{ github.event.before }}
           files_yaml: |
             ingest:
               - '${{ env.INGEST_SERVICE_DIR }}/**'
