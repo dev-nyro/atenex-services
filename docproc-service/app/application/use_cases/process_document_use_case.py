@@ -128,3 +128,4 @@ class ProcessDocumentUseCase:
             self.log.error("Chunking failed during use case execution", error=str(e))
             # Decide si re-elevar o devolver lista vacía. Por ahora, re-elevar.
             raise
+

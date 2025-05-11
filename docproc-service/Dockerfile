@@ -1,6 +1,7 @@
 # docproc-service/Dockerfile
 FROM python:3.10-slim AS builder
 
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     POETRY_VERSION=1.8.2 \
