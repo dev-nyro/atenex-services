@@ -285,6 +285,12 @@ jobs:
           EMBEDDING_MANIFEST_PATH_REL: ${{ env.EMBEDDING_SERVICE_DIR }}/deployment.yaml
           DOCPROC_MANIFEST_PATH_REL: ${{ env.DOCPROC_SERVICE_DIR }}/deployment.yaml
           RERANKER_MANIFEST_PATH_REL: ${{ env.RERANKER_SERVICE_DIR }}/deployment.yaml
+          INGEST_IMAGE_NAME: ${{ env.INGEST_IMAGE_NAME }}
+          QUERY_IMAGE_NAME: ${{ env.QUERY_IMAGE_NAME }}
+          GATEWAY_IMAGE_NAME: ${{ env.GATEWAY_IMAGE_NAME }}
+          EMBEDDING_IMAGE_NAME: ${{ env.EMBEDDING_IMAGE_NAME }}
+          DOCPROC_IMAGE_NAME: ${{ env.DOCPROC_IMAGE_NAME }}
+          RERANKER_IMAGE_NAME: ${{ env.RERANKER_IMAGE_NAME }}
         run: |
           echo "::group::Updating Manifest Files Conditionally"
           cd manifests-repo
