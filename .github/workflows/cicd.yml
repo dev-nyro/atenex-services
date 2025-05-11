@@ -29,7 +29,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-      pull-requests: read # tj-actions/changed-files puede necesitarlo incluso para push en algunos escenarios
+      pull-requests: read
     outputs:
       ingest_built: ${{ steps.build_ingest.outputs.digest != '' && steps.build_ingest.outcome == 'success' }}
       query_built: ${{ steps.build_query.outputs.digest != '' && steps.build_query.outcome == 'success' }}
@@ -43,15 +43,16 @@ jobs:
       - name: Checkout Application Code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Necesario para que changed-files compare con github.event.before
+          fetch-depth: 0
 
       - name: Get changed files
         id: changed_files
         uses: tj-actions/changed-files@v44
         with:
-          # Para eventos push, compara el GITHUB_SHA actual con el SHA antes del push.
-          # Esto asegura que solo se consideren los cambios introducidos por el push actual.
-          sha: ${{ github.event.before }}
+          # Si github.event.before es el mismo que github.sha (y no es el SHA '000..00' de nueva rama),
+          # pasa una cadena vacía a 'sha'. La acción usará su lógica por defecto para push.
+          # De lo contrario, usa github.event.before.
+          sha: ${{ (github.event.before == github.sha && github.event.before != '0000000000000000000000000000000000000000') && '' || github.event.before }}
           files_yaml: |
             ingest:
               - '${{ env.INGEST_SERVICE_DIR }}/**'
@@ -147,7 +148,7 @@ jobs:
       - name: Build and push DocProc Service Docker image
         id: build_docproc
         if: steps.changed_files.outputs.docproc_any_changed == 'true'
-        continue-on-error: true # Re-añadido, asumiendo que quieres que el pipeline continúe
+        continue-on-error: true
         uses: docker/build-push-action@v5
         with:
           context: ./${{ env.DOCPROC_SERVICE_DIR }}
@@ -161,7 +162,7 @@ jobs:
       - name: Build and push Reranker Service Docker image
         id: build_reranker
         if: steps.changed_files.outputs.reranker_any_changed == 'true'
-        continue-on-error: true # IMPORTANTE: Si esto falla, reranker_built será false. REVISA LOS LOGS DE ESTE PASO.
+        continue-on-error: true
         uses: docker/build-push-action@v5
         with:
           context: ./${{ env.RERANKER_SERVICE_DIR }}
@@ -178,9 +179,10 @@ jobs:
           echo "::group::Debug Information from build-push job"
           echo "Event Name: ${{ github.event_name }}"
           echo "Commit SHA before push (github.event.before): ${{ github.event.before }}"
-          echo "Current Commit SHA (GITHUB_SHA): ${GITHUB_SHA}"
+          echo "Current Commit SHA (GITHUB_SHA): ${GITHUB_SHA}" # o github.sha
+          echo "Passed to tj-actions/changed-files 'sha' input: ${{ (github.event.before == github.sha && github.event.before != '0000000000000000000000000000000000000000') && '' || github.event.before }}"
           echo "Common Image Tag Generated (steps.image_tag_common.outputs.image_tag): ${{ steps.image_tag_common.outputs.image_tag }}"
-          echo "--- Changed Files Outputs (based on diff with ${{ github.event.before }}) ---"
+          echo "--- Changed Files Outputs ---"
           echo "Ingest any_changed: ${{ steps.changed_files.outputs.ingest_any_changed }}"
           echo "Query any_changed: ${{ steps.changed_files.outputs.query_any_changed }}"
           echo "Gateway any_changed: ${{ steps.changed_files.outputs.gateway_any_changed }}"
@@ -193,7 +195,7 @@ jobs:
           echo "build_gateway outcome: ${{ steps.build_gateway.outcome }}, digest: '${{ steps.build_gateway.outputs.digest }}'"
           echo "build_embedding outcome: ${{ steps.build_embedding.outcome }}, digest: '${{ steps.build_embedding.outputs.digest }}'"
           echo "build_docproc outcome: ${{ steps.build_docproc.outcome }}, digest: '${{ steps.build_docproc.outputs.digest }}'"
-          echo "build_reranker outcome: ${{ steps.build_reranker.outcome }}, digest: '${{ steps.build_reranker.outputs.digest }}' <--- REVISA ESTE LOG SI EL MANIFIESTO DEL RERANKER NO SE ACTUALIZA"
+          echo "build_reranker outcome: ${{ steps.build_reranker.outcome }}, digest: '${{ steps.build_reranker.outputs.digest }}'"
           echo "--- Job Outputs Evaluation (as they would be for 'needs' context) ---"
           echo "Output ingest_built: ${{ (steps.build_ingest.outputs.digest != '' && steps.build_ingest.outcome == 'success') }}"
           echo "Output query_built: ${{ (steps.build_query.outputs.digest != '' && steps.build_query.outcome == 'success') }}"
@@ -231,7 +233,7 @@ jobs:
           path: manifests-repo
 
       - name: Update Manifest Files Conditionally
-        id: update_manifest_files # Renombrado para claridad
+        id: update_manifest_files
         env:
           INGEST_BUILT: ${{ needs.build-push.outputs.ingest_built }}
           QUERY_BUILT: ${{ needs.build-push.outputs.query_built }}
@@ -240,7 +242,6 @@ jobs:
           DOCPROC_BUILT: ${{ needs.build-push.outputs.docproc_built }}
           RERANKER_BUILT: ${{ needs.build-push.outputs.reranker_built }}
           COMMON_TAG: ${{ needs.build-push.outputs.image_tag }}
-          # Rutas relativas al checkout del repo de manifiestos
           INGEST_MANIFEST_PATH_API_REL: ${{ env.INGEST_SERVICE_DIR }}/deployment-api.yaml
           INGEST_MANIFEST_PATH_WORKER_REL: ${{ env.INGEST_SERVICE_DIR }}/deployment-worker.yaml
           QUERY_MANIFEST_PATH_REL: ${{ env.QUERY_SERVICE_DIR }}/deployment.yaml
@@ -270,7 +271,6 @@ jobs:
               TARGET_IMAGE="${IMAGE_BASE_NAME}:$COMMON_TAG"
               echo "Attempting to update $SERVICE_NAME image to: $TARGET_IMAGE in $MANIFEST_PATH_REL"
               if [ -f "$MANIFEST_PATH_REL" ]; then
-                # Usar delimitador | para sed, asumiendo que no está en COMMON_TAG (ya sanitizado)
                 sed -i "s|image: .*|image: $TARGET_IMAGE|" "$MANIFEST_PATH_REL"
                 echo "Updated $MANIFEST_PATH_REL for $SERVICE_NAME"
               else
@@ -282,8 +282,10 @@ jobs:
           }
 
           update_single_manifest "Ingest API" "$INGEST_BUILT" "INGEST_IMAGE_NAME" "$INGEST_MANIFEST_PATH_API_REL"
-          if [ -n "$INGEST_MANIFEST_PATH_WORKER_REL" ]; then
+          if [ -n "$INGEST_MANIFEST_PATH_WORKER_REL" ] && [ -f "$INGEST_MANIFEST_PATH_WORKER_REL" ]; then # Check if path is defined and file exists
             update_single_manifest "Ingest Worker" "$INGEST_BUILT" "INGEST_IMAGE_NAME" "$INGEST_MANIFEST_PATH_WORKER_REL"
+          elif [ -n "$INGEST_MANIFEST_PATH_WORKER_REL" ]; then # Path defined but file not found
+             echo "::warning::Ingest Worker manifest path defined ($INGEST_MANIFEST_PATH_WORKER_REL) but file not found. Skipping."
           fi
           update_single_manifest "Query Service" "$QUERY_BUILT" "QUERY_IMAGE_NAME" "$QUERY_MANIFEST_PATH_REL"
           update_single_manifest "API Gateway" "$GATEWAY_BUILT" "GATEWAY_IMAGE_NAME" "$GATEWAY_MANIFEST_PATH_REL"
@@ -292,10 +294,9 @@ jobs:
           update_single_manifest "Reranker Service" "$RERANKER_BUILT" "RERANKER_IMAGE_NAME" "$RERANKER_MANIFEST_PATH_REL"
           
           echo "--- Checking Git Status Before Commit ---"
-          git status # Muestra qué archivos han cambiado según git
+          git status
           
-          # Determinar si hubo cambios reales para el output
-          git add . # Stage all potential changes
+          git add .
           if git diff --staged --quiet; then
             echo "manifest_actually_changed=false" >> $GITHUB_OUTPUT
             echo "No actual manifest changes were detected by git after sed commands."
@@ -306,7 +307,6 @@ jobs:
           echo "::endgroup::"
 
       - name: Commit and Push Manifest Changes
-        # Solo commitear si update_manifest_files realmente resultó en cambios en git
         if: steps.update_manifest_files.outputs.manifest_actually_changed == 'true'
         env:
           IMAGE_TAG_FOR_COMMIT: ${{ needs.build-push.outputs.image_tag }}
@@ -316,9 +316,6 @@ jobs:
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           
-          # Los archivos ya deberían estar staged por el paso anterior
-          # git add . # No es necesario si el paso anterior ya hizo git add . y git diff --staged
-
           echo "Manifest changes detected. Committing..."
           COMMIT_MSG="Update service image(s) to tag $IMAGE_TAG_FOR_COMMIT [CI]"
           git commit -m "$COMMIT_MSG"
