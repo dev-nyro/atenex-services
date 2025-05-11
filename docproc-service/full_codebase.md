@@ -252,7 +252,7 @@ class ChunkingPort(ABC):
 ## File: `app\application\ports\extraction_port.py`
 ```py
 from abc import ABC, abstractmethod
-from typing import List, Tuple, Union, Any
+from typing import List, Tuple, Union, Any, Dict # <--- AÑADIR Dict AQUÍ
 
 class ExtractionError(Exception):
     """Base exception for extraction errors."""
@@ -273,7 +273,7 @@ class ExtractionPort(ABC):
         file_bytes: bytes,
         filename: str,
         content_type: str
-    ) -> Tuple[Union[str, List[Tuple[int, str]]], Dict[str, Any]]:
+    ) -> Tuple[Union[str, List[Tuple[int, str]]], Dict[str, Any]]: # Ahora Dict es conocido
         """
         Extrae texto de los bytes de un archivo.
 
@@ -432,6 +432,8 @@ class ProcessDocumentUseCase:
             self.log.error("Chunking failed during use case execution", error=str(e))
             # Decide si re-elevar o devolver lista vacía. Por ahora, re-elevar.
             raise
+
+
 ```
 
 ## File: `app\core\__init__.py`
@@ -1384,7 +1386,7 @@ if __name__ == "__main__":
     )
 
 # === 0.1.0 ===
-# - jfu
+# - jfu 2
 ```
 
 ## File: `pyproject.toml`

@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 import structlog
 import uvicorn
+from app.api.v1 import schemas
 from fastapi import FastAPI, HTTPException, Request, status as fastapi_status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
