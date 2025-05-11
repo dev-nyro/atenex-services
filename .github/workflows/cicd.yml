@@ -43,7 +43,7 @@ jobs:
       - name: Checkout Application Code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Necesario para que changed-files pueda comparar commits arbitrarios
+          fetch-depth: 0
 
       - name: Debug Before/After SHAs
         run: |
@@ -51,13 +51,11 @@ jobs:
           echo "github.sha: ${{ github.sha }}"
 
       - name: Get changed files if commits differ or new branch
-        id: changed_files_action # ID temporal para este paso
-        # Ejecutar la acción si:
-        # 1. Es una nueva rama (github.event.before es el SHA nulo '000...000')
-        # 2. O si el SHA 'before' es diferente del SHA actual (hubo commits en el push)
+        id: changed_files_action
         if: github.event.before == '0000000000000000000000000000000000000000' || github.event.before != github.sha
         uses: tj-actions/changed-files@v44
         with:
+          sha: ${{ github.event.before }}
           files_yaml: |
             ingest:
               - '${{ env.INGEST_SERVICE_DIR }}/**'
@@ -72,20 +70,17 @@ jobs:
             reranker:
               - '${{ env.RERANKER_SERVICE_DIR }}/**'
 
-      # Este paso consolida las salidas bajo el ID 'changed_files' que los pasos posteriores esperan.
       - name: Set changed files outputs
-        id: changed_files # Este es el ID que usarán los pasos siguientes
+        id: changed_files
         shell: bash
         run: |
-          # Determinar si la acción changed_files_action debería haberse ejecutado
           SHOULD_RUN_TJ_ACTION=false
           if [[ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" || "${{ github.event.before }}" != "${{ github.sha }}" ]]; then
             SHOULD_RUN_TJ_ACTION=true
           fi
 
           if [[ "$SHOULD_RUN_TJ_ACTION" == "true" ]]; then
-            echo "Using outputs from tj-actions/changed-files (new branch or different commits)"
-            # Usar fallback 'false' si una salida específica no está presente (aunque no debería pasar si la acción se ejecutó)
+            echo "Using outputs from tj-actions/changed-files"
             echo "ingest_any_changed=${{ steps.changed_files_action.outputs.ingest_any_changed || 'false' }}" >> $GITHUB_OUTPUT
             echo "query_any_changed=${{ steps.changed_files_action.outputs.query_any_changed || 'false' }}" >> $GITHUB_OUTPUT
             echo "gateway_any_changed=${{ steps.changed_files_action.outputs.gateway_any_changed || 'false' }}" >> $GITHUB_OUTPUT
@@ -93,9 +88,7 @@ jobs:
             echo "docproc_any_changed=${{ steps.changed_files_action.outputs.docproc_any_changed || 'false' }}" >> $GITHUB_OUTPUT
             echo "reranker_any_changed=${{ steps.changed_files_action.outputs.reranker_any_changed || 'false' }}" >> $GITHUB_OUTPUT
           else
-            # Este caso es cuando github.event.before == github.sha (y no es una nueva rama)
-            # El paso changed_files_action no se ejecutó. Establecer todas las banderas a false.
-            echo "No new commits in this push (github.event.before == github.sha, and not a new branch). Setting all changed flags to false."
+            echo "No new commits in this push. Setting all changed flags to false."
             echo "ingest_any_changed=false" >> $GITHUB_OUTPUT
             echo "query_any_changed=false" >> $GITHUB_OUTPUT
             echo "gateway_any_changed=false" >> $GITHUB_OUTPUT
@@ -126,6 +119,7 @@ jobs:
           echo "Generated Common Tag: $TAG"
           echo "image_tag=$TAG" >> $GITHUB_OUTPUT
 
+      # ... (Pasos de build para cada servicio, como los tenías) ...
       - name: Build and push Ingest Service Docker image
         id: build_ingest
         if: steps.changed_files.outputs.ingest_any_changed == 'true'
@@ -199,10 +193,10 @@ jobs:
       - name: Build and push Reranker Service Docker image
         id: build_reranker
         if: steps.changed_files.outputs.reranker_any_changed == 'true'
-        continue-on-error: true
+        continue-on-error: true # Importante: revisa los logs de este paso si falla.
         uses: docker/build-push-action@v5
         with:
-          context: ./${{ env.RERANKER_SERVICE_DIR }}
+          context: ./${{ env.RERANKER_SERVICE_DIR }} # Asegúrate que esta es la ruta correcta al Dockerfile
           file: ./${{ env.RERANKER_SERVICE_DIR }}/Dockerfile
           push: ${{ github.event_name == 'push' }}
           tags: ${{ env.RERANKER_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
@@ -213,6 +207,7 @@ jobs:
       - name: Debug Build Outputs and Job Outputs Evaluation
         if: always()
         run: |
+          # ... (como lo tenías, es útil para depurar) ...
           echo "::group::Debug Information from build-push job"
           echo "Event Name: ${{ github.event_name }}"
           echo "Commit SHA before push (github.event.before): ${{ github.event.before }}"
@@ -249,9 +244,12 @@ jobs:
     steps:
       - name: Install yq
         run: |
-          sudo wget -O /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64"
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
           sudo chmod +x /usr/local/bin/yq
+          yq --version
+
       - name: Debug Update Manifests Job Trigger
+        # ... (como lo tenías) ...
         run: |
           echo "::group::Debug Information for update-manifests job trigger"
           echo "Job triggered because at least one service was built."
@@ -275,6 +273,7 @@ jobs:
       - name: Update Manifest Files Conditionally
         id: update_manifest_files
         env:
+          # ... (variables de entorno como las tenías) ...
           INGEST_BUILT: ${{ needs.build-push.outputs.ingest_built }}
           QUERY_BUILT: ${{ needs.build-push.outputs.query_built }}
           GATEWAY_BUILT: ${{ needs.build-push.outputs.gateway_built }}
@@ -289,12 +288,13 @@ jobs:
           EMBEDDING_MANIFEST_PATH_REL: ${{ env.EMBEDDING_SERVICE_DIR }}/deployment.yaml
           DOCPROC_MANIFEST_PATH_REL: ${{ env.DOCPROC_SERVICE_DIR }}/deployment.yaml
           RERANKER_MANIFEST_PATH_REL: ${{ env.RERANKER_SERVICE_DIR }}/deployment.yaml
-          INGEST_IMAGE_NAME: ${{ env.INGEST_IMAGE_NAME }}
-          QUERY_IMAGE_NAME: ${{ env.QUERY_IMAGE_NAME }}
-          GATEWAY_IMAGE_NAME: ${{ env.GATEWAY_IMAGE_NAME }}
-          EMBEDDING_IMAGE_NAME: ${{ env.EMBEDDING_IMAGE_NAME }}
-          DOCPROC_IMAGE_NAME: ${{ env.DOCPROC_IMAGE_NAME }}
-          RERANKER_IMAGE_NAME: ${{ env.RERANKER_IMAGE_NAME }}
+          # Pasar nombres de imagen base para la expansión indirecta
+          INGEST_IMAGE_NAME_BASE: ${{ env.INGEST_IMAGE_NAME }}
+          QUERY_IMAGE_NAME_BASE: ${{ env.QUERY_IMAGE_NAME }}
+          GATEWAY_IMAGE_NAME_BASE: ${{ env.GATEWAY_IMAGE_NAME }}
+          EMBEDDING_IMAGE_NAME_BASE: ${{ env.EMBEDDING_IMAGE_NAME }}
+          DOCPROC_IMAGE_NAME_BASE: ${{ env.DOCPROC_IMAGE_NAME }}
+          RERANKER_IMAGE_NAME_BASE: ${{ env.RERANKER_IMAGE_NAME }}
         run: |
           echo "::group::Updating Manifest Files Conditionally"
           cd manifests-repo
@@ -307,53 +307,77 @@ jobs:
           fi
 
           update_single_manifest() {
-            local SERVICE_NAME="$1"
+            local SERVICE_DISPLAY_NAME="$1" # e.g., "Reranker Service"
             local BUILT_FLAG="$2"
-            local IMAGE_BASE_NAME_VAR="$3" 
+            local IMAGE_BASE_NAME_ENV_VAR_SUFFIX="$3" # e.g., RERANKER (para construir RERANKER_IMAGE_NAME_BASE)
             local MANIFEST_PATH_REL="$4"
-            local IMAGE_BASE_NAME="${!IMAGE_BASE_NAME_VAR}" # Indirect expansion to get value of env var
+            
+            # Construir el nombre de la variable de entorno que contiene el nombre base de la imagen
+            local IMAGE_BASE_NAME_VAR_NAME="${IMAGE_BASE_NAME_ENV_VAR_SUFFIX}_IMAGE_NAME_BASE"
+            local IMAGE_BASE_NAME="${!IMAGE_BASE_NAME_VAR_NAME}" # Expansión indirecta
+
+            # Derivar el nombre del contenedor k8s esperado (ej: "reranker-service")
+            local K8S_CONTAINER_NAME
+            if [[ "$SERVICE_DISPLAY_NAME" == "Ingest API" || "$SERVICE_DISPLAY_NAME" == "Ingest Worker" ]]; then
+                # Asume que ambos manifiestos de ingest usan el mismo nombre de contenedor 'ingest-service'
+                # O ajusta si tienen nombres de contenedor diferentes (ej: 'ingest-api', 'ingest-worker')
+                K8S_CONTAINER_NAME="ingest-service" 
+            else
+                # Convierte "Query Service" a "query-service", "Reranker Service" a "reranker-service"
+                K8S_CONTAINER_NAME=$(echo "$SERVICE_DISPLAY_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/ /-/g')
+            fi
+            echo "Derived K8S_CONTAINER_NAME: $K8S_CONTAINER_NAME for $SERVICE_DISPLAY_NAME"
+
 
             if [ "$BUILT_FLAG" = "true" ]; then
-              TARGET_IMAGE="${IMAGE_BASE_NAME}:$COMMON_TAG"
-              echo "Attempting to update $SERVICE_NAME image to: $TARGET_IMAGE in $MANIFEST_PATH_REL"
+              TARGET_IMAGE="${IMAGE_BASE_NAME}:${COMMON_TAG}"
+              echo "Attempting to update $SERVICE_DISPLAY_NAME (container: $K8S_CONTAINER_NAME) image to: $TARGET_IMAGE in $MANIFEST_PATH_REL"
               if [ -f "$MANIFEST_PATH_REL" ]; then
-                # Reemplaza la línea de imagen aunque tenga comentarios o espacios
-                # Usar yq para actualizar la imagen de forma robusta
-                yq -i '(.spec.template.spec.containers[] | select(.name == "'${SERVICE_NAME,,// /-}'") ).image = "'$TARGET_IMAGE'"' "$MANIFEST_PATH_REL" || \
-                yq -i '(.spec.template.spec.containers[0].image) = "'$TARGET_IMAGE'"' "$MANIFEST_PATH_REL"
-                echo "Updated $MANIFEST_PATH_REL for $SERVICE_NAME"
+                # Intentar actualizar usando el nombre del contenedor derivado
+                if yq -i '(.spec.template.spec.containers[] | select(.name == "'"$K8S_CONTAINER_NAME"'") ).image = "'"$TARGET_IMAGE"'"' "$MANIFEST_PATH_REL"; then
+                  echo "Successfully updated image for container '$K8S_CONTAINER_NAME' in $MANIFEST_PATH_REL"
+                else
+                  # Fallback si el nombre del contenedor no coincide o yq falla con ese selector
+                  echo "::warning::Could not update image for container '$K8S_CONTAINER_NAME' by name in $MANIFEST_PATH_REL. Attempting to update the first container as fallback."
+                  if yq -i '(.spec.template.spec.containers[0].image) = "'"$TARGET_IMAGE"'"' "$MANIFEST_PATH_REL"; then
+                     echo "Successfully updated image for the first container in $MANIFEST_PATH_REL as fallback."
+                  else
+                     echo "::error::Failed to update image in $MANIFEST_PATH_REL for $SERVICE_DISPLAY_NAME using yq (both by name and fallback)."
+                  fi
+                fi
               else
-                echo "::error::$SERVICE_NAME manifest file '$MANIFEST_PATH_REL' not found!"
+                echo "::error::$SERVICE_DISPLAY_NAME manifest file '$MANIFEST_PATH_REL' not found!"
               fi
             else
-              echo "Skipping $SERVICE_NAME manifest update (BUILT_FLAG is '$BUILT_FLAG', not 'true')."
+              echo "Skipping $SERVICE_DISPLAY_NAME manifest update (BUILT_FLAG is '$BUILT_FLAG', not 'true')."
             fi
           }
-
-          update_single_manifest "Ingest API" "$INGEST_BUILT" "INGEST_IMAGE_NAME" "$INGEST_MANIFEST_PATH_API_REL"
+          
+          # Pasar un sufijo para construir el nombre de la variable IMAGE_BASE_NAME_VAR_NAME
+          update_single_manifest "Ingest API" "$INGEST_BUILT" "INGEST" "$INGEST_MANIFEST_PATH_API_REL"
           if [ -n "$INGEST_MANIFEST_PATH_WORKER_REL" ]; then
             if [ -f "$INGEST_MANIFEST_PATH_WORKER_REL" ]; then
-              update_single_manifest "Ingest Worker" "$INGEST_BUILT" "INGEST_IMAGE_NAME" "$INGEST_MANIFEST_PATH_WORKER_REL"
+              update_single_manifest "Ingest Worker" "$INGEST_BUILT" "INGEST" "$INGEST_MANIFEST_PATH_WORKER_REL"
             else
               echo "::warning::Ingest Worker manifest path defined ($INGEST_MANIFEST_PATH_WORKER_REL) but file not found. Skipping."
             fi
           fi
-          update_single_manifest "Query Service" "$QUERY_BUILT" "QUERY_IMAGE_NAME" "$QUERY_MANIFEST_PATH_REL"
-          update_single_manifest "API Gateway" "$GATEWAY_BUILT" "GATEWAY_IMAGE_NAME" "$GATEWAY_MANIFEST_PATH_REL"
-          update_single_manifest "Embedding Service" "$EMBEDDING_BUILT" "EMBEDDING_IMAGE_NAME" "$EMBEDDING_MANIFEST_PATH_REL"
-          update_single_manifest "DocProc Service" "$DOCPROC_BUILT" "DOCPROC_IMAGE_NAME" "$DOCPROC_MANIFEST_PATH_REL"
-          update_single_manifest "Reranker Service" "$RERANKER_BUILT" "RERANKER_IMAGE_NAME" "$RERANKER_MANIFEST_PATH_REL"
+          update_single_manifest "Query Service" "$QUERY_BUILT" "QUERY" "$QUERY_MANIFEST_PATH_REL"
+          update_single_manifest "API Gateway" "$GATEWAY_BUILT" "GATEWAY" "$GATEWAY_MANIFEST_PATH_REL"
+          update_single_manifest "Embedding Service" "$EMBEDDING_BUILT" "EMBEDDING" "$EMBEDDING_MANIFEST_PATH_REL"
+          update_single_manifest "DocProc Service" "$DOCPROC_BUILT" "DOCPROC" "$DOCPROC_MANIFEST_PATH_REL"
+          update_single_manifest "Reranker Service" "$RERANKER_BUILT" "RERANKER" "$RERANKER_MANIFEST_PATH_REL"
           
           echo "--- Checking Git Status Before Commit ---"
           git status
           
-          git add . # Stage all potential changes
+          git add .
           if git diff --staged --quiet; then
             echo "manifest_actually_changed=false" >> $GITHUB_OUTPUT
-            echo "No actual manifest changes were detected by git after sed commands."
+            echo "No actual manifest changes were detected by git after yq commands."
           else
             echo "manifest_actually_changed=true" >> $GITHUB_OUTPUT
-            echo "Manifest changes detected by git after sed commands."
+            echo "Manifest changes detected by git after yq commands."
           fi
           echo "::endgroup::"
 
@@ -362,6 +386,7 @@ jobs:
         env:
           IMAGE_TAG_FOR_COMMIT: ${{ needs.build-push.outputs.image_tag }}
         run: |
+          # ... (como lo tenías) ...
           echo "::group::Committing and Pushing Manifest Changes"
           cd manifests-repo
           git config --global user.name 'github-actions[bot]'
