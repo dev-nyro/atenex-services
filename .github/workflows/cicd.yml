@@ -314,7 +314,7 @@ jobs:
               echo "Attempting to update $SERVICE_NAME image to: $TARGET_IMAGE in $MANIFEST_PATH_REL"
               if [ -f "$MANIFEST_PATH_REL" ]; then
                 # Reemplaza la línea de imagen aunque tenga comentarios o espacios
-                sed -i "s|^\s*image:.*|image: $TARGET_IMAGE|" "$MANIFEST_PATH_REL"
+                sed -i "s|^[[:space:]]*image:.*|image: $TARGET_IMAGE|" "$MANIFEST_PATH_REL"
                 echo "Updated $MANIFEST_PATH_REL for $SERVICE_NAME"
               else
                 echo "::error::$SERVICE_NAME manifest file '$MANIFEST_PATH_REL' not found!"
