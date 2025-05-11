@@ -23,11 +23,11 @@ env:
   EMBEDDING_SERVICE_DIR: embedding-service
   EMBEDDING_IMAGE_NAME: ghcr.io/dev-nyro/embedding-service
 
-  DOCPROC_SERVICE_DIR: docproc-service # NEW
-  DOCPROC_IMAGE_NAME: ghcr.io/dev-nyro/docproc-service # NEW
+  DOCPROC_SERVICE_DIR: docproc-service
+  DOCPROC_IMAGE_NAME: ghcr.io/dev-nyro/docproc-service
 
-  RERANKER_SERVICE_DIR: reranker-service # NEW
-  RERANKER_IMAGE_NAME: ghcr.io/dev-nyro/reranker-service # NEW
+  RERANKER_SERVICE_DIR: reranker-service
+  RERANKER_IMAGE_NAME: ghcr.io/dev-nyro/reranker-service
 
 jobs:
   build-push:
@@ -35,21 +35,21 @@ jobs:
     permissions:
       contents: read
       packages: write
-      pull-requests: read
+      pull-requests: read # Aunque no es estrictamente necesario para este job, está bien dejarlo
     outputs:
       ingest_built: ${{ steps.build_ingest.outputs.digest != '' && steps.build_ingest.outcome == 'success' }}
       query_built: ${{ steps.build_query.outputs.digest != '' && steps.build_query.outcome == 'success' }}
       gateway_built: ${{ steps.build_gateway.outputs.digest != '' && steps.build_gateway.outcome == 'success' }}
       embedding_built: ${{ steps.build_embedding.outputs.digest != '' && steps.build_embedding.outcome == 'success' }}
-      docproc_built: ${{ steps.build_docproc.outputs.digest != '' && steps.build_docproc.outcome == 'success' }} # NEW
-      reranker_built: ${{ steps.build_reranker.outputs.digest != '' && steps.build_reranker.outcome == 'success' }} # NEW
+      docproc_built: ${{ steps.build_docproc.outputs.digest != '' && steps.build_docproc.outcome == 'success' }}
+      reranker_built: ${{ steps.build_reranker.outputs.digest != '' && steps.build_reranker.outcome == 'success' }}
       image_tag: ${{ steps.image_tag_common.outputs.image_tag }}
 
     steps:
       - name: Checkout Application Code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0 # Necesario para que tj-actions/changed-files funcione correctamente
 
       - name: Get changed files
         id: changed_files
@@ -64,17 +64,18 @@ jobs:
               - '${{ env.GATEWAY_SERVICE_DIR }}/**'
             embedding:
               - '${{ env.EMBEDDING_SERVICE_DIR }}/**'
-            docproc: # NEW
+            docproc:
               - '${{ env.DOCPROC_SERVICE_DIR }}/**'
-            reranker: # NEW
+            reranker:
               - '${{ env.RERANKER_SERVICE_DIR }}/**'
 
       - name: Set up Docker Buildx
-        if: steps.changed_files.outputs.ingest_any_changed == 'true' || steps.changed_files.outputs.query_any_changed == 'true' || steps.changed_files.outputs.gateway_any_changed == 'true' || steps.changed_files.outputs.embedding_any_changed == 'true' || steps.changed_files.outputs.docproc_any_changed == 'true' || steps.changed_files.outputs.reranker_any_changed == 'true' # UPDATED
+        # Ejecutar solo si algún servicio ha cambiado
+        if: steps.changed_files.outputs.ingest_any_changed == 'true' || steps.changed_files.outputs.query_any_changed == 'true' || steps.changed_files.outputs.gateway_any_changed == 'true' || steps.changed_files.outputs.embedding_any_changed == 'true' || steps.changed_files.outputs.docproc_any_changed == 'true' || steps.changed_files.outputs.reranker_any_changed == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GitHub Container Registry
-        if: steps.changed_files.outputs.ingest_any_changed == 'true' || steps.changed_files.outputs.query_any_changed == 'true' || steps.changed_files.outputs.gateway_any_changed == 'true' || steps.changed_files.outputs.embedding_any_changed == 'true' || steps.changed_files.outputs.docproc_any_changed == 'true' || steps.changed_files.outputs.reranker_any_changed == 'true' # UPDATED
+        if: steps.changed_files.outputs.ingest_any_changed == 'true' || steps.changed_files.outputs.query_any_changed == 'true' || steps.changed_files.outputs.gateway_any_changed == 'true' || steps.changed_files.outputs.embedding_any_changed == 'true' || steps.changed_files.outputs.docproc_any_changed == 'true' || steps.changed_files.outputs.reranker_any_changed == 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -82,11 +83,13 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate Common Image Tag
-        if: steps.changed_files.outputs.ingest_any_changed == 'true' || steps.changed_files.outputs.query_any_changed == 'true' || steps.changed_files.outputs.gateway_any_changed == 'true' || steps.changed_files.outputs.embedding_any_changed == 'true' || steps.changed_files.outputs.docproc_any_changed == 'true' || steps.changed_files.outputs.reranker_any_changed == 'true' # UPDATED
+        if: steps.changed_files.outputs.ingest_any_changed == 'true' || steps.changed_files.outputs.query_any_changed == 'true' || steps.changed_files.outputs.gateway_any_changed == 'true' || steps.changed_files.outputs.embedding_any_changed == 'true' || steps.changed_files.outputs.docproc_any_changed == 'true' || steps.changed_files.outputs.reranker_any_changed == 'true'
         id: image_tag_common
         run: |
           TAG="${{ github.ref_name }}-$(echo $GITHUB_SHA | cut -c1-7)"
+          # Reemplazar caracteres no válidos para etiquetas Docker y limpiar guiones/puntos al inicio/final
           TAG=$(echo $TAG | sed 's/[^a-zA-Z0-9.-]/-/g' | sed 's/^[.-]*//;s/[.-]*$//')
+          # Truncar si es necesario (Docker tags tienen un límite, GHCR es generoso pero buena práctica)
           TAG=${TAG::128}
           echo "Generated Common Tag: $TAG"
           echo "image_tag=$TAG" >> $GITHUB_OUTPUT
@@ -94,16 +97,16 @@ jobs:
       - name: Build and push Ingest Service Docker image
         id: build_ingest
         if: steps.changed_files.outputs.ingest_any_changed == 'true'
-        continue-on-error: true
+        continue-on-error: true # Continuar si este build falla para no bloquear otros
         uses: docker/build-push-action@v5
         with:
           context: ./${{ env.INGEST_SERVICE_DIR }}
           file: ./${{ env.INGEST_SERVICE_DIR }}/Dockerfile
-          push: ${{ github.event_name == 'push' }}
+          push: ${{ github.event_name == 'push' }} # Solo hacer push en eventos de push (no en PRs, por ejemplo)
           tags: ${{ env.INGEST_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          outputs: type=registry,push=${{ github.event_name == 'push' }}
+          outputs: type=registry # CORREGIDO: Simplificado para asegurar que 'digest' se genere
 
       - name: Build and push Query Service Docker image
         id: build_query
@@ -117,7 +120,7 @@ jobs:
           tags: ${{ env.QUERY_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          outputs: type=registry,push=${{ github.event_name == 'push' }}
+          outputs: type=registry # CORREGIDO
 
       - name: Build and push API Gateway Docker image
         id: build_gateway
@@ -131,7 +134,7 @@ jobs:
           tags: ${{ env.GATEWAY_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          outputs: type=registry,push=${{ github.event_name == 'push' }}
+          outputs: type=registry # CORREGIDO
 
       - name: Build and push Embedding Service Docker image
         id: build_embedding
@@ -145,9 +148,9 @@ jobs:
           tags: ${{ env.EMBEDDING_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          outputs: type=registry,push=${{ github.event_name == 'push' }}
+          outputs: type=registry # CORREGIDO
 
-      - name: Build and push DocProc Service Docker image # NEW
+      - name: Build and push DocProc Service Docker image
         id: build_docproc
         if: steps.changed_files.outputs.docproc_any_changed == 'true'
         continue-on-error: true
@@ -159,9 +162,9 @@ jobs:
           tags: ${{ env.DOCPROC_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          outputs: type=registry,push=${{ github.event_name == 'push' }}
+          outputs: type=registry # CORREGIDO
 
-      - name: Build and push Reranker Service Docker image # NEW
+      - name: Build and push Reranker Service Docker image
         id: build_reranker
         if: steps.changed_files.outputs.reranker_any_changed == 'true'
         continue-on-error: true
@@ -173,12 +176,13 @@ jobs:
           tags: ${{ env.RERANKER_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          outputs: type=registry,push=${{ github.event_name == 'push' }}
+          outputs: type=registry # CORREGIDO
 
   update-manifests:
     needs: build-push
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (needs.build-push.outputs.ingest_built == 'true' || needs.build-push.outputs.query_built == 'true' || needs.build-push.outputs.gateway_built == 'true' || needs.build-push.outputs.embedding_built == 'true' || needs.build-push.outputs.docproc_built == 'true' || needs.build-push.outputs.reranker_built == 'true') # UPDATED
+    # Ejecutar solo si es un push y al menos un servicio fue construido exitosamente
+    if: github.event_name == 'push' && (needs.build-push.outputs.ingest_built == 'true' || needs.build-push.outputs.query_built == 'true' || needs.build-push.outputs.gateway_built == 'true' || needs.build-push.outputs.embedding_built == 'true' || needs.build-push.outputs.docproc_built == 'true' || needs.build-push.outputs.reranker_built == 'true')
 
     steps:
       - name: Checkout Manifests Repository
@@ -186,40 +190,46 @@ jobs:
         with:
           repository: ${{ env.MANIFEST_REPO_OWNER }}/${{ env.MANIFEST_REPO_NAME }}
           ref: ${{ env.MANIFEST_REPO_BRANCH }}
-          token: ${{ secrets.MANIFEST_PAT }}
-          path: manifests-repo
+          token: ${{ secrets.MANIFEST_PAT }} # Asegúrate que este PAT tiene permisos de escritura en el repo de manifiestos
+          path: manifests-repo # Hacer checkout en un subdirectorio
 
       - name: Update Manifest Files Conditionally
         id: update_manifest
         env:
+          # Variables de entorno para el script, basadas en las salidas del job build-push
           INGEST_BUILT: ${{ needs.build-push.outputs.ingest_built }}
           QUERY_BUILT: ${{ needs.build-push.outputs.query_built }}
           GATEWAY_BUILT: ${{ needs.build-push.outputs.gateway_built }}
           EMBEDDING_BUILT: ${{ needs.build-push.outputs.embedding_built }}
-          DOCPROC_BUILT: ${{ needs.build-push.outputs.docproc_built }} # NEW
-          RERANKER_BUILT: ${{ needs.build-push.outputs.reranker_built }} # NEW
-          COMMON_TAG: ${{ needs.build-push.outputs.image_tag }}
+          DOCPROC_BUILT: ${{ needs.build-push.outputs.docproc_built }}
+          RERANKER_BUILT: ${{ needs.build-push.outputs.reranker_built }}
+          COMMON_TAG: ${{ needs.build-push.outputs.image_tag }} # La etiqueta de imagen generada
 
-          # MANIFEST PATHS - IMPORTANT: These paths are relative to the root of the 'manifests-repo'
+          # Rutas a los archivos de manifiesto, relativas a la raíz de 'manifests-repo'
           INGEST_MANIFEST_PATH_API_REL: ${{ env.INGEST_SERVICE_DIR }}/deployment-api.yaml
           INGEST_MANIFEST_PATH_WORKER_REL: ${{ env.INGEST_SERVICE_DIR }}/deployment-worker.yaml
           QUERY_MANIFEST_PATH_REL: ${{ env.QUERY_SERVICE_DIR }}/deployment.yaml
           GATEWAY_MANIFEST_PATH_REL: ${{ env.GATEWAY_SERVICE_DIR }}/deployment.yaml
-          # Assuming embedding-service manifest is at 'embedding-service/deployment.yaml' in manifests-repo
           EMBEDDING_MANIFEST_PATH_REL: ${{ env.EMBEDDING_SERVICE_DIR }}/deployment.yaml
-          DOCPROC_MANIFEST_PATH_REL: ${{ env.DOCPROC_SERVICE_DIR }}/deployment.yaml # NEW
-          RERANKER_MANIFEST_PATH_REL: ${{ env.RERANKER_SERVICE_DIR }}/deployment.yaml # NEW
-
+          DOCPROC_MANIFEST_PATH_REL: ${{ env.DOCPROC_SERVICE_DIR }}/deployment.yaml
+          RERANKER_MANIFEST_PATH_REL: ${{ env.RERANKER_SERVICE_DIR }}/deployment.yaml
         run: |
           echo "::group::Updating Manifest Files Conditionally"
           cd manifests-repo
           echo "Current directory: $(pwd)"
           echo "Common Tag: $COMMON_TAG"
+
+          # Salir si COMMON_TAG está vacío (no debería pasar si la condición del job 'if' es correcta y image_tag_common se ejecutó)
+          if [ -z "$COMMON_TAG" ]; then
+            echo "::error::COMMON_TAG is empty. This indicates an issue with image tag generation or propagation. Aborting manifest update."
+            exit 1
+          fi
+
           MANIFEST_UPDATED=false
 
           # --- Update Ingest Service ---
           if [ "$INGEST_BUILT" = "true" ]; then
-            INGEST_TARGET_IMAGE="${{ env.INGEST_IMAGE_NAME }}:$COMMON_TAG"
+            INGEST_TARGET_IMAGE="${INGEST_IMAGE_NAME}:$COMMON_TAG" # Usa la var de entorno del workflow para el nombre base de la imagen
             echo "Attempting to update Ingest Service image to: $INGEST_TARGET_IMAGE"
             if [ -f "$INGEST_MANIFEST_PATH_API_REL" ]; then
               sed -i "s|image: .*|image: $INGEST_TARGET_IMAGE|" "$INGEST_MANIFEST_PATH_API_REL"
@@ -231,84 +241,90 @@ jobs:
               echo "Updated $INGEST_MANIFEST_PATH_WORKER_REL"
               MANIFEST_UPDATED=true
             elif [ -n "$INGEST_MANIFEST_PATH_WORKER_REL" ]; then echo "WARNING: Ingest Worker manifest '$INGEST_MANIFEST_PATH_WORKER_REL' provided but not found!"; fi
-          else echo "Skipping Ingest Service manifest update (not built)."; fi
+          else echo "Skipping Ingest Service manifest update (not built or build failed)."; fi
 
           # --- Update Query Service ---
           if [ "$QUERY_BUILT" = "true" ]; then
-            QUERY_TARGET_IMAGE="${{ env.QUERY_IMAGE_NAME }}:$COMMON_TAG"
+            QUERY_TARGET_IMAGE="${QUERY_IMAGE_NAME}:$COMMON_TAG"
             echo "Attempting to update Query Service image to: $QUERY_TARGET_IMAGE in $QUERY_MANIFEST_PATH_REL"
             if [ -f "$QUERY_MANIFEST_PATH_REL" ]; then
               sed -i "s|image: .*|image: $QUERY_TARGET_IMAGE|" "$QUERY_MANIFEST_PATH_REL"
               echo "Updated $QUERY_MANIFEST_PATH_REL"
               MANIFEST_UPDATED=true
             else echo "::error::Query manifest file '$QUERY_MANIFEST_PATH_REL' not found!"; exit 1; fi
-          else echo "Skipping Query Service manifest update (not built)."; fi
+          else echo "Skipping Query Service manifest update (not built or build failed)."; fi
 
           # --- Update API Gateway ---
           if [ "$GATEWAY_BUILT" = "true" ]; then
-            GATEWAY_TARGET_IMAGE="${{ env.GATEWAY_IMAGE_NAME }}:$COMMON_TAG"
+            GATEWAY_TARGET_IMAGE="${GATEWAY_IMAGE_NAME}:$COMMON_TAG"
             echo "Attempting to update API Gateway image to: $GATEWAY_TARGET_IMAGE in $GATEWAY_MANIFEST_PATH_REL"
             if [ -f "$GATEWAY_MANIFEST_PATH_REL" ]; then
               sed -i "s|image: .*|image: $GATEWAY_TARGET_IMAGE|" "$GATEWAY_MANIFEST_PATH_REL"
               echo "Updated $GATEWAY_MANIFEST_PATH_REL"
               MANIFEST_UPDATED=true
             else echo "::error::API Gateway manifest file '$GATEWAY_MANIFEST_PATH_REL' not found!"; exit 1; fi
-          else echo "Skipping API Gateway manifest update (not built)."; fi
+          else echo "Skipping API Gateway manifest update (not built or build failed)."; fi
 
           # --- Update Embedding Service ---
           if [ "$EMBEDDING_BUILT" = "true" ]; then
-            EMBEDDING_TARGET_IMAGE="${{ env.EMBEDDING_IMAGE_NAME }}:$COMMON_TAG"
+            EMBEDDING_TARGET_IMAGE="${EMBEDDING_IMAGE_NAME}:$COMMON_TAG"
             echo "Attempting to update Embedding Service image to: $EMBEDDING_TARGET_IMAGE in $EMBEDDING_MANIFEST_PATH_REL"
             if [ -f "$EMBEDDING_MANIFEST_PATH_REL" ]; then
               sed -i "s|image: .*|image: $EMBEDDING_TARGET_IMAGE|" "$EMBEDDING_MANIFEST_PATH_REL"
               echo "Updated $EMBEDDING_MANIFEST_PATH_REL"
               MANIFEST_UPDATED=true
             else echo "::error::Embedding Service manifest file '$EMBEDDING_MANIFEST_PATH_REL' not found!"; exit 1; fi
-          else echo "Skipping Embedding Service manifest update (not built)."; fi
+          else echo "Skipping Embedding Service manifest update (not built or build failed)."; fi
 
-          # --- Update DocProc Service --- # NEW
+          # --- Update DocProc Service ---
           if [ "$DOCPROC_BUILT" = "true" ]; then
-            DOCPROC_TARGET_IMAGE="${{ env.DOCPROC_IMAGE_NAME }}:$COMMON_TAG"
+            DOCPROC_TARGET_IMAGE="${DOCPROC_IMAGE_NAME}:$COMMON_TAG"
             echo "Attempting to update DocProc Service image to: $DOCPROC_TARGET_IMAGE in $DOCPROC_MANIFEST_PATH_REL"
             if [ -f "$DOCPROC_MANIFEST_PATH_REL" ]; then
               sed -i "s|image: .*|image: $DOCPROC_TARGET_IMAGE|" "$DOCPROC_MANIFEST_PATH_REL"
               echo "Updated $DOCPROC_MANIFEST_PATH_REL"
               MANIFEST_UPDATED=true
             else echo "::error::DocProc Service manifest file '$DOCPROC_MANIFEST_PATH_REL' not found!"; exit 1; fi
-          else echo "Skipping DocProc Service manifest update (not built)."; fi
+          else echo "Skipping DocProc Service manifest update (not built or build failed)."; fi
 
-          # --- Update Reranker Service --- # NEW
+          # --- Update Reranker Service ---
           if [ "$RERANKER_BUILT" = "true" ]; then
-            RERANKER_TARGET_IMAGE="${{ env.RERANKER_IMAGE_NAME }}:$COMMON_TAG"
+            RERANKER_TARGET_IMAGE="${RERANKER_IMAGE_NAME}:$COMMON_TAG"
             echo "Attempting to update Reranker Service image to: $RERANKER_TARGET_IMAGE in $RERANKER_MANIFEST_PATH_REL"
             if [ -f "$RERANKER_MANIFEST_PATH_REL" ]; then
               sed -i "s|image: .*|image: $RERANKER_TARGET_IMAGE|" "$RERANKER_MANIFEST_PATH_REL"
               echo "Updated $RERANKER_MANIFEST_PATH_REL"
               MANIFEST_UPDATED=true
             else echo "::error::Reranker Service manifest file '$RERANKER_MANIFEST_PATH_REL' not found!"; exit 1; fi
-          else echo "Skipping Reranker Service manifest update (not built)."; fi
+          else echo "Skipping Reranker Service manifest update (not built or build failed)."; fi
 
           echo "manifest_updated=$MANIFEST_UPDATED" >> $GITHUB_OUTPUT
           echo "--- Checking Git Status Before Commit ---"
-          git status
+          git status # Para depuración, muestra qué archivos han cambiado
           echo "::endgroup::"
 
       - name: Commit and Push Manifest Changes
         if: steps.update_manifest.outputs.manifest_updated == 'true'
+        env:
+          # Pasar la etiqueta de imagen específica utilizada para las actualizaciones a este paso para el mensaje de commit
+          IMAGE_TAG_FOR_COMMIT: ${{ needs.build-push.outputs.image_tag }}
         run: |
           echo "::group::Committing and Pushing Manifest Changes"
           cd manifests-repo
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add .
+          git add . # Añadir todos los cambios (los archivos de manifiesto actualizados)
+          
+          # Verificar si realmente hay cambios para commitear
           if git diff --staged --quiet; then
             echo "No actual changes staged. Skipping commit."
           else
             echo "Manifest changes detected. Committing..."
-            COMMIT_MSG="Update service image(s) to tag ${{ env.COMMON_TAG }} [CI]"
+            # Usar la etiqueta de imagen específica de la salida del job build-push para el mensaje de commit
+            COMMIT_MSG="Update service image(s) to tag $IMAGE_TAG_FOR_COMMIT [CI]"
             git commit -m "$COMMIT_MSG"
             if git push origin ${{ env.MANIFEST_REPO_BRANCH }}; then
                echo "Push successful."
-            else echo "::error::Push failed."; exit 1; fi
+            else echo "::error::Push failed."; exit 1; fi # Salir si el push falla
           fi
           echo "::endgroup::"
