@@ -48,8 +48,10 @@ COPY ./app ${APP_HOME}/app
 
 RUN mkdir -p ${HF_HOME} ${FASTEMBED_CACHE_DIR} && \
     chown -R nobody:nogroup ${APP_HOME}/.cache && \
-    chmod -R 777 ${APP_HOME}/.cache
+    chmod -R 777 ${APP_HOME}/.cache # Considerar permisos más restrictivos si es posible
 
 EXPOSE ${EMBEDDING_PORT}
 
-CMD ["gunicorn", "-w", "2", "-k", "uvicorn.workers.UvicornWorker", "app.main:app", "--bind", "0.0.0.0:${EMBEDDING_PORT}", "--timeout", "120"]
+# CORREGIDO: Usar sh -c para permitir la expansión de la variable de entorno
+# y 'exec' para que Gunicorn sea el proceso PID 1.
+CMD exec sh -c "gunicorn -w 2 -k uvicorn.workers.UvicornWorker app.main:app --bind 0.0.0.0:${EMBEDDING_PORT} --timeout 120"
