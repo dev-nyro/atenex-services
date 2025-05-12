@@ -1245,7 +1245,8 @@ POSTGRES_K8S_DB_DEFAULT = "atenex"
 POSTGRES_K8S_USER_DEFAULT = "postgres"
 
 # Milvus
-MILVUS_K8S_DEFAULT_URI = "http://milvus-standalone.nyro-develop.svc.cluster.local:19530"
+# MILVUS_K8S_DEFAULT_URI = "http://milvus-standalone.nyro-develop.svc.cluster.local:19530" # No longer default
+ZILLIZ_ENDPOINT_DEFAULT = "https://in03-0afab716eb46d7f.serverless.gcp-us-west1.cloud.zilliz.com"
 MILVUS_DEFAULT_COLLECTION = "document_chunks_minilm"
 MILVUS_DEFAULT_EMBEDDING_FIELD = "embedding"
 MILVUS_DEFAULT_CONTENT_FIELD = "content"
@@ -1373,9 +1374,10 @@ class Settings(BaseSettings):
     POSTGRES_PORT: int = Field(default=POSTGRES_K8S_PORT_DEFAULT)
     POSTGRES_DB: str = Field(default=POSTGRES_K8S_DB_DEFAULT)
 
-    # --- Vector Store (Milvus) ---
+    # --- Vector Store (Milvus/Zilliz) ---
     ZILLIZ_API_KEY: SecretStr = Field(description="API Key for Zilliz Cloud connection.")
-    MILVUS_URI: AnyHttpUrl = Field(default="https://in03-0afab716eb46d7f.serverless.gcp-us-west1.cloud.zilliz.com")
+    MILVUS_URI: AnyHttpUrl = Field(default_factory=lambda: AnyHttpUrl(ZILLIZ_ENDPOINT_DEFAULT))
+
     @field_validator('MILVUS_URI', mode='before')
     @classmethod
     def validate_milvus_uri(cls, v: Any) -> AnyHttpUrl:
@@ -1393,9 +1395,15 @@ class Settings(BaseSettings):
     @field_validator('ZILLIZ_API_KEY', mode='before')
     @classmethod
     def check_zilliz_key(cls, v: Any, info: ValidationInfo) -> Any:
-        if v is None or v == "":
+        # Allow SecretStr to be passed, check its content
+        if isinstance(v, SecretStr):
+            secret_value = v.get_secret_value()
+            if secret_value is None or secret_value == "":
+                raise ValueError(f"Required secret field 'QUERY_ZILLIZ_API_KEY' cannot be empty.")
+        elif v is None or v == "": # Handle direct string or None input before SecretStr conversion
             raise ValueError(f"Required secret field 'QUERY_ZILLIZ_API_KEY' cannot be empty.")
         return v
+
     MILVUS_COLLECTION_NAME: str = Field(default=MILVUS_DEFAULT_COLLECTION)
     MILVUS_EMBEDDING_FIELD: str = Field(default=MILVUS_DEFAULT_EMBEDDING_FIELD)
     MILVUS_CONTENT_FIELD: str = Field(default=MILVUS_DEFAULT_CONTENT_FIELD)
@@ -1404,13 +1412,14 @@ class Settings(BaseSettings):
     MILVUS_FILENAME_FIELD: str = Field(default=MILVUS_DEFAULT_FILENAME_FIELD)
     MILVUS_METADATA_FIELDS: List[str] = Field(default=MILVUS_DEFAULT_METADATA_FIELDS)
     MILVUS_GRPC_TIMEOUT: int = Field(default=MILVUS_DEFAULT_GRPC_TIMEOUT)
-    MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default=MILVUS_DEFAULT_SEARCH_PARAMS)
+    MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default_factory=lambda: MILVUS_DEFAULT_SEARCH_PARAMS.copy())
+
 
     # --- Embedding Settings (General) ---
     EMBEDDING_DIMENSION: int = Field(default=DEFAULT_EMBEDDING_DIMENSION, description="Dimension of embeddings, used for Milvus and validation.")
 
     # --- External Embedding Service ---
-    EMBEDDING_SERVICE_URL: AnyHttpUrl = Field(default=AnyHttpUrl(EMBEDDING_SERVICE_K8S_URL_DEFAULT), description="URL of the Atenex Embedding Service.")
+    EMBEDDING_SERVICE_URL: AnyHttpUrl = Field(default_factory=lambda: AnyHttpUrl(EMBEDDING_SERVICE_K8S_URL_DEFAULT), description="URL of the Atenex Embedding Service.")
     EMBEDDING_CLIENT_TIMEOUT: int = Field(default=30, description="Timeout in seconds for calls to the Embedding Service.")
 
 
@@ -1420,7 +1429,7 @@ class Settings(BaseSettings):
 
     # --- Reranker Settings ---
     RERANKER_ENABLED: bool = Field(default=DEFAULT_RERANKER_ENABLED)
-    RERANKER_SERVICE_URL: AnyHttpUrl = Field(default=AnyHttpUrl(RERANKER_SERVICE_K8S_URL_DEFAULT), description="URL of the Atenex Reranker Service.")
+    RERANKER_SERVICE_URL: AnyHttpUrl = Field(default_factory=lambda: AnyHttpUrl(RERANKER_SERVICE_K8S_URL_DEFAULT), description="URL of the Atenex Reranker Service.")
     RERANKER_CLIENT_TIMEOUT: int = Field(default=30, description="Timeout in seconds for calls to the Reranker Service.")
 
 
@@ -1459,10 +1468,15 @@ class Settings(BaseSettings):
     @field_validator('POSTGRES_PASSWORD', 'GEMINI_API_KEY', mode='before')
     @classmethod
     def check_secret_value_present(cls, v: Any, info: ValidationInfo) -> Any:
-        if v is None or (isinstance(v, str) and v == ""):
-            field_name = info.field_name if info.field_name else "Unknown Secret Field"
-            raise ValueError(f"Required secret field 'QUERY_{field_name.upper()}' cannot be empty.")
+         # Allow SecretStr to be passed, check its content
+        if isinstance(v, SecretStr):
+            secret_value = v.get_secret_value()
+            if secret_value is None or secret_value == "":
+                raise ValueError(f"Required secret field 'QUERY_{info.field_name.upper()}' cannot be empty.")
+        elif v is None or v == "": # Handle direct string or None input
+            raise ValueError(f"Required secret field 'QUERY_{info.field_name.upper()}' cannot be empty.")
         return v
+
 
     @field_validator('EMBEDDING_DIMENSION')
     @classmethod
@@ -1476,9 +1490,9 @@ class Settings(BaseSettings):
     @classmethod
     def check_max_context_chunks(cls, v: int, info: ValidationInfo) -> int:
         retriever_k = info.data.get('RETRIEVER_TOP_K', DEFAULT_RETRIEVER_TOP_K)
-        max_possible_after_fusion = retriever_k * 2
+        max_possible_after_fusion = retriever_k * 2 # Simplistic assumption, could be just retriever_k if no sparse
         if v > max_possible_after_fusion:
-            logging.warning(f"MAX_CONTEXT_CHUNKS ({v}) is greater than the maximum possible chunks after fusion ({max_possible_after_fusion} based on RETRIEVER_TOP_K={retriever_k}). Effective limit will be {max_possible_after_fusion}.")
+            logging.warning(f"MAX_CONTEXT_CHUNKS ({v}) is greater than a typical max after fusion based on RETRIEVER_TOP_K ({retriever_k}). Effective limit will be applied.")
         if v <= 0:
              raise ValueError("MAX_CONTEXT_CHUNKS must be a positive integer.")
         return v
@@ -1499,7 +1513,7 @@ class Settings(BaseSettings):
 temp_log = logging.getLogger("query_service.config.loader")
 if not temp_log.handlers:
     handler = logging.StreamHandler(sys.stdout)
-    formatter = logging.Formatter('%(levelname)s: [%(name)s] %(message)s')
+    formatter = logging.Formatter('%(levelname)s: [%(asctime)s] [%(name)s] %(message)s') # Added asctime
     handler.setFormatter(formatter)
     temp_log.addHandler(handler)
     temp_log.setLevel(logging.INFO)
@@ -1507,21 +1521,31 @@ if not temp_log.handlers:
 try:
     temp_log.info("Loading Query Service settings...")
     settings = Settings()
-    temp_log.info("Query Service Settings Loaded Successfully:")
-    log_data = settings.model_dump(exclude={'POSTGRES_PASSWORD', 'GEMINI_API_KEY'})
+    temp_log.info("--- Query Service Settings Loaded ---")
+    # Log settings, excluding sensitive ones and long templates by default
+    excluded_fields = {'POSTGRES_PASSWORD', 'GEMINI_API_KEY', 'ZILLIZ_API_KEY', 'RAG_PROMPT_TEMPLATE', 'GENERAL_PROMPT_TEMPLATE'}
+    log_data = settings.model_dump(exclude=excluded_fields)
+
     for key, value in log_data.items():
-        if key.endswith('_PROMPT_TEMPLATE') and isinstance(value, str) and len(value) > 200:
-             temp_log.info(f"  {key.upper()}: {value[:100]}... (truncated)")
-        else:
-             temp_log.info(f"  {key.upper()}: {value}")
-    temp_log.info(f"  POSTGRES_PASSWORD: *** SET ***")
-    temp_log.info(f"  GEMINI_API_KEY: *** SET ***")
+        temp_log.info(f"  {key.upper()}: {value}")
+
+    # Log status of sensitive fields and templates
+    pg_pass_status = '*** SET ***' if settings.POSTGRES_PASSWORD and settings.POSTGRES_PASSWORD.get_secret_value() else '!!! NOT SET !!!'
+    temp_log.info(f"  POSTGRES_PASSWORD:            {pg_pass_status}")
+    gemini_key_status = '*** SET ***' if settings.GEMINI_API_KEY and settings.GEMINI_API_KEY.get_secret_value() else '!!! NOT SET !!!'
+    temp_log.info(f"  GEMINI_API_KEY:               {gemini_key_status}")
+    zilliz_api_key_status = '*** SET ***' if settings.ZILLIZ_API_KEY and settings.ZILLIZ_API_KEY.get_secret_value() else '!!! NOT SET !!!'
+    temp_log.info(f"  ZILLIZ_API_KEY:               {zilliz_api_key_status}") # ADDED LOG FOR ZILLIZ_API_KEY
+    temp_log.info(f"  RAG_PROMPT_TEMPLATE:          Present (length: {len(settings.RAG_PROMPT_TEMPLATE)})")
+    temp_log.info(f"  GENERAL_PROMPT_TEMPLATE:      Present (length: {len(settings.GENERAL_PROMPT_TEMPLATE)})")
+    temp_log.info(f"------------------------------------")
+
 
 except (ValidationError, ValueError) as e:
     error_details = ""
     if isinstance(e, ValidationError):
         try: error_details = f"\nValidation Errors:\n{json.dumps(e.errors(), indent=2)}"
-        except Exception: error_details = f"\nRaw Errors: {e}"
+        except Exception: error_details = f"\nRaw Errors: {e}" # Fallback for e.errors()
     else: error_details = f"\nError: {e}"
     temp_log.critical(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     temp_log.critical(f"! FATAL: Query Service configuration validation failed!{error_details}")
@@ -2833,18 +2857,21 @@ from app.domain.models import RetrievedChunk # Import domain model
 # These constants represent the actual field names used in the Milvus collection schema
 # defined by the ingest-service.
 # This improves maintainability if field names change in the ingest service.
+# LLM_FLAG: MANUALLY_VERIFIED_INGEST_SCHEMA_FIELDS_CONSISTENCY
 try:
-    from app.services.ingest_pipeline import (
-        MILVUS_PK_FIELD, # "pk_id"
-        MILVUS_VECTOR_FIELD, # "embedding"
-        MILVUS_CONTENT_FIELD, # "content"
-        MILVUS_COMPANY_ID_FIELD, # "company_id"
-        MILVUS_DOCUMENT_ID_FIELD, # "document_id"
-        MILVUS_FILENAME_FIELD, # "file_name"
-        MILVUS_PAGE_FIELD, # "page"
-        MILVUS_TITLE_FIELD, # "title"
-        # Add others if needed (tokens, content_hash)
-    )
+    # Attempt to import from a shared location if ingest-service fields are exposed
+    # For now, we assume these constants are defined based on ingest-service's current schema
+    # In a mono-repo or shared library, this would be more direct.
+    # Hardcoding them here as a fallback based on the ingest-service README and common practice.
+    MILVUS_PK_FIELD = "pk_id"
+    MILVUS_VECTOR_FIELD = "embedding" # Corresponds to settings.MILVUS_EMBEDDING_FIELD from ingest
+    MILVUS_CONTENT_FIELD = "content" # Corresponds to settings.MILVUS_CONTENT_FIELD from ingest
+    MILVUS_COMPANY_ID_FIELD = "company_id"
+    MILVUS_DOCUMENT_ID_FIELD = "document_id"
+    MILVUS_FILENAME_FIELD = "file_name"
+    MILVUS_PAGE_FIELD = "page"
+    MILVUS_TITLE_FIELD = "title"
+
     INGEST_SCHEMA_FIELDS = {
         "pk": MILVUS_PK_FIELD,
         "vector": MILVUS_VECTOR_FIELD,
@@ -2856,17 +2883,15 @@ try:
         "title": MILVUS_TITLE_FIELD,
     }
 except ImportError:
-     # Fallback to using settings directly if ingest schema isn't available
-     # (less ideal but allows standalone use)
-     structlog.getLogger(__name__).warning("Could not import ingest schema constants, using settings directly for field names.")
+     structlog.getLogger(__name__).warning("Could not import ingest schema constants, using settings and fallbacks for field names.")
      INGEST_SCHEMA_FIELDS = {
-        "pk": "pk_id", # Assuming default from ingest
+        "pk": "pk_id",
         "vector": settings.MILVUS_EMBEDDING_FIELD,
         "content": settings.MILVUS_CONTENT_FIELD,
         "company": settings.MILVUS_COMPANY_ID_FIELD,
         "document": settings.MILVUS_DOCUMENT_ID_FIELD,
         "filename": settings.MILVUS_FILENAME_FIELD,
-        "page": "page", # Add fallbacks for metadata
+        "page": "page",
         "title": "title",
     }
 
@@ -2878,10 +2903,9 @@ class MilvusAdapter(VectorStorePort):
 
     _collection: Optional[Collection] = None
     _connected = False
-    _alias = "query_service_milvus_adapter" # Unique alias for this adapter's connection
+    _alias = "query_service_milvus_adapter"
 
     def __init__(self):
-        # Connection is established lazily on first use or explicitly via connect()
         pass
 
     async def _ensure_connection(self):
@@ -2894,7 +2918,7 @@ class MilvusAdapter(VectorStorePort):
                 connections.connect(
                     alias=self._alias,
                     uri=uri,
-                    token=settings.ZILLIZ_API_KEY.get_secret_value(),
+                    token=settings.ZILLIZ_API_KEY.get_secret_value(), # MODIFIED: Added token
                     timeout=settings.MILVUS_GRPC_TIMEOUT
                 )
                 self._connected = True
@@ -2910,12 +2934,12 @@ class MilvusAdapter(VectorStorePort):
 
     async def _get_collection(self) -> Collection:
         """Gets the Milvus collection object, ensuring connection and loading."""
-        await self._ensure_connection() # Ensure connection is active
+        await self._ensure_connection()
 
         if self._collection is None:
-            collection_name = settings.MILVUS_COLLECTION_NAME # Now uses the corrected default or ENV var
+            collection_name = settings.MILVUS_COLLECTION_NAME
             collection_log = log.bind(adapter="MilvusAdapter", action="get_collection", collection=collection_name, alias=self._alias)
-            collection_log.info(f"Attempting to access Milvus collection: '{collection_name}'") # Log the name being used
+            collection_log.info(f"Attempting to access Milvus collection: '{collection_name}'")
             try:
                 if not utility.has_collection(collection_name, using=self._alias):
                     collection_log.error("Milvus collection does not exist.", target_collection=collection_name)
@@ -2929,14 +2953,14 @@ class MilvusAdapter(VectorStorePort):
 
             except MilvusException as e:
                 collection_log.error("Failed to get or load Milvus collection", error_code=e.code, error_message=e.message)
-                if "multiple indexes" in e.message.lower():
+                if "multiple indexes" in e.message.lower(): # LLM_FLAG: SENSITIVE_ERROR_HANDLING
                     collection_log.critical("Potential 'Ambiguous Index' error encountered. Please check Milvus indices for this collection.")
                 raise RuntimeError(f"Milvus collection access error (Code: {e.code}): {e.message}") from e
             except Exception as e:
                  collection_log.exception("Unexpected error accessing Milvus collection")
                  raise RuntimeError(f"Unexpected error accessing Milvus collection: {e}") from e
 
-        if not isinstance(self._collection, Collection):
+        if not isinstance(self._collection, Collection): # LLM_FLAG: ROBUSTNESS_CHECK
             log.critical("Milvus collection object is unexpectedly None or invalid type after initialization attempt.")
             raise RuntimeError("Failed to obtain a valid Milvus collection object.")
 
@@ -2948,78 +2972,67 @@ class MilvusAdapter(VectorStorePort):
         try:
             collection = await self._get_collection()
 
-            search_params = settings.MILVUS_SEARCH_PARAMS
-            # --- Use consistent field name for filtering ---
+            search_params = settings.MILVUS_SEARCH_PARAMS.copy() # Use a copy to avoid modifying global settings
             filter_expr = f'{INGEST_SCHEMA_FIELDS["company"]} == "{company_id}"'
             search_log.debug("Using filter expression", expr=filter_expr)
 
-            # --- CORRECTION: Construct output_fields based on INGEST_SCHEMA_FIELDS and settings.MILVUS_METADATA_FIELDS ---
-            # Start with mandatory fields used directly by the adapter/domain model
-            required_output_fields = {
-                INGEST_SCHEMA_FIELDS["pk"], # Need the PK to populate RetrievedChunk.id
-                INGEST_SCHEMA_FIELDS["vector"], # Need the vector for diversity filter
+            required_output_fields_set = {
+                INGEST_SCHEMA_FIELDS["pk"],
+                INGEST_SCHEMA_FIELDS["vector"],
                 INGEST_SCHEMA_FIELDS["content"],
                 INGEST_SCHEMA_FIELDS["company"],
                 INGEST_SCHEMA_FIELDS["document"],
                 INGEST_SCHEMA_FIELDS["filename"],
             }
-            # Add fields specified in the query service's metadata list config
-            # This ensures we fetch what the query service expects for its metadata dict
-            required_output_fields.update(settings.MILVUS_METADATA_FIELDS)
-            output_fields = list(required_output_fields)
-            # --- END CORRECTION ---
+            required_output_fields_set.update(settings.MILVUS_METADATA_FIELDS)
+            output_fields_list = list(required_output_fields_set)
 
             search_log.debug("Performing Milvus vector search...",
-                             vector_field=INGEST_SCHEMA_FIELDS["vector"], # Use consistent vector field
-                             output_fields=output_fields)
+                             vector_field=INGEST_SCHEMA_FIELDS["vector"],
+                             output_fields=output_fields_list)
 
             loop = asyncio.get_running_loop()
             search_results = await loop.run_in_executor(
                 None,
                 lambda: collection.search(
                     data=[embedding],
-                    anns_field=INGEST_SCHEMA_FIELDS["vector"], # Use consistent vector field
+                    anns_field=INGEST_SCHEMA_FIELDS["vector"],
                     param=search_params,
                     limit=top_k,
                     expr=filter_expr,
-                    output_fields=output_fields,
-                    consistency_level="Strong"
+                    output_fields=output_fields_list,
+                    consistency_level="Strong" # Recommended for RAG consistency
                 )
             )
 
-            search_log.debug(f"Milvus search completed. Hits: {len(search_results[0]) if search_results else 0}")
+            search_log.debug(f"Milvus search completed. Hits: {len(search_results[0]) if search_results and search_results[0] else 0}")
 
             domain_chunks: List[RetrievedChunk] = []
             if search_results and search_results[0]:
                 for hit in search_results[0]:
-                    # --- CORRECTION: Use hit.entity if available, handle potential absence ---
                     entity_data = hit.entity.to_dict() if hasattr(hit, 'entity') and hasattr(hit.entity, 'to_dict') else {}
 
-                    # Extract core fields using consistent names
-                    pk_id = str(hit.id) # hit.id *should* be the primary key value
+                    pk_id = str(hit.id)
                     content = entity_data.get(INGEST_SCHEMA_FIELDS["content"], "")
                     embedding_vector = entity_data.get(INGEST_SCHEMA_FIELDS["vector"])
 
-                    # Prepare metadata dict from all returned entity data, excluding vector
-                    metadata = {k: v for k, v in entity_data.items() if k != INGEST_SCHEMA_FIELDS["vector"]}
-                    # Ensure standard fields expected by domain model are present in metadata (using consistent keys)
-                    doc_id = metadata.get(INGEST_SCHEMA_FIELDS["document"])
-                    comp_id = metadata.get(INGEST_SCHEMA_FIELDS["company"])
-                    fname = metadata.get(INGEST_SCHEMA_FIELDS["filename"])
+                    metadata_dict = {k: v for k, v in entity_data.items() if k != INGEST_SCHEMA_FIELDS["vector"]}
+                    
+                    doc_id_val = metadata_dict.get(INGEST_SCHEMA_FIELDS["document"])
+                    comp_id_val = metadata_dict.get(INGEST_SCHEMA_FIELDS["company"])
+                    fname_val = metadata_dict.get(INGEST_SCHEMA_FIELDS["filename"])
 
                     chunk = RetrievedChunk(
-                        id=pk_id, # Use the primary key
+                        id=pk_id,
                         content=content,
                         score=hit.score,
-                        metadata=metadata, # Store all retrieved metadata
+                        metadata=metadata_dict,
                         embedding=embedding_vector,
-                        # Populate direct domain fields from metadata if available
-                        document_id=str(doc_id) if doc_id else None,
-                        file_name=str(fname) if fname else None,
-                        company_id=str(comp_id) if comp_id else None
+                        document_id=str(doc_id_val) if doc_id_val else None,
+                        file_name=str(fname_val) if fname_val else None,
+                        company_id=str(comp_id_val) if comp_id_val else None
                     )
                     domain_chunks.append(chunk)
-                # --- END CORRECTION ---
 
             search_log.info(f"Converted {len(domain_chunks)} Milvus hits to domain objects.")
             return domain_chunks
@@ -3042,7 +3055,7 @@ class MilvusAdapter(VectorStorePort):
             try:
                 connections.disconnect(self._alias)
                 self._connected = False
-                self._collection = None # Reset collection object on disconnect
+                self._collection = None
                 log.info("Disconnected from Milvus.", adapter="MilvusAdapter")
             except Exception as e:
                 log.error("Error during Milvus disconnect", error=str(e), exc_info=True)
@@ -3421,7 +3434,7 @@ if __name__ == "__main__":
     print(f"----- Starting {settings.PROJECT_NAME} locally on port {port} -----")
     uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True, log_level=log_level_str)
 
-# jfu
+# jfu 2
 ```
 
 ## File: `app\models\__init__.py`
@@ -3482,20 +3495,24 @@ structlog = "^24.1.0"
 # --- Haystack Dependencies ---
 # haystack-ai is kept for Document, PromptBuilder, etc.
 haystack-ai = "^2.0.1"
-pymilvus = "^2.4.1"
+pymilvus = "==2.5.3"
 
 # --- LLM Dependency ---
 google-generativeai = "^0.5.4"
 
 # --- RAG Component Dependencies ---
 # sentence-transformers is REMOVED as reranking is now external
-numpy = "1.26.4" # Kept, as bm2s or other parts might need it. Haystack might also use it.
-# fastembed and fastembed-haystack are REMOVED as embedding is now external
+numpy = "1.26.4" 
+
 
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"
 pytest-asyncio = "^0.21.1"
+
+[tool.poetry.extras]
+
+
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
