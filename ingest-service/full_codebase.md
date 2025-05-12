@@ -153,13 +153,18 @@ def _get_milvus_collection_sync() -> Collection:
     alias = "api_sync_helper"
     sync_milvus_log = log.bind(component="MilvusHelperSync", alias=alias)
     if alias not in connections.list_connections():
-        sync_milvus_log.info("Connecting to Milvus for sync helper...")
+        sync_milvus_log.info("Connecting to Milvus (Zilliz) for sync helper...")
         try:
-            connections.connect(alias=alias, uri=settings.MILVUS_URI, timeout=settings.MILVUS_GRPC_TIMEOUT)
-            sync_milvus_log.info("Milvus connection established for sync helper.")
+            connections.connect(
+                alias=alias,
+                uri=settings.MILVUS_URI,
+                timeout=settings.MILVUS_GRPC_TIMEOUT,
+                token=settings.ZILLIZ_API_KEY.get_secret_value() if settings.ZILLIZ_API_KEY else None
+            )
+            sync_milvus_log.info("Milvus (Zilliz) connection established for sync helper.")
         except MilvusException as e:
-            sync_milvus_log.error("Failed to connect to Milvus for sync helper", error=str(e))
-            raise RuntimeError(f"Milvus connection failed for API helper: {e}") from e
+            sync_milvus_log.error("Failed to connect to Milvus (Zilliz) for sync helper", error=str(e))
+            raise RuntimeError(f"Milvus (Zilliz) connection failed for API helper: {e}") from e
     else:
         sync_milvus_log.debug("Reusing existing Milvus connection for sync helper.")
     try:
@@ -1158,6 +1163,7 @@ class PaginatedStatusResponse(BaseModel):
 ## File: `app\core\config.py`
 ```py
 # ingest-service/app/core/config.py
+# LLM: NO COMMENTS unless absolutely necessary for processing logic.
 import logging
 import os
 from typing import Optional, List, Any, Dict, Union
@@ -1168,7 +1174,7 @@ from pydantic import (
 )
 import sys
 import json
-from urllib.parse import urlparse # Añadir import
+from urllib.parse import urlparse
 
 # --- Service Names en K8s ---
 POSTGRES_K8S_SVC = "postgresql-service.nyro-develop.svc.cluster.local"
@@ -1182,6 +1188,8 @@ POSTGRES_K8S_PORT_DEFAULT = 5432
 POSTGRES_K8S_DB_DEFAULT = "atenex"
 POSTGRES_K8S_USER_DEFAULT = "postgres"
 MILVUS_K8S_PORT_DEFAULT = 19530
+ZILLIZ_ENDPOINT_DEFAULT = "https://in03-0afab716eb46d7f.serverless.gcp-us-west1.cloud.zilliz.com"
+DEFAULT_MILVUS_URI = f"http://{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}"
 MILVUS_DEFAULT_COLLECTION = "document_chunks_minilm"
 MILVUS_DEFAULT_INDEX_PARAMS = '{"metric_type": "IP", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}}'
 MILVUS_DEFAULT_SEARCH_PARAMS = '{"metric_type": "IP", "params": {"ef": 128}}'
@@ -1211,9 +1219,10 @@ class Settings(BaseSettings):
     POSTGRES_PORT: int = POSTGRES_K8S_PORT_DEFAULT
     POSTGRES_DB: str = POSTGRES_K8S_DB_DEFAULT
 
+    ZILLIZ_API_KEY: SecretStr = Field(description="API Key for Zilliz Cloud connection.")
     MILVUS_URI: str = Field(
-        default=f"http://{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}", # Default is http for clarity of input
-        description="Milvus connection URI. Input can be 'http(s)://host:port' or 'host:port'. Stored as 'host:port'."
+        default=ZILLIZ_ENDPOINT_DEFAULT,
+        description="Milvus connection URI (Zilliz Cloud HTTPS endpoint)."
     )
     MILVUS_COLLECTION_NAME: str = MILVUS_DEFAULT_COLLECTION
     MILVUS_GRPC_TIMEOUT: int = 10
@@ -1267,44 +1276,48 @@ class Settings(BaseSettings):
              raise ValueError(f"Required secret field '{field_name}' cannot be empty.")
         return v
 
+    # --- START CORRECTION: Modify Milvus URI Validator ---
     @field_validator('MILVUS_URI', mode='before')
     @classmethod
     def validate_milvus_uri(cls, v: Any) -> str:
         if not isinstance(v, str):
             raise ValueError("MILVUS_URI must be a string.")
 
-        val_log = logging.getLogger("ingest_service.config.validator.milvus") # Specific logger for this validator
+        val_log = logging.getLogger("ingest_service.config.validator.milvus")
         val_log.debug(f"Validating MILVUS_URI input: '{v}'")
+        v_strip = v.strip()
 
-        if v.startswith("http://") or v.startswith("https://"):
+        if v_strip.startswith("http://") or v_strip.startswith("https://") or v_strip.startswith("tcp://"):
             try:
-                parsed = urlparse(v)
-                if parsed.hostname and parsed.port:
-                    transformed_uri = f"{parsed.hostname}:{parsed.port}"
-                    val_log.debug(f"Transformed MILVUS_URI from '{v}' to '{transformed_uri}'")
-                    return transformed_uri
-                elif parsed.hostname: # Should ideally have port for Milvus
-                    val_log.warning(f"MILVUS_URI '{v}' parsed to only hostname '{parsed.hostname}'. Pymilvus might assume default port. Ensure this is intended.")
-                    return parsed.hostname
-                else:
-                    raise ValueError(f"Could not extract hostname from Milvus URI: {v}")
+                # Basic validation: Check if it has a host part after the scheme
+                parsed = urlparse(v_strip)
+                if not parsed.hostname:
+                    raise ValueError(f"Invalid URI: Missing hostname in '{v_strip}'")
+                if not parsed.port:
+                    val_log.warning(f"MILVUS_URI '{v_strip}' provided without a port. Using as is, ensure Milvus default port is intended or connection works.")
+                val_log.debug(f"MILVUS_URI '{v_strip}' has a valid scheme. Using as is.")
+                return v_strip # Keep the scheme
             except Exception as e:
-                raise ValueError(f"Invalid http(s) Milvus URI format '{v}': {e}") from e
-        elif ":" in v and not "/" in v: # Check for host:port format
-            parts = v.split(':', 1)
+                raise ValueError(f"Invalid Milvus URI format with scheme '{v_strip}': {e}") from e
+        elif ":" in v_strip and not "/" in v_strip: # Check for host:port format (no scheme)
+            parts = v_strip.split(':', 1)
             if len(parts) == 2 and parts[1].isdigit():
-                val_log.debug(f"MILVUS_URI '{v}' already in 'host:port' format.")
-                return v 
-            elif len(parts) == 1 and "." in parts[0]: # Only hostname
-                 val_log.warning(f"MILVUS_URI '{v}' is only a hostname. Pymilvus might assume default port. Ensure this is intended.")
-                 return v
-            else: # Invalid format if it contains ':' but not as host:port
-                raise ValueError(f"Invalid Milvus URI format '{v}'. Expected 'host:port', 'hostname', or 'http(s)://host:port'.")
-        elif "." in v and not "/" in v and not ":" in v: # Only hostname
-            val_log.warning(f"MILVUS_URI '{v}' is only a hostname. Pymilvus might assume default port. Ensure this is intended.")
-            return v
+                # Prepend http:// as default for pymilvus connect compatibility
+                transformed_uri = f"http://{v_strip}"
+                val_log.debug(f"Prepended 'http://' to MILVUS_URI. Storing as '{transformed_uri}'")
+                return transformed_uri
+            elif len(parts) == 1 and "." in parts[0]: # Only hostname without scheme or port
+                 val_log.warning(f"MILVUS_URI '{v_strip}' is only a hostname. Defaulting to 'http://{v_strip}:19530'. Ensure this is correct.")
+                 return f"http://{v_strip}:19530" # Add default scheme and port
+            else: # Invalid host:port format
+                raise ValueError(f"Invalid Milvus URI format '{v_strip}'. Expected 'scheme://host:port' or 'host:port'.")
+        elif "." in v_strip and not "/" in v_strip and not ":" in v_strip: # Only hostname
+            val_log.warning(f"MILVUS_URI '{v_strip}' is only a hostname. Defaulting to 'http://{v_strip}:19530'. Ensure this is correct.")
+            return f"http://{v_strip}:19530" # Add default scheme and port
         else: # Does not match any expected format
-            raise ValueError(f"Unsupported Milvus URI format: {v}. Expected 'host:port', 'hostname', or 'http(s)://host:port'.")
+            raise ValueError(f"Unsupported Milvus URI format: {v_strip}. Expected 'scheme://host:port' or 'host:port'.")
+    # --- END CORRECTION: Modify Milvus URI Validator ---
+
 
     @field_validator('INGEST_EMBEDDING_SERVICE_URL', 'INGEST_DOCPROC_SERVICE_URL', mode='before')
     @classmethod
@@ -1315,12 +1328,17 @@ class Settings(BaseSettings):
         }
         default_url_key = str(info.field_name) if info.field_name else ""
         default_url = default_map.get(default_url_key, "")
-        
+
         url_to_validate = v or default_url
         if not url_to_validate:
             raise ValueError(f"URL for {default_url_key} cannot be empty.")
-            
-        return str(AnyHttpUrl(url_to_validate))
+
+        # Use Pydantic's AnyHttpUrl validation directly
+        try:
+            validated_url = AnyHttpUrl(url_to_validate)
+            return str(validated_url) # Return as string
+        except ValidationError as ve:
+             raise ValueError(f"Invalid URL format for {default_url_key}: {ve}") from ve
 
 
 temp_log = logging.getLogger("ingest_service.config.loader")
@@ -1344,7 +1362,9 @@ try:
     temp_log.info(f"  POSTGRES_DB:                  {settings.POSTGRES_DB}")
     temp_log.info(f"  POSTGRES_USER:                {settings.POSTGRES_USER}")
     temp_log.info(f"  POSTGRES_PASSWORD:            {'*** SET ***' if settings.POSTGRES_PASSWORD and settings.POSTGRES_PASSWORD.get_secret_value() else '!!! NOT SET !!!'}")
-    temp_log.info(f"  MILVUS_URI (for Pymilvus):    {settings.MILVUS_URI}")
+    # --- Log the corrected MILVUS_URI format ---
+temp_log.info(f"  MILVUS_URI (for Pymilvus):    {settings.MILVUS_URI}") # Will now include http://
+temp_log.info(f"  ZILLIZ_API_KEY:            {'*** SET ***' if settings.ZILLIZ_API_KEY and settings.ZILLIZ_API_KEY.get_secret_value() else '!!! NOT SET !!!'}")
     temp_log.info(f"  MILVUS_COLLECTION_NAME:       {settings.MILVUS_COLLECTION_NAME}")
     temp_log.info(f"  GCS_BUCKET_NAME:              {settings.GCS_BUCKET_NAME}")
     temp_log.info(f"  EMBEDDING_DIMENSION (Milvus): {settings.EMBEDDING_DIMENSION}")
@@ -1370,8 +1390,6 @@ except (ValidationError, ValueError) as e:
 except Exception as e:
     temp_log.exception(f"FATAL: Unexpected error loading Ingest Service settings: {e}")
     sys.exit(1)
-
-# jfu
 ```
 
 ## File: `app\core\logging_config.py`
@@ -2737,16 +2755,21 @@ def _ensure_milvus_connection_and_collection_for_pipeline(alias: str = "pipeline
 
     if not connection_exists:
         uri = settings.MILVUS_URI
-        connect_log.info("Connecting to Milvus for pipeline worker indexing...", uri=uri)
+        connect_log.info("Connecting to Milvus (Zilliz) for pipeline worker indexing...", uri=uri)
         try:
-            connections.connect(alias=alias, uri=uri, timeout=settings.MILVUS_GRPC_TIMEOUT)
-            connect_log.info("Connected to Milvus for pipeline worker indexing.")
+            connections.connect(
+                alias=alias,
+                uri=uri,
+                timeout=settings.MILVUS_GRPC_TIMEOUT,
+                token=settings.ZILLIZ_API_KEY.get_secret_value() if settings.ZILLIZ_API_KEY else None
+            )
+            connect_log.info("Connected to Milvus (Zilliz) for pipeline worker indexing.")
         except MilvusException as e:
-            connect_log.error("Failed to connect to Milvus for pipeline worker indexing.", error=str(e))
-            raise ConnectionError(f"Milvus connection failed: {e}") from e
+            connect_log.error("Failed to connect to Milvus (Zilliz) for pipeline worker indexing.", error=str(e))
+            raise ConnectionError(f"Milvus (Zilliz) connection failed: {e}") from e
         except Exception as e:
-            connect_log.error("Unexpected error connecting to Milvus for pipeline worker indexing.", error=str(e))
-            raise ConnectionError(f"Unexpected Milvus connection error: {e}") from e
+            connect_log.error("Unexpected error connecting to Milvus (Zilliz) for pipeline worker indexing.", error=str(e))
+            raise ConnectionError(f"Unexpected Milvus (Zilliz) connection error: {e}") from e
 
     # Check and initialize collection if needed
     if _milvus_collection_pipeline is None or _milvus_collection_pipeline.name != MILVUS_COLLECTION_NAME:
@@ -3480,7 +3503,7 @@ structlog = "^24.1.0"
 google-cloud-storage = "^2.16.0"
 
 # --- Core Processing Dependencies (v0.3.2) ---
-pymilvus = ">=2.4.1,<2.5.0"
+pymilvus = "==2.5.3"
 tiktoken = "^0.7.0"
 
 

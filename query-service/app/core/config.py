@@ -15,7 +15,8 @@ POSTGRES_K8S_DB_DEFAULT = "atenex"
 POSTGRES_K8S_USER_DEFAULT = "postgres"
 
 # Milvus
-MILVUS_K8S_DEFAULT_URI = "http://milvus-standalone.nyro-develop.svc.cluster.local:19530"
+# MILVUS_K8S_DEFAULT_URI = "http://milvus-standalone.nyro-develop.svc.cluster.local:19530" # No longer default
+ZILLIZ_ENDPOINT_DEFAULT = "https://in03-0afab716eb46d7f.serverless.gcp-us-west1.cloud.zilliz.com"
 MILVUS_DEFAULT_COLLECTION = "document_chunks_minilm"
 MILVUS_DEFAULT_EMBEDDING_FIELD = "embedding"
 MILVUS_DEFAULT_CONTENT_FIELD = "content"
@@ -143,8 +144,36 @@ class Settings(BaseSettings):
     POSTGRES_PORT: int = Field(default=POSTGRES_K8S_PORT_DEFAULT)
     POSTGRES_DB: str = Field(default=POSTGRES_K8S_DB_DEFAULT)
 
-    # --- Vector Store (Milvus) ---
-    MILVUS_URI: AnyHttpUrl = Field(default=AnyHttpUrl(MILVUS_K8S_DEFAULT_URI))
+    # --- Vector Store (Milvus/Zilliz) ---
+    ZILLIZ_API_KEY: SecretStr = Field(description="API Key for Zilliz Cloud connection.")
+    MILVUS_URI: AnyHttpUrl = Field(default_factory=lambda: AnyHttpUrl(ZILLIZ_ENDPOINT_DEFAULT))
+
+    @field_validator('MILVUS_URI', mode='before')
+    @classmethod
+    def validate_milvus_uri(cls, v: Any) -> AnyHttpUrl:
+        if not isinstance(v, str):
+            raise ValueError("MILVUS_URI must be a string.")
+        v_strip = v.strip()
+        if not v_strip.startswith("https://"):
+            raise ValueError(f"Invalid Zilliz URI: Must start with https://. Received: '{v_strip}'")
+        try:
+            validated_url = AnyHttpUrl(v_strip)
+            return validated_url
+        except Exception as e:
+            raise ValueError(f"Invalid Milvus URI format '{v_strip}': {e}") from e
+
+    @field_validator('ZILLIZ_API_KEY', mode='before')
+    @classmethod
+    def check_zilliz_key(cls, v: Any, info: ValidationInfo) -> Any:
+        # Allow SecretStr to be passed, check its content
+        if isinstance(v, SecretStr):
+            secret_value = v.get_secret_value()
+            if secret_value is None or secret_value == "":
+                raise ValueError(f"Required secret field 'QUERY_ZILLIZ_API_KEY' cannot be empty.")
+        elif v is None or v == "": # Handle direct string or None input before SecretStr conversion
+            raise ValueError(f"Required secret field 'QUERY_ZILLIZ_API_KEY' cannot be empty.")
+        return v
+
     MILVUS_COLLECTION_NAME: str = Field(default=MILVUS_DEFAULT_COLLECTION)
     MILVUS_EMBEDDING_FIELD: str = Field(default=MILVUS_DEFAULT_EMBEDDING_FIELD)
     MILVUS_CONTENT_FIELD: str = Field(default=MILVUS_DEFAULT_CONTENT_FIELD)
@@ -153,13 +182,14 @@ class Settings(BaseSettings):
     MILVUS_FILENAME_FIELD: str = Field(default=MILVUS_DEFAULT_FILENAME_FIELD)
     MILVUS_METADATA_FIELDS: List[str] = Field(default=MILVUS_DEFAULT_METADATA_FIELDS)
     MILVUS_GRPC_TIMEOUT: int = Field(default=MILVUS_DEFAULT_GRPC_TIMEOUT)
-    MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default=MILVUS_DEFAULT_SEARCH_PARAMS)
+    MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default_factory=lambda: MILVUS_DEFAULT_SEARCH_PARAMS.copy())
+
 
     # --- Embedding Settings (General) ---
     EMBEDDING_DIMENSION: int = Field(default=DEFAULT_EMBEDDING_DIMENSION, description="Dimension of embeddings, used for Milvus and validation.")
 
     # --- External Embedding Service ---
-    EMBEDDING_SERVICE_URL: AnyHttpUrl = Field(default=AnyHttpUrl(EMBEDDING_SERVICE_K8S_URL_DEFAULT), description="URL of the Atenex Embedding Service.")
+    EMBEDDING_SERVICE_URL: AnyHttpUrl = Field(default_factory=lambda: AnyHttpUrl(EMBEDDING_SERVICE_K8S_URL_DEFAULT), description="URL of the Atenex Embedding Service.")
     EMBEDDING_CLIENT_TIMEOUT: int = Field(default=30, description="Timeout in seconds for calls to the Embedding Service.")
 
 
@@ -169,7 +199,7 @@ class Settings(BaseSettings):
 
     # --- Reranker Settings ---
     RERANKER_ENABLED: bool = Field(default=DEFAULT_RERANKER_ENABLED)
-    RERANKER_SERVICE_URL: AnyHttpUrl = Field(default=AnyHttpUrl(RERANKER_SERVICE_K8S_URL_DEFAULT), description="URL of the Atenex Reranker Service.")
+    RERANKER_SERVICE_URL: AnyHttpUrl = Field(default_factory=lambda: AnyHttpUrl(RERANKER_SERVICE_K8S_URL_DEFAULT), description="URL of the Atenex Reranker Service.")
     RERANKER_CLIENT_TIMEOUT: int = Field(default=30, description="Timeout in seconds for calls to the Reranker Service.")
 
 
@@ -208,10 +238,15 @@ class Settings(BaseSettings):
     @field_validator('POSTGRES_PASSWORD', 'GEMINI_API_KEY', mode='before')
     @classmethod
     def check_secret_value_present(cls, v: Any, info: ValidationInfo) -> Any:
-        if v is None or (isinstance(v, str) and v == ""):
-            field_name = info.field_name if info.field_name else "Unknown Secret Field"
-            raise ValueError(f"Required secret field 'QUERY_{field_name.upper()}' cannot be empty.")
+         # Allow SecretStr to be passed, check its content
+        if isinstance(v, SecretStr):
+            secret_value = v.get_secret_value()
+            if secret_value is None or secret_value == "":
+                raise ValueError(f"Required secret field 'QUERY_{info.field_name.upper()}' cannot be empty.")
+        elif v is None or v == "": # Handle direct string or None input
+            raise ValueError(f"Required secret field 'QUERY_{info.field_name.upper()}' cannot be empty.")
         return v
+
 
     @field_validator('EMBEDDING_DIMENSION')
     @classmethod
@@ -225,9 +260,9 @@ class Settings(BaseSettings):
     @classmethod
     def check_max_context_chunks(cls, v: int, info: ValidationInfo) -> int:
         retriever_k = info.data.get('RETRIEVER_TOP_K', DEFAULT_RETRIEVER_TOP_K)
-        max_possible_after_fusion = retriever_k * 2
+        max_possible_after_fusion = retriever_k * 2 # Simplistic assumption, could be just retriever_k if no sparse
         if v > max_possible_after_fusion:
-            logging.warning(f"MAX_CONTEXT_CHUNKS ({v}) is greater than the maximum possible chunks after fusion ({max_possible_after_fusion} based on RETRIEVER_TOP_K={retriever_k}). Effective limit will be {max_possible_after_fusion}.")
+            logging.warning(f"MAX_CONTEXT_CHUNKS ({v}) is greater than a typical max after fusion based on RETRIEVER_TOP_K ({retriever_k}). Effective limit will be applied.")
         if v <= 0:
              raise ValueError("MAX_CONTEXT_CHUNKS must be a positive integer.")
         return v
@@ -248,7 +283,7 @@ class Settings(BaseSettings):
 temp_log = logging.getLogger("query_service.config.loader")
 if not temp_log.handlers:
     handler = logging.StreamHandler(sys.stdout)
-    formatter = logging.Formatter('%(levelname)s: [%(name)s] %(message)s')
+    formatter = logging.Formatter('%(levelname)s: [%(asctime)s] [%(name)s] %(message)s') # Added asctime
     handler.setFormatter(formatter)
     temp_log.addHandler(handler)
     temp_log.setLevel(logging.INFO)
@@ -256,21 +291,31 @@ if not temp_log.handlers:
 try:
     temp_log.info("Loading Query Service settings...")
     settings = Settings()
-    temp_log.info("Query Service Settings Loaded Successfully:")
-    log_data = settings.model_dump(exclude={'POSTGRES_PASSWORD', 'GEMINI_API_KEY'})
+    temp_log.info("--- Query Service Settings Loaded ---")
+    # Log settings, excluding sensitive ones and long templates by default
+    excluded_fields = {'POSTGRES_PASSWORD', 'GEMINI_API_KEY', 'ZILLIZ_API_KEY', 'RAG_PROMPT_TEMPLATE', 'GENERAL_PROMPT_TEMPLATE'}
+    log_data = settings.model_dump(exclude=excluded_fields)
+
     for key, value in log_data.items():
-        if key.endswith('_PROMPT_TEMPLATE') and isinstance(value, str) and len(value) > 200:
-             temp_log.info(f"  {key.upper()}: {value[:100]}... (truncated)")
-        else:
-             temp_log.info(f"  {key.upper()}: {value}")
-    temp_log.info(f"  POSTGRES_PASSWORD: *** SET ***")
-    temp_log.info(f"  GEMINI_API_KEY: *** SET ***")
+        temp_log.info(f"  {key.upper()}: {value}")
+
+    # Log status of sensitive fields and templates
+    pg_pass_status = '*** SET ***' if settings.POSTGRES_PASSWORD and settings.POSTGRES_PASSWORD.get_secret_value() else '!!! NOT SET !!!'
+    temp_log.info(f"  POSTGRES_PASSWORD:            {pg_pass_status}")
+    gemini_key_status = '*** SET ***' if settings.GEMINI_API_KEY and settings.GEMINI_API_KEY.get_secret_value() else '!!! NOT SET !!!'
+    temp_log.info(f"  GEMINI_API_KEY:               {gemini_key_status}")
+    zilliz_api_key_status = '*** SET ***' if settings.ZILLIZ_API_KEY and settings.ZILLIZ_API_KEY.get_secret_value() else '!!! NOT SET !!!'
+    temp_log.info(f"  ZILLIZ_API_KEY:               {zilliz_api_key_status}") # ADDED LOG FOR ZILLIZ_API_KEY
+    temp_log.info(f"  RAG_PROMPT_TEMPLATE:          Present (length: {len(settings.RAG_PROMPT_TEMPLATE)})")
+    temp_log.info(f"  GENERAL_PROMPT_TEMPLATE:      Present (length: {len(settings.GENERAL_PROMPT_TEMPLATE)})")
+    temp_log.info(f"------------------------------------")
+
 
 except (ValidationError, ValueError) as e:
     error_details = ""
     if isinstance(e, ValidationError):
         try: error_details = f"\nValidation Errors:\n{json.dumps(e.errors(), indent=2)}"
-        except Exception: error_details = f"\nRaw Errors: {e}"
+        except Exception: error_details = f"\nRaw Errors: {e}" # Fallback for e.errors()
     else: error_details = f"\nError: {e}"
     temp_log.critical(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     temp_log.critical(f"! FATAL: Query Service configuration validation failed!{error_details}")

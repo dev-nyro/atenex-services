@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 
 # --- Service Names en K8s ---
 POSTGRES_K8S_SVC = "postgresql-service.nyro-develop.svc.cluster.local"
-MILVUS_K8S_SVC = "milvus-standalone.nyro-develop.svc.cluster.local"
+# MILVUS_K8S_SVC = "milvus-standalone.nyro-develop.svc.cluster.local" # No longer default for URI
 REDIS_K8S_SVC = "redis-service-master.nyro-develop.svc.cluster.local"
 EMBEDDING_SERVICE_K8S_SVC = "embedding-service.nyro-develop.svc.cluster.local"
 DOCPROC_SERVICE_K8S_SVC = "docproc-service.nyro-develop.svc.cluster.local"
@@ -23,9 +23,9 @@ DOCPROC_SERVICE_K8S_SVC = "docproc-service.nyro-develop.svc.cluster.local"
 POSTGRES_K8S_PORT_DEFAULT = 5432
 POSTGRES_K8S_DB_DEFAULT = "atenex"
 POSTGRES_K8S_USER_DEFAULT = "postgres"
-MILVUS_K8S_PORT_DEFAULT = 19530
-# --- Default URI ahora incluye http:// ---
-DEFAULT_MILVUS_URI = f"http://{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}"
+# MILVUS_K8S_PORT_DEFAULT = 19530 # No longer default for URI
+ZILLIZ_ENDPOINT_DEFAULT = "https://in03-0afab716eb46d7f.serverless.gcp-us-west1.cloud.zilliz.com"
+# DEFAULT_MILVUS_URI = f"http://{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}" # Replaced by ZILLIZ_ENDPOINT_DEFAULT
 MILVUS_DEFAULT_COLLECTION = "document_chunks_minilm"
 MILVUS_DEFAULT_INDEX_PARAMS = '{"metric_type": "IP", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}}'
 MILVUS_DEFAULT_SEARCH_PARAMS = '{"metric_type": "IP", "params": {"ef": 128}}'
@@ -55,12 +55,13 @@ class Settings(BaseSettings):
     POSTGRES_PORT: int = POSTGRES_K8S_PORT_DEFAULT
     POSTGRES_DB: str = POSTGRES_K8S_DB_DEFAULT
 
+    ZILLIZ_API_KEY: SecretStr = Field(description="API Key for Zilliz Cloud connection.")
     MILVUS_URI: str = Field(
-        default=DEFAULT_MILVUS_URI,
-        description="Milvus connection URI (including scheme, e.g., 'http://host:port'). Pymilvus requires the scheme."
+        default=ZILLIZ_ENDPOINT_DEFAULT,
+        description="Milvus connection URI (Zilliz Cloud HTTPS endpoint)."
     )
     MILVUS_COLLECTION_NAME: str = MILVUS_DEFAULT_COLLECTION
-    MILVUS_GRPC_TIMEOUT: int = 10
+    MILVUS_GRPC_TIMEOUT: int = 10 # Default timeout, can be adjusted via ENV
     MILVUS_CONTENT_FIELD: str = "content"
     MILVUS_EMBEDDING_FIELD: str = "embedding"
     MILVUS_CONTENT_FIELD_MAX_LENGTH: int = 20000
@@ -70,8 +71,8 @@ class Settings(BaseSettings):
     GCS_BUCKET_NAME: str = Field(default="atenex", description="Name of the Google Cloud Storage bucket for storing original files.")
 
     EMBEDDING_DIMENSION: int = Field(default=DEFAULT_EMBEDDING_DIM, description="Dimension of embeddings expected from the embedding service, used for Milvus schema.")
-    INGEST_EMBEDDING_SERVICE_URL: AnyHttpUrl = Field(default=DEFAULT_EMBEDDING_SERVICE_URL, description="URL of the external embedding service.")
-    INGEST_DOCPROC_SERVICE_URL: AnyHttpUrl = Field(default=DEFAULT_DOCPROC_SERVICE_URL, description="URL of the external document processing service.")
+    INGEST_EMBEDDING_SERVICE_URL: AnyHttpUrl = Field(default_factory=lambda: AnyHttpUrl(DEFAULT_EMBEDDING_SERVICE_URL), description="URL of the external embedding service.")
+    INGEST_DOCPROC_SERVICE_URL: AnyHttpUrl = Field(default_factory=lambda: AnyHttpUrl(DEFAULT_DOCPROC_SERVICE_URL), description="URL of the external document processing service.")
 
     TIKTOKEN_ENCODING_NAME: str = Field(default=DEFAULT_TIKTOKEN_ENCODING, description="Name of the tiktoken encoding to use for token counting.")
 
@@ -100,6 +101,7 @@ class Settings(BaseSettings):
     @classmethod
     def check_embedding_dimension(cls, v: int, info: ValidationInfo) -> int:
         if v <= 0: raise ValueError("EMBEDDING_DIMENSION must be a positive integer.")
+        # Using standard logging as temp_log might not be configured yet or this is cleaner for validators
         logging.debug(f"Using EMBEDDING_DIMENSION for Milvus schema: {v}")
         return v
 
@@ -108,51 +110,37 @@ class Settings(BaseSettings):
     def check_required_secret_value_present(cls, v: Any, info: ValidationInfo) -> Any:
         if v is None or v == "":
              field_name = info.field_name if info.field_name else "Unknown Secret Field"
-             raise ValueError(f"Required secret field '{field_name}' cannot be empty.")
+             # Using generic field_name from info, as this validator is generic
+             raise ValueError(f"Required secret field '{field_name}' (mapped from INGEST_{field_name.upper()}) cannot be empty.")
         return v
 
-    # --- START CORRECTION: Modify Milvus URI Validator ---
     @field_validator('MILVUS_URI', mode='before')
     @classmethod
     def validate_milvus_uri(cls, v: Any) -> str:
         if not isinstance(v, str):
             raise ValueError("MILVUS_URI must be a string.")
-
-        val_log = logging.getLogger("ingest_service.config.validator.milvus")
-        val_log.debug(f"Validating MILVUS_URI input: '{v}'")
         v_strip = v.strip()
+        if not v_strip.startswith("https://"): # Zilliz uses HTTPS
+            raise ValueError(f"Invalid Zilliz URI: Must start with https://. Received: '{v_strip}'")
+        try:
+            parsed = urlparse(v_strip)
+            if not parsed.hostname:
+                raise ValueError(f"Invalid URI: Missing hostname in '{v_strip}'")
+            # Zilliz Cloud endpoints usually do not require a port in the URI (HTTPS implies 443)
+            # If a port is present, urlparse will handle it.
+            return v_strip # Mantener HTTPS URI tal cual
+        except Exception as e:
+            raise ValueError(f"Invalid Milvus URI format '{v_strip}': {e}") from e
 
-        if v_strip.startswith("http://") or v_strip.startswith("https://") or v_strip.startswith("tcp://"):
-            try:
-                # Basic validation: Check if it has a host part after the scheme
-                parsed = urlparse(v_strip)
-                if not parsed.hostname:
-                    raise ValueError(f"Invalid URI: Missing hostname in '{v_strip}'")
-                if not parsed.port:
-                    val_log.warning(f"MILVUS_URI '{v_strip}' provided without a port. Using as is, ensure Milvus default port is intended or connection works.")
-                val_log.debug(f"MILVUS_URI '{v_strip}' has a valid scheme. Using as is.")
-                return v_strip # Keep the scheme
-            except Exception as e:
-                raise ValueError(f"Invalid Milvus URI format with scheme '{v_strip}': {e}") from e
-        elif ":" in v_strip and not "/" in v_strip: # Check for host:port format (no scheme)
-            parts = v_strip.split(':', 1)
-            if len(parts) == 2 and parts[1].isdigit():
-                # Prepend http:// as default for pymilvus connect compatibility
-                transformed_uri = f"http://{v_strip}"
-                val_log.debug(f"Prepended 'http://' to MILVUS_URI. Storing as '{transformed_uri}'")
-                return transformed_uri
-            elif len(parts) == 1 and "." in parts[0]: # Only hostname without scheme or port
-                 val_log.warning(f"MILVUS_URI '{v_strip}' is only a hostname. Defaulting to 'http://{v_strip}:19530'. Ensure this is correct.")
-                 return f"http://{v_strip}:19530" # Add default scheme and port
-            else: # Invalid host:port format
-                raise ValueError(f"Invalid Milvus URI format '{v_strip}'. Expected 'scheme://host:port' or 'host:port'.")
-        elif "." in v_strip and not "/" in v_strip and not ":" in v_strip: # Only hostname
-            val_log.warning(f"MILVUS_URI '{v_strip}' is only a hostname. Defaulting to 'http://{v_strip}:19530'. Ensure this is correct.")
-            return f"http://{v_strip}:19530" # Add default scheme and port
-        else: # Does not match any expected format
-            raise ValueError(f"Unsupported Milvus URI format: {v_strip}. Expected 'scheme://host:port' or 'host:port'.")
-    # --- END CORRECTION: Modify Milvus URI Validator ---
-
+    @field_validator('ZILLIZ_API_KEY', mode='before')
+    @classmethod
+    def check_zilliz_key(cls, v: Any, info: ValidationInfo) -> Any:
+         if v is None or v == "" or (isinstance(v, SecretStr) and not v.get_secret_value()):
+            # The plan's error message refers to 'INGEST_ZILLIZ_API_KEY' which is the env var.
+            # Pydantic's info.field_name will be 'ZILLIZ_API_KEY'.
+            # For clarity, we'll use the env var name as per the plan.
+            raise ValueError(f"Required secret field for Zilliz (expected as INGEST_ZILLIZ_API_KEY) cannot be empty.")
+         return v
 
     @field_validator('INGEST_EMBEDDING_SERVICE_URL', 'INGEST_DOCPROC_SERVICE_URL', mode='before')
     @classmethod
@@ -161,19 +149,19 @@ class Settings(BaseSettings):
             "INGEST_EMBEDDING_SERVICE_URL": DEFAULT_EMBEDDING_SERVICE_URL,
             "INGEST_DOCPROC_SERVICE_URL": DEFAULT_DOCPROC_SERVICE_URL
         }
-        default_url_key = str(info.field_name) if info.field_name else ""
+        # Ensure info.field_name is valid before using it as a key
+        default_url_key = str(info.field_name) if info.field_name and info.field_name in default_map else ""
         default_url = default_map.get(default_url_key, "")
 
-        url_to_validate = v or default_url
+        url_to_validate = v if v is not None else default_url # Prioritize env var over default
         if not url_to_validate:
-            raise ValueError(f"URL for {default_url_key} cannot be empty.")
+            raise ValueError(f"URL for {default_url_key or info.field_name} cannot be empty and no default is set.")
 
-        # Use Pydantic's AnyHttpUrl validation directly
         try:
             validated_url = AnyHttpUrl(url_to_validate)
-            return str(validated_url) # Return as string
+            return str(validated_url)
         except ValidationError as ve:
-             raise ValueError(f"Invalid URL format for {default_url_key}: {ve}") from ve
+             raise ValueError(f"Invalid URL format for {default_url_key or info.field_name}: {ve}") from ve
 
 
 temp_log = logging.getLogger("ingest_service.config.loader")
@@ -182,7 +170,7 @@ if not temp_log.handlers:
     formatter = logging.Formatter('%(levelname)-8s [%(asctime)s] [%(name)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
     handler.setFormatter(formatter)
     temp_log.addHandler(handler)
-    temp_log.setLevel(logging.INFO)
+    temp_log.setLevel(logging.INFO) # Ensure temp_log level is appropriate
 
 try:
     temp_log.info("Loading Ingest Service settings...")
@@ -196,10 +184,13 @@ try:
     temp_log.info(f"  POSTGRES_SERVER:              {settings.POSTGRES_SERVER}:{settings.POSTGRES_PORT}")
     temp_log.info(f"  POSTGRES_DB:                  {settings.POSTGRES_DB}")
     temp_log.info(f"  POSTGRES_USER:                {settings.POSTGRES_USER}")
-    temp_log.info(f"  POSTGRES_PASSWORD:            {'*** SET ***' if settings.POSTGRES_PASSWORD and settings.POSTGRES_PASSWORD.get_secret_value() else '!!! NOT SET !!!'}")
-    # --- Log the corrected MILVUS_URI format ---
-    temp_log.info(f"  MILVUS_URI (for Pymilvus):    {settings.MILVUS_URI}") # Will now include http://
+    pg_pass_status = '*** SET ***' if settings.POSTGRES_PASSWORD and settings.POSTGRES_PASSWORD.get_secret_value() else '!!! NOT SET !!!'
+    temp_log.info(f"  POSTGRES_PASSWORD:            {pg_pass_status}")
+    temp_log.info(f"  MILVUS_URI (for Pymilvus):    {settings.MILVUS_URI}")
+    zilliz_api_key_status = '*** SET ***' if settings.ZILLIZ_API_KEY and settings.ZILLIZ_API_KEY.get_secret_value() else '!!! NOT SET !!!'
+    temp_log.info(f"  ZILLIZ_API_KEY:               {zilliz_api_key_status}")
     temp_log.info(f"  MILVUS_COLLECTION_NAME:       {settings.MILVUS_COLLECTION_NAME}")
+    temp_log.info(f"  MILVUS_GRPC_TIMEOUT:          {settings.MILVUS_GRPC_TIMEOUT}")
     temp_log.info(f"  GCS_BUCKET_NAME:              {settings.GCS_BUCKET_NAME}")
     temp_log.info(f"  EMBEDDING_DIMENSION (Milvus): {settings.EMBEDDING_DIMENSION}")
     temp_log.info(f"  INGEST_EMBEDDING_SERVICE_URL: {settings.INGEST_EMBEDDING_SERVICE_URL}")
@@ -221,6 +212,6 @@ except (ValidationError, ValueError) as e:
     temp_log.critical(f"! Original Error Type: {type(e).__name__}")
     temp_log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     sys.exit(1)
-except Exception as e:
+except Exception as e: # Catch any other unexpected error during settings load
     temp_log.exception(f"FATAL: Unexpected error loading Ingest Service settings: {e}")
     sys.exit(1)

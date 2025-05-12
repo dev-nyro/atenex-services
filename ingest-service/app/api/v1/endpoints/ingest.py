@@ -91,13 +91,18 @@ def _get_milvus_collection_sync() -> Collection:
     alias = "api_sync_helper"
     sync_milvus_log = log.bind(component="MilvusHelperSync", alias=alias)
     if alias not in connections.list_connections():
-        sync_milvus_log.info("Connecting to Milvus for sync helper...")
+        sync_milvus_log.info("Connecting to Milvus (Zilliz) for sync helper...")
         try:
-            connections.connect(alias=alias, uri=settings.MILVUS_URI, timeout=settings.MILVUS_GRPC_TIMEOUT)
-            sync_milvus_log.info("Milvus connection established for sync helper.")
+            connections.connect(
+                alias=alias,
+                uri=settings.MILVUS_URI,
+                timeout=settings.MILVUS_GRPC_TIMEOUT,
+                token=settings.ZILLIZ_API_KEY.get_secret_value() if settings.ZILLIZ_API_KEY else None
+            )
+            sync_milvus_log.info("Milvus (Zilliz) connection established for sync helper.")
         except MilvusException as e:
-            sync_milvus_log.error("Failed to connect to Milvus for sync helper", error=str(e))
-            raise RuntimeError(f"Milvus connection failed for API helper: {e}") from e
+            sync_milvus_log.error("Failed to connect to Milvus (Zilliz) for sync helper", error=str(e))
+            raise RuntimeError(f"Milvus (Zilliz) connection failed for API helper: {e}") from e
     else:
         sync_milvus_log.debug("Reusing existing Milvus connection for sync helper.")
     try:

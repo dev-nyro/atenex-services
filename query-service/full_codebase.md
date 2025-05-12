@@ -1374,7 +1374,28 @@ class Settings(BaseSettings):
     POSTGRES_DB: str = Field(default=POSTGRES_K8S_DB_DEFAULT)
 
     # --- Vector Store (Milvus) ---
-    MILVUS_URI: AnyHttpUrl = Field(default=AnyHttpUrl(MILVUS_K8S_DEFAULT_URI))
+    ZILLIZ_API_KEY: SecretStr = Field(description="API Key for Zilliz Cloud connection.")
+    MILVUS_URI: AnyHttpUrl = Field(default="https://in03-0afab716eb46d7f.serverless.gcp-us-west1.cloud.zilliz.com")
+    @field_validator('MILVUS_URI', mode='before')
+    @classmethod
+    def validate_milvus_uri(cls, v: Any) -> AnyHttpUrl:
+        if not isinstance(v, str):
+            raise ValueError("MILVUS_URI must be a string.")
+        v_strip = v.strip()
+        if not v_strip.startswith("https://"):
+            raise ValueError(f"Invalid Zilliz URI: Must start with https://. Received: '{v_strip}'")
+        try:
+            validated_url = AnyHttpUrl(v_strip)
+            return validated_url
+        except Exception as e:
+            raise ValueError(f"Invalid Milvus URI format '{v_strip}': {e}") from e
+
+    @field_validator('ZILLIZ_API_KEY', mode='before')
+    @classmethod
+    def check_zilliz_key(cls, v: Any, info: ValidationInfo) -> Any:
+        if v is None or v == "":
+            raise ValueError(f"Required secret field 'QUERY_ZILLIZ_API_KEY' cannot be empty.")
+        return v
     MILVUS_COLLECTION_NAME: str = Field(default=MILVUS_DEFAULT_COLLECTION)
     MILVUS_EMBEDDING_FIELD: str = Field(default=MILVUS_DEFAULT_EMBEDDING_FIELD)
     MILVUS_CONTENT_FIELD: str = Field(default=MILVUS_DEFAULT_CONTENT_FIELD)
@@ -2868,19 +2889,24 @@ class MilvusAdapter(VectorStorePort):
         if not self._connected or self._alias not in connections.list_connections():
             uri = str(settings.MILVUS_URI)
             connect_log = log.bind(adapter="MilvusAdapter", action="connect", uri=uri, alias=self._alias)
-            connect_log.debug("Attempting to connect to Milvus...")
+            connect_log.debug("Attempting to connect to Milvus (Zilliz)...")
             try:
-                connections.connect(alias=self._alias, uri=uri, timeout=settings.MILVUS_GRPC_TIMEOUT)
+                connections.connect(
+                    alias=self._alias,
+                    uri=uri,
+                    token=settings.ZILLIZ_API_KEY.get_secret_value(),
+                    timeout=settings.MILVUS_GRPC_TIMEOUT
+                )
                 self._connected = True
-                connect_log.info("Connected to Milvus successfully.")
+                connect_log.info("Connected to Milvus (Zilliz) successfully.")
             except MilvusException as e:
-                connect_log.error("Failed to connect to Milvus.", error_code=e.code, error_message=e.message)
+                connect_log.error("Failed to connect to Milvus (Zilliz).", error_code=e.code, error_message=e.message)
                 self._connected = False
-                raise ConnectionError(f"Milvus connection failed (Code: {e.code}): {e.message}") from e
+                raise ConnectionError(f"Milvus (Zilliz) connection failed (Code: {e.code}): {e.message}") from e
             except Exception as e:
-                connect_log.error("Unexpected error connecting to Milvus.", error=str(e), exc_info=True)
+                connect_log.error("Unexpected error connecting to Milvus (Zilliz).", error=str(e), exc_info=True)
                 self._connected = False
-                raise ConnectionError(f"Unexpected Milvus connection error: {e}") from e
+                raise ConnectionError(f"Unexpected Milvus (Zilliz) connection error: {e}") from e
 
     async def _get_collection(self) -> Collection:
         """Gets the Milvus collection object, ensuring connection and loading."""

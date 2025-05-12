@@ -69,16 +69,21 @@ def _ensure_milvus_connection_and_collection_for_pipeline(alias: str = "pipeline
 
     if not connection_exists:
         uri = settings.MILVUS_URI
-        connect_log.info("Connecting to Milvus for pipeline worker indexing...", uri=uri)
+        connect_log.info("Connecting to Milvus (Zilliz) for pipeline worker indexing...", uri=uri)
         try:
-            connections.connect(alias=alias, uri=uri, timeout=settings.MILVUS_GRPC_TIMEOUT)
-            connect_log.info("Connected to Milvus for pipeline worker indexing.")
+            connections.connect(
+                alias=alias,
+                uri=uri,
+                timeout=settings.MILVUS_GRPC_TIMEOUT,
+                token=settings.ZILLIZ_API_KEY.get_secret_value() if settings.ZILLIZ_API_KEY else None
+            )
+            connect_log.info("Connected to Milvus (Zilliz) for pipeline worker indexing.")
         except MilvusException as e:
-            connect_log.error("Failed to connect to Milvus for pipeline worker indexing.", error=str(e))
-            raise ConnectionError(f"Milvus connection failed: {e}") from e
+            connect_log.error("Failed to connect to Milvus (Zilliz) for pipeline worker indexing.", error=str(e))
+            raise ConnectionError(f"Milvus (Zilliz) connection failed: {e}") from e
         except Exception as e:
-            connect_log.error("Unexpected error connecting to Milvus for pipeline worker indexing.", error=str(e))
-            raise ConnectionError(f"Unexpected Milvus connection error: {e}") from e
+            connect_log.error("Unexpected error connecting to Milvus (Zilliz) for pipeline worker indexing.", error=str(e))
+            raise ConnectionError(f"Unexpected Milvus (Zilliz) connection error: {e}") from e
 
     # Check and initialize collection if needed
     if _milvus_collection_pipeline is None or _milvus_collection_pipeline.name != MILVUS_COLLECTION_NAME:
