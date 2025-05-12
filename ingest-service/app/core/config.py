@@ -9,6 +9,7 @@ from pydantic import (
 )
 import sys
 import json
+from urllib.parse import urlparse # Añadir import
 
 # --- Service Names en K8s ---
 POSTGRES_K8S_SVC = "postgresql-service.nyro-develop.svc.cluster.local"
@@ -51,7 +52,10 @@ class Settings(BaseSettings):
     POSTGRES_PORT: int = POSTGRES_K8S_PORT_DEFAULT
     POSTGRES_DB: str = POSTGRES_K8S_DB_DEFAULT
 
-    MILVUS_URI: str = Field(default=f"http://{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}")
+    MILVUS_URI: str = Field(
+        default=f"http://{MILVUS_K8S_SVC}:{MILVUS_K8S_PORT_DEFAULT}", # Default is http for clarity of input
+        description="Milvus connection URI. Input can be 'http(s)://host:port' or 'host:port'. Stored as 'host:port'."
+    )
     MILVUS_COLLECTION_NAME: str = MILVUS_DEFAULT_COLLECTION
     MILVUS_GRPC_TIMEOUT: int = 10
     MILVUS_CONTENT_FIELD: str = "content"
@@ -106,13 +110,42 @@ class Settings(BaseSettings):
 
     @field_validator('MILVUS_URI', mode='before')
     @classmethod
-    def validate_milvus_uri(cls, v: str) -> str:
-        if not v.startswith("http://") and not v.startswith("https://"):
-             if "." not in v: # Assume it's a K8s service name without scheme
-                 return f"http://{v}"
-             # If it has a dot but no scheme, it's likely an invalid format
-             raise ValueError(f"Invalid MILVUS_URI format: '{v}'. Must start with 'http://' or 'https://' or be a valid service name.")
-        return v
+    def validate_milvus_uri(cls, v: Any) -> str:
+        if not isinstance(v, str):
+            raise ValueError("MILVUS_URI must be a string.")
+
+        val_log = logging.getLogger("ingest_service.config.validator.milvus") # Specific logger for this validator
+        val_log.debug(f"Validating MILVUS_URI input: '{v}'")
+
+        if v.startswith("http://") or v.startswith("https://"):
+            try:
+                parsed = urlparse(v)
+                if parsed.hostname and parsed.port:
+                    transformed_uri = f"{parsed.hostname}:{parsed.port}"
+                    val_log.debug(f"Transformed MILVUS_URI from '{v}' to '{transformed_uri}'")
+                    return transformed_uri
+                elif parsed.hostname: # Should ideally have port for Milvus
+                    val_log.warning(f"MILVUS_URI '{v}' parsed to only hostname '{parsed.hostname}'. Pymilvus might assume default port. Ensure this is intended.")
+                    return parsed.hostname
+                else:
+                    raise ValueError(f"Could not extract hostname from Milvus URI: {v}")
+            except Exception as e:
+                raise ValueError(f"Invalid http(s) Milvus URI format '{v}': {e}") from e
+        elif ":" in v and not "/" in v: # Check for host:port format
+            parts = v.split(':', 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                val_log.debug(f"MILVUS_URI '{v}' already in 'host:port' format.")
+                return v 
+            elif len(parts) == 1 and "." in parts[0]: # Only hostname
+                 val_log.warning(f"MILVUS_URI '{v}' is only a hostname. Pymilvus might assume default port. Ensure this is intended.")
+                 return v
+            else: # Invalid format if it contains ':' but not as host:port
+                raise ValueError(f"Invalid Milvus URI format '{v}'. Expected 'host:port', 'hostname', or 'http(s)://host:port'.")
+        elif "." in v and not "/" in v and not ":" in v: # Only hostname
+            val_log.warning(f"MILVUS_URI '{v}' is only a hostname. Pymilvus might assume default port. Ensure this is intended.")
+            return v
+        else: # Does not match any expected format
+            raise ValueError(f"Unsupported Milvus URI format: {v}. Expected 'host:port', 'hostname', or 'http(s)://host:port'.")
 
     @field_validator('INGEST_EMBEDDING_SERVICE_URL', 'INGEST_DOCPROC_SERVICE_URL', mode='before')
     @classmethod
@@ -121,12 +154,11 @@ class Settings(BaseSettings):
             "INGEST_EMBEDDING_SERVICE_URL": DEFAULT_EMBEDDING_SERVICE_URL,
             "INGEST_DOCPROC_SERVICE_URL": DEFAULT_DOCPROC_SERVICE_URL
         }
-        # Ensure info.field_name is not None before using it as a key
         default_url_key = str(info.field_name) if info.field_name else ""
         default_url = default_map.get(default_url_key, "")
         
         url_to_validate = v or default_url
-        if not url_to_validate: # Should not happen if defaults are correctly set
+        if not url_to_validate:
             raise ValueError(f"URL for {default_url_key} cannot be empty.")
             
         return str(AnyHttpUrl(url_to_validate))
@@ -153,7 +185,7 @@ try:
     temp_log.info(f"  POSTGRES_DB:                  {settings.POSTGRES_DB}")
     temp_log.info(f"  POSTGRES_USER:                {settings.POSTGRES_USER}")
     temp_log.info(f"  POSTGRES_PASSWORD:            {'*** SET ***' if settings.POSTGRES_PASSWORD and settings.POSTGRES_PASSWORD.get_secret_value() else '!!! NOT SET !!!'}")
-    temp_log.info(f"  MILVUS_URI:                   {settings.MILVUS_URI}")
+    temp_log.info(f"  MILVUS_URI (for Pymilvus):    {settings.MILVUS_URI}")
     temp_log.info(f"  MILVUS_COLLECTION_NAME:       {settings.MILVUS_COLLECTION_NAME}")
     temp_log.info(f"  GCS_BUCKET_NAME:              {settings.GCS_BUCKET_NAME}")
     temp_log.info(f"  EMBEDDING_DIMENSION (Milvus): {settings.EMBEDDING_DIMENSION}")
