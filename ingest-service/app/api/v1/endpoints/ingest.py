@@ -1,3 +1,98 @@
+from fastapi import Body
+from typing import List, Dict, Any
+# --- Bulk Delete Endpoint ---
+@router.delete(
+    "/bulk",
+    status_code=status.HTTP_200_OK,
+    summary="Bulk delete documents and all associated data (DB, GCS, Zilliz)",
+    response_model=Dict[str, Any],
+    responses={
+        200: {"description": "Bulk delete result: lists of deleted and failed IDs."},
+        401: {"model": ErrorDetail, "description": "Unauthorized"},
+        422: {"model": ErrorDetail, "description": "Validation Error (Missing Headers or Invalid Body)"},
+        500: {"model": ErrorDetail, "description": "Internal Server Error"},
+    }
+)
+async def bulk_delete_documents(
+    request: Request,
+    body: Dict[str, List[str]] = Body(..., example={"document_ids": ["id1", "id2"]}),
+    gcs_client: GCSClient = Depends(get_gcs_client),
+):
+    """
+    Bulk deletes documents: removes from Milvus (Zilliz), GCS, and PostgreSQL.
+    Continues on error, returns lists of deleted and failed IDs with reasons.
+    """
+    company_id = request.headers.get("X-Company-ID")
+    req_id = getattr(request.state, 'request_id', 'N/A')
+    if not company_id:
+        log.bind(request_id=req_id).warning("Missing X-Company-ID header in bulk_delete_documents")
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing required header: X-Company-ID")
+    try:
+        company_uuid = uuid.UUID(company_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Company ID format.")
+
+    document_ids = body.get("document_ids")
+    if not document_ids or not isinstance(document_ids, list):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Body must include 'document_ids' as a list.")
+
+    deleted: List[str] = []
+    failed: List[Dict[str, str]] = []
+
+    for doc_id in document_ids:
+        try:
+            doc_uuid = uuid.UUID(doc_id)
+        except Exception:
+            failed.append({"id": doc_id, "error": "ID inválido"})
+            continue
+        try:
+            # Reuse the single delete logic for each document
+            # (simulate a request for each, but keep the same company_id)
+            # This logic is similar to delete_document_endpoint
+            doc_data = None
+            async with get_db_conn() as conn:
+                doc_data = await api_db_retry_strategy(db_client.get_document_by_id)(
+                    conn, doc_id=doc_uuid, company_id=company_uuid
+                )
+            if not doc_data:
+                failed.append({"id": doc_id, "error": "No encontrado"})
+                continue
+            errors = []
+            # 1. Milvus
+            loop = asyncio.get_running_loop()
+            try:
+                milvus_deleted = await loop.run_in_executor(None, _delete_milvus_sync, str(doc_uuid), company_id)
+                if not milvus_deleted:
+                    errors.append("Milvus")
+            except Exception as e:
+                errors.append(f"Milvus: {type(e).__name__}")
+            # 2. GCS
+            gcs_path = doc_data.get('file_path')
+            if gcs_path:
+                try:
+                    await gcs_client.delete_file_async(gcs_path)
+                except Exception as e:
+                    errors.append(f"GCS: {type(e).__name__}")
+            else:
+                errors.append("GCS: path desconocido")
+            # 3. PostgreSQL
+            try:
+                async with get_db_conn() as conn:
+                    deleted_in_db = await api_db_retry_strategy(db_client.delete_document)(
+                        conn=conn, doc_id=doc_uuid, company_id=company_uuid
+                    )
+                if not deleted_in_db:
+                    errors.append("DB: no eliminado")
+            except Exception as e:
+                errors.append(f"DB: {type(e).__name__}")
+            if errors:
+                failed.append({"id": doc_id, "error": ", ".join(errors)})
+            else:
+                deleted.append(doc_id)
+        except Exception as e:
+            failed.append({"id": doc_id, "error": str(e)})
+
+    return {"deleted": deleted, "failed": failed}
 # ingest-service/app/api/v1/endpoints/ingest.py
 def normalize_filename(filename: str) -> str:
     """Normaliza el nombre de archivo eliminando espacios al inicio/final y espacios duplicados."""
