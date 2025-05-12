@@ -90,12 +90,21 @@ jobs:
       id: changed_files
       shell: bash
       run: |
-        echo "ingest_any_changed=${{ steps.changed_files_action.outputs.ingest_any_changed   || 'false' }}" >> "$GITHUB_OUTPUT"
-        echo "query_any_changed=${{ steps.changed_files_action.outputs.query_any_changed    || 'false' }}" >> "$GITHUB_OUTPUT"
-        echo "gateway_any_changed=${{ steps.changed_files_action.outputs.gateway_any_changed|| 'false' }}" >> "$GITHUB_OUTPUT"
-        echo "embedding_any_changed=${{ steps.changed_files_action.outputs.embedding_any_changed || 'false' }}" >> "$GITHUB_OUTPUT"
-        echo "docproc_any_changed=${{ steps.changed_files_action.outputs.docproc_any_changed|| 'false' }}" >> "$GITHUB_OUTPUT"
-        echo "reranker_any_changed=${{ steps.changed_files_action.outputs.reranker_any_changed|| 'false' }}" >> "$GITHUB_OUTPUT"
+        if [ "${{ steps.diff_check.outputs.run_changed_files_action }}" = "true" ]; then
+          echo "ingest_any_changed=${{ steps.changed_files_action.outputs.ingest_any_changed   == 'true' }}" >> "$GITHUB_OUTPUT"
+          echo "query_any_changed=${{ steps.changed_files_action.outputs.query_any_changed    == 'true' }}" >> "$GITHUB_OUTPUT"
+          echo "gateway_any_changed=${{ steps.changed_files_action.outputs.gateway_any_changed == 'true' }}" >> "$GITHUB_OUTPUT"
+          echo "embedding_any_changed=${{ steps.changed_files_action.outputs.embedding_any_changed == 'true' }}" >> "$GITHUB_OUTPUT"
+          echo "docproc_any_changed=${{ steps.changed_files_action.outputs.docproc_any_changed == 'true' }}" >> "$GITHUB_OUTPUT"
+          echo "reranker_any_changed=${{ steps.changed_files_action.outputs.reranker_any_changed == 'true' }}" >> "$GITHUB_OUTPUT"
+        else
+          echo "ingest_any_changed=false" >> "$GITHUB_OUTPUT"
+          echo "query_any_changed=false" >> "$GITHUB_OUTPUT"
+          echo "gateway_any_changed=false" >> "$GITHUB_OUTPUT"
+          echo "embedding_any_changed=false" >> "$GITHUB_OUTPUT"
+          echo "docproc_any_changed=false" >> "$GITHUB_OUTPUT"
+          echo "reranker_any_changed=false" >> "$GITHUB_OUTPUT"
+        fi
 
     - name: Set up Docker Buildx
       if: |
