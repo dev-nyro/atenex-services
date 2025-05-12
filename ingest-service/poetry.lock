@@ -1543,19 +1543,19 @@ yaml = ["pyyaml (>=6.0.1)"]
 
 [[package]]
 name = "pymilvus"
-version = "2.4.15"
+version = "2.5.3"
 description = "Python Sdk for Milvus"
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
 files = [
-    {file = "pymilvus-2.4.15-py3-none-any.whl", hash = "sha256:0601591ce0498315e19e9ac3f4fdd3051102ca87b6ddff5b33849f522288cff7"},
-    {file = "pymilvus-2.4.15.tar.gz", hash = "sha256:b21878e5df74dca91b3f3cf0b0597fa6b6aed7bf5cde9a1b10641994faa353bf"},
+    {file = "pymilvus-2.5.3-py3-none-any.whl", hash = "sha256:64ca63594284586937274800be27a402f3be2d078130bf81d94ab8d7798ac9c8"},
+    {file = "pymilvus-2.5.3.tar.gz", hash = "sha256:68bc3797b7a14c494caf116cee888894ffd6eba7b96a3ac841be85d60694cc5d"},
 ]
 
 [package.dependencies]
 grpcio = ">=1.49.1,<=1.67.1"
-milvus-lite = {version = ">=2.4.0,<2.5.0", markers = "sys_platform != \"win32\""}
+milvus-lite = {version = ">=2.4.0", markers = "sys_platform != \"win32\""}
 pandas = ">=1.2.4"
 protobuf = ">=3.20.0"
 python-dotenv = ">=1.0.1,<2.0.0"
@@ -2616,4 +2616,4 @@ files = [
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "3e6e88b3488974f4c1e4a630f7b577b454cd633596f448dbdd98c5eab6cc6b6d"
+content-hash = "03bca8f4f3664ad341018b203a8b2ffcaa3e938ec7a185c0891f925d2e90fc32"
