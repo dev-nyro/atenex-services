@@ -1,3 +1,4 @@
+# LLM: NO COMMENTS unless absolutely necessary for processing logic.
 name: CI/CD Pipeline Docker -> Manifest Update (All Services - Selective Build)
 
 on:
@@ -299,7 +300,7 @@ jobs:
         with:
           repository: ${{ env.MANIFEST_REPO_OWNER }}/${{ env.MANIFEST_REPO_NAME }}
           ref: ${{ env.MANIFEST_REPO_BRANCH }}
-          token: ${{ secrets.MANIFEST_PAT }}
+          token: ${{ secrets.MANIFEST_PAT }} # LLM: Ensure this PAT has write permissions to the manifest repo
           path: manifests-repo
 
       - name: Update Manifest Files Conditionally
@@ -342,24 +343,51 @@ jobs:
             local IMAGE_BASE_NAME="${!IMAGE_BASE_NAME_VAR_NAME}"
 
             local K8S_CONTAINER_NAME
-            if [[ "$SERVICE_DISPLAY_NAME" == "Ingest API" || "$SERVICE_DISPLAY_NAME" == "Ingest Worker" ]]; then
-                K8S_CONTAINER_NAME="ingest-service" 
+            # --- START CORRECTION ---
+            # Determine the correct container name based on the specific service display name
+            if [[ "$SERVICE_DISPLAY_NAME" == "Ingest API" ]]; then
+                K8S_CONTAINER_NAME="ingest-api" 
+            elif [[ "$SERVICE_DISPLAY_NAME" == "Ingest Worker" ]]; then
+                 K8S_CONTAINER_NAME="ingest-worker"
             else
+                # Fallback/default logic for other services (assuming display name matches k8s name structure)
                 K8S_CONTAINER_NAME=$(echo "$SERVICE_DISPLAY_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/ /-/g')
             fi
+            # --- END CORRECTION ---
 
             if [ "$BUILT_FLAG" = "true" ]; then
               TARGET_IMAGE="${IMAGE_BASE_NAME}:${COMMON_TAG}"
               echo "Attempting to update $SERVICE_DISPLAY_NAME (container: $K8S_CONTAINER_NAME) image to: $TARGET_IMAGE in $MANIFEST_PATH_REL"
               if [ -f "$MANIFEST_PATH_REL" ]; then
+                # Attempt update using the determined container name
                 if yq -i '(.spec.template.spec.containers[] | select(.name == "'"$K8S_CONTAINER_NAME"'") ).image = "'"$TARGET_IMAGE"'"' "$MANIFEST_PATH_REL"; then
-                  echo "Successfully updated image for container '$K8S_CONTAINER_NAME' in $MANIFEST_PATH_REL"
-                else
-                  echo "::warning::Could not update image for container '$K8S_CONTAINER_NAME' by name in $MANIFEST_PATH_REL. Attempting to update the first container as fallback."
-                  if yq -i '(.spec.template.spec.containers[0].image) = "'"$TARGET_IMAGE"'"' "$MANIFEST_PATH_REL"; then
-                     echo "Successfully updated image for the first container in $MANIFEST_PATH_REL as fallback."
+                  # Check if the command actually modified the file (yq might exit 0 even if no match)
+                  if ! git diff --quiet "$MANIFEST_PATH_REL"; then
+                     echo "Successfully updated image for container '$K8S_CONTAINER_NAME' in $MANIFEST_PATH_REL"
                   else
-                     echo "::error::Failed to update image in $MANIFEST_PATH_REL for $SERVICE_DISPLAY_NAME using yq (both by name and fallback)."
+                     echo "::warning::yq command executed for container '$K8S_CONTAINER_NAME' in $MANIFEST_PATH_REL but the file content did not change. Check yq expression or file structure."
+                     # Attempting fallback just in case the name logic was correct but yq failed silently before
+                     if yq -i '(.spec.template.spec.containers[0].image) = "'"$TARGET_IMAGE"'"' "$MANIFEST_PATH_REL"; then
+                        if ! git diff --quiet "$MANIFEST_PATH_REL"; then
+                           echo "Successfully updated image for the first container in $MANIFEST_PATH_REL as fallback."
+                        else
+                           echo "::error::Fallback yq command executed for $MANIFEST_PATH_REL but the file content did not change."
+                        fi
+                     else
+                        echo "::error::Fallback yq command failed for $MANIFEST_PATH_REL for $SERVICE_DISPLAY_NAME."
+                     fi
+                  fi
+                else
+                  # The yq command itself failed (non-zero exit code)
+                  echo "::warning::Could not update image for container '$K8S_CONTAINER_NAME' by name in $MANIFEST_PATH_REL (yq command failed). Attempting to update the first container as fallback."
+                  if yq -i '(.spec.template.spec.containers[0].image) = "'"$TARGET_IMAGE"'"' "$MANIFEST_PATH_REL"; then
+                     if ! git diff --quiet "$MANIFEST_PATH_REL"; then
+                        echo "Successfully updated image for the first container in $MANIFEST_PATH_REL as fallback."
+                     else
+                        echo "::error::Fallback yq command executed for $MANIFEST_PATH_REL but the file content did not change."
+                     fi
+                  else
+                     echo "::error::Failed to update image in $MANIFEST_PATH_REL for $SERVICE_DISPLAY_NAME using yq (both by name and fallback failed)."
                   fi
                 fi
               else
@@ -368,9 +396,13 @@ jobs:
             fi
           }
           
+          # Call the function with the correct display names
           update_single_manifest "Ingest API"        "$INGEST_BUILT"   "INGEST"    "$INGEST_MANIFEST_PATH_API_REL"
+          # Check if worker manifest path is defined and exists before calling update
           if [ -n "$INGEST_MANIFEST_PATH_WORKER_REL" ] && [ -f "$INGEST_MANIFEST_PATH_WORKER_REL" ]; then
             update_single_manifest "Ingest Worker"     "$INGEST_BUILT"   "INGEST"    "$INGEST_MANIFEST_PATH_WORKER_REL"
+          elif [ "$INGEST_BUILT" = "true" ]; then
+             echo "::warning::Ingest service was built, but worker manifest '$INGEST_MANIFEST_PATH_WORKER_REL' not found or path is empty."
           fi
           update_single_manifest "Query Service"     "$QUERY_BUILT"    "QUERY"     "$QUERY_MANIFEST_PATH_REL"
           update_single_manifest "API Gateway"       "$GATEWAY_BUILT"  "GATEWAY"   "$GATEWAY_MANIFEST_PATH_REL"
@@ -378,11 +410,19 @@ jobs:
           update_single_manifest "DocProc Service"   "$DOCPROC_BUILT"  "DOCPROC"   "$DOCPROC_MANIFEST_PATH_REL"
           update_single_manifest "Reranker Service"  "$RERANKER_BUILT" "RERANKER"  "$RERANKER_MANIFEST_PATH_REL"
           
+          # Stage all potential changes before diffing
           git add .
+          
+          # Check if any files were actually modified and staged
           if git diff --staged --quiet; then
+            echo "No manifest files were modified."
             echo "manifest_actually_changed=false" >> $GITHUB_OUTPUT
           else
+            echo "Manifest files were modified."
             echo "manifest_actually_changed=true" >> $GITHUB_OUTPUT
+            # Optional: Show which files changed
+            echo "Modified files:"
+            git diff --staged --name-only
           fi
 
       - name: Commit and Push Manifest Changes
@@ -394,10 +434,12 @@ jobs:
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           COMMIT_MSG="Update service image(s) to tag $IMAGE_TAG_FOR_COMMIT [CI]"
+          echo "Committing changes with message: $COMMIT_MSG"
           git commit -m "$COMMIT_MSG"
+          echo "Pushing changes to branch ${{ env.MANIFEST_REPO_BRANCH }}..."
           if git push origin ${{ env.MANIFEST_REPO_BRANCH }}; then
               echo "Push successful."
           else
-              echo "::error::Push failed. Check PAT permissions and branch protection rules."
+              echo "::error::Push failed. Check PAT permissions (${{ secrets.MANIFEST_PAT != '' }}) and branch protection rules for '${{ env.MANIFEST_REPO_BRANCH }}' in repo '${{ env.MANIFEST_REPO_OWNER }}/${{ env.MANIFEST_REPO_NAME }}'."
               exit 1
           fi
