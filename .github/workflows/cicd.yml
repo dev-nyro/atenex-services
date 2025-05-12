@@ -365,7 +365,7 @@ jobs:
           fi
           update_single_manifest "Query Service"     "$QUERY_BUILT"    "QUERY"     "$QUERY_MANIFEST_PATH_REL"
           update_single_manifest "API Gateway"       "$GATEWAY_BUILT"  "GATEWAY"   "$GATEWAY_MANIFEST_PATH_REL"
-          update_single_manifest "Embedding Service" "$EMBEDDING_BUILT""EMBEDDING" "$EMBEDDING_MANIFEST_PATH_REL"
+          update_single_manifest "Embedding Service" "$EMBEDDING_BUILT" "EMBEDDING" "$EMBEDDING_MANIFEST_PATH_REL"
           update_single_manifest "DocProc Service"   "$DOCPROC_BUILT"  "DOCPROC"   "$DOCPROC_MANIFEST_PATH_REL"
           update_single_manifest "Reranker Service"  "$RERANKER_BUILT" "RERANKER"  "$RERANKER_MANIFEST_PATH_REL"
           
