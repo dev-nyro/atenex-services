@@ -6,11 +6,10 @@ import structlog
 import json
 from datetime import datetime, timezone
 
-# LLM_REFACTOR_STEP_2: Update import paths and add Ports/Domain models
 from app.core.config import settings
-from app.api.v1 import schemas # Keep for API schema hints if needed, but prefer domain models
-from app.domain.models import Chat, ChatMessage, ChatSummary, QueryLog # Import domain models
-from app.application.ports.repository_ports import ChatRepositoryPort, LogRepositoryPort, ChunkContentRepositoryPort # Import Ports
+from app.api.v1 import schemas 
+from app.domain.models import Chat, ChatMessage, ChatSummary, QueryLog 
+from app.application.ports.repository_ports import ChatRepositoryPort, LogRepositoryPort, ChunkContentRepositoryPort 
 from .postgres_connector import get_db_pool
 
 log = structlog.get_logger(__name__)
@@ -39,7 +38,7 @@ class PostgresChatRepository(ChatRepositoryPort):
                 raise RuntimeError("Failed to create chat, no ID returned")
         except Exception as e:
             repo_log.exception("Failed to create chat")
-            raise # Re-raise the exception
+            raise 
 
     async def get_user_chats(self, user_id: uuid.UUID, company_id: uuid.UUID, limit: int = 50, offset: int = 0) -> List[ChatSummary]:
         pool = await get_db_pool()
@@ -52,7 +51,7 @@ class PostgresChatRepository(ChatRepositoryPort):
         try:
             async with pool.acquire() as conn:
                 rows = await conn.fetch(query, user_id, company_id, limit, offset)
-            # Map rows to domain model ChatSummary
+            
             chats = [ChatSummary(**dict(row)) for row in rows]
             repo_log.info(f"Retrieved {len(chats)} chat summaries")
             return chats
@@ -71,7 +70,7 @@ class PostgresChatRepository(ChatRepositoryPort):
             return exists is True
         except Exception as e:
             repo_log.exception("Failed to check chat ownership")
-            return False # Assume not owner on error
+            return False 
 
     async def get_chat_messages(self, chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID, limit: int = 100, offset: int = 0) -> List[ChatMessage]:
         pool = await get_db_pool()
@@ -93,27 +92,27 @@ class PostgresChatRepository(ChatRepositoryPort):
             messages = []
             for row in message_rows:
                 msg_dict = dict(row)
-                # JSON decoding should be handled by asyncpg codec setup in connector
+                
                 if msg_dict.get('sources') is None:
                      msg_dict['sources'] = None
                 elif not isinstance(msg_dict.get('sources'), (list, dict, type(None))):
-                     # Fallback if codec failed or sources isn't valid JSON in DB
+                    
                     log.warning("Unexpected type for 'sources' from DB", type=type(msg_dict['sources']).__name__, message_id=str(msg_dict.get('id')))
                     try:
-                        # Attempt manual load if it's a string
+                        
                         if isinstance(msg_dict['sources'], str):
                             msg_dict['sources'] = json.loads(msg_dict['sources'])
                         else:
-                             msg_dict['sources'] = None # Set to None if type is unexpected
+                             msg_dict['sources'] = None 
                     except (json.JSONDecodeError, TypeError):
                          log.error("Failed to manually decode 'sources'", message_id=str(msg_dict.get('id')))
                          msg_dict['sources'] = None
 
-                # Ensure sources is a list or None before creating the domain object
+                
                 if not isinstance(msg_dict.get('sources'), (list, type(None))):
                     msg_dict['sources'] = None
 
-                messages.append(ChatMessage(**msg_dict)) # Map to domain model
+                messages.append(ChatMessage(**msg_dict)) 
 
             repo_log.info(f"Retrieved {len(messages)} messages")
             return messages
@@ -129,19 +128,19 @@ class PostgresChatRepository(ChatRepositoryPort):
         try:
             conn = await pool.acquire()
             async with conn.transaction():
-                # Update chat timestamp
+                
                 update_chat_query = "UPDATE chats SET updated_at = NOW() AT TIME ZONE 'UTC' WHERE id = $1 RETURNING id;"
                 chat_updated = await conn.fetchval(update_chat_query, chat_id)
                 if not chat_updated:
                     repo_log.error("Failed to update chat timestamp, chat might not exist")
                     raise ValueError(f"Chat with ID {chat_id} not found for saving message.")
 
-                # Insert message
+                
                 insert_message_query = """
                 INSERT INTO messages (id, chat_id, role, content, sources, created_at)
                 VALUES ($1, $2, $3, $4, $5, NOW() AT TIME ZONE 'UTC') RETURNING id;
                 """
-                # sources_json should be handled by the codec, pass the Python object directly
+                
                 result = await conn.fetchval(insert_message_query, message_id, chat_id, role, content, sources)
 
                 if result and result == message_id:
@@ -200,7 +199,7 @@ class PostgresLogRepository(LogRepositoryPort):
         company_id: uuid.UUID,
         query: str,
         answer: str,
-        retrieved_documents_data: List[Dict[str, Any]], # Keep Dict for logging flexibility
+        retrieved_documents_data: List[Dict[str, Any]], 
         metadata: Optional[Dict[str, Any]] = None,
         chat_id: Optional[uuid.UUID] = None,
     ) -> uuid.UUID:
@@ -216,7 +215,7 @@ class PostgresLogRepository(LogRepositoryPort):
             $1, $2, $3, $4, $5, $6, $7, NOW() AT TIME ZONE 'UTC'
         ) RETURNING id;
         """
-        # Prepare metadata, ensuring retrieved_summary is included
+        
         final_metadata = metadata or {}
         final_metadata["retrieved_summary"] = [
             {"id": d.get("id"), "score": d.get("score"), "file_name": d.get("file_name")}
@@ -225,11 +224,11 @@ class PostgresLogRepository(LogRepositoryPort):
 
         try:
             async with pool.acquire() as connection:
-                # Pass the Python dict directly, codec handles JSON conversion
+                
                 result = await connection.fetchval(
                     query_sql,
                     log_id, user_id, company_id, query, answer,
-                    final_metadata, # Pass the dict
+                    final_metadata, 
                     chat_id
                 )
             if not result or result != log_id:
@@ -247,58 +246,49 @@ class PostgresChunkContentRepository(ChunkContentRepositoryPort):
     """Implementación concreta para obtener contenido de chunks desde PostgreSQL."""
 
     async def get_chunk_contents_by_company(self, company_id: uuid.UUID) -> Dict[str, str]:
-        """Recupera {chunk_id: content} para todos los chunks de una compañía."""
-        # WARNING: This can be very memory-intensive for large companies.
-        # Consider adding limits, pagination, or using alternative strategies if performance is an issue.
         pool = await get_db_pool()
-        # Asegúrate de que la tabla `document_chunks` tiene una FK a `documents` y un índice en `company_id`
         query = """
-        SELECT dc.id, dc.content
+        SELECT dc.embedding_id, dc.content
         FROM document_chunks dc
         JOIN documents d ON dc.document_id = d.id
-        WHERE d.company_id = $1;
+        WHERE d.company_id = $1 AND dc.embedding_id IS NOT NULL;
         """
         repo_log = log.bind(repo="PostgresChunkContentRepository", action="get_chunk_contents_by_company", company_id=str(company_id))
-        repo_log.warning("Fetching all chunk contents for company, this might be memory intensive!")
+        repo_log.warning("Fetching all chunk contents (keyed by embedding_id) for company, this might be memory intensive!")
         try:
             async with pool.acquire() as conn:
                 rows = await conn.fetch(query, company_id)
-            # Convert chunk UUIDs to string for dictionary keys
-            contents = {str(row['id']): row['content'] for row in rows if row['content']}
-            repo_log.info(f"Retrieved content for {len(contents)} chunks")
+            
+            contents = {row['embedding_id']: row['content'] for row in rows if row['embedding_id'] and row['content']}
+            repo_log.info(f"Retrieved content for {len(contents)} chunks (keyed by embedding_id)")
             return contents
         except Exception as e:
-            repo_log.exception("Failed to get chunk contents by company")
+            repo_log.exception("Failed to get chunk contents by company (keyed by embedding_id)")
             raise
 
     async def get_chunk_contents_by_ids(self, chunk_ids: List[str]) -> Dict[str, str]:
-        """Recupera {chunk_id: content} para una lista específica de IDs de chunks."""
         if not chunk_ids:
             return {}
         pool = await get_db_pool()
-        # Convert string UUIDs back to UUID objects for the query
-        try:
-            uuid_list = [uuid.UUID(cid) for cid in chunk_ids]
-        except ValueError:
-            log.error("Invalid UUID format in chunk_ids list", provided_ids=chunk_ids)
-            raise ValueError("One or more provided chunk IDs are not valid UUIDs.")
-
+        
+        # Los chunk_ids que llegan son los embedding_id (PKs de Milvus), que son strings.
+        # La columna en la DB es 'embedding_id' de tipo VARCHAR.
         query = """
-        SELECT id, content FROM document_chunks WHERE id = ANY($1::uuid[]);
+        SELECT embedding_id, content FROM document_chunks WHERE embedding_id = ANY($1::text[]);
         """
         repo_log = log.bind(repo="PostgresChunkContentRepository", action="get_chunk_contents_by_ids", count=len(chunk_ids))
         try:
             async with pool.acquire() as conn:
-                rows = await conn.fetch(query, uuid_list)
-            # Convert chunk UUIDs to string for dictionary keys
-            contents = {str(row['id']): row['content'] for row in rows if row['content']}
-            repo_log.info(f"Retrieved content for {len(contents)} chunks out of {len(chunk_ids)} requested")
-            # Optionally log if some IDs weren't found
+                rows = await conn.fetch(query, chunk_ids) 
+            
+            contents = {row['embedding_id']: row['content'] for row in rows if row['embedding_id'] and row['content']}
+            repo_log.info(f"Retrieved content for {len(contents)} chunks (keyed by embedding_id) out of {len(chunk_ids)} requested")
+            
             if len(contents) != len(chunk_ids):
                 found_ids = set(contents.keys())
                 missing_ids = [cid for cid in chunk_ids if cid not in found_ids]
-                repo_log.warning("Could not find content for some requested chunk IDs", missing_ids=missing_ids)
+                repo_log.warning("Could not find content for some requested chunk IDs (embedding_ids)", missing_ids=missing_ids)
             return contents
         except Exception as e:
-            repo_log.exception("Failed to get chunk contents by IDs")
+            repo_log.exception("Failed to get chunk contents by IDs (embedding_ids)")
             raise

@@ -28,7 +28,8 @@ google-generativeai = "^0.5.4"
 
 # --- RAG Component Dependencies ---
 # sentence-transformers is REMOVED as reranking is now external
-numpy = "1.26.4" 
+numpy = "1.26.4"
+rank-bm25 = "^0.2.2"
 
 
 
