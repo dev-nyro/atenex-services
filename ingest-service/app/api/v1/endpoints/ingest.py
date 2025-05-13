@@ -1,5 +1,4 @@
 # ingest-service/app/api/v1/endpoints/ingest.py
-# --- LLM_FLAG: Copying existing code ---
 import uuid
 import mimetypes
 import json
@@ -50,7 +49,6 @@ def get_gcs_client():
             detail="Storage service configuration error."
         )
 
-# LLM_FLAG: NO_CHANGE - API DB Retry Strategy
 api_db_retry_strategy = retry(
     stop=stop_after_attempt(2),
     wait=wait_fixed(1),
@@ -58,7 +56,6 @@ api_db_retry_strategy = retry(
     before_sleep=before_sleep_log(log, logging.WARNING)
 )
 
-# LLM_FLAG: NO_CHANGE - DB Connection Context Manager
 @asynccontextmanager
 async def get_db_conn():
     """Provides a single connection from the pool for API request context."""
@@ -74,10 +71,10 @@ async def get_db_conn():
         if conn and pool:
             await pool.release(conn)
 
-# --- CORRECTION: Modified _get_milvus_collection_sync ---
 def _get_milvus_collection_sync() -> Optional[Collection]:
     """
-    Synchronously connects to Milvus and returns the Collection object if it exists and is loaded.
+    Synchronously connects to Milvus and returns the Collection object if it exists.
+    For Zilliz Cloud, loading is managed by the service.
     Returns None if the collection does not exist.
     Raises RuntimeError for connection failures.
     """
@@ -89,7 +86,7 @@ def _get_milvus_collection_sync() -> Optional[Collection]:
             connections.connect(
                 alias=alias,
                 uri=settings.MILVUS_URI,
-                timeout=settings.MILVUS_GRPC_TIMEOUT,
+                timeout=settings.MILVUS_GRPC_TIMEOUT, # Renombrado de settings.MILVUS_TIMEOUT
                 token=settings.ZILLIZ_API_KEY.get_secret_value() if settings.ZILLIZ_API_KEY else None
             )
             sync_milvus_log.info("Milvus (Zilliz) connection established for sync helper.")
@@ -103,45 +100,26 @@ def _get_milvus_collection_sync() -> Optional[Collection]:
         sync_milvus_log.debug("Reusing existing Milvus connection for sync helper.")
 
     try:
-        # Check if collection exists first
         if not utility.has_collection(MILVUS_COLLECTION_NAME, using=alias):
             sync_milvus_log.warning("Milvus collection does not exist for sync helper.")
             return None
 
         collection = Collection(name=MILVUS_COLLECTION_NAME, using=alias)
-        # Check if loaded, attempt to load if not (best effort for sync helper)
-        if not collection.is_loading:
-            sync_milvus_log.info("Attempting to load Milvus collection for sync helper (was not loaded)...")
-            try:
-                collection.load()
-                # Add a small delay or check progress, load can be async internally
-                # For a sync helper, this is best effort. Check status again.
-                if collection.is_loading: # Still loading
-                    sync_milvus_log.warning("Milvus collection load initiated, may not be ready immediately for sync helper.")
-                    # Depending on use case, might return collection or raise error/return None
-                else: # Load completed quickly or was already loaded
-                    sync_milvus_log.info("Milvus collection loaded successfully for sync helper.")
-            except MilvusException as load_err:
-                sync_milvus_log.error("Failed to load Milvus collection for sync helper", error=str(load_err))
-                # Treat load failure as collection not ready
-                return None
-        else:
-            sync_milvus_log.debug("Milvus collection is already loading or loaded for sync helper.")
-
-        return collection # Return collection even if load was just initiated
+        
+        # For Zilliz Cloud, explicit load() might ensure partition/replica readiness if needed,
+        # but is often not strictly required for basic operations once data is flushed.
+        # If issues persist, consider adding collection.load() here and check behavior.
+        # For now, removing the problematic 'is_loading' check.
+        sync_milvus_log.debug(f"Collection object for '{MILVUS_COLLECTION_NAME}' obtained for sync helper.")
+        return collection
 
     except MilvusException as e:
-        # Catching potential errors during has_collection or Collection() instantiation
         sync_milvus_log.error("Milvus error during collection check/instantiation for sync helper", error=str(e))
-        # Treat as collection not accessible
         return None
     except Exception as e:
         sync_milvus_log.exception("Unexpected error during Milvus collection access for sync helper", error=str(e))
-        # Treat as collection not accessible
         return None
-# --- END CORRECTION ---
 
-# --- CORRECTION: Modified _get_milvus_chunk_count_sync ---
 def _get_milvus_chunk_count_sync(document_id: str, company_id: str) -> int:
     """
     Synchronously counts chunks in Milvus for a specific document using pymilvus query.
@@ -152,33 +130,31 @@ def _get_milvus_chunk_count_sync(document_id: str, company_id: str) -> int:
         collection = _get_milvus_collection_sync()
         if collection is None:
             count_log.warning("Cannot count chunks: Milvus collection does not exist or is not accessible.")
-            return -1 # Indicate collection not available
+            return -1 
 
         expr = f'{MILVUS_COMPANY_ID_FIELD} == "{company_id}" and {MILVUS_DOCUMENT_ID_FIELD} == "{document_id}"'
         count_log.debug("Attempting to query Milvus chunk count", filter_expr=expr)
-        # Use count_entities for potentially better performance if supported and appropriate
-        # query_res = collection.query(expr=expr, output_fields=[MILVUS_PK_FIELD]) # Use PK field for count
-        # count = len(query_res) if query_res else 0
-        count = collection.num_entities # This counts ALL entities if expr is not applied before, need query
-        # Let's stick to query for accuracy with filter
-        query_res = collection.query(expr=expr, output_fields=[MILVUS_PK_FIELD])
+        
+        # Using query with count=True is generally more efficient for just counting.
+        # However, Zilliz Cloud might have different performance characteristics.
+        # The original approach of querying PKs and taking len() is also valid.
+        # Let's try using collection.query with count=True if available or stick to len(results).
+        # For simplicity and to avoid introducing new potential issues, stick to len(results) for now.
+        query_res = collection.query(expr=expr, output_fields=[MILVUS_PK_FIELD]) # Only need PK for counting
         count = len(query_res) if query_res else 0
 
         count_log.info("Milvus chunk count successful (pymilvus)", count=count)
         return count
-    except RuntimeError as re: # Raised by _get_milvus_collection_sync on connection failure
+    except RuntimeError as re: 
         count_log.error("Failed to get Milvus count due to connection error", error=str(re))
         return -1
     except MilvusException as e:
-        # Handle potential errors if collection exists but query fails (e.g., index not ready)
         count_log.error("Milvus query error during count", error=str(e), exc_info=True)
         return -1
     except Exception as e:
         count_log.exception("Unexpected error during Milvus count", error=str(e))
         return -1
-# --- END CORRECTION ---
 
-# --- CORRECTION: Modified _delete_milvus_sync ---
 def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
     """
     Synchronously deletes chunks from Milvus using pymilvus: Query PKs first, then delete by PK list.
@@ -192,7 +168,7 @@ def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
         collection = _get_milvus_collection_sync()
         if collection is None:
             delete_log.warning("Cannot delete chunks: Milvus collection does not exist or is not accessible.")
-            return False # Indicate collection not available, treat as non-critical failure for delete
+            return False 
 
         delete_log.info("Querying Milvus for PKs to delete (sync)...", filter_expr=expr)
         query_res = collection.query(expr=expr, output_fields=[MILVUS_PK_FIELD])
@@ -200,7 +176,7 @@ def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
 
         if not pks_to_delete:
             delete_log.info("No matching primary keys found in Milvus for deletion (sync).")
-            return True # Nothing to delete, operation considered successful in context
+            return True 
 
         delete_log.info(f"Found {len(pks_to_delete)} primary keys to delete (sync).")
 
@@ -211,10 +187,9 @@ def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
 
         if delete_result.delete_count != len(pks_to_delete):
              delete_log.warning("Milvus delete count mismatch (sync).", expected=len(pks_to_delete), reported=delete_result.delete_count)
-        # Even with mismatch, the delete was attempted. Return True for API flow.
         return True
 
-    except RuntimeError as re: # Raised by _get_milvus_collection_sync on connection failure
+    except RuntimeError as re: 
         delete_log.error("Failed to delete Milvus chunks due to connection error", error=str(re))
         return False
     except MilvusException as e:
@@ -223,7 +198,6 @@ def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
     except Exception as e:
         delete_log.exception("Unexpected error during Milvus delete (sync)", error=str(e))
         return False
-# --- END CORRECTION ---
 
 
 def normalize_filename(filename: str) -> str:
@@ -270,59 +244,84 @@ async def bulk_delete_documents(
     deleted: List[str] = []
     failed: List[Dict[str, str]] = []
 
-    for doc_id in document_ids:
+    for doc_id_str in document_ids:
+        single_delete_log = log.bind(request_id=req_id, current_doc_id_bulk=doc_id_str, company_id=company_id)
         try:
-            doc_uuid = uuid.UUID(doc_id)
-        except Exception:
-            failed.append({"id": doc_id, "error": "ID inválido"})
+            doc_uuid = uuid.UUID(doc_id_str)
+        except ValueError:
+            single_delete_log.warning("Invalid document ID format in bulk list.")
+            failed.append({"id": doc_id_str, "error": "ID inválido"})
             continue
+        
+        doc_data = None
         try:
-            doc_data = None
             async with get_db_conn() as conn:
                 doc_data = await api_db_retry_strategy(db_client.get_document_by_id)(
                     conn, doc_id=doc_uuid, company_id=company_uuid
                 )
             if not doc_data:
-                failed.append({"id": doc_id, "error": "No encontrado"})
+                single_delete_log.warning("Document not found in DB for this company during bulk delete.")
+                failed.append({"id": doc_id_str, "error": "No encontrado"})
                 continue
-            errors = []
-            loop = asyncio.get_running_loop()
-            try:
-                # Use updated _delete_milvus_sync which handles collection non-existence
-                milvus_deleted = await loop.run_in_executor(None, _delete_milvus_sync, str(doc_uuid), company_id)
-                if not milvus_deleted:
-                    # Distinguish between "collection missing" and actual delete error if needed,
-                    # but for now, just note a non-critical failure.
-                    errors.append("Milvus (check logs)")
-            except Exception as e:
-                errors.append(f"Milvus: {type(e).__name__}")
 
+            errors_for_this_doc: List[str] = []
+            loop = asyncio.get_running_loop()
+            
+            # Milvus Delete
+            single_delete_log.debug("Bulk: Attempting Milvus delete for document.")
+            try:
+                milvus_deleted_ok = await loop.run_in_executor(None, _delete_milvus_sync, str(doc_uuid), company_id)
+                if not milvus_deleted_ok:
+                    errors_for_this_doc.append("Milvus (check logs)")
+                    single_delete_log.warning("Bulk: Milvus delete for document reported failure or collection missing.")
+                else:
+                    single_delete_log.info("Bulk: Milvus delete for document successful or no data to delete.")
+            except Exception as e_milvus:
+                single_delete_log.exception("Bulk: Unexpected error during Milvus delete execution for document.", error=str(e_milvus))
+                errors_for_this_doc.append(f"Milvus: {type(e_milvus).__name__}")
+
+            # GCS Delete
             gcs_path = doc_data.get('file_path')
             if gcs_path:
+                single_delete_log.debug("Bulk: Attempting GCS delete for document.", gcs_path=gcs_path)
                 try:
                     await gcs_client.delete_file_async(gcs_path)
-                except Exception as e:
-                    errors.append(f"GCS: {type(e).__name__}")
+                    single_delete_log.info("Bulk: GCS delete for document successful.")
+                except Exception as e_gcs:
+                    single_delete_log.exception("Bulk: GCS delete for document failed.", error=str(e_gcs))
+                    errors_for_this_doc.append(f"GCS: {type(e_gcs).__name__}")
             else:
-                errors.append("GCS: path desconocido")
+                single_delete_log.warning("Bulk: GCS path unknown for document, skipping GCS delete.")
+                # Not adding to errors_for_this_doc as it might be legitimate if upload failed.
 
+            # PostgreSQL Delete
+            single_delete_log.debug("Bulk: Attempting PostgreSQL delete for document.")
             try:
                 async with get_db_conn() as conn:
                     deleted_in_db = await api_db_retry_strategy(db_client.delete_document)(
                         conn=conn, doc_id=doc_uuid, company_id=company_uuid
                     )
                 if not deleted_in_db:
-                    errors.append("DB: no eliminado")
-            except Exception as e:
-                errors.append(f"DB: {type(e).__name__}")
+                    single_delete_log.warning("Bulk: PostgreSQL delete for document returned false (already gone or company mismatch).")
+                    # Potentially add to errors if this is unexpected, but delete_document handles "not found" gracefully
+                    # errors_for_this_doc.append("DB: no eliminado") 
+                else:
+                    single_delete_log.info("Bulk: PostgreSQL delete for document successful.")
+            except Exception as e_db:
+                single_delete_log.exception("Bulk: PostgreSQL delete for document failed.", error=str(e_db))
+                errors_for_this_doc.append(f"DB: {type(e_db).__name__}")
 
-            if errors:
-                failed.append({"id": doc_id, "error": ", ".join(errors)})
+            if errors_for_this_doc:
+                failed.append({"id": doc_id_str, "error": ", ".join(errors_for_this_doc)})
             else:
-                deleted.append(doc_id)
-        except Exception as e:
-            failed.append({"id": doc_id, "error": str(e)})
+                deleted.append(doc_id_str)
+                single_delete_log.info("Bulk: Document deleted successfully from all stores.")
 
+        except Exception as e_outer:
+            single_delete_log.exception("Bulk: Outer exception processing document.", error=str(e_outer))
+            failed.append({"id": doc_id_str, "error": f"Error general: {type(e_outer).__name__}"})
+    
+    log.info("Bulk delete operation completed.", num_requested=len(document_ids), num_deleted=len(deleted), num_failed=len(failed))
     return {"deleted": deleted, "failed": failed}
 
 @router.post(
@@ -343,11 +342,11 @@ async def bulk_delete_documents(
     "/ingest/upload",
     response_model=IngestResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    include_in_schema=False
+    include_in_schema=False # Hide duplicate path from OpenAPI
 )
 async def upload_document(
     request: Request,
-    background_tasks: BackgroundTasks,
+    background_tasks: BackgroundTasks, # FastAPI's BackgroundTasks
     file: UploadFile = File(...),
     metadata_json: Optional[str] = Form(None),
     gcs_client: GCSClient = Depends(get_gcs_client),
@@ -357,8 +356,8 @@ async def upload_document(
     creates a record in PostgreSQL, and queues a Celery task for processing.
     """
     company_id = request.headers.get("X-Company-ID")
-    user_id = request.headers.get("X-User-ID")
-    req_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
+    user_id = request.headers.get("X-User-ID") # Aunque no se usa directamente, es bueno recibirlo
+    req_id = getattr(request.state, 'request_id', str(uuid.uuid4())) # From gateway or new
     endpoint_log = log.bind(request_id=req_id)
 
     if not company_id:
@@ -367,7 +366,7 @@ async def upload_document(
     try: company_uuid = uuid.UUID(company_id)
     except ValueError: raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Company ID format.")
 
-    if not user_id:
+    if not user_id: # Required by spec, even if not directly used here
         endpoint_log.warning("Missing X-User-ID header")
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing required header: X-User-ID")
 
@@ -524,7 +523,7 @@ async def upload_document(
 @router.get(
     "/ingest/status/{document_id}",
     response_model=StatusResponse,
-    include_in_schema=False
+    include_in_schema=False # Hide duplicate path from OpenAPI
 )
 async def get_document_status(
     request: Request,
@@ -576,7 +575,7 @@ async def get_document_status(
     if updated_at:
         if isinstance(updated_at, datetime): updated_at_dt = updated_at.astimezone(timezone.utc)
         else:
-            try: updated_at_dt = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
+            try: updated_at_dt = datetime.fromisoformat(str(updated_at).replace('Z', '+00:00'))
             except Exception: updated_at_dt = None
 
     GRACE_PERIOD_SECONDS = 120
@@ -623,18 +622,14 @@ async def get_document_status(
     loop = asyncio.get_running_loop()
     milvus_chunk_count = -1
     try:
-        # Use updated _get_milvus_chunk_count_sync which handles collection non-existence
         milvus_chunk_count = await loop.run_in_executor(
             None, _get_milvus_chunk_count_sync, str(document_id), company_id
         )
         status_log.info("Milvus chunk count check complete (pymilvus)", count=milvus_chunk_count)
 
         if milvus_chunk_count == -1:
-            # This now means collection missing OR connection error OR query error
             status_log.error("Milvus count check failed or collection not accessible (returned -1).")
             if updated_status_enum != DocumentStatus.ERROR:
-                # Don't automatically flag as error if collection is just missing,
-                # maybe the worker hasn't created it yet. Only flag if state is unexpected.
                 if updated_status_enum == DocumentStatus.PROCESSED:
                      if not (updated_at_dt and (now_utc - updated_at_dt).total_seconds() < GRACE_PERIOD_SECONDS):
                         needs_update = True
@@ -671,7 +666,7 @@ async def get_document_status(
                 needs_update = True
                 updated_chunk_count = 0
 
-    except Exception as e: # Catch unexpected errors from run_in_executor
+    except Exception as e: 
         status_log.exception("Unexpected error during Milvus count check execution", error=str(e))
         milvus_chunk_count = -1
         if updated_status_enum != DocumentStatus.ERROR:
@@ -717,7 +712,7 @@ async def get_document_status(
 
 @router.get(
     "/status",
-    response_model=List[StatusResponse],
+    response_model=List[StatusResponse], # FastAPI will handle creating PaginatedStatusResponse if this is what's returned
     summary="List document statuses with pagination and live checks",
     responses={
         422: {"model": ErrorDetail, "description": "Validation Error (Missing Headers)"},
@@ -727,8 +722,8 @@ async def get_document_status(
 )
 @router.get(
     "/ingest/status",
-    response_model=List[StatusResponse],
-    include_in_schema=False
+    response_model=List[StatusResponse], # Keep as List[StatusResponse] for direct return
+    include_in_schema=False # Hide duplicate path from OpenAPI
 )
 async def list_document_statuses(
     request: Request,
@@ -752,7 +747,7 @@ async def list_document_statuses(
     list_log.info("Listing document statuses with real-time checks")
 
     documents_db: List[Dict[str, Any]] = []
-    total_db_count: int = 0
+    total_db_count: int = 0 # Not used for PaginatedStatusResponse in current FastAPI return type
     try:
         async with get_db_conn() as conn:
             documents_db, total_db_count = await api_db_retry_strategy(db_client.list_documents_paginated)(
@@ -763,7 +758,7 @@ async def list_document_statuses(
         list_log.exception("Error listing documents from DB", error=str(e))
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error listing documents.")
 
-    if not documents_db: return []
+    if not documents_db: return [] # Return empty list directly
 
     async def check_single_document(doc_db_data: Dict[str, Any]) -> Dict[str, Any]:
         check_log = log.bind(request_id=req_id, document_id=str(doc_db_data['id']), company_id=company_id)
@@ -796,7 +791,7 @@ async def list_document_statuses(
                     doc_updated_error_msg = (doc_updated_error_msg or "") + f" GCS check error."
                     doc_updated_chunk_count = 0
         else:
-            live_gcs_exists = False # No path, can't exist
+            live_gcs_exists = False 
             if doc_updated_status_enum not in [DocumentStatus.ERROR, DocumentStatus.PENDING]:
                  doc_needs_update = True
                  doc_updated_status_enum = DocumentStatus.ERROR
@@ -807,10 +802,8 @@ async def list_document_statuses(
         live_milvus_chunk_count = -1
         loop = asyncio.get_running_loop()
         try:
-             # Use updated _get_milvus_chunk_count_sync
             live_milvus_chunk_count = await loop.run_in_executor(None, _get_milvus_chunk_count_sync, doc_id_str, company_id)
             if live_milvus_chunk_count == -1:
-                # Collection missing or error during check
                 if doc_updated_status_enum == DocumentStatus.PROCESSED:
                     doc_needs_update = True
                     doc_updated_status_enum = DocumentStatus.ERROR
@@ -842,7 +835,6 @@ async def list_document_statuses(
                 doc_updated_status_enum = DocumentStatus.ERROR
                 doc_updated_error_msg = (doc_updated_error_msg or "") + f" Error checking Milvus."
 
-        # Clean up error message if status is no longer ERROR
         if doc_updated_status_enum != DocumentStatus.ERROR:
             doc_updated_error_msg = None
 
@@ -911,6 +903,7 @@ async def list_document_statuses(
          ))
 
     list_log.info("Returning enriched statuses", count=len(final_response_items))
+    # Returning List[StatusResponse] directly as per response_model
     return final_response_items
 
 
@@ -931,7 +924,7 @@ async def list_document_statuses(
     "/ingest/retry/{document_id}",
     response_model=IngestResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    include_in_schema=False
+    include_in_schema=False # Hide duplicate path from OpenAPI
 )
 async def retry_ingestion(
     request: Request,
@@ -942,7 +935,7 @@ async def retry_ingestion(
     Uses the refactored task name.
     """
     company_id = request.headers.get("X-Company-ID")
-    user_id = request.headers.get("X-User-ID")
+    user_id = request.headers.get("X-User-ID") # Required by spec
     req_id = getattr(request.state, 'request_id', 'N/A')
     if not company_id: raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing required header: X-Company-ID")
     try: company_uuid = uuid.UUID(company_id)
@@ -975,10 +968,9 @@ async def retry_ingestion(
 
     try:
         async with get_db_conn() as conn:
-            # Clear error message and set status to PROCESSING for retry
             await api_db_retry_strategy(db_client.update_document_status)(
                 conn=conn, document_id=document_id, status=DocumentStatus.PROCESSING,
-                chunk_count=None, error_message=None
+                chunk_count=None, error_message=None # Clear previous error
             )
         retry_log.info("Document status updated to 'processing' for retry.")
     except Exception as e:
@@ -1023,7 +1015,7 @@ async def retry_ingestion(
 @router.delete(
     "/ingest/{document_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    include_in_schema=False
+    include_in_schema=False # Hide duplicate path from OpenAPI
 )
 async def delete_document_endpoint(
     request: Request,
@@ -1059,17 +1051,15 @@ async def delete_document_endpoint(
         delete_log.exception("Error verifying document before deletion", error=str(e))
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error during delete verification.")
 
-    errors = []
+    errors: List[str] = []
 
     delete_log.info("Attempting to delete chunks from Milvus (pymilvus)...")
     loop = asyncio.get_running_loop()
     try:
-        # Use updated _delete_milvus_sync
         milvus_deleted_ok = await loop.run_in_executor(None, _delete_milvus_sync, str(document_id), company_id)
         if milvus_deleted_ok:
             delete_log.info("Milvus delete operation completed or collection not found (pymilvus helper).")
         else:
-            # This now likely indicates a connection or unexpected Milvus error during delete
             errors.append("Failed Milvus delete (check helper logs)")
             delete_log.warning("Milvus delete operation reported failure.")
     except Exception as e:
@@ -1090,7 +1080,6 @@ async def delete_document_endpoint(
             errors.append(f"GCS delete exception: {type(e).__name__}")
     else:
         delete_log.warning("Skipping GCS delete: file path not found in DB record.")
-        # Don't add error if path missing, just log warning
 
     delete_log.info("Attempting to delete record from PostgreSQL...")
     try:
@@ -1099,10 +1088,12 @@ async def delete_document_endpoint(
                 conn=conn, doc_id=document_id, company_id=company_uuid
             )
             if deleted_in_db: delete_log.info("Document record deleted successfully from PostgreSQL")
-            else: delete_log.warning("PostgreSQL delete command executed but no record was deleted (already gone?).") # Changed log level
+            else: delete_log.warning("PostgreSQL delete command executed but no record was deleted (already gone?).") 
     except Exception as e:
         delete_log.exception("CRITICAL: Failed to delete document record from PostgreSQL", error=str(e))
         error_detail = f"Deleted/Attempted delete from storage/vectors (errors: {', '.join(errors)}) but FAILED to delete DB record: {e}"
+        # No need to update DB status to ERROR here, as we are trying to delete the record.
+        # If this fails, the record remains, possibly in an inconsistent state.
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=error_detail)
 
     if errors: delete_log.warning("Document deletion process completed with non-critical errors", errors=errors)
