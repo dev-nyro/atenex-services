@@ -89,7 +89,8 @@ jobs:
             image_repo_name: "sparse-search-service"
             manifest_configs: |
               [
-                {"path": "sparse-search-service/deployment.yaml", "container_name": "sparse-search-service-container"}
+                {"path": "sparse-search-service/deployment.yaml", "container_name": "sparse-search-service-container"},
+                {"path": "sparse-search-service/cronjob.yaml", "container_name": "index-builder-container"}
               ]
 
     steps:
@@ -235,11 +236,20 @@ jobs:
             echo "::error::Manifest file '${manifest_file_rel_path}' not found in manifest repo for service ${{ matrix.service.name }}!"
             continue
           fi
+          
+          yq_expression=""
+          # Adapt yq expression based on manifest type (Deployment vs CronJob)
+          if [[ "${manifest_file_rel_path}" == *"/cronjob.yaml" ]]; then
+            # CronJob: .spec.jobTemplate.spec.template.spec.containers[]
+            yq_expression="(.spec.jobTemplate.spec.template.spec.containers[] | select(.name == \"${k8s_container_name}\") ).image = \"${TARGET_IMAGE_WITH_TAG}\""
+          else
+            # Deployment (default)
+            yq_expression="(.spec.template.spec.containers[] | select(.name == \"${k8s_container_name}\") ).image = \"${TARGET_IMAGE_WITH_TAG}\""
+          fi
 
-          echo "Attempting to update image for container '${k8s_container_name}' to '${TARGET_IMAGE_WITH_TAG}' in '${manifest_file_rel_path}'"
+          echo "Attempting to update image for container '${k8s_container_name}' to '${TARGET_IMAGE_WITH_TAG}' in '${manifest_file_rel_path}' using expression: ${yq_expression}"
           original_content=$(cat "${manifest_file_rel_path}")
-          yq_expression="(.spec.template.spec.containers[] | select(.name == \"${k8s_container_name}\") ).image = \"${TARGET_IMAGE_WITH_TAG}\""
-
+          
           if yq -i "${yq_expression}" "${manifest_file_rel_path}"; then
             updated_content=$(cat "${manifest_file_rel_path}")
             if [[ "${original_content}" != "${updated_content}" ]]; then
