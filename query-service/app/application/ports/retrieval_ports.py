@@ -1,5 +1,6 @@
 # query-service/app/application/ports/retrieval_ports.py
 import abc
+import uuid # Importar uuid
 from typing import List, Tuple
 # LLM_REFACTOR_STEP_3: Importar modelo de dominio
 from app.domain.models import RetrievedChunk
@@ -9,13 +10,13 @@ class SparseRetrieverPort(abc.ABC):
     """Puerto abstracto para recuperar chunks usando métodos dispersos (keyword-based)."""
 
     @abc.abstractmethod
-    async def search(self, query: str, company_id: str, top_k: int) -> List[Tuple[str, float]]:
+    async def search(self, query: str, company_id: uuid.UUID, top_k: int) -> List[Tuple[str, float]]: # MODIFICADO: company_id es uuid.UUID
         """
         Busca chunks relevantes basados en la consulta textual y filtra por compañía.
 
         Args:
             query: La consulta del usuario.
-            company_id: El ID de la compañía para filtrar.
+            company_id: El ID de la compañía para filtrar (UUID).
             top_k: El número máximo de IDs de chunks a devolver.
 
         Returns:

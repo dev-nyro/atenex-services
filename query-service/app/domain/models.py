@@ -1,6 +1,6 @@
 # query-service/app/domain/models.py
 import uuid
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
@@ -25,36 +25,30 @@ class ChatMessage(BaseModel):
     chat_id: uuid.UUID
     role: str # 'user' or 'assistant'
     content: str
-    sources: Optional[List[Dict[str, Any]]] = None # Mantener estructura JSON por ahora
+    sources: Optional[List[Dict[str, Any]]] = None 
     created_at: datetime
 
 class RetrievedChunk(BaseModel):
     """Representa un chunk recuperado de una fuente (ej: Milvus)."""
-    id: str # ID del chunk (ej: Milvus PK)
-    content: Optional[str] = None # Contenido textual del chunk
-    score: Optional[float] = None # Puntuación de relevancia
+    id: str 
+    content: Optional[str] = None 
+    score: Optional[float] = None 
     metadata: Dict[str, Any] = Field(default_factory=dict)
-    # --- Añadir campo para embedding ---
-    embedding: Optional[List[float]] = None # Embedding vectorial del chunk
-    # --- Fin adición ---
-    # Campos comunes esperados en metadata
-    document_id: Optional[str] = Field(None, alias="document_id") # Alias para mapeo desde meta
+    embedding: Optional[List[float]] = None 
+    
+    document_id: Optional[str] = Field(None, alias="document_id") 
     file_name: Optional[str] = Field(None, alias="file_name")
     company_id: Optional[str] = Field(None, alias="company_id")
 
-    # Permitir inicialización desde metadata
-    # model_config = ConfigDict(populate_by_name=True) # Pydantic v2
+    model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
+
 
     @classmethod
     def from_haystack_document(cls, doc: Any):
         """Convierte un Documento Haystack a un RetrievedChunk."""
-        # Intenta extraer campos comunes directamente de la metadata
         doc_meta = doc.meta or {}
-        # Asegura que los IDs se manejen correctamente
         doc_id_str = str(doc_meta.get("document_id")) if doc_meta.get("document_id") else None
         company_id_str = str(doc_meta.get("company_id")) if doc_meta.get("company_id") else None
-
-        # Extraer embedding si existe en el documento Haystack
         embedding_vector = getattr(doc, 'embedding', None)
 
         return cls(
@@ -62,7 +56,7 @@ class RetrievedChunk(BaseModel):
             content=doc.content,
             score=doc.score,
             metadata=doc_meta,
-            embedding=embedding_vector, # Añadir embedding
+            embedding=embedding_vector, 
             document_id=doc_id_str,
             file_name=doc_meta.get("file_name"),
             company_id=company_id_str
@@ -77,3 +71,19 @@ class QueryLog(BaseModel):
     metadata: Dict[str, Any]
     chat_id: Optional[uuid.UUID]
     created_at: datetime
+
+# --- Nuevos modelos para Respuesta Estructurada ---
+class FuenteCitada(BaseModel):
+    id_documento: Optional[str] = Field(None, description="El ID del chunk o documento original, si está disponible en la metadata del chunk.")
+    nombre_archivo: str = Field(..., description="Nombre del archivo fuente.")
+    pagina: Optional[str] = Field(None, description="Número de página si está disponible.")
+    score: Optional[float] = Field(None, description="Score de relevancia original del chunk (si aplica).")
+    cita_tag: str = Field(..., description="La etiqueta de cita usada en el texto, ej: '[Doc 1]'.")
+
+class RespuestaEstructurada(BaseModel):
+    resumen_ejecutivo: Optional[str] = Field(None, description="Un breve resumen de 1-2 frases, si la respuesta es larga y aplica.")
+    respuesta_detallada: str = Field(..., description="La respuesta completa y elaborada, incluyendo citas [Doc N] donde corresponda.")
+    fuentes_citadas: List[FuenteCitada] = Field(default_factory=list, description="Lista de los documentos efectivamente utilizados y citados en la respuesta_detallada.")
+    siguiente_pregunta_sugerida: Optional[str] = Field(None, description="Una pregunta de seguimiento relevante que el usuario podría hacer, si aplica.")
+    
+    model_config = ConfigDict(extra='ignore') 

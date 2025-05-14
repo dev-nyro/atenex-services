@@ -35,7 +35,8 @@ app/
 │   ├── __init__.py
 │   ├── clients
 │   │   ├── __init__.py
-│   │   └── embedding_service_client.py
+│   │   ├── embedding_service_client.py
+│   │   └── sparse_search_service_client.py
 │   ├── embedding
 │   │   ├── __init__.py
 │   │   └── remote_embedding_adapter.py
@@ -49,12 +50,9 @@ app/
 │   │   ├── __init__.py
 │   │   ├── postgres_connector.py
 │   │   └── postgres_repositories.py
-│   ├── rerankers
-│   │   ├── __init__.py
-│   │   └── diversity_filter.py
 │   ├── retrievers
 │   │   ├── __init__.py
-│   │   └── bm25_retriever.py
+│   │   └── remote_sparse_retriever_adapter.py
 │   └── vectorstores
 │       ├── __init__.py
 │       └── milvus_adapter.py
@@ -63,6 +61,11 @@ app/
 │   └── __init__.py
 ├── pipelines
 │   └── rag_pipeline.py
+├── prompts
+│   ├── general_template_gemini_v2.txt
+│   ├── map_prompt_template.txt
+│   ├── rag_template_gemini_v2.txt
+│   └── reduce_prompt_template_v2.txt
 └── utils
     ├── __init__.py
     └── helpers.py
@@ -633,6 +636,7 @@ class ChunkContentRepositoryPort(abc.ABC):
 ```py
 # query-service/app/application/ports/retrieval_ports.py
 import abc
+import uuid # Importar uuid
 from typing import List, Tuple
 # LLM_REFACTOR_STEP_3: Importar modelo de dominio
 from app.domain.models import RetrievedChunk
@@ -642,13 +646,13 @@ class SparseRetrieverPort(abc.ABC):
     """Puerto abstracto para recuperar chunks usando métodos dispersos (keyword-based)."""
 
     @abc.abstractmethod
-    async def search(self, query: str, company_id: str, top_k: int) -> List[Tuple[str, float]]:
+    async def search(self, query: str, company_id: uuid.UUID, top_k: int) -> List[Tuple[str, float]]: # MODIFICADO: company_id es uuid.UUID
         """
         Busca chunks relevantes basados en la consulta textual y filtra por compañía.
 
         Args:
             query: La consulta del usuario.
-            company_id: El ID de la compañía para filtrar.
+            company_id: El ID de la compañía para filtrar (UUID).
             top_k: El número máximo de IDs de chunks a devolver.
 
         Returns:
@@ -740,26 +744,22 @@ import re
 from typing import Dict, Any, List, Tuple, Optional, Type, Set
 from datetime import datetime, timezone, timedelta
 import httpx
+import os 
+import json 
+from pydantic import ValidationError 
 
 # Import Ports and Domain Models
 from app.application.ports import (
     ChatRepositoryPort, LogRepositoryPort, VectorStorePort, LLMPort,
     SparseRetrieverPort, DiversityFilterPort, ChunkContentRepositoryPort,
-    EmbeddingPort, RerankerPort # RerankerPort might be removed if not used as interface
+    EmbeddingPort, RerankerPort 
 )
-from app.domain.models import RetrievedChunk, ChatMessage
-
-
-try:
-    import bm2s
-except ImportError:
-    bm2s = None
-
+from app.domain.models import RetrievedChunk, ChatMessage, RespuestaEstructurada, FuenteCitada # Added RespuestaEstructurada, FuenteCitada
 from haystack.components.builders.prompt_builder import PromptBuilder
 from haystack import Document
 
 from app.core.config import settings
-from app.api.v1.schemas import RetrievedDocument as RetrievedDocumentSchema # For logging
+from app.api.v1.schemas import RetrievedDocument as RetrievedDocumentSchema 
 from app.utils.helpers import truncate_text
 from fastapi import HTTPException, status
 
@@ -767,6 +767,9 @@ log = structlog.get_logger(__name__)
 
 GREETING_REGEX = re.compile(r"^\s*(hola|hello|hi|buenos días|buenas tardes|buenas noches|hey|qué tal|hi there)\s*[\.,!?]*\s*$", re.IGNORECASE)
 RRF_K = 60
+
+MAP_REDUCE_NO_RELEVANT_INFO = "No hay información relevante en este fragmento."
+
 
 def format_time_delta(dt: datetime) -> str:
     now = datetime.now(timezone.utc)
@@ -791,42 +794,85 @@ class AskQueryUseCase:
                  vector_store: VectorStorePort,
                  llm: LLMPort,
                  embedding_adapter: EmbeddingPort,
-                 http_client: httpx.AsyncClient,
-                 # Optional components
-                 sparse_retriever: Optional[SparseRetrieverPort] = None,
-                 chunk_content_repo: Optional[ChunkContentRepositoryPort] = None,
+                 http_client: httpx.AsyncClient, # Para Reranker
+                 sparse_retriever: Optional[SparseRetrieverPort] = None, # Puede ser RemoteSparseRetrieverAdapter
+                 chunk_content_repo: Optional[ChunkContentRepositoryPort] = None, # Se mantiene para fusión
                  diversity_filter: Optional[DiversityFilterPort] = None):
         self.chat_repo = chat_repo
         self.log_repo = log_repo
         self.vector_store = vector_store
         self.llm = llm
         self.embedding_adapter = embedding_adapter
-        self.http_client = http_client
+        self.http_client = http_client # Global client for reranker etc.
         self.settings = settings
-        self.sparse_retriever = sparse_retriever if settings.BM25_ENABLED and bm2s is not None else None
-        self.chunk_content_repo = chunk_content_repo
+        
+        # Sparse retriever (ahora puede ser el RemoteSparseRetrieverAdapter)
+        self.sparse_retriever = sparse_retriever if settings.BM25_ENABLED and sparse_retriever else None
+        
+        self.chunk_content_repo = chunk_content_repo # Necesario para fusionar si sparse devuelve solo IDs
         self.diversity_filter = diversity_filter if settings.DIVERSITY_FILTER_ENABLED else None
 
-        self._prompt_builder_rag = self._initialize_prompt_builder(settings.RAG_PROMPT_TEMPLATE)
-        self._prompt_builder_general = self._initialize_prompt_builder(settings.GENERAL_PROMPT_TEMPLATE)
+        self._prompt_builder_rag = self._initialize_prompt_builder_from_path(settings.RAG_PROMPT_TEMPLATE_PATH)
+        self._prompt_builder_general = self._initialize_prompt_builder_from_path(settings.GENERAL_PROMPT_TEMPLATE_PATH)
+        self._prompt_builder_map = self._initialize_prompt_builder_from_path(settings.MAP_PROMPT_TEMPLATE_PATH)
+        self._prompt_builder_reduce = self._initialize_prompt_builder_from_path(settings.REDUCE_PROMPT_TEMPLATE_PATH)
 
-        log.info("AskQueryUseCase Initialized",
-                 embedding_adapter_type=type(self.embedding_adapter).__name__,
-                 bm25_enabled=bool(self.sparse_retriever),
-                 reranker_enabled=self.settings.RERANKER_ENABLED,
-                 reranker_service_url=str(self.settings.RERANKER_SERVICE_URL) if self.settings.RERANKER_ENABLED else "N/A",
-                 diversity_filter_enabled=settings.DIVERSITY_FILTER_ENABLED,
-                 diversity_filter_type=type(self.diversity_filter).__name__ if self.diversity_filter else "None"
-                 )
-        if settings.BM25_ENABLED and bm2s is None:
-             log.error("BM25_ENABLED is true in settings, but 'bm2s' library is not installed. Sparse retrieval will be skipped.")
+        log_params = {
+            "embedding_adapter_type": type(self.embedding_adapter).__name__,
+            "bm25_enabled_setting": settings.BM25_ENABLED, # El flag general
+            "sparse_retriever_active": bool(self.sparse_retriever), # Si la instancia está activa
+            "sparse_retriever_type": type(self.sparse_retriever).__name__ if self.sparse_retriever else "None",
+            "reranker_enabled": settings.RERANKER_ENABLED,
+            "reranker_service_url": str(settings.RERANKER_SERVICE_URL) if settings.RERANKER_ENABLED else "N/A",
+            "diversity_filter_enabled": settings.DIVERSITY_FILTER_ENABLED,
+            "diversity_filter_type": type(self.diversity_filter).__name__ if self.diversity_filter else "None",
+            "map_reduce_enabled": settings.MAPREDUCE_ENABLED,
+            "map_reduce_threshold": settings.MAPREDUCE_ACTIVATION_THRESHOLD,
+            "map_reduce_batch_size": settings.MAPREDUCE_CHUNK_BATCH_SIZE,
+            "rag_prompt_path": settings.RAG_PROMPT_TEMPLATE_PATH,
+            "general_prompt_path": settings.GENERAL_PROMPT_TEMPLATE_PATH,
+            "map_prompt_path": settings.MAP_PROMPT_TEMPLATE_PATH,
+            "reduce_prompt_path": settings.REDUCE_PROMPT_TEMPLATE_PATH,
+            "gemini_model_name": settings.GEMINI_MODEL_NAME,
+            "max_context_chunks": settings.MAX_CONTEXT_CHUNKS,
+            "max_prompt_tokens": settings.MAX_PROMPT_TOKENS,
+        }
+        log.info("AskQueryUseCase Initialized", **log_params)
+        if settings.BM25_ENABLED and not self.sparse_retriever:
+             log.error("BM25_ENABLED in settings, but sparse_retriever instance is NOT available (init failed or service unavailable). Sparse search will be skipped.")
+        # ChunkContentRepository es necesario si sparse_retriever solo devuelve IDs
         if self.sparse_retriever and not self.chunk_content_repo:
-            log.error("SparseRetriever is enabled but ChunkContentRepositoryPort is missing!")
+            log.error("SparseRetriever is active but ChunkContentRepository is missing. Content fetching for sparse results will fail.")
 
 
-    def _initialize_prompt_builder(self, template: str) -> PromptBuilder:
-        log.debug("Initializing PromptBuilder...", template_start=template[:100]+"...")
-        return PromptBuilder(template=template)
+    def _initialize_prompt_builder_from_path(self, template_path: str) -> PromptBuilder:
+        init_log = log.bind(action="_initialize_prompt_builder_from_path", path=template_path)
+        init_log.debug("Initializing PromptBuilder from path...")
+        try:
+            path_to_template = template_path
+            
+            if not os.path.exists(path_to_template):
+                init_log.error("Prompt template file not found at absolute path.")
+                raise FileNotFoundError(f"Prompt template file not found at {template_path}")
+
+            with open(path_to_template, "r", encoding="utf-8") as f:
+                template_content = f.read()
+            
+            if not template_content.strip():
+                init_log.error("Prompt template file is empty.")
+                raise ValueError(f"Prompt template file is empty: {template_path}")
+
+            builder = PromptBuilder(template=template_content)
+            init_log.info("PromptBuilder initialized successfully from file.")
+            return builder
+        except FileNotFoundError:
+            init_log.error("Prompt template file not found.")
+            default_fallback_template = "Query: {{ query }}\n{% if documents %}Context: {{documents}}{% endif %}\nAnswer:"
+            init_log.warning(f"Falling back to basic template due to missing file: {template_path}")
+            return PromptBuilder(template=default_fallback_template)
+        except Exception as e:
+            init_log.exception("Failed to load or initialize PromptBuilder from path.")
+            raise RuntimeError(f"Critical error loading prompt template from {template_path}: {e}") from e
 
     async def _embed_query(self, query: str) -> List[float]:
         embed_log = log.bind(action="_embed_query_use_case_call_remote")
@@ -837,122 +883,147 @@ class AskQueryUseCase:
                 raise ValueError("Embedding adapter returned invalid or empty vector.")
             embed_log.debug("Query embedded successfully via remote adapter", vector_dim=len(embedding))
             return embedding
-        except ConnectionError as e: # Specific error from adapter if service is down
+        except ConnectionError as e: 
             embed_log.error("Embedding failed: Connection to embedding service failed.", error=str(e), exc_info=False)
             raise ConnectionError(f"Embedding service error: {e}") from e
-        except ValueError as e: # Specific error from adapter for bad response
+        except ValueError as e: 
             embed_log.error("Embedding failed: Invalid data from embedding service.", error=str(e), exc_info=False)
             raise ValueError(f"Embedding service data error: {e}") from e
-        except Exception as e: # Catch-all for other unexpected issues
+        except Exception as e: 
             embed_log.error("Unexpected error during query embedding via adapter", error=str(e), exc_info=True)
             raise ConnectionError(f"Unexpected error contacting embedding service: {e}") from e
-
 
     def _format_chat_history(self, messages: List[ChatMessage]) -> str:
         if not messages:
             return ""
         history_str = []
-        for msg in reversed(messages): # Show newest first in internal processing, then reverse for prompt
+        for msg in reversed(messages): 
             role = "Usuario" if msg.role == 'user' else "Atenex"
             time_mark = format_time_delta(msg.created_at)
             history_str.append(f"{role} ({time_mark}): {msg.content}")
-        # The prompt template expects history oldest to newest
         return "\n".join(reversed(history_str))
 
-    async def _build_prompt(self, query: str, documents: List[Document], chat_history: Optional[str] = None) -> str:
-        builder_log = log.bind(action="build_prompt_use_case", num_docs=len(documents), history_included=bool(chat_history))
-        prompt_data = {"query": query}
-        try:
+    async def _build_prompt(self, query: str, documents: List[Document], chat_history: Optional[str] = None, builder: Optional[PromptBuilder] = None, prompt_data_override: Optional[Dict[str,Any]] = None) -> str:
+        
+        final_prompt_data = {"query": query}
+        if prompt_data_override:
+            final_prompt_data.update(prompt_data_override)
+        else: 
             if documents:
-                prompt_builder = self._prompt_builder_rag
-                prompt_data["documents"] = documents
-                builder_log.debug("Using RAG prompt template.")
-            else:
-                prompt_builder = self._prompt_builder_general
-                builder_log.debug("Using General prompt template.")
-
+                final_prompt_data["documents"] = documents
             if chat_history:
-                prompt_data["chat_history"] = chat_history
+                final_prompt_data["chat_history"] = chat_history
+        
+        effective_builder = builder
+        if not effective_builder: 
+            if documents or "documents" in final_prompt_data or "mapped_responses" in final_prompt_data: 
+                effective_builder = self._prompt_builder_rag 
+                if "mapped_responses" in final_prompt_data: effective_builder = self._prompt_builder_reduce
+            else: 
+                effective_builder = self._prompt_builder_general
+        
+        log.debug("Building prompt", builder_type=type(effective_builder).__name__, data_keys=list(final_prompt_data.keys()))
 
-            result = await asyncio.to_thread(prompt_builder.run, **prompt_data)
+        try:
+            result = await asyncio.to_thread(effective_builder.run, **final_prompt_data)
             prompt = result.get("prompt")
             if not prompt: raise ValueError("Prompt generation returned empty.")
-
-            builder_log.debug("Prompt built successfully.")
+            log.debug("Prompt built successfully.", length=len(prompt))
             return prompt
         except Exception as e:
-            builder_log.error("Prompt building failed", error=str(e), exc_info=True)
+            log.error("Prompt building failed", error=str(e), data_keys=list(final_prompt_data.keys()), exc_info=True)
             raise ValueError(f"Prompt building error: {e}") from e
 
     def _reciprocal_rank_fusion(self,
                                 dense_results: List[RetrievedChunk],
-                                sparse_results: List[Tuple[str, float]],
+                                sparse_results: List[Tuple[str, float]], # chunk_id, score
                                 k: int = RRF_K) -> Dict[str, float]:
         fused_scores: Dict[str, float] = {}
+        # Dense results: RetrievedChunk (con id, score, etc.)
         for rank, chunk in enumerate(dense_results):
-            if chunk.id:
+            if chunk.id: # Asegurar que el chunk tiene un ID
                 fused_scores[chunk.id] = fused_scores.get(chunk.id, 0.0) + 1.0 / (k + rank + 1)
+        
+        # Sparse results: Tupla (chunk_id, score)
         for rank, (chunk_id, _) in enumerate(sparse_results):
-            if chunk_id:
+            if chunk_id: # Asegurar que el chunk_id es válido
                 fused_scores[chunk_id] = fused_scores.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
         return fused_scores
 
     async def _fetch_content_for_fused_results(
         self,
-        fused_scores: Dict[str, float],
-        dense_map: Dict[str, RetrievedChunk],
+        fused_scores: Dict[str, float], # chunk_id: fused_score
+        dense_map: Dict[str, RetrievedChunk], # chunk_id: RetrievedChunk (de resultados densos)
         top_n: int
         ) -> List[RetrievedChunk]:
         fetch_log = log.bind(action="fetch_content_for_fused", top_n=top_n, fused_count=len(fused_scores))
         if not fused_scores: return []
 
-        sorted_chunk_ids = sorted(fused_scores.items(), key=lambda item: item[1], reverse=True)
-        top_ids = [cid for cid, score in sorted_chunk_ids[:top_n]]
-        fetch_log.debug("Top IDs after fusion", top_ids_count=len(top_ids))
+        # Ordenar por score fusionado y tomar top_n
+        sorted_chunk_ids_with_scores = sorted(fused_scores.items(), key=lambda item: item[1], reverse=True)
+        top_ids_with_scores_tuples: List[Tuple[str, float]] = sorted_chunk_ids_with_scores[:top_n]
+        
+        fetch_log.debug("Top IDs after fusion", top_ids_count=len(top_ids_with_scores_tuples))
 
         chunks_with_content: List[RetrievedChunk] = []
         ids_needing_content: List[str] = []
-        final_scores: Dict[str, float] = dict(sorted_chunk_ids[:top_n])
+        
+        # Mapa para reconstruir RetrievedChunk para los que se busca contenido
+        # Esto es crucial porque el sparse_retriever solo devuelve (id, score)
+        # Necesitamos crear un RetrievedChunk placeholder.
         placeholder_map: Dict[str, RetrievedChunk] = {}
 
-        for cid in top_ids:
+
+        for cid, fused_score_val in top_ids_with_scores_tuples:
             if not cid:
                  fetch_log.warning("Skipping invalid chunk ID found during fusion processing.")
                  continue
+            
+            # Si el chunk ya tiene contenido (vino de la búsqueda densa)
             if cid in dense_map and dense_map[cid].content:
                 chunk = dense_map[cid]
-                chunk.score = final_scores[cid] # Update score with fused score
+                chunk.score = fused_score_val # Actualizar con el score fusionado
                 chunks_with_content.append(chunk)
-            else: # Chunk from sparse results or dense results missing content
-                # Create a placeholder, content will be fetched
-                # Preserve original metadata if available (e.g., from dense_map but content was None)
-                original_metadata = dense_map[cid].metadata if cid in dense_map and dense_map[cid].metadata else {"retrieval_source": "sparse/fused"}
-                document_id = dense_map[cid].document_id if cid in dense_map and dense_map[cid].document_id else None
-                file_name = dense_map[cid].file_name if cid in dense_map and dense_map[cid].file_name else None
-                company_id_val = dense_map[cid].company_id if cid in dense_map and dense_map[cid].company_id else None
-                
+            else: # Chunk vino de la búsqueda dispersa o es un ID denso sin contenido precargado
+                # Crear un placeholder si no estaba en dense_map (vino de sparse)
+                # o si estaba en dense_map pero no tenía contenido.
+                # Para los chunks de sparse, no tenemos metadata original aquí.
+                # Esta es una limitación si no pasamos toda la metadata de sparse_search_service.
+                # El sparse-search-service devuelve chunk_id (embedding_id) y score.
+                # Si necesitamos más metadata de los chunks dispersos, el servicio debe devolverla,
+                # o hacemos otra query a la DB aquí (lo que es menos ideal).
+                # Por ahora, solo tendremos ID y score para los puramente dispersos.
+                original_metadata = dense_map.get(cid, RetrievedChunk(id=cid, score=None, metadata={})).metadata
+                document_id_val = dense_map.get(cid, RetrievedChunk(id=cid, score=None, document_id=None)).document_id
+                file_name_val = dense_map.get(cid, RetrievedChunk(id=cid, score=None, file_name=None)).file_name
+                company_id_val = dense_map.get(cid, RetrievedChunk(id=cid, score=None, company_id=None)).company_id
+
+
                 chunk_placeholder = RetrievedChunk(
                     id=cid,
-                    score=final_scores[cid],
-                    content=None, # To be fetched
-                    metadata=original_metadata,
-                    document_id=document_id,
-                    file_name=file_name,
+                    score=fused_score_val, # Usar el score fusionado
+                    content=None, # Será llenado si es necesario
+                    metadata=original_metadata or {"retrieval_source": "sparse_or_fused_no_initial_meta"},
+                    document_id=document_id_val,
+                    file_name=file_name_val,
                     company_id=company_id_val
                 )
-                chunks_with_content.append(chunk_placeholder)
-                placeholder_map[cid] = chunk_placeholder # Keep track for content update
+                chunks_with_content.append(chunk_placeholder) # Añadir placeholder a la lista principal
+                placeholder_map[cid] = chunk_placeholder # Guardar para actualizar contenido
                 ids_needing_content.append(cid)
-
 
         if ids_needing_content and self.chunk_content_repo:
              fetch_log.info("Fetching content for chunks missing content", count=len(ids_needing_content))
              try:
                  content_map = await self.chunk_content_repo.get_chunk_contents_by_ids(ids_needing_content)
                  for cid_item, content_val in content_map.items():
-                     if cid_item in placeholder_map:
+                     if cid_item in placeholder_map: # Si es un placeholder que creamos
                           placeholder_map[cid_item].content = content_val
-                          placeholder_map[cid_item].metadata["content_fetched"] = True # Mark as fetched
+                          # Actualizamos metadata si el placeholder es "genérico"
+                          if placeholder_map[cid_item].metadata.get("retrieval_source") == "sparse_or_fused_no_initial_meta":
+                            placeholder_map[cid_item].metadata["content_fetched_for_sparse"] = True
+                          else:
+                            placeholder_map[cid_item].metadata["content_fetched"] = True
                  missing_after_fetch = [cid_item_check for cid_item_check in ids_needing_content if cid_item_check not in content_map or not content_map[cid_item_check]]
                  if missing_after_fetch:
                       fetch_log.warning("Content not found or empty for some chunks after fetch", missing_ids=missing_after_fetch)
@@ -961,264 +1032,480 @@ class AskQueryUseCase:
         elif ids_needing_content:
             fetch_log.warning("Cannot fetch content for sparse/fused results, ChunkContentRepository not available.")
 
-        # Filter out any chunks that still don't have content after attempting fetch
-        final_chunks = [c for c in chunks_with_content if c.content and c.content.strip()]
-        fetch_log.debug("Chunks remaining after content check and fetch", count=len(final_chunks))
-        # Re-sort by score as the list might have been reordered during content fetching
-        final_chunks.sort(key=lambda c: c.score or 0.0, reverse=True)
-        return final_chunks
+        # Filtrar los que finalmente no tienen contenido
+        final_chunks_with_content = [c for c in chunks_with_content if c.content and c.content.strip()]
+        fetch_log.debug("Chunks remaining after content check and fetch", count=len(final_chunks_with_content))
+        
+        # Re-ordenar por el score fusionado después de tener todo el contenido
+        final_chunks_with_content.sort(key=lambda c: c.score or 0.0, reverse=True)
+        return final_chunks_with_content
+        
+    async def _handle_llm_response(
+        self,
+        json_answer_str: str,
+        query: str,
+        company_id: uuid.UUID,
+        user_id: uuid.UUID,
+        final_chat_id: uuid.UUID,
+        original_chunks_for_citation: List[RetrievedChunk], 
+        pipeline_stages_used: List[str],
+        map_reduce_used: bool = False,
+        retriever_k_effective: int = 0,
+        fusion_fetch_k_effective: int = 0,
+        num_chunks_after_rerank_or_fusion_fetch_effective: int = 0,
+        num_final_chunks_sent_to_llm_effective: int = 0,
+        num_history_messages_effective: int = 0
+    ) -> Tuple[str, List[RetrievedChunk], Optional[uuid.UUID]]:
+        
+        llm_handler_log = log.bind(action="_handle_llm_response", chat_id=str(final_chat_id))
+        answer_for_user: str
+        retrieved_chunks_for_response: List[RetrievedChunk] = []
+        assistant_sources_for_db: List[Dict[str, Any]] = []
+        log_id: Optional[uuid.UUID] = None
+        
+        try:
+            structured_answer_obj = RespuestaEstructurada.model_validate_json(json_answer_str)
+            answer_for_user = structured_answer_obj.respuesta_detallada
+            
+            llm_handler_log.info("LLM response successfully parsed and validated into RespuestaEstructurada.",
+                                 has_summary=bool(structured_answer_obj.resumen_ejecutivo),
+                                 num_fuentes_citadas_by_llm=len(structured_answer_obj.fuentes_citadas),
+                                 siguiente_pregunta_sugerida=structured_answer_obj.siguiente_pregunta_sugerida)
+
+            assistant_sources_for_db = [f.model_dump(exclude_none=True) for f in structured_answer_obj.fuentes_citadas]
+            
+            map_chunk_id_to_original = {chunk.id: chunk for chunk in original_chunks_for_citation}
+            
+            processed_chunk_ids_for_response = set()
+
+            for cited_source_by_llm in structured_answer_obj.fuentes_citadas:
+                if cited_source_by_llm.id_documento and cited_source_by_llm.id_documento in map_chunk_id_to_original:
+                    original_chunk = map_chunk_id_to_original[cited_source_by_llm.id_documento]
+                    if original_chunk.id not in processed_chunk_ids_for_response:
+                       retrieved_chunks_for_response.append(original_chunk)
+                       processed_chunk_ids_for_response.add(original_chunk.id)
+
+            if not retrieved_chunks_for_response and structured_answer_obj.fuentes_citadas:
+                llm_handler_log.warning("LLM cited sources, but no direct match found by id_documento. Using filename as fallback or top N.")
+                for cited_source_by_llm in structured_answer_obj.fuentes_citadas:
+                    if len(retrieved_chunks_for_response) >= self.settings.NUM_SOURCES_TO_SHOW: break
+                    found_by_name = False
+                    for orig_chunk in original_chunks_for_citation:
+                        if orig_chunk.id not in processed_chunk_ids_for_response and \
+                           orig_chunk.file_name == cited_source_by_llm.nombre_archivo:
+                             retrieved_chunks_for_response.append(orig_chunk)
+                             processed_chunk_ids_for_response.add(orig_chunk.id)
+                             found_by_name = True
+                             break 
+                    if not found_by_name:
+                         llm_handler_log.info("LLM cited source not found by filename either", cited_source_name=cited_source_by_llm.nombre_archivo)
+            
+            # If still not enough sources from LLM's explicit citations, fill with top from original input if any.
+            if len(retrieved_chunks_for_response) < self.settings.NUM_SOURCES_TO_SHOW and original_chunks_for_citation:
+                llm_handler_log.debug("Filling remaining source slots with top original chunks provided to LLM/MapReduce.")
+                for chunk in original_chunks_for_citation:
+                    if len(retrieved_chunks_for_response) >= self.settings.NUM_SOURCES_TO_SHOW: break
+                    if chunk.id not in processed_chunk_ids_for_response:
+                        retrieved_chunks_for_response.append(chunk)
+                        processed_chunk_ids_for_response.add(chunk.id)
+
+
+        except ValidationError as pydantic_err:
+            llm_handler_log.error("LLM JSON response failed Pydantic validation", raw_response=truncate_text(json_answer_str, 500), errors=pydantic_err.errors())
+            answer_for_user = "La respuesta del asistente no tuvo el formato esperado. Por favor, intenta de nuevo."
+            assistant_sources_for_db = [{"error": "Pydantic validation failed", "details": pydantic_err.errors()}]
+            retrieved_chunks_for_response = original_chunks_for_citation[:self.settings.NUM_SOURCES_TO_SHOW] # Fallback
+        except json.JSONDecodeError as json_err:
+            llm_handler_log.error("Failed to parse JSON response from LLM", raw_response=truncate_text(json_answer_str, 500), error=str(json_err))
+            answer_for_user = f"Hubo un error al procesar la respuesta del asistente (JSON malformado): {truncate_text(json_answer_str,100)}. Por favor, intenta de nuevo."
+            assistant_sources_for_db = [{"error": "JSON decode error", "details": str(json_err)}]
+            retrieved_chunks_for_response = original_chunks_for_citation[:self.settings.NUM_SOURCES_TO_SHOW] # Fallback
+
+        # Always save assistant message
+        await self.chat_repo.save_message(
+            chat_id=final_chat_id, role='assistant',
+            content=answer_for_user, 
+            sources=assistant_sources_for_db[:self.settings.NUM_SOURCES_TO_SHOW] if assistant_sources_for_db else None
+        )
+        llm_handler_log.info(f"Assistant message saved with up to {self.settings.NUM_SOURCES_TO_SHOW} sources.")
+
+        try:
+            docs_for_log_summary = [
+                RetrievedDocumentSchema(**chunk.model_dump(exclude={'embedding'}, exclude_none=True)).model_dump(exclude_none=True) 
+                for chunk in retrieved_chunks_for_response # Log based on what's returned to API
+            ]
+            log_metadata_details = {
+                "pipeline_stages": pipeline_stages_used,
+                "map_reduce_used": map_reduce_used,
+                "retriever_k_initial": retriever_k_effective,
+                "fusion_fetch_k": fusion_fetch_k_effective,
+                "max_context_chunks_limit_for_llm": self.settings.MAX_CONTEXT_CHUNKS, # Config value
+                "num_chunks_after_rerank_or_fusion_content_fetch": num_chunks_after_rerank_or_fusion_fetch_effective,
+                "num_final_chunks_sent_to_llm": num_final_chunks_sent_to_llm_effective,
+                "num_sources_shown_to_user": len(assistant_sources_for_db), # Based on LLM's output
+                "num_retrieved_docs_in_api_response": len(retrieved_chunks_for_response),
+                "chat_history_messages_included_in_prompt": num_history_messages_effective,
+                "diversity_filter_enabled_in_settings": self.settings.DIVERSITY_FILTER_ENABLED,
+                "reranker_enabled_in_settings": self.settings.RERANKER_ENABLED,
+                "bm25_enabled_in_settings": self.settings.BM25_ENABLED,
+            }
+            log_id = await self.log_repo.log_query_interaction(
+                company_id=company_id, user_id=user_id, query=query, answer=answer_for_user,
+                retrieved_documents_data=docs_for_log_summary, 
+                chat_id=final_chat_id, metadata=log_metadata_details
+            )
+            llm_handler_log.info("Interaction logged successfully", db_log_id=str(log_id))
+        except Exception as log_err_final:
+            llm_handler_log.error("Failed to log RAG interaction", error=str(log_err_final), exc_info=False)
+
+        return answer_for_user, retrieved_chunks_for_response, log_id
+
 
     async def execute(
         self, query: str, company_id: uuid.UUID, user_id: uuid.UUID,
         chat_id: Optional[uuid.UUID] = None, top_k: Optional[int] = None
     ) -> Tuple[str, List[RetrievedChunk], Optional[uuid.UUID], uuid.UUID]:
-        exec_log = log.bind(use_case="AskQueryUseCase", company_id=str(company_id), user_id=str(user_id), query=truncate_text(query, 50))
-        retriever_k = top_k if top_k is not None and 0 < top_k <= self.settings.RETRIEVER_TOP_K else self.settings.RETRIEVER_TOP_K
-        exec_log = exec_log.bind(effective_retriever_k=retriever_k)
+        
+        exec_log = log.bind(use_case="AskQueryUseCase", company_id=str(company_id), user_id=str(user_id), query_preview=truncate_text(query, 50))
+        retriever_k_effective = top_k if top_k is not None and 0 < top_k <= self.settings.RETRIEVER_TOP_K else self.settings.RETRIEVER_TOP_K
+        exec_log = exec_log.bind(effective_retriever_k=retriever_k_effective)
 
-        pipeline_stages_used = ["remote_embedding", "dense_retrieval", "llm_generation"]
+        pipeline_stages_used: List[str] = []
         final_chat_id: uuid.UUID
-        log_id: Optional[uuid.UUID] = None
         chat_history_str: Optional[str] = None
         history_messages: List[ChatMessage] = []
 
         try:
+            # --- Chat Management ---
             if chat_id:
                 if not await self.chat_repo.check_chat_ownership(chat_id, user_id, company_id):
                     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Chat not found or access denied.")
                 final_chat_id = chat_id
                 if self.settings.MAX_CHAT_HISTORY_MESSAGES > 0:
-                    try:
-                        history_messages = await self.chat_repo.get_chat_messages(
-                            chat_id=final_chat_id, user_id=user_id, company_id=company_id,
-                            limit=self.settings.MAX_CHAT_HISTORY_MESSAGES, offset=0
-                        )
-                        chat_history_str = self._format_chat_history(history_messages)
-                        exec_log.info("Chat history retrieved and formatted", num_messages=len(history_messages))
-                    except Exception as hist_err:
-                        exec_log.error("Failed to retrieve chat history", error=str(hist_err)) # Non-critical, proceed without history
+                    history_messages = await self.chat_repo.get_chat_messages(
+                        chat_id=final_chat_id, user_id=user_id, company_id=company_id,
+                        limit=self.settings.MAX_CHAT_HISTORY_MESSAGES, offset=0
+                    )
+                    chat_history_str = self._format_chat_history(history_messages)
+                    exec_log.info("Chat history retrieved", num_messages=len(history_messages))
             else:
                 initial_title = f"Chat: {truncate_text(query, 40)}"
                 final_chat_id = await self.chat_repo.create_chat(user_id=user_id, company_id=company_id, title=initial_title)
             exec_log = exec_log.bind(chat_id=str(final_chat_id))
-            exec_log.info("Chat state managed", is_new=(not chat_id))
-
             await self.chat_repo.save_message(chat_id=final_chat_id, role='user', content=query)
+            exec_log.info("Chat state managed and user message saved", is_new_chat=(not chat_id))
 
+            # --- Greeting Check ---
             if GREETING_REGEX.match(query):
                 answer = "¡Hola! ¿En qué puedo ayudarte hoy con la información de tus documentos?"
                 await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=None)
-                exec_log.info("Use case finished (greeting).")
-                return answer, [], log_id, final_chat_id
+                exec_log.info("Greeting detected, responded directly.")
+                # Log this simple interaction
+                simple_log_id = await self.log_repo.log_query_interaction(
+                    user_id=user_id, company_id=company_id, query=query, answer=answer,
+                    retrieved_documents_data=[], metadata={"type": "greeting"}, chat_id=final_chat_id
+                )
+                return answer, [], simple_log_id, final_chat_id
 
-            exec_log.info("Proceeding with RAG pipeline...")
-            query_embedding = await self._embed_query(query) # Uses remote embedding adapter
+            # --- RAG Pipeline Starts ---
+            pipeline_stages_used.append("query_embedding (remote)")
+            query_embedding = await self._embed_query(query)
 
-            dense_task = self.vector_store.search(query_embedding, str(company_id), retriever_k)
-            sparse_task = asyncio.create_task(asyncio.sleep(0)) # Placeholder if sparse is disabled
-            sparse_results: List[Tuple[str, float]] = []
+            # --- Retrieval (Dense + Sparse) ---
+            pipeline_stages_used.append("dense_retrieval (milvus)")
+            dense_task = self.vector_store.search(query_embedding, str(company_id), retriever_k_effective)
+            
+            sparse_results_tuples: List[Tuple[str, float]] = [] # chunk_id, score
+            sparse_task_placeholder = asyncio.create_task(asyncio.sleep(0)) 
 
-            if self.sparse_retriever:
-                 pipeline_stages_used.append("sparse_retrieval (bm2s)")
-                 sparse_task = self.sparse_retriever.search(query, str(company_id), retriever_k)
-            elif self.settings.BM25_ENABLED: # Log if enabled but instance not available
-                 pipeline_stages_used.append("sparse_retrieval (skipped_no_lib_or_init_fail)")
-                 exec_log.warning("BM25 enabled in settings but sparse_retriever instance is not available.")
-            else: # Log if explicitly disabled
-                 pipeline_stages_used.append("sparse_retrieval (disabled_in_settings)")
+            if self.sparse_retriever: # self.sparse_retriever es RemoteSparseRetrieverAdapter o None
+                 pipeline_stages_used.append("sparse_retrieval (remote_sparse_search_service)")
+                 # company_id debe ser UUID para el puerto SparseRetrieverPort
+                 sparse_task = self.sparse_retriever.search(query, company_id, retriever_k_effective)
+            else:
+                 pipeline_stages_used.append(f"sparse_retrieval ({'disabled_no_adapter_instance' if self.settings.BM25_ENABLED else 'disabled_in_settings'})")
+                 sparse_task = sparse_task_placeholder # No-op
 
+            # Ejecutar tareas de retrieval en paralelo
+            dense_chunks_domain, sparse_results_maybe_tuples = await asyncio.gather(dense_task, sparse_task)
+            
+            if self.sparse_retriever and isinstance(sparse_results_maybe_tuples, list):
+                sparse_results_tuples = sparse_results_maybe_tuples # Ya es List[Tuple[str, float]]
+            
+            exec_log.info("Retrieval phase done", dense_count=len(dense_chunks_domain), sparse_count=len(sparse_results_tuples))
 
-            dense_chunks, sparse_results_maybe = await asyncio.gather(dense_task, sparse_task)
-            if self.sparse_retriever and isinstance(sparse_results_maybe, list): # Ensure sparse_results_maybe is the actual result
-                sparse_results = sparse_results_maybe
-            exec_log.info("Retrieval phase completed", dense_count=len(dense_chunks), sparse_count=len(sparse_results), retriever_k=retriever_k)
-
-
+            # --- Fusion & Content Fetching ---
             pipeline_stages_used.append("fusion (rrf)")
-            dense_map = {c.id: c for c in dense_chunks if c.id} # Map for easy lookup
-            fused_scores = self._reciprocal_rank_fusion(dense_chunks, sparse_results)
-            fusion_fetch_k = self.settings.MAX_CONTEXT_CHUNKS + 10 # Fetch slightly more for reranking/filtering
-            combined_chunks_with_content = await self._fetch_content_for_fused_results(fused_scores, dense_map, fusion_fetch_k)
-            exec_log.info("Fusion & Content Fetch completed", initial_fused_count=len(fused_scores), chunks_with_content=len(combined_chunks_with_content), fetch_limit=fusion_fetch_k)
-
+            # dense_chunks_domain ya es List[RetrievedChunk]
+            dense_map = {c.id: c for c in dense_chunks_domain if c.id} # Mapa de chunk_id a RetrievedChunk
+            
+            # sparse_results_tuples es List[Tuple[str, float]]
+            fused_scores: Dict[str, float] = self._reciprocal_rank_fusion(dense_chunks_domain, sparse_results_tuples)
+            
+            fusion_fetch_k_effective = self.settings.MAX_CONTEXT_CHUNKS 
+            if self.settings.RERANKER_ENABLED or self.settings.DIVERSITY_FILTER_ENABLED : 
+                 fusion_fetch_k_effective = max(self.settings.MAX_CONTEXT_CHUNKS + 20, int(self.settings.MAX_CONTEXT_CHUNKS * 1.2) ) 
+            
+            # combined_chunks_with_content ahora es List[RetrievedChunk]
+            combined_chunks_with_content: List[RetrievedChunk] = await self._fetch_content_for_fused_results(
+                fused_scores, dense_map, fusion_fetch_k_effective
+            )
+            exec_log.info("Fusion & content fetch done", fused_results_count=len(combined_chunks_with_content), fetch_k=fusion_fetch_k_effective)
+            num_chunks_after_fusion_fetch = len(combined_chunks_with_content)
 
             if not combined_chunks_with_content:
-                 exec_log.warning("No chunks with content available after fusion/fetch for RAG.")
-                 # Proceed to LLM without documents
-                 final_prompt = await self._build_prompt(query, [], chat_history=chat_history_str)
-                 answer = await self.llm.generate(final_prompt)
-                 await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=None)
-                 try: # Best effort logging
-                    log_id = await self.log_repo.log_query_interaction(company_id=company_id, user_id=user_id, query=query, answer=answer, retrieved_documents_data=[], chat_id=final_chat_id, metadata={"pipeline_stages": pipeline_stages_used, "result": "no_docs_found_after_fusion"})
-                 except Exception as log_exc_no_docs: exec_log.error("Failed to log interaction for no_docs_after_fusion case", error=str(log_exc_no_docs))
-                 return answer, [], log_id, final_chat_id
-
-            chunks_to_process_further = combined_chunks_with_content
-
-            # --- Remote Reranking Step ---
-            if self.settings.RERANKER_ENABLED:
-                rerank_log = exec_log.bind(action="remote_rerank")
-                rerank_log.debug(f"Performing remote reranking with {self.settings.RERANKER_SERVICE_URL}...", count=len(chunks_to_process_further))
+                exec_log.warning("No chunks with content after fusion/fetch. Using general prompt.")
+                general_prompt = await self._build_prompt(query, [], chat_history=chat_history_str, builder=self._prompt_builder_general)
+                answer_str = await self.llm.generate(general_prompt, response_pydantic_schema=None) 
                 
-                # Prepare payload for reranker service
-                documents_to_rerank_payload = []
-                for doc_chunk in chunks_to_process_further:
-                    if doc_chunk.content and doc_chunk.id: # Ensure content and ID exist
-                        documents_to_rerank_payload.append(
-                            {"id": doc_chunk.id, "text": doc_chunk.content, "metadata": doc_chunk.metadata or {}}
-                        )
+                await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer_str, sources=None)
+                no_docs_log_id = await self.log_repo.log_query_interaction(
+                    company_id=company_id, user_id=user_id, query=query, answer=answer_str, 
+                    retrieved_documents_data=[], chat_id=final_chat_id, 
+                    metadata={"pipeline_stages": pipeline_stages_used, "result_type": "no_docs_for_rag", "map_reduce_used": False}
+                )
+                return answer_str, [], no_docs_log_id, final_chat_id
+            
+            # --- Reranking (Remote) ---
+            chunks_for_llm_or_mapreduce = combined_chunks_with_content # Ya son RetrievedChunk
+            if self.settings.RERANKER_ENABLED and chunks_for_llm_or_mapreduce:
+                pipeline_stages_used.append("reranking (remote_reranker_service)")
+                rerank_log = exec_log.bind(action="rerank_remote", num_chunks_to_rerank=len(chunks_for_llm_or_mapreduce))
                 
-                if documents_to_rerank_payload:
-                    reranker_request_payload = {
+                # Preparar datos para el servicio de reranking
+                # El servicio espera: {"query": str, "documents": [{"id": str, "text": str, "metadata": dict}], "top_n": int}
+                # RetrievedChunk tiene id, content, metadata.
+                documents_for_reranker = []
+                for chk in chunks_for_llm_or_mapreduce:
+                    if chk.content and chk.id: # Asegurar que hay contenido e ID
+                        documents_for_reranker.append({
+                            "id": chk.id,
+                            "text": chk.content,
+                            "metadata": chk.metadata or {} # Usar metadata del chunk
+                        })
+                
+                if documents_for_reranker:
+                    reranker_payload = {
                         "query": query,
-                        "documents": documents_to_rerank_payload,
-                        "top_n": self.settings.MAX_CONTEXT_CHUNKS + 5 # Ask reranker for slightly more than needed for LLM
+                        "documents": documents_for_reranker,
+                        "top_n": self.settings.MAX_CONTEXT_CHUNKS # Reranker devuelve hasta este num
                     }
                     try:
-                        response = await self.http_client.post(
-                            str(self.settings.RERANKER_SERVICE_URL).rstrip('/') + "/api/v1/rerank",
-                            json=reranker_request_payload,
+                        rerank_log.debug("Sending request to reranker service...")
+                        reranker_url = str(self.settings.RERANKER_SERVICE_URL).rstrip('/') + "/api/v1/rerank"
+                        
+                        # Usar el http_client global del UseCase
+                        reranker_response = await self.http_client.post(
+                            reranker_url,
+                            json=reranker_payload,
                             timeout=self.settings.RERANKER_CLIENT_TIMEOUT
                         )
-                        response.raise_for_status() # Raise HTTPStatusError for 4xx/5xx
-                        
-                        reranker_response_json = response.json()
-                        # The reranker-service wraps its response in a "data" key
-                        api_response_data = reranker_response_json.get("data", {})
-                        reranked_docs_data = api_response_data.get("reranked_documents", [])
-                        
-                        # Map response back to domain.RetrievedChunk, preserving original embeddings if any
-                        original_chunks_map = {chunk.id: chunk for chunk in chunks_to_process_further}
-                        reranked_domain_chunks = []
-                        for reranked_doc_item in reranked_docs_data:
-                            original_chunk = original_chunks_map.get(reranked_doc_item["id"])
-                            if original_chunk:
-                                # Create new RetrievedChunk instances with updated scores
-                                updated_chunk = RetrievedChunk(
-                                    id=original_chunk.id,
-                                    content=original_chunk.content, # Use original fetched content
-                                    score=reranked_doc_item["score"], # New score from reranker
-                                    metadata=reranked_doc_item.get("metadata", original_chunk.metadata), # Prefer reranker's metadata if returned, else original
-                                    embedding=original_chunk.embedding, # Preserve original embedding
-                                    document_id=original_chunk.document_id,
-                                    file_name=original_chunk.file_name,
-                                    company_id=original_chunk.company_id
-                                )
-                                reranked_domain_chunks.append(updated_chunk)
-                        
-                        chunks_to_process_further = reranked_domain_chunks
-                        model_name_from_reranker = api_response_data.get("model_info",{}).get("model_name","unknown_remote")
-                        pipeline_stages_used.append(f"reranking (remote:{model_name_from_reranker})")
-                        rerank_log.info("Remote reranking successful.", count=len(chunks_to_process_further), model_used=model_name_from_reranker)
+                        reranker_response.raise_for_status()
+                        reranked_data = reranker_response.json()
 
+                        if "data" in reranked_data and "reranked_documents" in reranked_data["data"]:
+                            reranked_docs_from_service = reranked_data["data"]["reranked_documents"]
+                            # Mapear de nuevo a RetrievedChunk, actualizando scores y manteniendo el orden
+                            # Crear un mapa de los chunks originales por ID para fácil acceso
+                            original_chunks_map = {c.id: c for c in chunks_for_llm_or_mapreduce}
+                            
+                            updated_reranked_chunks = []
+                            for reranked_item in reranked_docs_from_service:
+                                chunk_id = reranked_item.get("id")
+                                new_score = reranked_item.get("score")
+                                if chunk_id in original_chunks_map:
+                                    original_chunk_obj = original_chunks_map[chunk_id]
+                                    original_chunk_obj.score = new_score # Actualizar el score
+                                    original_chunk_obj.metadata["reranked_score"] = new_score # Guardar también en metadata
+                                    updated_reranked_chunks.append(original_chunk_obj)
+                            
+                            chunks_for_llm_or_mapreduce = updated_reranked_chunks
+                            rerank_log.info(f"Reranking successful. {len(chunks_for_llm_or_mapreduce)} chunks after reranking.")
+                        else:
+                            rerank_log.warning("Reranker service response format invalid.", response_data=reranked_data)
                     except httpx.HTTPStatusError as http_err:
-                        rerank_log.error("Reranker service request failed (HTTPStatusError)", status_code=http_err.response.status_code, response_text=http_err.response.text, exc_info=False)
-                        pipeline_stages_used.append("reranking (remote_http_error)")
-                        # Optionally, could raise ConnectionError here or proceed with non-reranked chunks
+                        rerank_log.error("HTTP error from Reranker service", status_code=http_err.response.status_code, response_text=http_err.response.text, exc_info=False)
                     except httpx.RequestError as req_err:
-                        rerank_log.error("Reranker service request failed (RequestError)", error=str(req_err), exc_info=False)
-                        pipeline_stages_used.append("reranking (remote_request_error)")
-                        # Raise ConnectionError to signal service unavailability
-                        raise ConnectionError(f"Reranker service connection error: {req_err}") from req_err
-                    except Exception as e_rerank: # Catch other errors like JSONDecodeError
-                        rerank_log.error("Error processing reranker service response", error_message=str(e_rerank), exc_info=True)
-                        pipeline_stages_used.append("reranking (remote_client_error)")
+                        rerank_log.error("Request error contacting Reranker service", error=str(req_err), exc_info=False)
+                        # No detener el pipeline, continuar con los chunks fusionados/sin rerankear
+                    except Exception as e_rerank:
+                        rerank_log.exception("Unexpected error during reranking call.")
                 else:
-                    rerank_log.warning("No documents with content to send to reranker service.")
-                    pipeline_stages_used.append("reranking (skipped_no_content_for_remote)")
-            else:
-                 pipeline_stages_used.append("reranking (disabled_in_settings)")
+                    rerank_log.warning("No valid documents with content/id to send for reranking.")
 
+            else: # Reranking deshabilitado o no hay chunks
+                pipeline_stages_used.append(f"reranking ({'disabled' if not self.settings.RERANKER_ENABLED else 'skipped_no_chunks_or_content'})")
+            
+            num_chunks_after_rerank = len(chunks_for_llm_or_mapreduce)
 
-            final_chunks_for_llm = chunks_to_process_further
-            if self.diversity_filter:
-                 k_final_diversity = self.settings.MAX_CONTEXT_CHUNKS
+            # --- Diversity Filtering ---
+            if self.diversity_filter and chunks_for_llm_or_mapreduce:
+                 k_final_diversity = self.settings.MAX_CONTEXT_CHUNKS 
                  filter_type = type(self.diversity_filter).__name__
                  pipeline_stages_used.append(f"diversity_filter ({filter_type})")
-                 exec_log.debug(f"Applying {filter_type} k={k_final_diversity}...", count=len(chunks_to_process_further))
-                 final_chunks_for_llm = await self.diversity_filter.filter(chunks_to_process_further, k_final_diversity)
-                 exec_log.info(f"{filter_type} applied.", final_count=len(final_chunks_for_llm))
-            else: # If diversity filter is not enabled, just truncate
-                 final_chunks_for_llm = chunks_to_process_further[:self.settings.MAX_CONTEXT_CHUNKS]
-                 exec_log.info(f"Diversity filter disabled. Truncating to MAX_CONTEXT_CHUNKS.", final_count=len(final_chunks_for_llm), limit=self.settings.MAX_CONTEXT_CHUNKS)
+                 exec_log.debug(f"Applying {filter_type} k={k_final_diversity}...", count=len(chunks_for_llm_or_mapreduce))
+                 chunks_for_llm_or_mapreduce = await self.diversity_filter.filter(chunks_for_llm_or_mapreduce, k_final_diversity)
+                 exec_log.info(f"{filter_type} applied.", final_count=len(chunks_for_llm_or_mapreduce))
+            else: 
+                 pipeline_stages_used.append(f"diversity_filter ({'disabled' if not self.settings.DIVERSITY_FILTER_ENABLED else 'skipped_no_chunks'})")
+                 chunks_for_llm_or_mapreduce = chunks_for_llm_or_mapreduce[:self.settings.MAX_CONTEXT_CHUNKS]
+                 exec_log.info(f"Diversity filter not applied or no chunks. Truncating to MAX_CONTEXT_CHUNKS.", 
+                               count=len(chunks_for_llm_or_mapreduce), limit=self.settings.MAX_CONTEXT_CHUNKS)
 
-            # Ensure chunks passed to LLM have content
-            final_chunks_for_llm = [c for c in final_chunks_for_llm if c.content and c.content.strip()]
-            if not final_chunks_for_llm:
-                 exec_log.warning("No chunks with content remaining after final limiting/filtering for RAG.")
-                 final_prompt = await self._build_prompt(query, [], chat_history=chat_history_str)
-                 answer = await self.llm.generate(final_prompt)
-                 await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=None)
-                 try:
-                    log_id = await self.log_repo.log_query_interaction(company_id=company_id, user_id=user_id, query=query, answer=answer, retrieved_documents_data=[], chat_id=final_chat_id, metadata={"pipeline_stages": pipeline_stages_used, "result": "no_docs_after_final_processing"})
-                 except Exception as log_exc_final_no_docs: exec_log.error("Failed to log interaction for no_docs_after_final_processing case", error=str(log_exc_final_no_docs))
-                 return answer, [], log_id, final_chat_id
+            final_chunks_for_processing = [c for c in chunks_for_llm_or_mapreduce if c.content and c.content.strip()]
+            num_final_chunks_for_llm_or_mapreduce = len(final_chunks_for_processing)
 
-            haystack_docs_for_prompt = [
-                Document(id=c.id, content=c.content, meta=c.metadata, score=c.score)
-                for c in final_chunks_for_llm
-            ]
-            exec_log.info(f"Building RAG prompt with {len(haystack_docs_for_prompt)} final chunks and history.")
-            final_prompt = await self._build_prompt(query, haystack_docs_for_prompt, chat_history=chat_history_str)
-
-            answer = await self.llm.generate(final_prompt)
-            exec_log.info("LLM answer generated.", length=len(answer))
-
-            sources_to_show_count = self.settings.NUM_SOURCES_TO_SHOW
-            assistant_sources = [
-                {"chunk_id": c.id, "document_id": c.document_id, "file_name": c.file_name, "score": c.score, "preview": truncate_text(c.content, 150) if c.content else "Error: Contenido no disponible"}
-                for c in final_chunks_for_llm[:sources_to_show_count]
-            ]
-            await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=assistant_sources or None)
-            exec_log.info(f"Assistant message saved with top {len(assistant_sources)} sources.")
-
-            try:
-                docs_for_log_dump = [RetrievedDocumentSchema(**c.model_dump(exclude_none=True)).model_dump(exclude_none=True) for c in final_chunks_for_llm[:sources_to_show_count]]
-                log_metadata_details = {
-                    "pipeline_stages": pipeline_stages_used,
-                    "retriever_k_initial": retriever_k,
-                    "fusion_fetch_k": fusion_fetch_k,
-                    "max_context_chunks_limit_for_llm": self.settings.MAX_CONTEXT_CHUNKS,
-                    "num_chunks_after_rerank_or_fusion_content_fetch": len(chunks_to_process_further),
-                    "num_final_chunks_sent_to_llm": len(final_chunks_for_llm),
-                    "num_sources_shown_to_user": len(assistant_sources),
-                    "chat_history_messages_included_in_prompt": len(history_messages),
-                    "diversity_filter_enabled_in_settings": self.settings.DIVERSITY_FILTER_ENABLED,
-                    "reranker_enabled_in_settings": self.settings.RERANKER_ENABLED,
-                    "bm25_enabled_in_settings": self.settings.BM25_ENABLED,
-                 }
-                log_id = await self.log_repo.log_query_interaction(
-                    company_id=company_id, user_id=user_id, query=query, answer=answer,
-                    retrieved_documents_data=docs_for_log_dump, chat_id=final_chat_id, metadata=log_metadata_details
+            if not final_chunks_for_processing: 
+                exec_log.warning("No chunks with content after reranking/filtering. Using general prompt.")
+                general_prompt = await self._build_prompt(query, [], chat_history=chat_history_str, builder=self._prompt_builder_general)
+                answer_str = await self.llm.generate(general_prompt, response_pydantic_schema=None)
+                await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer_str, sources=None)
+                no_docs_final_log_id = await self.log_repo.log_query_interaction(
+                    company_id=company_id, user_id=user_id, query=query, answer=answer_str, 
+                    retrieved_documents_data=[], chat_id=final_chat_id, 
+                    metadata={"pipeline_stages": pipeline_stages_used, "result_type": "no_docs_after_postprocessing", "map_reduce_used": False}
                 )
-                exec_log.info("Interaction logged successfully", db_log_id=str(log_id))
-            except Exception as log_err_final:
-                exec_log.error("Failed to log RAG interaction", error=str(log_err_final), exc_info=False)
+                return answer_str, [], no_docs_final_log_id, final_chat_id
 
+
+            # --- MapReduce or Direct RAG ---
+            map_reduce_active = False
+            json_answer_str: str
+
+            if self.settings.MAPREDUCE_ENABLED and len(final_chunks_for_processing) > self.settings.MAPREDUCE_ACTIVATION_THRESHOLD:
+                exec_log.info(f"Activating MapReduce. Chunks: {len(final_chunks_for_processing)}, Threshold: {self.settings.MAPREDUCE_ACTIVATION_THRESHOLD}", flow_type="MapReduce")
+                pipeline_stages_used.append("map_reduce_flow")
+                map_reduce_active = True
+
+                # MAP PHASE
+                pipeline_stages_used.append("map_phase")
+                mapped_responses_parts = []
+                # RetrievedChunk a Haystack Document para el prompt builder
+                haystack_docs_for_map = [
+                    Document(
+                        id=c.id, 
+                        content=c.content, 
+                        meta={ # Pasar metadata relevante para el prompt de mapeo
+                            "file_name": c.file_name, 
+                            "page": c.metadata.get("page"), # Asumimos 'page' en metadata
+                            "title": c.metadata.get("title") # Asumimos 'title' en metadata
+                        },
+                        score=c.score
+                    ) for c in final_chunks_for_processing
+                ]
+                
+                map_tasks = []
+                for i in range(0, len(haystack_docs_for_map), self.settings.MAPREDUCE_CHUNK_BATCH_SIZE):
+                    batch_docs = haystack_docs_for_map[i:i + self.settings.MAPREDUCE_CHUNK_BATCH_SIZE]
+                    map_prompt_data = {
+                        "original_query": query, 
+                        "documents": batch_docs, # Lista de Haystack Documents
+                        "document_index": i, 
+                        "total_documents": len(haystack_docs_for_map) 
+                    }
+                    # Aquí no se pasan `documents` directamente al builder sino a `prompt_data_override`
+                    map_prompt_str_task = self._build_prompt(query="", documents=[], prompt_data_override=map_prompt_data, builder=self._prompt_builder_map)
+                    map_tasks.append(map_prompt_str_task)
+                
+                map_prompts = await asyncio.gather(*map_tasks)
+                
+                llm_map_tasks = []
+                for idx, map_prompt in enumerate(map_prompts):
+                    llm_map_tasks.append(self.llm.generate(map_prompt, response_pydantic_schema=None)) # Expect text
+                
+                map_phase_results = await asyncio.gather(*[asyncio.shield(task) for task in llm_map_tasks], return_exceptions=True)
+
+                for idx, result in enumerate(map_phase_results):
+                    map_log = exec_log.bind(map_batch_index=idx)
+                    if isinstance(result, Exception):
+                        map_log.error("LLM call failed for map batch", error=str(result), exc_info=True)
+                    elif result and MAP_REDUCE_NO_RELEVANT_INFO not in result:
+                        mapped_responses_parts.append(f"--- Extracto del Lote de Documentos {idx + 1} ---\n{result}\n")
+                        map_log.info("Map request processed for batch.", response_length=len(result), is_relevant=True)
+                    else:
+                         map_log.info("Map request processed for batch, no relevant info found by LLM.", response_length=len(result or ""))
+
+
+                if not mapped_responses_parts:
+                    exec_log.warning("MapReduce: All map steps reported no relevant information or failed.")
+                    concatenated_mapped_responses = "Todos los fragmentos procesados indicaron no tener información relevante para la consulta o hubo errores en su procesamiento."
+                else:
+                    concatenated_mapped_responses = "\n".join(mapped_responses_parts)
+
+                # REDUCE PHASE
+                pipeline_stages_used.append("reduce_phase")
+                reduce_prompt_data = {
+                    "original_query": query,
+                    "chat_history": chat_history_str,
+                    "mapped_responses": concatenated_mapped_responses,
+                    # Pasar los Haystack Documents originales al prompt de reducción para citación
+                    "original_documents_for_citation": haystack_docs_for_map 
+                }
+                reduce_prompt_str = await self._build_prompt(query="", documents=[], prompt_data_override=reduce_prompt_data, builder=self._prompt_builder_reduce)
+                
+                exec_log.info("Sending reduce request to LLM for final JSON response.")
+                json_answer_str = await self.llm.generate(reduce_prompt_str, response_pydantic_schema=RespuestaEstructurada)
+
+            else: # Direct RAG
+                exec_log.info(f"Using Direct RAG strategy. Chunks: {len(final_chunks_for_processing)}", flow_type="DirectRAG")
+                pipeline_stages_used.append("direct_rag_flow")
+                
+                # Convertir RetrievedChunk a Haystack Document para el prompt builder
+                haystack_docs_for_prompt = [
+                    Document(
+                        id=c.id, 
+                        content=c.content, 
+                        meta={ # Pasar metadata relevante para el prompt RAG
+                            "file_name": c.file_name, 
+                            "page": c.metadata.get("page"),
+                            "title": c.metadata.get("title")
+                        },
+                        score=c.score
+                    ) for c in final_chunks_for_processing
+                ]
+                direct_rag_prompt = await self._build_prompt(query, haystack_docs_for_prompt, chat_history_str, builder=self._prompt_builder_rag)
+                
+                exec_log.info("Sending direct RAG request to LLM for JSON response.")
+                json_answer_str = await self.llm.generate(direct_rag_prompt, response_pydantic_schema=RespuestaEstructurada)
+
+            # --- Handle LLM Response (Common for MapReduce and Direct RAG) ---
+            answer_text, relevant_chunks_for_api, final_log_id = await self._handle_llm_response(
+                json_answer_str=json_answer_str,
+                query=query,
+                company_id=company_id,
+                user_id=user_id,
+                final_chat_id=final_chat_id,
+                original_chunks_for_citation=final_chunks_for_processing, # Usar los chunks que entraron a LLM/MapReduce
+                pipeline_stages_used=pipeline_stages_used,
+                map_reduce_used=map_reduce_active,
+                retriever_k_effective=retriever_k_effective,
+                fusion_fetch_k_effective=fusion_fetch_k_effective,
+                num_chunks_after_rerank_or_fusion_fetch_effective=num_chunks_after_rerank, # Antes de diversidad/truncamiento final
+                num_final_chunks_sent_to_llm_effective=num_final_chunks_for_llm_or_mapreduce,
+                num_history_messages_effective=len(history_messages)
+            )
+            
             exec_log.info("Use case execution finished successfully.")
-            return answer, final_chunks_for_llm[:sources_to_show_count], log_id, final_chat_id
+            return answer_text, relevant_chunks_for_api, final_log_id, final_chat_id
 
-        except ConnectionError as ce: # Catch specific ConnectionErrors from sub-components
-            exec_log.error("Connection error during use case execution", error=str(ce), exc_info=True)
+        except ConnectionError as ce: 
+            exec_log.error("Connection error during use case execution", error=str(ce), exc_info=False)
             detail_message = "A required external service is unavailable. Please try again later."
-            # More specific messages based on error content
-            if "Embedding service" in str(ce) or "embedding service" in str(ce).lower():
-                detail_message = "The embedding service is currently unavailable. Please try again later."
-            elif "Reranker service" in str(ce) or "reranker service" in str(ce).lower():
-                detail_message = "The reranking service is currently unavailable. Please try again later."
-            elif "Gemini API" in str(ce) or "gemini" in str(ce).lower():
-                detail_message = "The language model service (Gemini) is currently unavailable. Please try again later."
-            elif "Vector DB" in str(ce) or "Milvus" in str(ce).lower():
-                detail_message = "The vector database service is currently unavailable. Please try again later."
+            if "Embedding service" in str(ce): detail_message = "The embedding service is currently unavailable."
+            elif "Reranker service" in str(ce): detail_message = "The reranking service is currently unavailable."
+            elif "Sparse search service" in str(ce): detail_message = "The sparse search service is currently unavailable."
+            elif "Gemini API" in str(ce): detail_message = "The language model service (Gemini) is currently unavailable."
+            elif "Vector DB" in str(ce): detail_message = "The vector database service is currently unavailable."
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=detail_message) from ce
-        except ValueError as ve: # Catch specific ValueErrors (e.g., from prompt building, bad embedding data)
-            exec_log.error("Value error during use case execution", error=str(ve), exc_info=True) # Log with traceback for ValueError
+        except ValueError as ve: 
+            exec_log.error("Value error during use case execution", error=str(ve), exc_info=True) 
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Data processing error: {ve}") from ve
-        except HTTPException as http_exc: # Re-raise HTTPExceptions from chat ownership check etc.
+        except HTTPException as http_exc: 
+            exec_log.warning("HTTPException caught in use case", status_code=http_exc.status_code, detail=http_exc.detail)
             raise http_exc
-        except Exception as e: # Catch-all for any other unhandled error
-            exec_log.exception("Unexpected error during use case execution") # Log with full traceback
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An internal error occurred: {type(e).__name__}") from e
+        except Exception as e: 
+            exec_log.exception("Unexpected error during use case execution") 
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An internal server error occurred: {type(e).__name__}. Please contact support if this persists.") from e
 ```
 
 ## File: `app\core\__init__.py`
@@ -1236,6 +1523,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import AnyHttpUrl, SecretStr, Field, field_validator, ValidationError, ValidationInfo
 import sys
 import json
+from pathlib import Path 
 
 # --- Default Values ---
 # PostgreSQL
@@ -1245,7 +1533,6 @@ POSTGRES_K8S_DB_DEFAULT = "atenex"
 POSTGRES_K8S_USER_DEFAULT = "postgres"
 
 # Milvus
-# MILVUS_K8S_DEFAULT_URI = "http://milvus-standalone.nyro-develop.svc.cluster.local:19530" # No longer default
 ZILLIZ_ENDPOINT_DEFAULT = "https://in03-0afab716eb46d7f.serverless.gcp-us-west1.cloud.zilliz.com"
 MILVUS_DEFAULT_COLLECTION = "document_chunks_minilm"
 MILVUS_DEFAULT_EMBEDDING_FIELD = "embedding"
@@ -1258,99 +1545,41 @@ MILVUS_DEFAULT_SEARCH_PARAMS = {"metric_type": "IP", "params": {"nprobe": 10}}
 MILVUS_DEFAULT_METADATA_FIELDS = ["company_id", "document_id", "file_name", "page", "title"]
 
 # Embedding Service
-EMBEDDING_SERVICE_K8S_URL_DEFAULT = "http://embedding-service.nyro-develop.svc.cluster.local:8003"
+EMBEDDING_SERVICE_K8S_URL_DEFAULT = "http://embedding-service.nyro-develop.svc.cluster.local:80" # Puerto 80 por el service K8s
 # Reranker Service
-RERANKER_SERVICE_K8S_URL_DEFAULT = "http://reranker-service.nyro-develop.svc.cluster.local:80"
+RERANKER_SERVICE_K8S_URL_DEFAULT = "http://reranker-service.nyro-develop.svc.cluster.local:80" # Puerto 80 por el service K8s
+# Sparse Search Service
+SPARSE_SEARCH_SERVICE_K8S_URL_DEFAULT = "http://sparse-search-service.nyro-develop.svc.cluster.local:80" # Puerto 80 por el service K8s
 
 
-# ==========================================================================================
-#  ATENEX SYSTEM PROMPT ADAPTADO - v1.3 (Mayo 2025)
-# ==========================================================================================
-# Adaptado del System Prompt detallado, enfocado en instrucciones para el LLM en tiempo de ejecución.
+# --- Paths for Prompt Templates ---
+PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts"
+DEFAULT_RAG_PROMPT_TEMPLATE_PATH = str(PROMPT_DIR / "rag_template_gemini_v2.txt")
+DEFAULT_GENERAL_PROMPT_TEMPLATE_PATH = str(PROMPT_DIR / "general_template_gemini_v2.txt")
+DEFAULT_MAP_PROMPT_TEMPLATE_PATH = str(PROMPT_DIR / "map_prompt_template.txt")
+DEFAULT_REDUCE_PROMPT_TEMPLATE_PATH = str(PROMPT_DIR / "reduce_prompt_template_v2.txt")
 
-ATENEX_RAG_PROMPT_TEMPLATE = r"""
-════════════════════════════════════════════════════════════════════
-A T E N E X · INSTRUCCIONES DE GENERACIÓN (Gemini 2.5 Flash)
-════════════════════════════════════════════════════════════════════
 
-1 · IDENTIDAD Y TONO
-Eres **Atenex**, un asistente de IA experto en consulta de documentación empresarial (PDFs, manuales, etc.). Eres profesional, directo, verificable y empático. Escribe en **español latino** claro y conciso. Prioriza la precisión y la seguridad.
-
-2 · PRINCIPIOS CLAVE
-   - **BASATE SOLO EN EL CONTEXTO:** Usa *únicamente* la información del HISTORIAL RECIENTE y los DOCUMENTOS RECUPERADOS a continuación. **No inventes**, especules ni uses conocimiento externo. Si la respuesta no está explícitamente en el contexto, indícalo claramente.
-   - **CITACIÓN:** Cuando uses información de un documento recuperado, añade una cita al final de la frase o párrafo relevante indicando el documento y página. Formato preferido: `[Doc N]`. El formato detallado de la fuente se listará al final.
-   - **NO ESPECULACIÓN:** Si la información solicitada no se encuentra, responde claramente: "No encontré información específica sobre eso en los documentos proporcionados ni en el historial reciente." y, si es posible, sugiere cómo el usuario podría encontrarla (ej. probar otros términos, revisar un documento específico si parece muy relevante).
-   - **NO CÓDIGO:** No generes bloques de código ejecutable. Puedes explicar conceptos o pseudocódigo si es útil.
-   - **PREGUNTAS AMPLIAS:** Si la pregunta es muy general (ej. "dame todo sobre X"), en lugar de intentar resumir todo, identifica 1-3 temas clave cubiertos en los documentos y formula preguntas aclaratorias al usuario para enfocar la consulta. Ejemplo: "Los documentos mencionan X en relación a Y y Z. ¿Te interesa algún aspecto en particular?".
-   - **PETICIONES DE ARCHIVOS:** Si el usuario pide explícitamente "el PDF" o "el documento" y varios chunks recuperados pertenecen al mismo archivo (identificable por `doc.meta.file_name`), tu respuesta debe indicar que tienes información *proveniente* de ese archivo específico, resumir lo más relevante según la consulta, y citarlo. **No puedes entregar el archivo binario**, solo responder basado en su contenido textual.
-
-3 · CONTEXTO PROPORCIONADO
-{% if chat_history %}
-───────────────────── HISTORIAL RECIENTE (Más antiguo a más nuevo) ─────────────────────
-{{ chat_history }}
-────────────────────────────────────────────────────────────────────────────────────────
-{% endif %}
-──────────────────── DOCUMENTOS RECUPERADOS (Ordenados por relevancia) ──────────────────
-{% for doc in documents %}
-[Doc {{ loop.index }}] «{{ doc.meta.file_name | default("Archivo Desconocido") }}»
- Título : {{ doc.meta.title | default("Sin Título") }}
- Página : {{ doc.meta.page | default("?") }}
- Score  : {{ "%.3f"|format(doc.score) if doc.score is not none else "N/A" }}
- Extracto: {{ doc.content | trim }}
---------------------------------------------------------------------------------------------{% endfor %}
-────────────────────────────────────────────────────────────────────────────────────────
-
-4 · PREGUNTA ACTUAL DEL USUARIO
-{{ query }}
-
-5 · FORMATO DE RESPUESTA REQUERIDO
-   - **Respuesta Principal:** Escribe una respuesta natural, fluida y conversacional directamente abordando la pregunta del usuario. Si la respuesta es extensa (más de ~160 palabras), puedes iniciar con un breve resumen ejecutivo (1-2 frases). Integra la información clave y las citas `[Doc N]` donde corresponda. Evita usar explícitamente etiquetas como "Respuesta directa:" o "Siguiente acción sugerida:". Concluye la respuesta sugiriendo un próximo paso lógico o una pregunta relacionada si tiene sentido para continuar la conversación productivamente.
-   - **Sección de Fuentes:** Obligatoriamente después de tu respuesta principal, añade una sección titulada `**Fuentes:**`. Lista aquí *solo* los documentos que **efectivamente utilizaste** para construir tu respuesta (basándote en las citas `[Doc N]` que incluiste). Usa una lista numerada ordenada por relevancia (el Doc 1 suele ser el más relevante). Formato:
-     `1. «Nombre Archivo» (Título: <Título si existe>, Pág: <Página>)`
-     `2. «Otro Archivo» (Pág: <Página>)`
-     ... (No incluyas documentos que no citaste en la respuesta principal).
-
-════════════════════════════════════════════════════════════════════
-RESPUESTA DE ATENEX (en español latino):
-════════════════════════════════════════════════════════════════════
-"""
-
-# ------------------------------------------------------------------------------
-
-ATENEX_GENERAL_PROMPT_TEMPLATE = r"""
-Eres **Atenex**, el Gestor de Conocimiento Empresarial. Responde de forma útil, concisa y profesional en español latino.
-
-{% if chat_history %}
-───────────────────── HISTORIAL RECIENTE (Más antiguo a más nuevo) ─────────────────────
-{{ chat_history }}
-────────────────────────────────────────────────────────────────────────────────────────
-{% endif %}
-
-PREGUNTA ACTUAL DEL USUARIO:
-{{ query }}
-
-INSTRUCCIONES:
-- Basándote únicamente en el HISTORIAL RECIENTE (si existe) y tu conocimiento general como asistente, responde la pregunta.
-- Si la consulta requiere información específica de documentos que no te han sido proporcionados en esta interacción (porque no se activó el RAG), indica amablemente que no tienes acceso a documentos externos para responder y sugiere al usuario subir un documento relevante o precisar su pregunta si busca información documental.
-- NO inventes información que no tengas.
-
-RESPUESTA DE ATENEX (en español latino):
-"""
 # Models
 DEFAULT_EMBEDDING_DIMENSION = 384
-DEFAULT_GEMINI_MODEL = "gemini-1.5-flash-latest"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-preview-04-17" 
 
 # RAG Pipeline Parameters
-DEFAULT_RETRIEVER_TOP_K = 100
+DEFAULT_RETRIEVER_TOP_K = 200 
 DEFAULT_BM25_ENABLED: bool = True
 DEFAULT_RERANKER_ENABLED: bool = True
-DEFAULT_DIVERSITY_FILTER_ENABLED: bool = False
-DEFAULT_MAX_CONTEXT_CHUNKS: int = 75
+DEFAULT_DIVERSITY_FILTER_ENABLED: bool = False 
+DEFAULT_MAX_CONTEXT_CHUNKS: int = 200 
 DEFAULT_HYBRID_ALPHA: float = 0.5
 DEFAULT_DIVERSITY_LAMBDA: float = 0.5
-DEFAULT_MAX_PROMPT_TOKENS: int = 500000
-DEFAULT_MAX_CHAT_HISTORY_MESSAGES = 10
+DEFAULT_MAX_PROMPT_TOKENS: int = 524288 
+DEFAULT_MAX_CHAT_HISTORY_MESSAGES = 20 
 DEFAULT_NUM_SOURCES_TO_SHOW = 7
+
+# MapReduce settings
+DEFAULT_MAPREDUCE_ENABLED: bool = True 
+DEFAULT_MAPREDUCE_CHUNK_BATCH_SIZE: int = 5
+DEFAULT_MAPREDUCE_ACTIVATION_THRESHOLD: int = 25 
 
 
 class Settings(BaseSettings):
@@ -1384,7 +1613,7 @@ class Settings(BaseSettings):
         if not isinstance(v, str):
             raise ValueError("MILVUS_URI must be a string.")
         v_strip = v.strip()
-        if not v_strip.startswith("https://"):
+        if not v_strip.startswith("https://"): # Zilliz Cloud URIs son https
             raise ValueError(f"Invalid Zilliz URI: Must start with https://. Received: '{v_strip}'")
         try:
             validated_url = AnyHttpUrl(v_strip)
@@ -1395,12 +1624,11 @@ class Settings(BaseSettings):
     @field_validator('ZILLIZ_API_KEY', mode='before')
     @classmethod
     def check_zilliz_key(cls, v: Any, info: ValidationInfo) -> Any:
-        # Allow SecretStr to be passed, check its content
         if isinstance(v, SecretStr):
             secret_value = v.get_secret_value()
             if secret_value is None or secret_value == "":
                 raise ValueError(f"Required secret field 'QUERY_ZILLIZ_API_KEY' cannot be empty.")
-        elif v is None or v == "": # Handle direct string or None input before SecretStr conversion
+        elif v is None or v == "":
             raise ValueError(f"Required secret field 'QUERY_ZILLIZ_API_KEY' cannot be empty.")
         return v
 
@@ -1414,14 +1642,12 @@ class Settings(BaseSettings):
     MILVUS_GRPC_TIMEOUT: int = Field(default=MILVUS_DEFAULT_GRPC_TIMEOUT)
     MILVUS_SEARCH_PARAMS: Dict[str, Any] = Field(default_factory=lambda: MILVUS_DEFAULT_SEARCH_PARAMS.copy())
 
-
     # --- Embedding Settings (General) ---
     EMBEDDING_DIMENSION: int = Field(default=DEFAULT_EMBEDDING_DIMENSION, description="Dimension of embeddings, used for Milvus and validation.")
 
     # --- External Embedding Service ---
     EMBEDDING_SERVICE_URL: AnyHttpUrl = Field(default_factory=lambda: AnyHttpUrl(EMBEDDING_SERVICE_K8S_URL_DEFAULT), description="URL of the Atenex Embedding Service.")
     EMBEDDING_CLIENT_TIMEOUT: int = Field(default=30, description="Timeout in seconds for calls to the Embedding Service.")
-
 
     # --- LLM (Google Gemini) ---
     GEMINI_API_KEY: SecretStr
@@ -1432,9 +1658,11 @@ class Settings(BaseSettings):
     RERANKER_SERVICE_URL: AnyHttpUrl = Field(default_factory=lambda: AnyHttpUrl(RERANKER_SERVICE_K8S_URL_DEFAULT), description="URL of the Atenex Reranker Service.")
     RERANKER_CLIENT_TIMEOUT: int = Field(default=30, description="Timeout in seconds for calls to the Reranker Service.")
 
+    # --- Sparse Retriever (Remote Service) ---
+    BM25_ENABLED: bool = Field(default=DEFAULT_BM25_ENABLED, description="Enables/disables the sparse search step (uses sparse-search-service).")
+    SPARSE_SEARCH_SERVICE_URL: AnyHttpUrl = Field(default_factory=lambda: AnyHttpUrl(SPARSE_SEARCH_SERVICE_K8S_URL_DEFAULT), description="URL of the Atenex Sparse Search Service.")
+    SPARSE_SEARCH_CLIENT_TIMEOUT: int = Field(default=30, description="Timeout for calls to Sparse Search Service.")
 
-    # --- Sparse Retriever (BM25) ---
-    BM25_ENABLED: bool = Field(default=DEFAULT_BM25_ENABLED)
 
     # --- Diversity Filter ---
     DIVERSITY_FILTER_ENABLED: bool = Field(default=DEFAULT_DIVERSITY_FILTER_ENABLED)
@@ -1444,14 +1672,25 @@ class Settings(BaseSettings):
     # --- RAG Pipeline Parameters ---
     RETRIEVER_TOP_K: int = Field(default=DEFAULT_RETRIEVER_TOP_K, gt=0, le=500)
     HYBRID_FUSION_ALPHA: float = Field(default=DEFAULT_HYBRID_ALPHA, ge=0.0, le=1.0)
-    RAG_PROMPT_TEMPLATE: str = Field(default=ATENEX_RAG_PROMPT_TEMPLATE)
-    GENERAL_PROMPT_TEMPLATE: str = Field(default=ATENEX_GENERAL_PROMPT_TEMPLATE)
+    
+    # Prompt template paths
+    RAG_PROMPT_TEMPLATE_PATH: str = Field(default=DEFAULT_RAG_PROMPT_TEMPLATE_PATH)
+    GENERAL_PROMPT_TEMPLATE_PATH: str = Field(default=DEFAULT_GENERAL_PROMPT_TEMPLATE_PATH)
+    MAP_PROMPT_TEMPLATE_PATH: str = Field(default=DEFAULT_MAP_PROMPT_TEMPLATE_PATH)
+    REDUCE_PROMPT_TEMPLATE_PATH: str = Field(default=DEFAULT_REDUCE_PROMPT_TEMPLATE_PATH)
+
     MAX_PROMPT_TOKENS: Optional[int] = Field(default=DEFAULT_MAX_PROMPT_TOKENS)
     MAX_CHAT_HISTORY_MESSAGES: int = Field(default=DEFAULT_MAX_CHAT_HISTORY_MESSAGES, ge=0)
     NUM_SOURCES_TO_SHOW: int = Field(default=DEFAULT_NUM_SOURCES_TO_SHOW, ge=0)
 
+    # --- MapReduce Settings ---
+    MAPREDUCE_ENABLED: bool = Field(default=DEFAULT_MAPREDUCE_ENABLED)
+    MAPREDUCE_CHUNK_BATCH_SIZE: int = Field(default=DEFAULT_MAPREDUCE_CHUNK_BATCH_SIZE, gt=0)
+    MAPREDUCE_ACTIVATION_THRESHOLD: int = Field(default=DEFAULT_MAPREDUCE_ACTIVATION_THRESHOLD, gt=0)
+
+
     # --- Service Client Config ---
-    HTTP_CLIENT_TIMEOUT: int = Field(default=60) # General timeout for httpx client
+    HTTP_CLIENT_TIMEOUT: int = Field(default=60) 
     HTTP_CLIENT_MAX_RETRIES: int = Field(default=2)
     HTTP_CLIENT_BACKOFF_FACTOR: float = Field(default=1.0)
 
@@ -1468,15 +1707,13 @@ class Settings(BaseSettings):
     @field_validator('POSTGRES_PASSWORD', 'GEMINI_API_KEY', mode='before')
     @classmethod
     def check_secret_value_present(cls, v: Any, info: ValidationInfo) -> Any:
-         # Allow SecretStr to be passed, check its content
         if isinstance(v, SecretStr):
             secret_value = v.get_secret_value()
             if secret_value is None or secret_value == "":
                 raise ValueError(f"Required secret field 'QUERY_{info.field_name.upper()}' cannot be empty.")
-        elif v is None or v == "": # Handle direct string or None input
+        elif v is None or v == "":
             raise ValueError(f"Required secret field 'QUERY_{info.field_name.upper()}' cannot be empty.")
         return v
-
 
     @field_validator('EMBEDDING_DIMENSION')
     @classmethod
@@ -1490,12 +1727,31 @@ class Settings(BaseSettings):
     @classmethod
     def check_max_context_chunks(cls, v: int, info: ValidationInfo) -> int:
         retriever_k = info.data.get('RETRIEVER_TOP_K', DEFAULT_RETRIEVER_TOP_K)
-        max_possible_after_fusion = retriever_k * 2 # Simplistic assumption, could be just retriever_k if no sparse
-        if v > max_possible_after_fusion:
-            logging.warning(f"MAX_CONTEXT_CHUNKS ({v}) is greater than a typical max after fusion based on RETRIEVER_TOP_K ({retriever_k}). Effective limit will be applied.")
+        if v > retriever_k * 2 and info.data.get('MAPREDUCE_ENABLED', DEFAULT_MAPREDUCE_ENABLED) is False:
+             logging.warning(f"MAX_CONTEXT_CHUNKS ({v}) for direct RAG is significantly larger than typical fused results from RETRIEVER_TOP_K ({retriever_k}). Ensure this is intended.")
         if v <= 0:
              raise ValueError("MAX_CONTEXT_CHUNKS must be a positive integer.")
         return v
+    
+    @field_validator('MAPREDUCE_CHUNK_BATCH_SIZE')
+    @classmethod
+    def check_mapreduce_batch_size(cls, v: int, info: ValidationInfo) -> int:
+        if v <=0:
+            raise ValueError("MAPREDUCE_CHUNK_BATCH_SIZE must be positive.")
+        if v > 20: 
+            logging.warning(f"MAPREDUCE_CHUNK_BATCH_SIZE ({v}) is quite large. Ensure LLM can handle this many docs in a single map prompt.")
+        return v
+        
+    @field_validator('MAPREDUCE_ACTIVATION_THRESHOLD')
+    @classmethod
+    def check_mapreduce_activation_threshold(cls, v: int, info: ValidationInfo) -> int:
+        max_context = info.data.get('MAX_CONTEXT_CHUNKS', DEFAULT_MAX_CONTEXT_CHUNKS)
+        if v > max_context:
+            logging.warning(f"MAPREDUCE_ACTIVATION_THRESHOLD ({v}) is greater than MAX_CONTEXT_CHUNKS ({max_context}). MapReduce may never activate if MAX_CONTEXT_CHUNKS is the effective limit for documents to process.")
+        if v <= 0:
+            raise ValueError("MAPREDUCE_ACTIVATION_THRESHOLD must be positive.")
+        return v
+
 
     @field_validator('NUM_SOURCES_TO_SHOW')
     @classmethod
@@ -1508,12 +1764,11 @@ class Settings(BaseSettings):
             raise ValueError("NUM_SOURCES_TO_SHOW cannot be negative.")
         return v
 
-
 # --- Global Settings Instance ---
 temp_log = logging.getLogger("query_service.config.loader")
 if not temp_log.handlers:
     handler = logging.StreamHandler(sys.stdout)
-    formatter = logging.Formatter('%(levelname)s: [%(asctime)s] [%(name)s] %(message)s') # Added asctime
+    formatter = logging.Formatter('%(levelname)s: [%(asctime)s] [%(name)s] %(message)s')
     handler.setFormatter(formatter)
     temp_log.addHandler(handler)
     temp_log.setLevel(logging.INFO)
@@ -1522,30 +1777,34 @@ try:
     temp_log.info("Loading Query Service settings...")
     settings = Settings()
     temp_log.info("--- Query Service Settings Loaded ---")
-    # Log settings, excluding sensitive ones and long templates by default
-    excluded_fields = {'POSTGRES_PASSWORD', 'GEMINI_API_KEY', 'ZILLIZ_API_KEY', 'RAG_PROMPT_TEMPLATE', 'GENERAL_PROMPT_TEMPLATE'}
+    
+    excluded_fields = {'POSTGRES_PASSWORD', 'GEMINI_API_KEY', 'ZILLIZ_API_KEY'}
     log_data = settings.model_dump(exclude=excluded_fields)
 
     for key, value in log_data.items():
-        temp_log.info(f"  {key.upper()}: {value}")
+        if key.endswith("_PATH"): 
+            try:
+                path_obj = Path(value)
+                status_msg = "Present and readable" if path_obj.is_file() and os.access(path_obj, os.R_OK) else "!!! NOT FOUND or UNREADABLE !!!"
+                temp_log.info(f"  {key.upper()}: {value} (Status: {status_msg})")
+            except Exception as path_e:
+                temp_log.info(f"  {key.upper()}: {value} (Status: Error checking path: {path_e})")
+        else:
+            temp_log.info(f"  {key.upper()}: {value}")
 
-    # Log status of sensitive fields and templates
     pg_pass_status = '*** SET ***' if settings.POSTGRES_PASSWORD and settings.POSTGRES_PASSWORD.get_secret_value() else '!!! NOT SET !!!'
     temp_log.info(f"  POSTGRES_PASSWORD:            {pg_pass_status}")
     gemini_key_status = '*** SET ***' if settings.GEMINI_API_KEY and settings.GEMINI_API_KEY.get_secret_value() else '!!! NOT SET !!!'
     temp_log.info(f"  GEMINI_API_KEY:               {gemini_key_status}")
     zilliz_api_key_status = '*** SET ***' if settings.ZILLIZ_API_KEY and settings.ZILLIZ_API_KEY.get_secret_value() else '!!! NOT SET !!!'
-    temp_log.info(f"  ZILLIZ_API_KEY:               {zilliz_api_key_status}") # ADDED LOG FOR ZILLIZ_API_KEY
-    temp_log.info(f"  RAG_PROMPT_TEMPLATE:          Present (length: {len(settings.RAG_PROMPT_TEMPLATE)})")
-    temp_log.info(f"  GENERAL_PROMPT_TEMPLATE:      Present (length: {len(settings.GENERAL_PROMPT_TEMPLATE)})")
+    temp_log.info(f"  ZILLIZ_API_KEY:               {zilliz_api_key_status}")
     temp_log.info(f"------------------------------------")
-
 
 except (ValidationError, ValueError) as e:
     error_details = ""
     if isinstance(e, ValidationError):
         try: error_details = f"\nValidation Errors:\n{json.dumps(e.errors(), indent=2)}"
-        except Exception: error_details = f"\nRaw Errors: {e}" # Fallback for e.errors()
+        except Exception: error_details = f"\nRaw Errors: {e}"
     else: error_details = f"\nError: {e}"
     temp_log.critical(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     temp_log.critical(f"! FATAL: Query Service configuration validation failed!{error_details}")
@@ -1681,7 +1940,7 @@ def get_ask_query_use_case() -> AskQueryUseCase:
 ```py
 # query-service/app/domain/models.py
 import uuid
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
@@ -1706,36 +1965,30 @@ class ChatMessage(BaseModel):
     chat_id: uuid.UUID
     role: str # 'user' or 'assistant'
     content: str
-    sources: Optional[List[Dict[str, Any]]] = None # Mantener estructura JSON por ahora
+    sources: Optional[List[Dict[str, Any]]] = None 
     created_at: datetime
 
 class RetrievedChunk(BaseModel):
     """Representa un chunk recuperado de una fuente (ej: Milvus)."""
-    id: str # ID del chunk (ej: Milvus PK)
-    content: Optional[str] = None # Contenido textual del chunk
-    score: Optional[float] = None # Puntuación de relevancia
+    id: str 
+    content: Optional[str] = None 
+    score: Optional[float] = None 
     metadata: Dict[str, Any] = Field(default_factory=dict)
-    # --- Añadir campo para embedding ---
-    embedding: Optional[List[float]] = None # Embedding vectorial del chunk
-    # --- Fin adición ---
-    # Campos comunes esperados en metadata
-    document_id: Optional[str] = Field(None, alias="document_id") # Alias para mapeo desde meta
+    embedding: Optional[List[float]] = None 
+    
+    document_id: Optional[str] = Field(None, alias="document_id") 
     file_name: Optional[str] = Field(None, alias="file_name")
     company_id: Optional[str] = Field(None, alias="company_id")
 
-    # Permitir inicialización desde metadata
-    # model_config = ConfigDict(populate_by_name=True) # Pydantic v2
+    model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
+
 
     @classmethod
     def from_haystack_document(cls, doc: Any):
         """Convierte un Documento Haystack a un RetrievedChunk."""
-        # Intenta extraer campos comunes directamente de la metadata
         doc_meta = doc.meta or {}
-        # Asegura que los IDs se manejen correctamente
         doc_id_str = str(doc_meta.get("document_id")) if doc_meta.get("document_id") else None
         company_id_str = str(doc_meta.get("company_id")) if doc_meta.get("company_id") else None
-
-        # Extraer embedding si existe en el documento Haystack
         embedding_vector = getattr(doc, 'embedding', None)
 
         return cls(
@@ -1743,7 +1996,7 @@ class RetrievedChunk(BaseModel):
             content=doc.content,
             score=doc.score,
             metadata=doc_meta,
-            embedding=embedding_vector, # Añadir embedding
+            embedding=embedding_vector, 
             document_id=doc_id_str,
             file_name=doc_meta.get("file_name"),
             company_id=company_id_str
@@ -1758,6 +2011,22 @@ class QueryLog(BaseModel):
     metadata: Dict[str, Any]
     chat_id: Optional[uuid.UUID]
     created_at: datetime
+
+# --- Nuevos modelos para Respuesta Estructurada ---
+class FuenteCitada(BaseModel):
+    id_documento: Optional[str] = Field(None, description="El ID del chunk o documento original, si está disponible en la metadata del chunk.")
+    nombre_archivo: str = Field(..., description="Nombre del archivo fuente.")
+    pagina: Optional[str] = Field(None, description="Número de página si está disponible.")
+    score: Optional[float] = Field(None, description="Score de relevancia original del chunk (si aplica).")
+    cita_tag: str = Field(..., description="La etiqueta de cita usada en el texto, ej: '[Doc 1]'.")
+
+class RespuestaEstructurada(BaseModel):
+    resumen_ejecutivo: Optional[str] = Field(None, description="Un breve resumen de 1-2 frases, si la respuesta es larga y aplica.")
+    respuesta_detallada: str = Field(..., description="La respuesta completa y elaborada, incluyendo citas [Doc N] donde corresponda.")
+    fuentes_citadas: List[FuenteCitada] = Field(default_factory=list, description="Lista de los documentos efectivamente utilizados y citados en la respuesta_detallada.")
+    siguiente_pregunta_sugerida: Optional[str] = Field(None, description="Una pregunta de seguimiento relevante que el usuario podría hacer, si aplica.")
+    
+    model_config = ConfigDict(extra='ignore') 
 ```
 
 ## File: `app\infrastructure\__init__.py`
@@ -1897,6 +2166,130 @@ class EmbeddingServiceClient:
         """Cierra el cliente HTTP."""
         await self._client.aclose()
         log.info("EmbeddingServiceClient closed.")
+```
+
+## File: `app\infrastructure\clients\sparse_search_service_client.py`
+```py
+# query-service/app/infrastructure/clients/sparse_search_service_client.py
+import httpx
+import structlog
+import uuid
+from typing import List, Dict, Any, Tuple, Optional
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+from app.core.config import settings # Para timeouts y URL base
+from app.domain.models import SparseSearchResultItem # Para el tipo de retorno del servicio
+
+log = structlog.get_logger(__name__)
+
+class SparseSearchServiceClient:
+    """
+    Cliente HTTP para interactuar con el Atenex Sparse Search Service.
+    """
+    def __init__(self, base_url: str, timeout: int = settings.HTTP_CLIENT_TIMEOUT):
+        # Asegurar que la URL base no tenga /api/v1 al final si el endpoint ya lo incluye
+        self.base_url = base_url.rstrip('/')
+        # El endpoint del sparse-search-service es /api/v1/search
+        self.search_endpoint = f"{self.base_url}/api/v1/search"
+        self.health_endpoint = f"{self.base_url}/health"
+
+        # Validar que la URL base no incluya /api/v1 si el endpoint ya lo hace.
+        # Ejemplo: si base_url es http://service/api/v1, endpoint es http://service/api/v1/search
+        # Ejemplo: si base_url es http://service, endpoint es http://service/api/v1/search
+        if self.base_url.endswith("/api/v1"):
+            self.search_endpoint = f"{self.base_url.rsplit('/api/v1', 1)[0]}/api/v1/search"
+        elif self.base_url.endswith("/api"):
+             self.search_endpoint = f"{self.base_url.rsplit('/api', 1)[0]}/api/v1/search"
+
+        self._client = httpx.AsyncClient(timeout=timeout)
+        log.info("SparseSearchServiceClient initialized",
+                 base_url=self.base_url,
+                 search_endpoint=self.search_endpoint,
+                 health_endpoint=self.health_endpoint)
+
+    @retry(
+        stop=stop_after_attempt(settings.HTTP_CLIENT_MAX_RETRIES + 1),
+        wait=wait_exponential(multiplier=settings.HTTP_CLIENT_BACKOFF_FACTOR, min=1, max=10),
+        retry=retry_if_exception_type((httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError)),
+        reraise=True
+    )
+    async def search(self, query_text: str, company_id: uuid.UUID, top_k: int) -> List[SparseSearchResultItem]:
+        """
+        Solicita una búsqueda dispersa al sparse-search-service.
+        Devuelve una lista de SparseSearchResultItem del dominio.
+        """
+        client_log = log.bind(action="sparse_search_remote",
+                              company_id=str(company_id),
+                              query_preview=query_text[:50]+"...",
+                              top_k=top_k,
+                              target_service="sparse-search-service")
+        if not query_text:
+            client_log.warning("No query text provided for sparse search.")
+            return []
+
+        payload = {
+            "query": query_text,
+            "company_id": str(company_id), # El servicio espera un UUID string en JSON
+            "top_k": top_k
+        }
+        try:
+            client_log.debug("Sending request to sparse search service")
+            response = await self._client.post(self.search_endpoint, json=payload)
+            response.raise_for_status()
+
+            data = response.json()
+            
+            if "results" not in data or not isinstance(data["results"], list):
+                client_log.error("Invalid response format from sparse search service: 'results' field missing or not a list.", response_data=data)
+                raise ValueError("Invalid response format from sparse search service: 'results' field.")
+
+            # Mapear a SparseSearchResultItem del dominio
+            domain_results = []
+            for item_data in data["results"]:
+                # El servicio sparse-search ya devuelve items que coinciden con SparseSearchResultItem
+                # así que podemos instanciarlos directamente si el schema coincide.
+                # Asumimos que 'chunk_id' y 'score' están presentes.
+                domain_results.append(SparseSearchResultItem(**item_data))
+            
+            client_log.info("Sparse search results received successfully from service", num_results=len(domain_results))
+            return domain_results
+
+        except httpx.HTTPStatusError as e:
+            client_log.error("HTTP error from sparse search service", status_code=e.response.status_code, response_body=e.response.text)
+            raise ConnectionError(f"Sparse search service returned error {e.response.status_code}: {e.response.text}") from e
+        except httpx.RequestError as e:
+            client_log.error("Request error while contacting sparse search service", error=str(e))
+            raise ConnectionError(f"Could not connect to sparse search service: {e}") from e
+        except (ValueError, TypeError, AttributeError) as e: # Errores de parsing JSON o validación de Pydantic
+            client_log.error("Error processing response from sparse search service", error=str(e))
+            raise ValueError(f"Invalid response or data from sparse search service: {e}") from e
+
+    async def check_health(self) -> bool:
+        client_log = log.bind(action="check_health_sparse_search", target_service="sparse-search-service")
+        try:
+            response = await self._client.get(self.health_endpoint, timeout=5) # Shorter timeout for health
+            if response.status_code == 200:
+                data = response.json()
+                # El health check del sparse-search-service devuelve un JSON con `status` y `ready`
+                if data.get("status") == "ok" and data.get("ready") is True:
+                    client_log.info("Sparse search service health check successful.", health_data=data)
+                    return True
+                else:
+                    client_log.warning("Sparse search service health check returned ok status but service/dependencies not ready.", health_data=data)
+                    return False
+            else:
+                client_log.warning("Sparse search service health check failed.", status_code=response.status_code, response_text=response.text)
+                return False
+        except httpx.RequestError as e:
+            client_log.error("Error connecting to sparse search service for health check.", error=str(e))
+            return False
+        except Exception as e:
+            client_log.error("Unexpected error during sparse search service health check.", error=str(e))
+            return False
+
+    async def close(self):
+        await self._client.aclose()
+        log.info("SparseSearchServiceClient closed.")
 ```
 
 ## File: `app\infrastructure\embedding\__init__.py`
@@ -2159,16 +2552,19 @@ class StubDiversityFilter(DiversityFilterPort):
 # query-service/app/infrastructure/llms/gemini_adapter.py
 import google.generativeai as genai
 import structlog
-from typing import Optional, List # Added List
+from typing import Optional, List, Type, Any # Import Type for Pydantic model
+from pydantic import BaseModel # For schema validation
+import json # For robust JSON parsing if needed
 
-# LLM_REFACTOR_STEP_2: Update import paths and add Port import
 from app.core.config import settings
-from app.application.ports.llm_port import LLMPort # Importar el puerto
+from app.application.ports.llm_port import LLMPort 
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+# Import Pydantic model for structured response to pass as schema
+from app.domain.models import RespuestaEstructurada
+
 
 log = structlog.get_logger(__name__)
 
-# LLM_REFACTOR_STEP_2: Implementar el puerto LLMPort
 class GeminiAdapter(LLMPort):
     """Adaptador concreto para interactuar con la API de Google Gemini."""
 
@@ -2192,67 +2588,133 @@ class GeminiAdapter(LLMPort):
             self.model = None
 
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
+        stop=stop_after_attempt(settings.HTTP_CLIENT_MAX_RETRIES +1), # Tenacity counts first attempt as one
+        wait=wait_exponential(multiplier=settings.HTTP_CLIENT_BACKOFF_FACTOR, min=2, max=10),
         retry=retry_if_exception_type((
             genai.types.generation_types.StopCandidateException,
             genai.types.generation_types.BlockedPromptException,
             TimeoutError,
-            # TODO: Add more specific google.api_core exceptions if needed
+            # Considerar añadir google.api_core.exceptions.DeadlineExceeded, google.api_core.exceptions.ServiceUnavailable
         )),
         reraise=True,
         before_sleep=lambda retry_state: log.warning(
             "Retrying Gemini API call",
             attempt=retry_state.attempt_number,
             wait_time=f"{retry_state.next_action.sleep:.2f}s",
-            error=str(retry_state.outcome.exception())
+            error_type=type(retry_state.outcome.exception()).__name__,
+            error_message=str(retry_state.outcome.exception())
         )
     )
-    async def generate(self, prompt: str) -> str:
-        """Genera una respuesta usando el modelo Gemini configurado."""
+    async def generate(self, prompt: str, 
+                       response_pydantic_schema: Optional[Type[BaseModel]] = None
+                      ) -> str: # Return value is always string (JSON string if schema provided)
+        """
+        Genera una respuesta usando el modelo Gemini configurado.
+        Si response_pydantic_schema se proporciona, solicita una salida JSON.
+        """
         if not self.model:
             log.error("Gemini client not initialized. Cannot generate answer.")
             raise ConnectionError("Gemini client is not properly configured (missing API key or init failed).")
 
-        generate_log = log.bind(adapter="GeminiAdapter", model_name=self._model_name, prompt_length=len(prompt))
+        generate_log = log.bind(
+            adapter="GeminiAdapter", 
+            model_name=self._model_name, 
+            prompt_length=len(prompt),
+            expecting_json=bool(response_pydantic_schema)
+        )
         generate_log.debug("Sending request to Gemini API...")
 
-        try:
-            response = await self.model.generate_content_async(prompt)
+        generation_config_dict: Dict[str, Any] = {
+            # Default max_output_tokens for Gemini Flash 2.5 is 65536, which is generous.
+            # We can override it here if needed, but often default is fine.
+            # "max_output_tokens": 8192, # Example if we need to limit
+            "temperature": 0.6, # Ajustar según necesidad, 0.2-0.7 es común para RAG
+            "top_p": 0.9,
+            # "top_k": (opcional, no suele usarse con top_p)
+        }
+        
+        if response_pydantic_schema:
+            generation_config_dict["response_mime_type"] = "application/json"
+            # El SDK de google-generativeai puede tomar directamente la clase Pydantic como schema.
+            generation_config_dict["response_schema"] = response_pydantic_schema
+        
+        final_generation_config = genai.types.GenerationConfig(**generation_config_dict)
 
-            # Check for blocked response or empty content
+        try:
+            response = await self.model.generate_content_async(
+                prompt,
+                generation_config=final_generation_config
+            )
+            
+            generated_text = "" # Inicializar
+
             if not response.candidates:
-                 # Try to get finish_reason from prompt_feedback if candidates list is empty
                  finish_reason = getattr(response.prompt_feedback, 'block_reason', "UNKNOWN")
-                 safety_ratings = getattr(response.prompt_feedback, 'safety_ratings', "N/A")
-                 generate_log.warning("Gemini response potentially blocked (no candidates)", finish_reason=str(finish_reason), safety_ratings=str(safety_ratings))
+                 safety_ratings_str = str(getattr(response.prompt_feedback, 'safety_ratings', "N/A"))
+                 generate_log.warning("Gemini response potentially blocked (no candidates)", 
+                                      finish_reason=str(finish_reason), safety_ratings=safety_ratings_str)
+                 # Devolver un JSON de error si se esperaba JSON
+                 if response_pydantic_schema:
+                     return json.dumps({
+                         "error_message": f"Respuesta bloqueada por Gemini (sin candidatos). Razón: {finish_reason}",
+                         "respuesta_detallada": f"Respuesta bloqueada por Gemini (sin candidatos). Razón: {finish_reason}",
+                         "fuentes_citadas": []
+                     })
                  return f"[Respuesta bloqueada por Gemini (sin candidatos). Razón: {finish_reason}]"
 
             candidate = response.candidates[0]
             if not hasattr(candidate, 'content') or not hasattr(candidate.content, 'parts') or not candidate.content.parts:
                  finish_reason = getattr(candidate, 'finish_reason', "UNKNOWN")
-                 safety_ratings = getattr(candidate, 'safety_ratings', "N/A")
-                 generate_log.warning("Gemini response candidate empty or missing parts", finish_reason=str(finish_reason), safety_ratings=str(safety_ratings))
+                 safety_ratings_str = str(getattr(candidate, 'safety_ratings', "N/A"))
+                 generate_log.warning("Gemini response candidate empty or missing parts", 
+                                      finish_reason=str(finish_reason), safety_ratings=str(safety_ratings_str))
+                 if response_pydantic_schema:
+                     return json.dumps({
+                         "error_message": f"Respuesta vacía de Gemini. Razón: {finish_reason}",
+                         "respuesta_detallada": f"Respuesta vacía de Gemini. Razón: {finish_reason}",
+                         "fuentes_citadas": []
+                     })
                  return f"[Respuesta vacía de Gemini. Razón: {finish_reason}]"
 
+            # response.text debería devolver el string JSON si se configuró response_mime_type
+            # Si no, .parts[0].text
+            if response_pydantic_schema and response.text:
+                 generated_text = response.text
+            else: # Fallback si .text no está o no es JSON
+                 generated_text = "".join(part.text for part in candidate.content.parts if hasattr(part, 'text'))
 
-            generated_text = "".join(part.text for part in candidate.content.parts if hasattr(part, 'text'))
 
-            generate_log.debug("Received response from Gemini API", response_length=len(generated_text))
+            if response_pydantic_schema:
+                generate_log.debug("Received JSON-like string from Gemini API", response_length=len(generated_text))
+                try:
+                    # Validar que sea un JSON parseable, aunque la validación del schema Pydantic se hará en el UseCase.
+                    json.loads(generated_text) 
+                except json.JSONDecodeError as json_err:
+                    generate_log.error("Gemini returned invalid JSON string", raw_response=truncate_text(generated_text, 500), error=str(json_err))
+                    # Devolver un error JSON formateado
+                    return json.dumps({
+                         "error_message": f"LLM returned malformed JSON: {str(json_err)}",
+                         "respuesta_detallada": f"Error: La respuesta del asistente no pudo ser procesada (JSON malformado). Respuesta recibida: {truncate_text(generated_text, 200)}",
+                         "fuentes_citadas": []
+                    })
+            else:
+                 generate_log.debug("Received text response from Gemini API", response_length=len(generated_text))
+
             return generated_text.strip()
 
         except (genai.types.generation_types.BlockedPromptException, genai.types.generation_types.StopCandidateException) as security_err:
-             # These exceptions might carry more specific info
-             finish_reason_err = getattr(security_err, 'finish_reason', 'N/A') # Attempt to get reason if available
+             finish_reason_err = getattr(security_err, 'finish_reason', 'N/A') 
              generate_log.warning("Gemini request blocked due to safety settings or prompt content", error=str(security_err), finish_reason=str(finish_reason_err))
+             if response_pydantic_schema:
+                 return json.dumps({
+                     "error_message": f"Contenido bloqueado por Gemini: {type(security_err).__name__}",
+                     "respuesta_detallada": f"Contenido bloqueado por Gemini: {type(security_err).__name__}",
+                     "fuentes_citadas": []
+                 })
              return f"[Contenido bloqueado por Gemini: {type(security_err).__name__}]"
         except Exception as e:
-            # Log other potential API errors or library issues
             generate_log.exception("Error during Gemini API call")
             raise ConnectionError(f"Gemini API call failed: {e}") from e
-
-# LLM_REFACTOR_STEP_2: No longer need global instance or getter here.
-# Instantiation and injection will be handled by the application setup (e.g., in main.py or dependency injector).
 ```
 
 ## File: `app\infrastructure\persistence\__init__.py`
@@ -2351,11 +2813,10 @@ import structlog
 import json
 from datetime import datetime, timezone
 
-# LLM_REFACTOR_STEP_2: Update import paths and add Ports/Domain models
 from app.core.config import settings
-from app.api.v1 import schemas # Keep for API schema hints if needed, but prefer domain models
-from app.domain.models import Chat, ChatMessage, ChatSummary, QueryLog # Import domain models
-from app.application.ports.repository_ports import ChatRepositoryPort, LogRepositoryPort, ChunkContentRepositoryPort # Import Ports
+from app.api.v1 import schemas 
+from app.domain.models import Chat, ChatMessage, ChatSummary, QueryLog 
+from app.application.ports.repository_ports import ChatRepositoryPort, LogRepositoryPort, ChunkContentRepositoryPort 
 from .postgres_connector import get_db_pool
 
 log = structlog.get_logger(__name__)
@@ -2384,7 +2845,7 @@ class PostgresChatRepository(ChatRepositoryPort):
                 raise RuntimeError("Failed to create chat, no ID returned")
         except Exception as e:
             repo_log.exception("Failed to create chat")
-            raise # Re-raise the exception
+            raise 
 
     async def get_user_chats(self, user_id: uuid.UUID, company_id: uuid.UUID, limit: int = 50, offset: int = 0) -> List[ChatSummary]:
         pool = await get_db_pool()
@@ -2397,7 +2858,7 @@ class PostgresChatRepository(ChatRepositoryPort):
         try:
             async with pool.acquire() as conn:
                 rows = await conn.fetch(query, user_id, company_id, limit, offset)
-            # Map rows to domain model ChatSummary
+            
             chats = [ChatSummary(**dict(row)) for row in rows]
             repo_log.info(f"Retrieved {len(chats)} chat summaries")
             return chats
@@ -2416,7 +2877,7 @@ class PostgresChatRepository(ChatRepositoryPort):
             return exists is True
         except Exception as e:
             repo_log.exception("Failed to check chat ownership")
-            return False # Assume not owner on error
+            return False 
 
     async def get_chat_messages(self, chat_id: uuid.UUID, user_id: uuid.UUID, company_id: uuid.UUID, limit: int = 100, offset: int = 0) -> List[ChatMessage]:
         pool = await get_db_pool()
@@ -2438,27 +2899,27 @@ class PostgresChatRepository(ChatRepositoryPort):
             messages = []
             for row in message_rows:
                 msg_dict = dict(row)
-                # JSON decoding should be handled by asyncpg codec setup in connector
+                
                 if msg_dict.get('sources') is None:
                      msg_dict['sources'] = None
                 elif not isinstance(msg_dict.get('sources'), (list, dict, type(None))):
-                     # Fallback if codec failed or sources isn't valid JSON in DB
+                    
                     log.warning("Unexpected type for 'sources' from DB", type=type(msg_dict['sources']).__name__, message_id=str(msg_dict.get('id')))
                     try:
-                        # Attempt manual load if it's a string
+                        
                         if isinstance(msg_dict['sources'], str):
                             msg_dict['sources'] = json.loads(msg_dict['sources'])
                         else:
-                             msg_dict['sources'] = None # Set to None if type is unexpected
+                             msg_dict['sources'] = None 
                     except (json.JSONDecodeError, TypeError):
                          log.error("Failed to manually decode 'sources'", message_id=str(msg_dict.get('id')))
                          msg_dict['sources'] = None
 
-                # Ensure sources is a list or None before creating the domain object
+                
                 if not isinstance(msg_dict.get('sources'), (list, type(None))):
                     msg_dict['sources'] = None
 
-                messages.append(ChatMessage(**msg_dict)) # Map to domain model
+                messages.append(ChatMessage(**msg_dict)) 
 
             repo_log.info(f"Retrieved {len(messages)} messages")
             return messages
@@ -2474,19 +2935,19 @@ class PostgresChatRepository(ChatRepositoryPort):
         try:
             conn = await pool.acquire()
             async with conn.transaction():
-                # Update chat timestamp
+                
                 update_chat_query = "UPDATE chats SET updated_at = NOW() AT TIME ZONE 'UTC' WHERE id = $1 RETURNING id;"
                 chat_updated = await conn.fetchval(update_chat_query, chat_id)
                 if not chat_updated:
                     repo_log.error("Failed to update chat timestamp, chat might not exist")
                     raise ValueError(f"Chat with ID {chat_id} not found for saving message.")
 
-                # Insert message
+                
                 insert_message_query = """
                 INSERT INTO messages (id, chat_id, role, content, sources, created_at)
                 VALUES ($1, $2, $3, $4, $5, NOW() AT TIME ZONE 'UTC') RETURNING id;
                 """
-                # sources_json should be handled by the codec, pass the Python object directly
+                
                 result = await conn.fetchval(insert_message_query, message_id, chat_id, role, content, sources)
 
                 if result and result == message_id:
@@ -2545,7 +3006,7 @@ class PostgresLogRepository(LogRepositoryPort):
         company_id: uuid.UUID,
         query: str,
         answer: str,
-        retrieved_documents_data: List[Dict[str, Any]], # Keep Dict for logging flexibility
+        retrieved_documents_data: List[Dict[str, Any]], 
         metadata: Optional[Dict[str, Any]] = None,
         chat_id: Optional[uuid.UUID] = None,
     ) -> uuid.UUID:
@@ -2561,7 +3022,7 @@ class PostgresLogRepository(LogRepositoryPort):
             $1, $2, $3, $4, $5, $6, $7, NOW() AT TIME ZONE 'UTC'
         ) RETURNING id;
         """
-        # Prepare metadata, ensuring retrieved_summary is included
+        
         final_metadata = metadata or {}
         final_metadata["retrieved_summary"] = [
             {"id": d.get("id"), "score": d.get("score"), "file_name": d.get("file_name")}
@@ -2570,11 +3031,11 @@ class PostgresLogRepository(LogRepositoryPort):
 
         try:
             async with pool.acquire() as connection:
-                # Pass the Python dict directly, codec handles JSON conversion
+                
                 result = await connection.fetchval(
                     query_sql,
                     log_id, user_id, company_id, query, answer,
-                    final_metadata, # Pass the dict
+                    final_metadata, 
                     chat_id
                 )
             if not result or result != log_id:
@@ -2592,245 +3053,121 @@ class PostgresChunkContentRepository(ChunkContentRepositoryPort):
     """Implementación concreta para obtener contenido de chunks desde PostgreSQL."""
 
     async def get_chunk_contents_by_company(self, company_id: uuid.UUID) -> Dict[str, str]:
-        """Recupera {chunk_id: content} para todos los chunks de una compañía."""
-        # WARNING: This can be very memory-intensive for large companies.
-        # Consider adding limits, pagination, or using alternative strategies if performance is an issue.
         pool = await get_db_pool()
-        # Asegúrate de que la tabla `document_chunks` tiene una FK a `documents` y un índice en `company_id`
         query = """
-        SELECT dc.id, dc.content
+        SELECT dc.embedding_id, dc.content
         FROM document_chunks dc
         JOIN documents d ON dc.document_id = d.id
-        WHERE d.company_id = $1;
+        WHERE d.company_id = $1 AND dc.embedding_id IS NOT NULL;
         """
         repo_log = log.bind(repo="PostgresChunkContentRepository", action="get_chunk_contents_by_company", company_id=str(company_id))
-        repo_log.warning("Fetching all chunk contents for company, this might be memory intensive!")
+        repo_log.warning("Fetching all chunk contents (keyed by embedding_id) for company, this might be memory intensive!")
         try:
             async with pool.acquire() as conn:
                 rows = await conn.fetch(query, company_id)
-            # Convert chunk UUIDs to string for dictionary keys
-            contents = {str(row['id']): row['content'] for row in rows if row['content']}
-            repo_log.info(f"Retrieved content for {len(contents)} chunks")
+            
+            contents = {row['embedding_id']: row['content'] for row in rows if row['embedding_id'] and row['content']}
+            repo_log.info(f"Retrieved content for {len(contents)} chunks (keyed by embedding_id)")
             return contents
         except Exception as e:
-            repo_log.exception("Failed to get chunk contents by company")
+            repo_log.exception("Failed to get chunk contents by company (keyed by embedding_id)")
             raise
 
     async def get_chunk_contents_by_ids(self, chunk_ids: List[str]) -> Dict[str, str]:
-        """Recupera {chunk_id: content} para una lista específica de IDs de chunks."""
         if not chunk_ids:
             return {}
         pool = await get_db_pool()
-        # Convert string UUIDs back to UUID objects for the query
-        try:
-            uuid_list = [uuid.UUID(cid) for cid in chunk_ids]
-        except ValueError:
-            log.error("Invalid UUID format in chunk_ids list", provided_ids=chunk_ids)
-            raise ValueError("One or more provided chunk IDs are not valid UUIDs.")
-
+        
+        # Los chunk_ids que llegan son los embedding_id (PKs de Milvus), que son strings.
+        # La columna en la DB es 'embedding_id' de tipo VARCHAR.
         query = """
-        SELECT id, content FROM document_chunks WHERE id = ANY($1::uuid[]);
+        SELECT embedding_id, content FROM document_chunks WHERE embedding_id = ANY($1::text[]);
         """
         repo_log = log.bind(repo="PostgresChunkContentRepository", action="get_chunk_contents_by_ids", count=len(chunk_ids))
         try:
             async with pool.acquire() as conn:
-                rows = await conn.fetch(query, uuid_list)
-            # Convert chunk UUIDs to string for dictionary keys
-            contents = {str(row['id']): row['content'] for row in rows if row['content']}
-            repo_log.info(f"Retrieved content for {len(contents)} chunks out of {len(chunk_ids)} requested")
-            # Optionally log if some IDs weren't found
+                rows = await conn.fetch(query, chunk_ids) 
+            
+            contents = {row['embedding_id']: row['content'] for row in rows if row['embedding_id'] and row['content']}
+            repo_log.info(f"Retrieved content for {len(contents)} chunks (keyed by embedding_id) out of {len(chunk_ids)} requested")
+            
             if len(contents) != len(chunk_ids):
                 found_ids = set(contents.keys())
                 missing_ids = [cid for cid in chunk_ids if cid not in found_ids]
-                repo_log.warning("Could not find content for some requested chunk IDs", missing_ids=missing_ids)
+                repo_log.warning("Could not find content for some requested chunk IDs (embedding_ids)", missing_ids=missing_ids)
             return contents
         except Exception as e:
-            repo_log.exception("Failed to get chunk contents by IDs")
+            repo_log.exception("Failed to get chunk contents by IDs (embedding_ids)")
             raise
-```
-
-## File: `app\infrastructure\rerankers\__init__.py`
-```py
-# query-service/app/infrastructure/rerankers/__init__.py
-```
-
-## File: `app\infrastructure\rerankers\diversity_filter.py`
-```py
-# query-service/app/infrastructure/filters/diversity_filter.py
-import structlog
-from typing import List
-
-from app.application.ports.retrieval_ports import DiversityFilterPort
-from app.domain.models import RetrievedChunk
-
-log = structlog.get_logger(__name__)
-
-class StubDiversityFilter(DiversityFilterPort):
-    """
-    Implementación Stub del filtro de diversidad.
-    Simplemente devuelve los primeros k_final chunks sin aplicar lógica de diversidad.
-    """
-
-    def __init__(self):
-        log.warning("Using StubDiversityFilter. No diversity logic is applied.", adapter="StubDiversityFilter")
-
-    async def filter(self, chunks: List[RetrievedChunk], k_final: int) -> List[RetrievedChunk]:
-        """Devuelve los primeros k_final chunks."""
-        filter_log = log.bind(adapter="StubDiversityFilter", action="filter", k_final=k_final, input_count=len(chunks))
-        if not chunks:
-            filter_log.debug("No chunks to filter.")
-            return []
-
-        filtered_chunks = chunks[:k_final]
-        filter_log.debug(f"Returning top {len(filtered_chunks)} chunks without diversity filtering.")
-        return filtered_chunks
-
-# TODO: Implementar MMRDiversityFilter o DartboardFilter aquí en el futuro.
-# class MMRDiversityFilter(DiversityFilterPort):
-#     async def filter(self, chunks: List[RetrievedChunk], k_final: int) -> List[RetrievedChunk]:
-#         # Implementación de MMR... necesitaría embeddings
-#         raise NotImplementedError
 ```
 
 ## File: `app\infrastructure\retrievers\__init__.py`
 ```py
-# query-service/app/infrastructure/retrievers/__init__.py
+
 ```
 
-## File: `app\infrastructure\retrievers\bm25_retriever.py`
+## File: `app\infrastructure\retrievers\remote_sparse_retriever_adapter.py`
 ```py
-# query-service/app/infrastructure/retrievers/bm25_retriever.py
+# query-service/app/infrastructure/retrievers/remote_sparse_retriever_adapter.py
 import structlog
-import asyncio
-from typing import List, Tuple, Dict, Optional
 import uuid
-import time
-
-# LLM_REFACTOR_STEP_2: Implement BM25 Adapter using bm25s
-try:
-    import bm2s
-except ImportError:
-    bm2s = None # Handle optional dependency
+from typing import List, Tuple
 
 from app.application.ports.retrieval_ports import SparseRetrieverPort
-from app.application.ports.repository_ports import ChunkContentRepositoryPort # To get content
+from app.infrastructure.clients.sparse_search_service_client import SparseSearchServiceClient
+from app.domain.models import SparseSearchResultItem # Para el tipo de resultado del cliente
 
 log = structlog.get_logger(__name__)
 
-class BM25sRetriever(SparseRetrieverPort):
+class RemoteSparseRetrieverAdapter(SparseRetrieverPort):
     """
-    Implementación de SparseRetrieverPort usando la librería bm25s.
-    Este retriever construye un índice en memoria por consulta,
-    lo cual puede ser intensivo en memoria y CPU para grandes volúmenes de datos.
+    Adaptador que utiliza SparseSearchServiceClient para realizar búsquedas dispersas
+    llamando al servicio externo sparse-search-service.
     """
+    def __init__(self, client: SparseSearchServiceClient):
+        self.client = client
+        log.info("RemoteSparseRetrieverAdapter initialized")
 
-    def __init__(self, chunk_content_repo: ChunkContentRepositoryPort):
-        if bm2s is None:
-            log.error("bm2s library not installed. BM25 retrieval is disabled. "
-                      "Install with: poetry add bm2s")
-            raise ImportError("bm2s library is required for BM25sRetriever.")
-        self.chunk_content_repo = chunk_content_repo
-        log.info("BM25sRetriever initialized.")
-
-    async def search(self, query: str, company_id: str, top_k: int) -> List[Tuple[str, float]]:
+    async def search(self, query: str, company_id: uuid.UUID, top_k: int) -> List[Tuple[str, float]]:
         """
-        Busca chunks usando BM25s. Recupera todo el contenido de la compañía,
-        construye el índice, tokeniza y busca.
+        Realiza una búsqueda dispersa llamando al servicio remoto.
+        Devuelve una lista de tuplas (chunk_id, score).
         """
-        search_log = log.bind(adapter="BM25sRetriever", action="search", company_id=company_id, top_k=top_k)
-        search_log.debug("Starting BM25 search...")
-
-        start_time = time.time()
+        adapter_log = log.bind(adapter="RemoteSparseRetrieverAdapter", action="search",
+                               company_id=str(company_id), top_k=top_k)
         try:
-            # 1. Obtener contenido de los chunks para la compañía
-            search_log.info("Fetching chunk contents for BM25 index...")
-            # Convert company_id string back to UUID for repository call
-            try:
-                company_uuid = uuid.UUID(company_id)
-            except ValueError:
-                 search_log.error("Invalid company_id format for UUID conversion", provided_id=company_id)
-                 return []
+            # El cliente devuelve una lista de SparseSearchResultItem
+            search_results_domain: List[SparseSearchResultItem] = await self.client.search(
+                query_text=query,
+                company_id=company_id,
+                top_k=top_k
+            )
 
-            contents_map: Dict[str, str] = await self.chunk_content_repo.get_chunk_contents_by_company(company_uuid)
+            # Mapear los resultados del dominio a List[Tuple[str, float]]
+            # SparseSearchResultItem tiene 'chunk_id' y 'score'
+            mapped_results: List[Tuple[str, float]] = [
+                (item.chunk_id, item.score) for item in search_results_domain
+            ]
 
-            if not contents_map:
-                search_log.warning("No chunk content found for company to build BM25 index.")
-                return []
-
-            fetch_time = time.time()
-            search_log.info(f"Fetched content for {len(contents_map)} chunks.", duration_ms=(fetch_time - start_time) * 1000)
-
-            # Preparar corpus y mapeo de IDs
-            # chunk_ids_list = list(contents_map.keys()) # Mantener el orden
-            # corpus = [contents_map[cid] for cid in chunk_ids_list]
-
-            # Crear listas separadas para asegurar correspondencia índice <-> ID
-            chunk_ids_list = []
-            corpus = []
-            for cid, content in contents_map.items():
-                 if content and isinstance(content, str): # Asegurar que hay contenido y es string
-                     chunk_ids_list.append(cid)
-                     corpus.append(content)
-                 else:
-                    search_log.warning("Skipping chunk due to missing or invalid content", chunk_id=cid)
-
-            if not corpus:
-                 search_log.warning("Corpus is empty after filtering invalid content.")
-                 return []
-
-            # 2. Tokenizar (simple split por ahora, mejorar si es necesario)
-            search_log.debug("Tokenizing query and corpus...")
-            query_tokens = query.lower().split()
-            # Usar bm2s para tokenizar el corpus (más eficiente)
-            corpus_tokens = bm2s.tokenize(corpus) # bm2s tiene su propio tokenizador eficiente
-            tokenize_time = time.time()
-            search_log.debug("Tokenization complete.", duration_ms=(tokenize_time - fetch_time) * 1000)
-
-            # 3. Crear y entrenar el índice BM25s
-            search_log.debug("Indexing corpus with BM25s...")
-            retriever = bm2s.BM25()
-            retriever.index(corpus_tokens)
-            index_time = time.time()
-            search_log.debug("BM25s indexing complete.", duration_ms=(index_time - tokenize_time) * 1000)
-
-            # 4. Realizar la búsqueda
-            search_log.debug("Performing BM25s retrieval...")
-            # `retrieve` devuelve (doc_indices, scores) para CADA consulta (aquí solo una)
-            # k es el número máximo a recuperar por consulta.
-            results_indices, results_scores = retriever.retrieve(
-                bm2s.tokenize(query), # Tokenizar la consulta con bm2s también
-                k=top_k
-                )
-
-            # Como solo hay una consulta, tomamos el primer elemento
-            doc_indices = results_indices[0]
-            scores = results_scores[0]
-            retrieval_time = time.time()
-            search_log.debug("BM25s retrieval complete.", duration_ms=(retrieval_time - index_time) * 1000, hits_found=len(doc_indices))
-
-            # 5. Mapear resultados a (chunk_id, score)
-            final_results: List[Tuple[str, float]] = []
-            for i, score in zip(doc_indices, scores):
-                if i < len(chunk_ids_list): # Check boundary
-                     original_chunk_id = chunk_ids_list[i]
-                     final_results.append((original_chunk_id, float(score))) # Asegurar float
-                else:
-                    search_log.error("BM25 returned index out of bounds", index=i, list_size=len(chunk_ids_list))
-
-
-            total_time = time.time() - start_time
-            search_log.info(f"BM25 search finished. Returning {len(final_results)} results.", total_duration_ms=total_time * 1000)
-
-            # Devolver ordenado por score descendente (BM25s ya lo devuelve así)
-            return final_results
-
-        except ImportError:
-             log.error("bm2s library is not available. Cannot perform BM25 search.")
-             return []
+            adapter_log.info(f"Sparse search successful via remote service. Returned {len(mapped_results)} results.")
+            return mapped_results
+        except ConnectionError as e:
+            adapter_log.error("Connection error during remote sparse search.", error=str(e), exc_info=False)
+            # Devolver una lista vacía para que el pipeline RAG pueda continuar
+            # si la búsqueda dispersa no es estrictamente crítica.
+            return []
+        except ValueError as e: # Por ej. si la respuesta del servicio es inválida
+            adapter_log.error("Value error during remote sparse search (invalid response from service?).", error=str(e), exc_info=True)
+            return []
         except Exception as e:
-            search_log.exception("Error during BM25 search")
-            # No relanzar ConnectionError aquí, ya que es un error interno de procesamiento
-            return [] # Devolver vacío en caso de error interno
+            adapter_log.exception("Unexpected error during remote sparse search.")
+            return [] # Devolver vacío en caso de error inesperado.
+
+    async def health_check(self) -> bool:
+        """
+        Delega la verificación de salud al cliente del servicio de búsqueda dispersa.
+        """
+        return await self.client.check_health()
 ```
 
 ## File: `app\infrastructure\vectorstores\__init__.py`
@@ -3099,7 +3436,10 @@ from app.infrastructure.persistence.postgres_repositories import (
 )
 from app.infrastructure.vectorstores.milvus_adapter import MilvusAdapter
 from app.infrastructure.llms.gemini_adapter import GeminiAdapter
-from app.infrastructure.retrievers.bm25_retriever import BM25sRetriever
+
+from app.infrastructure.clients.sparse_search_service_client import SparseSearchServiceClient
+from app.infrastructure.retrievers.remote_sparse_retriever_adapter import RemoteSparseRetrieverAdapter
+
 from app.infrastructure.filters.diversity_filter import MMRDiversityFilter, StubDiversityFilter
 from app.infrastructure.clients.embedding_service_client import EmbeddingServiceClient
 from app.infrastructure.embedding.remote_embedding_adapter import RemoteEmbeddingAdapter
@@ -3118,7 +3458,10 @@ log_repo_instance: Optional[LogRepositoryPort] = None
 chunk_content_repo_instance: Optional[ChunkContentRepositoryPort] = None
 vector_store_instance: Optional[VectorStorePort] = None
 llm_instance: Optional[LLMPort] = None
+# MODIFICADO: sparse_retriever_instance ahora puede ser RemoteSparseRetrieverAdapter
 sparse_retriever_instance: Optional[SparseRetrieverPort] = None
+sparse_search_service_client_instance: Optional[SparseSearchServiceClient] = None # NUEVO
+
 diversity_filter_instance: Optional[DiversityFilterPort] = None
 embedding_service_client_instance: Optional[EmbeddingServiceClient] = None
 embedding_adapter_instance: Optional[EmbeddingPort] = None
@@ -3131,6 +3474,7 @@ http_client_instance: Optional[httpx.AsyncClient] = None
 async def lifespan(app: FastAPI):
     global SERVICE_READY, chat_repo_instance, log_repo_instance, chunk_content_repo_instance, \
            vector_store_instance, llm_instance, sparse_retriever_instance, \
+           sparse_search_service_client_instance, \
            diversity_filter_instance, ask_query_use_case_instance, \
            embedding_service_client_instance, embedding_adapter_instance, http_client_instance
 
@@ -3161,7 +3505,7 @@ async def lifespan(app: FastAPI):
                 log.info("PostgreSQL connection pool initialized and verified.")
                 chat_repo_instance = PostgresChatRepository()
                 log_repo_instance = PostgresLogRepository()
-                chunk_content_repo_instance = PostgresChunkContentRepository()
+                chunk_content_repo_instance = PostgresChunkContentRepository() # Necesario para fusión
             else:
                 critical_failure_message = "Failed PostgreSQL connection verification during startup."
                 log.critical(f"CRITICAL: {critical_failure_message}")
@@ -3174,15 +3518,12 @@ async def lifespan(app: FastAPI):
     # 2. Initialize Embedding Service Client & Adapter
     if dependencies_ok:
         try:
-            # EmbeddingServiceClient creates its own internal httpx.AsyncClient
-            # but we could pass the global one if we refactor EmbeddingServiceClient.
-            # For now, it's fine as is.
             embedding_service_client_instance = EmbeddingServiceClient(
                 base_url=str(settings.EMBEDDING_SERVICE_URL),
-                timeout=settings.EMBEDDING_CLIENT_TIMEOUT # Specific timeout for embedding client
+                timeout=settings.EMBEDDING_CLIENT_TIMEOUT
             )
             embedding_adapter_instance = RemoteEmbeddingAdapter(client=embedding_service_client_instance)
-            await embedding_adapter_instance.initialize() # Tries to get dimension
+            await embedding_adapter_instance.initialize()
             
             emb_service_healthy = await embedding_adapter_instance.health_check()
             if emb_service_healthy:
@@ -3196,12 +3537,33 @@ async def lifespan(app: FastAPI):
             log.critical(f"CRITICAL: {critical_failure_message}", error=str(e_embed), exc_info=True, url=settings.EMBEDDING_SERVICE_URL)
             dependencies_ok = False
 
+    # 2.B. Initialize Sparse Search Service Client & Adapter
+    if dependencies_ok and settings.BM25_ENABLED: # Solo si BM25 está habilitado en config
+        try:
+            sparse_search_service_client_instance = SparseSearchServiceClient(
+                base_url=str(settings.SPARSE_SEARCH_SERVICE_URL),
+                timeout=settings.SPARSE_SEARCH_CLIENT_TIMEOUT
+            )
+            # El adaptador para SparseRetrieverPort
+            sparse_retriever_instance = RemoteSparseRetrieverAdapter(client=sparse_search_service_client_instance)
+            
+            sparse_service_healthy = await sparse_search_service_client_instance.check_health() # El cliente tiene health_check
+            if sparse_service_healthy:
+                log.info("Sparse Search Service client and adapter initialized, health check passed.")
+            else:
+                # Si BM25 está habilitado pero el servicio no está sano, es un warning, el pipeline puede continuar sin él.
+                log.warning(f"Sparse Search Service health check failed during startup. URL: {settings.SPARSE_SEARCH_SERVICE_URL}. Sparse search may be unavailable.")
+                # No marcamos dependencies_ok = False aquí, ya que BM25 es opcional en el pipeline
+                # Si sparse_retriever_instance es None, el use case lo manejará.
+        except Exception as e_sparse:
+            log.error(f"Failed to initialize Sparse Search Service client/adapter. Sparse search will be unavailable.", error=str(e_sparse), exc_info=True, url=str(settings.SPARSE_SEARCH_SERVICE_URL))
+            sparse_retriever_instance = None # Asegurar que es None si falla la inicialización
 
     # 3. Initialize Milvus Adapter
     if dependencies_ok:
         try:
             vector_store_instance = MilvusAdapter()
-            await vector_store_instance.connect() # Explicitly connect and load collection
+            await vector_store_instance.connect() 
             log.info("Milvus Adapter initialized and collection checked/loaded.")
         except Exception as e_milvus:
             critical_failure_message = "Failed to initialize Milvus Adapter or load collection."
@@ -3226,27 +3588,14 @@ async def lifespan(app: FastAPI):
             log.critical(f"CRITICAL: {critical_failure_message}", error=str(e_llm), exc_info=True)
             dependencies_ok = False
     
-    # Initialize optional components
+    # Initialize optional components (Diversity Filter)
     if dependencies_ok:
-        if settings.BM25_ENABLED:
-            try:
-                if chunk_content_repo_instance: # Make sure repo is available
-                    sparse_retriever_instance = BM25sRetriever(chunk_content_repo_instance)
-                    log.info("BM25s Retriever initialized.")
-                else:
-                    log.error("BM25 enabled but ChunkContentRepository failed to initialize. Disabling BM25 for this session.")
-                    sparse_retriever_instance = None # Ensure it's None
-            except ImportError:
-                log.error("BM25sRetriever dependency (bm2s) not installed. BM25 disabled.")
-                sparse_retriever_instance = None
-            except Exception as e_bm25:
-                log.error("Failed to initialize BM25s Retriever. BM25 will be disabled.", error=str(e_bm25), exc_info=True)
-                sparse_retriever_instance = None
-
+        # BM25/Sparse Retriever local ya no se inicializa aquí
+        # ELIMINADO: Código de inicialización de BM25sRetriever local
 
         if settings.DIVERSITY_FILTER_ENABLED:
             try:
-                if embedding_adapter_instance and embedding_adapter_instance.get_embedding_dimension() > 0 : # MMR needs embeddings
+                if embedding_adapter_instance and embedding_adapter_instance.get_embedding_dimension() > 0 :
                     diversity_filter_instance = MMRDiversityFilter(lambda_mult=settings.QUERY_DIVERSITY_LAMBDA)
                     log.info("MMR Diversity Filter initialized.")
                 else:
@@ -3255,14 +3604,14 @@ async def lifespan(app: FastAPI):
             except Exception as e_diversity:
                 log.error("Failed to initialize MMR Diversity Filter. Falling back to StubDiversityFilter.", error=str(e_diversity), exc_info=True)
                 diversity_filter_instance = StubDiversityFilter()
-        else: # If not enabled, use Stub
+        else: 
             log.info("Diversity filter disabled in settings, using StubDiversityFilter as placeholder.")
             diversity_filter_instance = StubDiversityFilter()
 
     # 5. Instantiate Use Case
     if dependencies_ok:
          try:
-             if not http_client_instance: # Should not happen if dependencies_ok is True
+             if not http_client_instance:
                  raise RuntimeError("HTTP client instance is not available for AskQueryUseCase.")
 
              ask_query_use_case_instance = AskQueryUseCase(
@@ -3271,13 +3620,14 @@ async def lifespan(app: FastAPI):
                  vector_store=vector_store_instance,
                  llm=llm_instance,
                  embedding_adapter=embedding_adapter_instance,
-                 http_client=http_client_instance, # Pass the global HTTP client
+                 http_client=http_client_instance,
+                 # Pasar la instancia del adaptador de sparse retriever (puede ser None si BM25_ENABLED=false o falló la init)
                  sparse_retriever=sparse_retriever_instance,
-                 chunk_content_repo=chunk_content_repo_instance,
+                 chunk_content_repo=chunk_content_repo_instance, # Sigue siendo necesario para la fusión
                  diversity_filter=diversity_filter_instance
              )
              log.info("AskQueryUseCase instantiated successfully.")
-             SERVICE_READY = True # Mark service as ready only if all critical components are up
+             SERVICE_READY = True 
              set_ask_query_use_case_instance(ask_query_use_case_instance, SERVICE_READY)
              log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY.")
 
@@ -3285,19 +3635,19 @@ async def lifespan(app: FastAPI):
               critical_failure_message = "Failed to instantiate AskQueryUseCase."
               log.critical(f"CRITICAL: {critical_failure_message}", error=str(e_usecase), exc_info=True)
               SERVICE_READY = False
-              set_ask_query_use_case_instance(None, False) # Ensure it's set to not ready
-    else: # If dependencies_ok was false earlier
+              set_ask_query_use_case_instance(None, False)
+    else:
         log.critical(f"{settings.PROJECT_NAME} startup sequence aborted due to critical failure: {critical_failure_message}")
         log.critical("SERVICE NOT READY.")
         set_ask_query_use_case_instance(None, False)
 
 
-    if not SERVICE_READY: # Double check the flag before concluding startup
+    if not SERVICE_READY:
         if not critical_failure_message: critical_failure_message = "Unknown critical dependency failure during startup."
         log.critical(f"Startup finished. Critical failure detected: {critical_failure_message}. SERVICE NOT READY.")
 
 
-    yield # Application runs here
+    yield 
 
     # --- Shutdown Logic ---
     log.info(f"Shutting down {settings.PROJECT_NAME}...")
@@ -3308,16 +3658,22 @@ async def lifespan(app: FastAPI):
     if vector_store_instance and hasattr(vector_store_instance, 'disconnect'):
         try: await vector_store_instance.disconnect()
         except Exception as e_milvus_close: log.error("Error during Milvus disconnect", error=str(e_milvus_close), exc_info=True)
-    if embedding_service_client_instance: # This client has its own httpx client internally
+    
+    if embedding_service_client_instance:
         try: await embedding_service_client_instance.close()
         except Exception as e_emb_client_close: log.error("Error closing EmbeddingServiceClient", error=str(e_emb_client_close), exc_info=True)
+    
+    if sparse_search_service_client_instance: # NUEVO
+        try: await sparse_search_service_client_instance.close()
+        except Exception as e_sparse_client_close: log.error("Error closing SparseSearchServiceClient", error=str(e_sparse_client_close), exc_info=True)
+        
     log.info("Shutdown complete.")
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
-    version="0.3.2",
-    description="Microservice to handle user queries using RAG pipeline, chat history, remote embedding, and remote reranking.",
+    version="0.3.3", # Incrementado por refactor
+    description="Microservice to handle user queries using RAG pipeline, chat history, remote embedding, remote reranking, and remote sparse search.",
     lifespan=lifespan
 )
 
@@ -3340,7 +3696,7 @@ async def add_request_id_timing_logging(request: Request, call_next):
     except Exception as e_middleware:
         process_time = (asyncio.get_event_loop().time() - start_time) * 1000
         exc_log = req_log.bind(status_code=500, duration_ms=round(process_time, 2))
-        exc_log.exception("Unhandled exception during request processing middleware") # Log with full traceback
+        exc_log.exception("Unhandled exception during request processing middleware") 
         response = JSONResponse(status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR, content={"detail": "Internal Server Error"})
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Process-Time-Ms"] = f"{process_time:.2f}"
@@ -3368,7 +3724,7 @@ async def response_validation_exception_handler(request: Request, exc: ResponseV
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    log.exception("Unhandled Exception caught by generic handler") # Log with full traceback
+    log.exception("Unhandled Exception caught by generic handler") 
     return JSONResponse(status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR, content={"detail": "Internal Server Error"})
 
 
@@ -3395,18 +3751,18 @@ async def read_root():
         if not emb_adapter_healthy:
             health_log.error("Health check (root) failed: Embedding Adapter reports unhealthy dependency (Embedding Service).")
             raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Critical dependency (Embedding Service) is unhealthy.")
-    else: # Should not happen if SERVICE_READY is true
+    else: 
         health_log.error("Health check (root) warning: Embedding Adapter instance not available, inconsistent with SERVICE_READY state.")
         raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service inconsistency: Embedding adapter missing.")
 
     # Check Reranker Service Health (if enabled)
     if settings.RERANKER_ENABLED:
-        if not http_client_instance: # Should not happen if SERVICE_READY and http_client is critical
+        if not http_client_instance: 
             health_log.error("Health check (root) warning: HTTP client instance not available for Reranker health check.")
             raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service inconsistency: HTTP client missing.")
         try:
             reranker_health_url = str(settings.RERANKER_SERVICE_URL).rstrip('/') + "/health"
-            response = await http_client_instance.get(reranker_health_url, timeout=5) # Short timeout for health
+            response = await http_client_instance.get(reranker_health_url, timeout=5) 
             if response.status_code == 200:
                  reranker_data = response.json()
                  if reranker_data.get("status") == "ok" and reranker_data.get("model_status") == "loaded":
@@ -3420,21 +3776,37 @@ async def read_root():
         except httpx.RequestError as e_rerank_health:
              health_log.error("Health check (root) failed: Error connecting to Reranker service.", error=str(e_rerank_health))
              raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Critical dependency (Reranker Service) connection failed.")
-        except Exception as e_rerank_health_generic: # Catch JSONDecodeError or other issues
+        except Exception as e_rerank_health_generic: 
             health_log.error("Health check (root) failed: Error processing Reranker service health response.", error=str(e_rerank_health_generic))
             raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Critical dependency (Reranker Service) health check processing error.")
+    
+    # Check Sparse Search Service Health (if enabled)
+    if settings.BM25_ENABLED: # El flag BM25_ENABLED ahora controla si se usa el servicio remoto
+        if sparse_search_service_client_instance: # Cliente para sparse-search-service
+            sparse_service_healthy = await sparse_search_service_client_instance.check_health()
+            if not sparse_service_healthy:
+                health_log.warning("Health check (root) warning: Sparse Search Service reports unhealthy. Sparse search functionality may be impaired but service can continue.")
+                # No lanzar HTTPException 503 aquí si se considera opcional, pero sí loguear.
+                # Si es crítico, sí lanzar:
+                # raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Dependency (Sparse Search Service) is unhealthy.")
+            else:
+                health_log.debug("Sparse Search Service health check successful via root.")
+        elif settings.BM25_ENABLED: # Si está habilitado en config pero el cliente no se inicializó
+            health_log.error("Health check (root) failed: BM25_ENABLED is true, but Sparse Search Service client is not available.")
+            # Podría ser un 503 si es un componente esperado
+            # raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service inconsistency: Sparse Search Service client missing.")
 
 
     health_log.debug("Health check (root) passed.")
     return PlainTextResponse("OK", status_code=fastapi_status.HTTP_200_OK)
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8001")) # Gunicorn/Cloud Run might set PORT
+    port = int(os.getenv("PORT", "8001")) 
     log_level_str = settings.LOG_LEVEL.lower()
     print(f"----- Starting {settings.PROJECT_NAME} locally on port {port} -----")
     uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True, log_level=log_level_str)
 
-# jfu 2
+# jfu 3
 ```
 
 ## File: `app\models\__init__.py`
@@ -3445,6 +3817,216 @@ if __name__ == "__main__":
 ## File: `app\pipelines\rag_pipeline.py`
 ```py
 
+```
+
+## File: `app\prompts\general_template_gemini_v2.txt`
+```txt
+Eres **Atenex**, el Gestor de Conocimiento Empresarial. Responde de forma útil, concisa y profesional en español latino.
+
+{% if chat_history %}
+───────────────────── HISTORIAL RECIENTE (Más antiguo a más nuevo) ─────────────────────
+{{ chat_history }}
+────────────────────────────────────────────────────────────────────────────────────────
+{% endif %}
+
+PREGUNTA ACTUAL DEL USUARIO:
+{{ query }}
+
+INSTRUCCIONES:
+- Basándote únicamente en el HISTORIAL RECIENTE (si existe) y tu conocimiento general como asistente, responde la pregunta.
+- Si la consulta requiere información específica de documentos que no te han sido proporcionados en esta interacción (porque no se activó el RAG), indica amablemente que no tienes acceso a documentos externos para responder y sugiere al usuario subir un documento relevante o precisar su pregunta si busca información documental.
+- NO inventes información que no tengas.
+
+RESPUESTA DE ATENEX (en español latino):
+```
+
+## File: `app\prompts\map_prompt_template.txt`
+```txt
+Eres un asistente especializado en extraer información concisa de fragmentos de texto.
+PREGUNTA ORIGINAL DEL USUARIO:
+{{ original_query }}
+
+DOCUMENTO ACTUAL (Fragmento {{ document_index + 1 }} de {{ total_documents }}):
+ID del Chunk: {{ document.id }}
+Nombre del Archivo: {{ document.meta.file_name | default("Desconocido") }}
+Página: {{ document.meta.page | default("N/A") }}
+Título del Documento (si existe): {{ document.meta.title | default("N/A") }}
+Score de Recuperación: {{ "%.3f"|format(document.score) if document.score is not none else "N/A" }}
+────────────────────────────────────────────────────────────────────────────────
+CONTENIDO DEL FRAGMENTO:
+{{ document.content | trim }}
+────────────────────────────────────────────────────────────────────────────────
+
+TAREA:
+1.  Lee atentamente la PREGUNTA ORIGINAL DEL USUARIO y el CONTENIDO DEL FRAGMENTO.
+2.  Extrae y resume *únicamente* la información del FRAGMENTO ACTUAL que sea **directa y explícitamente relevante** para responder a la PREGUNTA ORIGINAL DEL USUARIO.
+3.  Sé MUY CONCISO. El objetivo es obtener puntos clave, no una respuesta elaborada. Una o dos frases suelen ser suficientes.
+4.  Si el fragmento contiene información relevante, inicia tu respuesta con: "Información relevante encontrada:".
+5.  Si el fragmento **NO contiene información explícitamente relevante** para la pregunta, responde EXACTAMENTE: "No hay información relevante en este fragmento."
+6.  NO inventes información. NO uses conocimiento externo. NO hagas referencias a otros documentos. Céntrate SÓLO en este fragmento.
+7.  Menciona el nombre del archivo y la página si la información es muy específica de esa fuente. Ejemplo: "Información relevante encontrada: El informe 'Resultados_Q3.pdf' (página 5) indica que los ingresos aumentaron."
+
+EXTRACCIÓN CONCISA:
+```
+
+## File: `app\prompts\rag_template_gemini_v2.txt`
+```txt
+════════════════════════════════════════════════════════════════════
+A T E N E X · INSTRUCCIONES DE GENERACIÓN (Gemini 2.5 Flash - RAG Directo)
+════════════════════════════════════════════════════════════════════
+
+1 · IDENTIDAD Y TONO
+Eres **Atenex**, un asistente de IA experto en consulta de documentación empresarial (PDFs, manuales, etc.). Eres profesional, directo, verificable y empático. Escribe en **español latino** claro y conciso. Prioriza la precisión y la seguridad.
+
+2 · PRINCIPIOS CLAVE
+   - **BASATE SOLO EN EL CONTEXTO:** Usa *únicamente* la información del HISTORIAL RECIENTE y los DOCUMENTOS RECUPERADOS a continuación. **No inventes**, especules ni uses conocimiento externo. Si la respuesta no está explícitamente en el contexto, indícalo claramente en `respuesta_detallada`.
+   - **CITACIÓN:** Cuando uses información de un documento recuperado, añade una cita al final de la frase o párrafo relevante indicando el documento. Formato preferido: `[Doc N]`. Este `N` debe corresponder al índice del documento en la lista de DOCUMENTOS RECUPERADOS.
+   - **NO ESPECULACIÓN:** Si la información solicitada no se encuentra, `respuesta_detallada` debe ser "No encontré información específica sobre eso en los documentos proporcionados ni en el historial reciente."
+   - **NO CÓDIGO:** No generes bloques de código ejecutable. Puedes explicar conceptos o pseudocódigo si es útil.
+   - **PREGUNTAS AMPLIAS:** Si la pregunta es muy general (ej. "dame todo sobre X"), en lugar de intentar resumir todo, tu `respuesta_detallada` debe identificar 1-3 temas clave cubiertos en los documentos y una `siguiente_pregunta_sugerida` podría ser una pregunta aclaratoria al usuario para enfocar la consulta. Ejemplo: `respuesta_detallada`: "Los documentos mencionan X en relación a Y y Z.", `siguiente_pregunta_sugerida`: "¿Te interesa algún aspecto en particular de X, como su relación con Y o Z?".
+   - **PETICIONES DE ARCHIVOS:** Si el usuario pide explícitamente "el PDF" o "el documento" y varios chunks recuperados pertenecen al mismo archivo (identificable por `doc.meta.file_name`), tu `respuesta_detallada` debe indicar que tienes información *proveniente* de ese archivo específico, resumir lo más relevante según la consulta, y citarlo. **No puedes entregar el archivo binario**, solo responder basado en su contenido textual.
+
+3 · CONTEXTO PROPORCIONADO
+{% if chat_history %}
+───────────────────── HISTORIAL RECIENTE (Más antiguo a más nuevo) ─────────────────────
+{{ chat_history }}
+────────────────────────────────────────────────────────────────────────────────────────
+{% endif %}
+──────────────────── DOCUMENTOS RECUPERADOS (Ordenados por relevancia) ──────────────────
+{% for doc in documents %}
+[Doc {{ loop.index }}] «{{ doc.meta.file_name | default("Archivo Desconocido") }}»
+ ID Chunk: {{ doc.id }}
+ Título Doc: {{ doc.meta.title | default("Sin Título") }}
+ Página: {{ doc.meta.page | default("?") }}
+ Score: {{ "%.3f"|format(doc.score) if doc.score is not none else "N/A" }}
+ Extracto: {{ doc.content | trim }}
+--------------------------------------------------------------------------------------------{% endfor %}
+────────────────────────────────────────────────────────────────────────────────────────
+
+4 · PREGUNTA ACTUAL DEL USUARIO
+{{ query }}
+
+5 · PROCESO DE PENSAMIENTO SUGERIDO (INTERNO - Chain-of-Thought)
+Antes de generar la respuesta final en el formato JSON requerido, mentalmente sigue estos pasos:
+a. Revisa la PREGUNTA ACTUAL DEL USUARIO y el HISTORIAL RECIENTE para entender completamente la intención.
+b. Analiza los DOCUMENTOS RECUPERADOS. Identifica los fragmentos más relevantes que responden directamente a cada parte de la pregunta.
+c. Si hay información contradictoria o complementaria entre los documentos, resuélvela o preséntala de forma clara.
+d. Formula una respuesta concisa y directa a la pregunta principal en el campo `respuesta_detallada`.
+e. Asegúrate de que CADA DATO fáctico en `respuesta_detallada` que provenga de los documentos esté apropiadamente citado [Doc N].
+f. Genera un `resumen_ejecutivo` si la respuesta detallada es larga (más de ~160 palabras).
+g. Construye la lista `fuentes_citadas` basándote ESTRICTAMENTE en los [Doc N] que usaste y citaste. Verifica que los números de documento (`cita_tag`) coincidan con los índices de los DOCUMENTOS RECUPERADOS. Incluye el `id_documento` (ID del chunk), `nombre_archivo`, `pagina` y `score` de los documentos originales.
+h. Considera una `siguiente_pregunta_sugerida` que sea útil para el usuario.
+i. Finalmente, ensambla toda la respuesta en el formato JSON especificado.
+
+6 · FORMATO DE RESPUESTA REQUERIDO (OBJETO JSON VÁLIDO)
+Tu respuesta DEBE ser un objeto JSON válido con la siguiente estructura. Presta atención a los tipos de datos y campos requeridos/opcionales.
+```json
+{
+  "resumen_ejecutivo": "string | null (Un breve resumen de 1-2 frases si la respuesta es larga, sino null)",
+  "respuesta_detallada": "string (La respuesta completa y elaborada, incluyendo citas [Doc N] donde corresponda. Si no se encontró información, indícalo aquí)",
+  "fuentes_citadas": [
+    {
+      "id_documento": "string | null (ID del chunk original, corresponde al 'ID Chunk' de la lista de documentos recuperados)",
+      "nombre_archivo": "string (Nombre del archivo fuente)",
+      "pagina": "string | null (Número de página, si está disponible)",
+      "score": "number | null (Score de relevancia original del chunk, si está disponible)",
+      "cita_tag": "string (La etiqueta de cita usada en respuesta_detallada, ej: '[Doc 1]')"
+    }
+  ],
+  "siguiente_pregunta_sugerida": "string | null (Una pregunta de seguimiento relevante, si aplica, sino null)"
+}
+```
+Asegúrate de que:
+- El JSON sea sintácticamente correcto.
+- Las citas `[Doc N]` en `respuesta_detallada` coincidan con las listadas en `fuentes_citadas` (mismo `N` y misma fuente referenciada por el `loop.index` de los DOCUMENTOS RECUPERADOS).
+- `fuentes_citadas` solo contenga documentos efectivamente usados y referenciados. Para cada fuente, usa la información del chunk original listado arriba.
+- No incluyas comentarios dentro del JSON.
+
+════════════════════════════════════════════════════════════════════
+RESPUESTA JSON DE ATENEX:
+════════════════════════════════════════════════════════════════════
+
+```
+
+## File: `app\prompts\reduce_prompt_template_v2.txt`
+```txt
+════════════════════════════════════════════════════════════════════
+A T E N E X · SÍNTESIS DE RESPUESTA (Gemini 2.5 Flash)
+════════════════════════════════════════════════════════════════════
+
+1 · IDENTIDAD Y TONO
+Eres **Atenex**, un asistente de IA experto en consulta de documentación empresarial. Eres profesional, directo, verificable y empático. Escribe en **español latino** claro y conciso. Prioriza la precisión y la seguridad.
+
+2 · TAREA PRINCIPAL
+Tu tarea es sintetizar la INFORMACIÓN RECOPILADA (extractos de múltiples documentos) para responder de forma integral a la PREGUNTA ORIGINAL DEL USUARIO, considerando también el HISTORIAL RECIENTE de la conversación. Debes generar una respuesta en formato JSON estructurado.
+
+3 · CONTEXTO
+PREGUNTA ORIGINAL DEL USUARIO:
+{{ original_query }}
+
+{% if chat_history %}
+───────────────────── HISTORIAL RECIENTE (Más antiguo a más nuevo) ─────────────────────
+{{ chat_history }}
+────────────────────────────────────────────────────────────────────────────────────────
+{% endif %}
+
+──────────────────── INFORMACIÓN RECOPILADA DE DOCUMENTOS (Fase Map) ───────────────────
+A continuación se presentan varios extractos y resúmenes de diferentes documentos que podrían ser relevantes. Cada bloque de información fue extraído individualmente.
+{{ mapped_responses }} {# Aquí se concatenarán las respuestas de la fase Map #}
+────────────────────────────────────────────────────────────────────────────────────────
+
+──────────────────── LISTA DE CHUNKS ORIGINALES CONSIDERADOS (Para referencia de citación) ───────────────────
+Estos son los chunks originales de los cuales se extrajo la INFORMACIÓN RECOPILADA. Úsalos para construir la sección `fuentes_citadas` y para las citas `[Doc N]` en `respuesta_detallada`.
+{% for doc_chunk in original_documents_for_citation %}
+[Doc {{ loop.index }}] ID: {{ doc_chunk.id }}, Archivo: «{{ doc_chunk.meta.file_name | default("Archivo Desconocido") }}», Título: {{ doc_chunk.meta.title | default("Sin Título") }}, Pág: {{ doc_chunk.meta.page | default("?") }}, Score Original: {{ "%.3f"|format(doc_chunk.score) if doc_chunk.score is not none else "N/A" }}
+{% endfor %}
+─────────────────────────────────────────────────────────────────────────────────────────
+
+4 · PRINCIPIOS CLAVE PARA LA SÍNTESIS
+   - **BASATE SOLO EN EL CONTEXTO PROPORCIONADO:** Usa *únicamente* la INFORMACIÓN RECOPILADA y el HISTORIAL RECIENTE. **No inventes**, especules ni uses conocimiento externo.
+   - **CITACIÓN PRECISA:** Cuando uses información que provenga de un chunk específico (identificable en la INFORMACIÓN RECOPILADA), debes citarlo usando la etiqueta `[Doc N]` correspondiente al chunk de la LISTA DE CHUNKS ORIGINALES CONSIDERADOS.
+   - **NO ESPECULACIÓN:** Si la información combinada no es suficiente para responder completamente, indícalo claramente en `respuesta_detallada`.
+   - **RESPUESTA INTEGRAL:** Intenta conectar la información de diferentes extractos para dar una respuesta completa si es posible.
+   - **MANEJO DE "NO SÉ":** Si la INFORMACIÓN RECOPILADA es predominantemente "No hay información relevante...", tu `respuesta_detallada` debe ser "No encontré información específica sobre eso en los documentos procesados."
+
+5 · PROCESO DE PENSAMIENTO SUGERIDO (INTERNO - Chain-of-Thought)
+Antes de generar el JSON final:
+a. Revisa la PREGUNTA ORIGINAL y el HISTORIAL para la intención completa.
+b. Analiza la INFORMACIÓN RECOPILADA. Identifica los puntos clave de cada extracto.
+c. Sintetiza estos puntos en una narrativa coherente para `respuesta_detallada`.
+d. Cruza la información sintetizada con la LISTA DE CHUNKS ORIGINALES para asegurar que las citas `[Doc N]` sean correctas y se refieran al chunk correcto.
+e. Genera un `resumen_ejecutivo` si `respuesta_detallada` es extensa.
+f. Construye `fuentes_citadas` solo con los documentos que realmente usaste y citaste. El `cita_tag` debe coincidir con el usado en `respuesta_detallada`.
+g. Considera una `siguiente_pregunta_sugerida` si es natural.
+h. Ensambla el JSON.
+
+6 · FORMATO DE RESPUESTA REQUERIDO (OBJETO JSON VÁLIDO)
+Tu respuesta DEBE ser un objeto JSON válido con la siguiente estructura. Presta atención a los tipos de datos y campos requeridos/opcionales.
+```json
+{
+  "resumen_ejecutivo": "string | null (Un breve resumen de 1-2 frases si la respuesta es larga, sino null)",
+  "respuesta_detallada": "string (La respuesta completa y elaborada, incluyendo citas [Doc N] donde corresponda. Si no se encontró información, indícalo aquí)",
+  "fuentes_citadas": [
+    {
+      "id_documento": "string | null (ID del chunk original, si está disponible en su metadata)",
+      "nombre_archivo": "string (Nombre del archivo fuente)",
+      "pagina": "string | null (Número de página, si está disponible)",
+      "score": "number | null (Score de relevancia original del chunk, si está disponible)",
+      "cita_tag": "string (La etiqueta de cita usada en respuesta_detallada, ej: '[Doc 1]')"
+    }
+  ],
+  "siguiente_pregunta_sugerida": "string | null (Una pregunta de seguimiento relevante, si aplica, sino null)"
+}
+```
+Asegúrate de que:
+- El JSON sea sintácticamente correcto.
+- Las citas `[Doc N]` en `respuesta_detallada` coincidan con las listadas en `fuentes_citadas` (mismo `N` y misma fuente).
+- `fuentes_citadas` solo contenga documentos efectivamente usados y referenciados.
+- No incluyas comentarios dentro del JSON.
+
+════════════════════════════════════════════════════════════════════
+RESPUESTA JSON DE ATENEX:
+════════════════════════════════════════════════════════════════════
 ```
 
 ## File: `app\utils\__init__.py`
@@ -3474,8 +4056,8 @@ def truncate_text(text: str, max_length: int) -> str:
 ```toml
 [tool.poetry]
 name = "query-service"
-version = "0.3.2"
-description = "Query service for SaaS B2B using Clean Architecture, PyMilvus, Haystack & Advanced RAG with remote embeddings and reranking"
+version = "0.3.3" 
+description = "Query service for SaaS B2B using Clean Architecture, PyMilvus, Haystack & Advanced RAG with remote embeddings, reranking, and sparse search."
 authors = ["Nyro <dev@nyro.com>"]
 readme = "README.md"
 
@@ -3484,7 +4066,7 @@ python = "^3.10"
 fastapi = "^0.110.0"
 uvicorn = {extras = ["standard"], version = "^0.28.0"}
 gunicorn = "^21.2.0"
-pydantic = {extras = ["email"], version = "^2.6.4"}
+pydantic = {extras = ["email"], version = "^2.6.4"} 
 pydantic-settings = "^2.2.1"
 httpx = "^0.27.0"
 asyncpg = "^0.29.0"
@@ -3493,17 +4075,15 @@ tenacity = "^8.2.3"
 structlog = "^24.1.0"
 
 # --- Haystack Dependencies ---
-# haystack-ai is kept for Document, PromptBuilder, etc.
-haystack-ai = "^2.0.1"
-pymilvus = "==2.5.3"
+haystack-ai = "^2.0.1" 
+pymilvus = "==2.5.3" 
 
 # --- LLM Dependency ---
-google-generativeai = "^0.5.4"
+google-generativeai = "^0.5.4" 
 
 # --- RAG Component Dependencies ---
-# sentence-transformers is REMOVED as reranking is now external
 numpy = "1.26.4" 
-
+# rank-bm25 fue eliminado porque la búsqueda dispersa ahora es un servicio remoto
 
 
 [tool.poetry.group.dev.dependencies]
@@ -3511,8 +4091,6 @@ pytest = "^7.4.4"
 pytest-asyncio = "^0.21.1"
 
 [tool.poetry.extras]
-
-
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

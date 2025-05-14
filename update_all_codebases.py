@@ -10,6 +10,7 @@ MICROSERVICES = [
     "query-service",
     "reranker-service",
     "docproc-service",
+    "sparse-search-service",
 ]
 
 ROOT = Path(__file__).parent.resolve()

@@ -4,15 +4,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     POETRY_VERSION=1.8.2 \
     POETRY_HOME="/opt/poetry" \
-    PATH="/opt/poetry/bin:$PATH" \
     POETRY_NO_INTERACTION=1 \
-    POETRY_VIRTUALENVS_CREATE=false
+    POETRY_VIRTUALENVS_CREATE=false \
+    PIP_NO_CACHE_DIR=off \
+    PIP_DISABLE_PIP_VERSION_CHECK=on \
+    PIP_DEFAULT_TIMEOUT=100
+
+ENV PATH="${POETRY_HOME}/bin:${PATH}"
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl build-essential cmake && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* && \
+    curl -sSL https://install.python-poetry.org | python3 - --version ${POETRY_VERSION}
 
-RUN curl -sSL https://install.python-poetry.org | python3 - --version ${POETRY_VERSION}
 RUN poetry --version
 
 WORKDIR /build
@@ -26,8 +30,19 @@ FROM python:3.10-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    APP_HOME="/app" \
-    PORT=8001
+    APP_HOME="/app"
+
+ARG UID=10001
+RUN addgroup --system --gid ${UID} appgroup && \
+    adduser \
+    --system \
+    --disabled-password \
+    --ingroup appgroup \
+    --uid ${UID} \
+    --home "/nonexistent" \
+    --shell "/sbin/nologin" \
+    --no-create-home \
+    appuser
 
 WORKDIR ${APP_HOME}
 
@@ -36,6 +51,8 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 
 COPY ./app ${APP_HOME}/app
 
-EXPOSE ${PORT}
+RUN chown -R appuser:appgroup ${APP_HOME}
 
-CMD sh -c "gunicorn -k uvicorn.workers.UvicornWorker -w 2 -b 0.0.0.0:${PORT} app.main:app"
+USER appuser
+
+CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-c", "app/gunicorn_conf.py", "app.main:app"]

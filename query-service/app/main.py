@@ -34,7 +34,10 @@ from app.infrastructure.persistence.postgres_repositories import (
 )
 from app.infrastructure.vectorstores.milvus_adapter import MilvusAdapter
 from app.infrastructure.llms.gemini_adapter import GeminiAdapter
-from app.infrastructure.retrievers.bm25_retriever import BM25sRetriever
+
+from app.infrastructure.clients.sparse_search_service_client import SparseSearchServiceClient
+from app.infrastructure.retrievers.remote_sparse_retriever_adapter import RemoteSparseRetrieverAdapter
+
 from app.infrastructure.filters.diversity_filter import MMRDiversityFilter, StubDiversityFilter
 from app.infrastructure.clients.embedding_service_client import EmbeddingServiceClient
 from app.infrastructure.embedding.remote_embedding_adapter import RemoteEmbeddingAdapter
@@ -53,7 +56,10 @@ log_repo_instance: Optional[LogRepositoryPort] = None
 chunk_content_repo_instance: Optional[ChunkContentRepositoryPort] = None
 vector_store_instance: Optional[VectorStorePort] = None
 llm_instance: Optional[LLMPort] = None
+# MODIFICADO: sparse_retriever_instance ahora puede ser RemoteSparseRetrieverAdapter
 sparse_retriever_instance: Optional[SparseRetrieverPort] = None
+sparse_search_service_client_instance: Optional[SparseSearchServiceClient] = None # NUEVO
+
 diversity_filter_instance: Optional[DiversityFilterPort] = None
 embedding_service_client_instance: Optional[EmbeddingServiceClient] = None
 embedding_adapter_instance: Optional[EmbeddingPort] = None
@@ -66,6 +72,7 @@ http_client_instance: Optional[httpx.AsyncClient] = None
 async def lifespan(app: FastAPI):
     global SERVICE_READY, chat_repo_instance, log_repo_instance, chunk_content_repo_instance, \
            vector_store_instance, llm_instance, sparse_retriever_instance, \
+           sparse_search_service_client_instance, \
            diversity_filter_instance, ask_query_use_case_instance, \
            embedding_service_client_instance, embedding_adapter_instance, http_client_instance
 
@@ -96,7 +103,7 @@ async def lifespan(app: FastAPI):
                 log.info("PostgreSQL connection pool initialized and verified.")
                 chat_repo_instance = PostgresChatRepository()
                 log_repo_instance = PostgresLogRepository()
-                chunk_content_repo_instance = PostgresChunkContentRepository()
+                chunk_content_repo_instance = PostgresChunkContentRepository() # Necesario para fusión
             else:
                 critical_failure_message = "Failed PostgreSQL connection verification during startup."
                 log.critical(f"CRITICAL: {critical_failure_message}")
@@ -109,15 +116,12 @@ async def lifespan(app: FastAPI):
     # 2. Initialize Embedding Service Client & Adapter
     if dependencies_ok:
         try:
-            # EmbeddingServiceClient creates its own internal httpx.AsyncClient
-            # but we could pass the global one if we refactor EmbeddingServiceClient.
-            # For now, it's fine as is.
             embedding_service_client_instance = EmbeddingServiceClient(
                 base_url=str(settings.EMBEDDING_SERVICE_URL),
-                timeout=settings.EMBEDDING_CLIENT_TIMEOUT # Specific timeout for embedding client
+                timeout=settings.EMBEDDING_CLIENT_TIMEOUT
             )
             embedding_adapter_instance = RemoteEmbeddingAdapter(client=embedding_service_client_instance)
-            await embedding_adapter_instance.initialize() # Tries to get dimension
+            await embedding_adapter_instance.initialize()
             
             emb_service_healthy = await embedding_adapter_instance.health_check()
             if emb_service_healthy:
@@ -131,12 +135,33 @@ async def lifespan(app: FastAPI):
             log.critical(f"CRITICAL: {critical_failure_message}", error=str(e_embed), exc_info=True, url=settings.EMBEDDING_SERVICE_URL)
             dependencies_ok = False
 
+    # 2.B. Initialize Sparse Search Service Client & Adapter
+    if dependencies_ok and settings.BM25_ENABLED: # Solo si BM25 está habilitado en config
+        try:
+            sparse_search_service_client_instance = SparseSearchServiceClient(
+                base_url=str(settings.SPARSE_SEARCH_SERVICE_URL),
+                timeout=settings.SPARSE_SEARCH_CLIENT_TIMEOUT
+            )
+            # El adaptador para SparseRetrieverPort
+            sparse_retriever_instance = RemoteSparseRetrieverAdapter(client=sparse_search_service_client_instance)
+            
+            sparse_service_healthy = await sparse_search_service_client_instance.check_health() # El cliente tiene health_check
+            if sparse_service_healthy:
+                log.info("Sparse Search Service client and adapter initialized, health check passed.")
+            else:
+                # Si BM25 está habilitado pero el servicio no está sano, es un warning, el pipeline puede continuar sin él.
+                log.warning(f"Sparse Search Service health check failed during startup. URL: {settings.SPARSE_SEARCH_SERVICE_URL}. Sparse search may be unavailable.")
+                # No marcamos dependencies_ok = False aquí, ya que BM25 es opcional en el pipeline
+                # Si sparse_retriever_instance es None, el use case lo manejará.
+        except Exception as e_sparse:
+            log.error(f"Failed to initialize Sparse Search Service client/adapter. Sparse search will be unavailable.", error=str(e_sparse), exc_info=True, url=str(settings.SPARSE_SEARCH_SERVICE_URL))
+            sparse_retriever_instance = None # Asegurar que es None si falla la inicialización
 
     # 3. Initialize Milvus Adapter
     if dependencies_ok:
         try:
             vector_store_instance = MilvusAdapter()
-            await vector_store_instance.connect() # Explicitly connect and load collection
+            await vector_store_instance.connect() 
             log.info("Milvus Adapter initialized and collection checked/loaded.")
         except Exception as e_milvus:
             critical_failure_message = "Failed to initialize Milvus Adapter or load collection."
@@ -161,27 +186,14 @@ async def lifespan(app: FastAPI):
             log.critical(f"CRITICAL: {critical_failure_message}", error=str(e_llm), exc_info=True)
             dependencies_ok = False
     
-    # Initialize optional components
+    # Initialize optional components (Diversity Filter)
     if dependencies_ok:
-        if settings.BM25_ENABLED:
-            try:
-                if chunk_content_repo_instance: # Make sure repo is available
-                    sparse_retriever_instance = BM25sRetriever(chunk_content_repo_instance)
-                    log.info("BM25s Retriever initialized.")
-                else:
-                    log.error("BM25 enabled but ChunkContentRepository failed to initialize. Disabling BM25 for this session.")
-                    sparse_retriever_instance = None # Ensure it's None
-            except ImportError:
-                log.error("BM25sRetriever dependency (bm2s) not installed. BM25 disabled.")
-                sparse_retriever_instance = None
-            except Exception as e_bm25:
-                log.error("Failed to initialize BM25s Retriever. BM25 will be disabled.", error=str(e_bm25), exc_info=True)
-                sparse_retriever_instance = None
-
+        # BM25/Sparse Retriever local ya no se inicializa aquí
+        # ELIMINADO: Código de inicialización de BM25sRetriever local
 
         if settings.DIVERSITY_FILTER_ENABLED:
             try:
-                if embedding_adapter_instance and embedding_adapter_instance.get_embedding_dimension() > 0 : # MMR needs embeddings
+                if embedding_adapter_instance and embedding_adapter_instance.get_embedding_dimension() > 0 :
                     diversity_filter_instance = MMRDiversityFilter(lambda_mult=settings.QUERY_DIVERSITY_LAMBDA)
                     log.info("MMR Diversity Filter initialized.")
                 else:
@@ -190,14 +202,14 @@ async def lifespan(app: FastAPI):
             except Exception as e_diversity:
                 log.error("Failed to initialize MMR Diversity Filter. Falling back to StubDiversityFilter.", error=str(e_diversity), exc_info=True)
                 diversity_filter_instance = StubDiversityFilter()
-        else: # If not enabled, use Stub
+        else: 
             log.info("Diversity filter disabled in settings, using StubDiversityFilter as placeholder.")
             diversity_filter_instance = StubDiversityFilter()
 
     # 5. Instantiate Use Case
     if dependencies_ok:
          try:
-             if not http_client_instance: # Should not happen if dependencies_ok is True
+             if not http_client_instance:
                  raise RuntimeError("HTTP client instance is not available for AskQueryUseCase.")
 
              ask_query_use_case_instance = AskQueryUseCase(
@@ -206,13 +218,14 @@ async def lifespan(app: FastAPI):
                  vector_store=vector_store_instance,
                  llm=llm_instance,
                  embedding_adapter=embedding_adapter_instance,
-                 http_client=http_client_instance, # Pass the global HTTP client
+                 http_client=http_client_instance,
+                 # Pasar la instancia del adaptador de sparse retriever (puede ser None si BM25_ENABLED=false o falló la init)
                  sparse_retriever=sparse_retriever_instance,
-                 chunk_content_repo=chunk_content_repo_instance,
+                 chunk_content_repo=chunk_content_repo_instance, # Sigue siendo necesario para la fusión
                  diversity_filter=diversity_filter_instance
              )
              log.info("AskQueryUseCase instantiated successfully.")
-             SERVICE_READY = True # Mark service as ready only if all critical components are up
+             SERVICE_READY = True 
              set_ask_query_use_case_instance(ask_query_use_case_instance, SERVICE_READY)
              log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY.")
 
@@ -220,19 +233,19 @@ async def lifespan(app: FastAPI):
               critical_failure_message = "Failed to instantiate AskQueryUseCase."
               log.critical(f"CRITICAL: {critical_failure_message}", error=str(e_usecase), exc_info=True)
               SERVICE_READY = False
-              set_ask_query_use_case_instance(None, False) # Ensure it's set to not ready
-    else: # If dependencies_ok was false earlier
+              set_ask_query_use_case_instance(None, False)
+    else:
         log.critical(f"{settings.PROJECT_NAME} startup sequence aborted due to critical failure: {critical_failure_message}")
         log.critical("SERVICE NOT READY.")
         set_ask_query_use_case_instance(None, False)
 
 
-    if not SERVICE_READY: # Double check the flag before concluding startup
+    if not SERVICE_READY:
         if not critical_failure_message: critical_failure_message = "Unknown critical dependency failure during startup."
         log.critical(f"Startup finished. Critical failure detected: {critical_failure_message}. SERVICE NOT READY.")
 
 
-    yield # Application runs here
+    yield 
 
     # --- Shutdown Logic ---
     log.info(f"Shutting down {settings.PROJECT_NAME}...")
@@ -243,16 +256,22 @@ async def lifespan(app: FastAPI):
     if vector_store_instance and hasattr(vector_store_instance, 'disconnect'):
         try: await vector_store_instance.disconnect()
         except Exception as e_milvus_close: log.error("Error during Milvus disconnect", error=str(e_milvus_close), exc_info=True)
-    if embedding_service_client_instance: # This client has its own httpx client internally
+    
+    if embedding_service_client_instance:
         try: await embedding_service_client_instance.close()
         except Exception as e_emb_client_close: log.error("Error closing EmbeddingServiceClient", error=str(e_emb_client_close), exc_info=True)
+    
+    if sparse_search_service_client_instance: # NUEVO
+        try: await sparse_search_service_client_instance.close()
+        except Exception as e_sparse_client_close: log.error("Error closing SparseSearchServiceClient", error=str(e_sparse_client_close), exc_info=True)
+        
     log.info("Shutdown complete.")
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
-    version="0.3.2",
-    description="Microservice to handle user queries using RAG pipeline, chat history, remote embedding, and remote reranking.",
+    version="0.3.3", # Incrementado por refactor
+    description="Microservice to handle user queries using RAG pipeline, chat history, remote embedding, remote reranking, and remote sparse search.",
     lifespan=lifespan
 )
 
@@ -275,7 +294,7 @@ async def add_request_id_timing_logging(request: Request, call_next):
     except Exception as e_middleware:
         process_time = (asyncio.get_event_loop().time() - start_time) * 1000
         exc_log = req_log.bind(status_code=500, duration_ms=round(process_time, 2))
-        exc_log.exception("Unhandled exception during request processing middleware") # Log with full traceback
+        exc_log.exception("Unhandled exception during request processing middleware") 
         response = JSONResponse(status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR, content={"detail": "Internal Server Error"})
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Process-Time-Ms"] = f"{process_time:.2f}"
@@ -303,7 +322,7 @@ async def response_validation_exception_handler(request: Request, exc: ResponseV
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    log.exception("Unhandled Exception caught by generic handler") # Log with full traceback
+    log.exception("Unhandled Exception caught by generic handler") 
     return JSONResponse(status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR, content={"detail": "Internal Server Error"})
 
 
@@ -330,18 +349,18 @@ async def read_root():
         if not emb_adapter_healthy:
             health_log.error("Health check (root) failed: Embedding Adapter reports unhealthy dependency (Embedding Service).")
             raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Critical dependency (Embedding Service) is unhealthy.")
-    else: # Should not happen if SERVICE_READY is true
+    else: 
         health_log.error("Health check (root) warning: Embedding Adapter instance not available, inconsistent with SERVICE_READY state.")
         raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service inconsistency: Embedding adapter missing.")
 
     # Check Reranker Service Health (if enabled)
     if settings.RERANKER_ENABLED:
-        if not http_client_instance: # Should not happen if SERVICE_READY and http_client is critical
+        if not http_client_instance: 
             health_log.error("Health check (root) warning: HTTP client instance not available for Reranker health check.")
             raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service inconsistency: HTTP client missing.")
         try:
             reranker_health_url = str(settings.RERANKER_SERVICE_URL).rstrip('/') + "/health"
-            response = await http_client_instance.get(reranker_health_url, timeout=5) # Short timeout for health
+            response = await http_client_instance.get(reranker_health_url, timeout=5) 
             if response.status_code == 200:
                  reranker_data = response.json()
                  if reranker_data.get("status") == "ok" and reranker_data.get("model_status") == "loaded":
@@ -355,18 +374,34 @@ async def read_root():
         except httpx.RequestError as e_rerank_health:
              health_log.error("Health check (root) failed: Error connecting to Reranker service.", error=str(e_rerank_health))
              raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Critical dependency (Reranker Service) connection failed.")
-        except Exception as e_rerank_health_generic: # Catch JSONDecodeError or other issues
+        except Exception as e_rerank_health_generic: 
             health_log.error("Health check (root) failed: Error processing Reranker service health response.", error=str(e_rerank_health_generic))
             raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Critical dependency (Reranker Service) health check processing error.")
+    
+    # Check Sparse Search Service Health (if enabled)
+    if settings.BM25_ENABLED: # El flag BM25_ENABLED ahora controla si se usa el servicio remoto
+        if sparse_search_service_client_instance: # Cliente para sparse-search-service
+            sparse_service_healthy = await sparse_search_service_client_instance.check_health()
+            if not sparse_service_healthy:
+                health_log.warning("Health check (root) warning: Sparse Search Service reports unhealthy. Sparse search functionality may be impaired but service can continue.")
+                # No lanzar HTTPException 503 aquí si se considera opcional, pero sí loguear.
+                # Si es crítico, sí lanzar:
+                # raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Dependency (Sparse Search Service) is unhealthy.")
+            else:
+                health_log.debug("Sparse Search Service health check successful via root.")
+        elif settings.BM25_ENABLED: # Si está habilitado en config pero el cliente no se inicializó
+            health_log.error("Health check (root) failed: BM25_ENABLED is true, but Sparse Search Service client is not available.")
+            # Podría ser un 503 si es un componente esperado
+            # raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service inconsistency: Sparse Search Service client missing.")
 
 
     health_log.debug("Health check (root) passed.")
     return PlainTextResponse("OK", status_code=fastapi_status.HTTP_200_OK)
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8001")) # Gunicorn/Cloud Run might set PORT
+    port = int(os.getenv("PORT", "8001")) 
     log_level_str = settings.LOG_LEVEL.lower()
     print(f"----- Starting {settings.PROJECT_NAME} locally on port {port} -----")
     uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True, log_level=log_level_str)
 
-# jfu 2
+# jfu 3

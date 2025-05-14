@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "query-service"
-version = "0.3.2"
-description = "Query service for SaaS B2B using Clean Architecture, PyMilvus, Haystack & Advanced RAG with remote embeddings and reranking"
+version = "0.3.3" 
+description = "Query service for SaaS B2B using Clean Architecture, PyMilvus, Haystack & Advanced RAG with remote embeddings, reranking, and sparse search."
 authors = ["Nyro <dev@nyro.com>"]
 readme = "README.md"
 
@@ -10,7 +10,7 @@ python = "^3.10"
 fastapi = "^0.110.0"
 uvicorn = {extras = ["standard"], version = "^0.28.0"}
 gunicorn = "^21.2.0"
-pydantic = {extras = ["email"], version = "^2.6.4"}
+pydantic = {extras = ["email"], version = "^2.6.4"} 
 pydantic-settings = "^2.2.1"
 httpx = "^0.27.0"
 asyncpg = "^0.29.0"
@@ -19,18 +19,15 @@ tenacity = "^8.2.3"
 structlog = "^24.1.0"
 
 # --- Haystack Dependencies ---
-# haystack-ai is kept for Document, PromptBuilder, etc.
-haystack-ai = "^2.0.1"
-pymilvus = "==2.5.3"
+haystack-ai = "^2.0.1" 
+pymilvus = "==2.5.3" 
 
 # --- LLM Dependency ---
-google-generativeai = "^0.5.4"
+google-generativeai = "^0.5.4" 
 
 # --- RAG Component Dependencies ---
-# sentence-transformers is REMOVED as reranking is now external
-numpy = "1.26.4"
-rank-bm25 = "^0.2.2"
-
+numpy = "1.26.4" 
+# rank-bm25 fue eliminado porque la búsqueda dispersa ahora es un servicio remoto
 
 
 [tool.poetry.group.dev.dependencies]
@@ -38,8 +35,6 @@ pytest = "^7.4.4"
 pytest-asyncio = "^0.21.1"
 
 [tool.poetry.extras]
-
-
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
