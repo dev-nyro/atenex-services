@@ -21,6 +21,8 @@ main_log = structlog.get_logger("sparse_search_service.main")
 
 from app.api.v1.endpoints import search_endpoint
 
+from app.api.v1 import schemas
+
 from app.application.ports.repository_ports import ChunkContentRepositoryPort
 from app.application.ports.sparse_search_port import SparseSearchPort
 from app.application.ports.sparse_index_storage_port import SparseIndexStoragePort
