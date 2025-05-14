@@ -1509,83 +1509,130 @@ El servicio se configura mediante variables de entorno, con el prefijo `DOCPROC_
 
 ## sparse-search-service
 
-# Atenex Sparse Search Service v0.1.0
+# Atenex Sparse Search Service v1.0.0
 
 ## 1. Visión General
 
-El **Sparse Search Service** es un microservicio de Atenex dedicado a realizar búsquedas dispersas (basadas en palabras clave) utilizando el algoritmo **BM25**. Este servicio es consumido internamente por otros microservicios de Atenex, principalmente el `query-service`, para proporcionar una de las fuentes de recuperación de chunks en un pipeline RAG híbrido.
+El **Atenex Sparse Search Service** (v1.0.0) es un microservicio de Atenex dedicado a realizar búsquedas dispersas (basadas en palabras clave) utilizando el algoritmo **BM25**. Este servicio es consumido internamente por otros microservicios de Atenex, principalmente el `query-service`, para proporcionar una de las fuentes de recuperación de chunks en un pipeline RAG híbrido.
 
-Su responsabilidad principal es:
-1.  Recibir una consulta de texto, un `company_id` y un parámetro `top_k` a través de su API REST.
-2.  Obtener el contenido textual de todos los chunks procesados y válidos para la `company_id` dada desde la base de datos PostgreSQL (tabla `document_chunks`).
-3.  Construir un índice BM25 en memoria utilizando los contenidos de estos chunks para la compañía especificada.
-4.  Realizar la búsqueda de la consulta contra este índice BM25.
-5.  Devolver una lista de `chunk_id` (que corresponden a `embedding_id` en la tabla `document_chunks`) y sus respectivos `score` de BM25.
+En esta versión, el servicio ha sido **refactorizado significativamente** para mejorar el rendimiento y la escalabilidad:
+1.  **Indexación Offline:** Los índices BM25 ya no se construyen bajo demanda por cada solicitud. En su lugar, un **proceso de indexación offline (ejecutado como un Kubernetes CronJob)** precalcula los índices BM25 para cada compañía.
+2.  **Persistencia de Índices en Google Cloud Storage (GCS):** Los índices BM25 precalculados (el objeto BM25 serializado y un mapa de IDs de chunks) se almacenan de forma persistente en un bucket de GCS dedicado.
+3.  **Caché LRU/TTL en Memoria:** Al recibir una solicitud, el servicio primero intenta cargar el índice BM25 desde un caché en memoria (LRU con TTL). Si no está en caché (cache miss), lo descarga desde GCS, lo carga en memoria, lo sirve y lo almacena en el caché para futuras solicitudes.
+4.  **Búsqueda con Índices Precargados:** El servicio utiliza los índices cargados (desde caché o GCS) para realizar la búsqueda dispersa sobre la consulta del usuario.
 
-Este servicio está diseñado para ser sin estado con respecto a los índices BM25 entre solicitudes; los índices se construyen bajo demanda por cada `company_id` en el momento de la búsqueda.
+Este enfoque elimina la latencia y la carga en PostgreSQL asociadas con la construcción de índices en tiempo real, mejorando drásticamente el rendimiento de las búsquedas dispersas.
 
-## 2. Funcionalidades Clave
+## 2. Funcionalidades Clave (v1.0.0)
 
-*   **Búsqueda BM25 Dinámica:** Procesa una consulta y devuelve los chunks más relevantes según el score BM25, construyendo el índice en tiempo real para la compañía solicitada.
-*   **Extracción de Corpus desde PostgreSQL:** Carga los datos de chunks necesarios para la indexación directamente desde la base de datos PostgreSQL.
+*   **Búsqueda BM25 Eficiente:** Utiliza índices BM25 precalculados para realizar búsquedas dispersas de manera rápida.
+*   **Carga de Índices desde GCS:** Los índices serializados se descargan desde un bucket de Google Cloud Storage bajo demanda.
+*   **Caché en Memoria (LRU/TTL):** Mantiene las instancias de `bm2s.BM25` y sus mapas de IDs de chunks en un caché LRU (Least Recently Used) con TTL (Time To Live) para un acceso rápido en solicitudes subsecuentes para la misma compañía.
+*   **Indexación Offline mediante CronJob:** Un script (`app/jobs/index_builder_cronjob.py`), empaquetado en la misma imagen Docker, se ejecuta periódicamente como un Kubernetes CronJob para:
+    *   Extraer el contenido de los chunks procesados desde PostgreSQL para cada compañía.
+    *   Construir/reconstruir los índices BM25.
+    *   Subir los índices serializados y los mapas de IDs a GCS.
 *   **API Sencilla y Enfocada:** Expone un único endpoint principal (`POST /api/v1/search`) para realizar la búsqueda dispersa.
-*   **Health Check Robusto:** Proporciona un endpoint `/health` para verificar el estado del servicio y sus dependencias críticas (PostgreSQL y la disponibilidad de la librería `bm2s`).
-*   **Arquitectura Limpia y Modular:** Estructurado siguiendo principios de Clean Architecture (Puertos y Adaptadores) para facilitar el mantenimiento, la testabilidad y futuras extensiones.
-*   **Multi-tenancy:** Las búsquedas y la construcción de índices están aisladas por `company_id`.
+*   **Health Check Robusto:** Proporciona un endpoint `/health` para verificar el estado del servicio y sus dependencias críticas (PostgreSQL, GCS, y la disponibilidad de la librería `bm2s`).
+*   **Arquitectura Limpia y Modular:** Estructurado siguiendo principios de Clean Architecture (Puertos y Adaptadores).
+*   **Multi-tenancy:** Los índices y las búsquedas están aislados por `company_id`, tanto en GCS (mediante rutas) como en el caché.
 
 ## 3. Pila Tecnológica
 
 *   **Lenguaje:** Python 3.10+
 *   **Framework API:** FastAPI
-*   **Motor de Búsqueda Dispersa:** `bm2s` (para la implementación de BM25)
-*   **Base de Datos (Cliente):** PostgreSQL (acceso vía `asyncpg` para obtener contenido de chunks)
+*   **Motor de Búsqueda Dispersa:** `bm2s`
+*   **Almacenamiento de Índices Persistentes:** Google Cloud Storage (`google-cloud-storage`)
+*   **Caché en Memoria:** `cachetools` (para `TTLCache`)
+*   **Base de Datos (Cliente para Builder y Repositorio):** PostgreSQL (acceso vía `asyncpg`)
 *   **Servidor ASGI/WSGI:** Uvicorn gestionado por Gunicorn
 *   **Contenerización:** Docker
 *   **Gestión de Dependencias:** Poetry
 *   **Logging Estructurado:** Structlog
 
-## 4. Estructura del Proyecto
+## 4. Estructura del Proyecto (v1.0.0)
 
 ```
 sparse-search-service/
 ├── app/
 │   ├── api/v1/
-│   │   ├── endpoints/search_endpoint.py  # Controlador para /search
-│   │   └── schemas.py                    # DTOs Pydantic para la API
+│   │   ├── endpoints/search_endpoint.py
+│   │   └── schemas.py
 │   ├── application/
 │   │   ├── ports/
-│   │   │   ├── repository_ports.py       # Interfaz para acceso a datos de chunks
-│   │   │   └── sparse_search_port.py     # Interfaz para el motor de búsqueda BM25
-│   │   └── use_cases/sparse_search_use_case.py # Lógica de negocio para la búsqueda
+│   │   │   ├── repository_ports.py
+│   │   │   ├── sparse_index_storage_port.py  # NUEVO
+│   │   │   └── sparse_search_port.py
+│   │   └── use_cases/
+│   │       └── load_and_search_index_use_case.py # MODIFICADO (antes sparse_search_use_case.py)
 │   ├── core/
-│   │   ├── config.py                     # Configuración Pydantic (variables de entorno)
-│   │   └── logging_config.py             # Configuración de Structlog
-│   ├── domain/models.py                  # Modelos de datos del dominio (e.g., SparseSearchResultItem)
+│   │   ├── config.py
+│   │   └── logging_config.py
+│   ├── domain/models.py
 │   ├── infrastructure/
+│   │   ├── cache/                                # NUEVO
+│   │   │   └── index_lru_cache.py                # NUEVO
 │   │   ├── persistence/
-│   │   │   ├── postgres_connector.py     # Gestión de pool de conexiones a PostgreSQL
-│   │   │   └── postgres_repositories.py  # Implementación de ChunkContentRepositoryPort
-│   │   └── sparse_retrieval/bm25_adapter.py # Implementación de SparseSearchPort (BM25Adapter)
-│   ├── dependencies.py                   # Gestión de dependencias para FastAPI
-│   ├── gunicorn_conf.py                  # Configuración de Gunicorn
-│   └── main.py                           # Entrypoint de la aplicación FastAPI (lifespan, middlewares, routers)
-├── k8s/                                  # Manifiestos de Kubernetes
+│   │   │   ├── postgres_connector.py
+│   │   │   └── postgres_repositories.py
+│   │   ├── sparse_retrieval/bm25_adapter.py      # MODIFICADO
+│   │   └── storage/                              # NUEVO
+│   │       └── gcs_index_storage_adapter.py      # NUEVO
+│   ├── jobs/                                     # NUEVO
+│   │   └── index_builder_cronjob.py              # NUEVO
+│   ├── dependencies.py
+│   ├── gunicorn_conf.py
+│   └── main.py
+├── k8s/
 │   ├── sparse-search-service-configmap.yaml
+│   ├── sparse-search-service-cronjob.yaml      # NUEVO
 │   ├── sparse-search-service-deployment.yaml
-│   ├── sparse-search-service-secret.example.yaml # Ejemplo de Secret
+│   ├── sparse-search-service-secret.example.yaml
 │   └── sparse-search-service-svc.yaml
-├── Dockerfile                            # Define la imagen Docker del servicio
-├── pyproject.toml                        # Dependencias y configuración del proyecto Poetry
-├── poetry.lock                           # Lockfile de dependencias
-├── README.md                             # Este archivo
-└── .env.example                          # Ejemplo de variables de entorno para desarrollo local
+├── Dockerfile
+├── pyproject.toml
+├── poetry.lock
+├── README.md (Este archivo)
+└── .env.example
 ```
 
-## 5. API Endpoints
+## 5. Flujo de Búsqueda
+
+1.  **Solicitud API:** El cliente (e.g., `query-service`) envía una petición `POST /api/v1/search` con `query`, `company_id`, y `top_k`.
+2.  **Use Case (`LoadAndSearchIndexUseCase`):**
+    a.  Intenta obtener el par `(instancia_bm25, mapa_ids)` del **Caché LRU/TTL** usando la `company_id`.
+    b.  **Cache Hit:** Si se encuentra, pasa la instancia BM25 y el mapa de IDs al `BM25Adapter` para la búsqueda.
+    c.  **Cache Miss:**
+        i.  Utiliza `GCSIndexStorageAdapter` para descargar los archivos `bm25_index.bm2s` y `id_map.json` desde `gs://{SPARSE_INDEX_GCS_BUCKET_NAME}/indices/{company_id}/`.
+        ii. Si los archivos no existen en GCS o hay un error, se loguea y se devuelven resultados vacíos (no hay fallback a indexación on-demand).
+        iii. Si se descargan, `BM25Adapter.load_bm2s_from_file()` carga el índice y se lee el `id_map.json`.
+        iv. El par `(instancia_bm25, mapa_ids)` se almacena en el Caché LRU/TTL.
+        v. Se procede con la búsqueda.
+3.  **Adaptador BM25 (`BM25Adapter`):**
+    a.  Recibe la consulta, la instancia BM25 pre-cargada, el mapa de IDs y `top_k`.
+    b.  Ejecuta `bm25_instance.retrieve()` para obtener los índices de los documentos y sus scores.
+    c.  Mapea los índices de documentos a los `chunk_id` reales usando el `id_map`.
+    d.  Devuelve la lista de `SparseSearchResultItem`.
+4.  **Respuesta API:** El endpoint devuelve la respuesta al cliente.
+
+## 6. Proceso de Indexación Offline (CronJob)
+
+Un script Python (`app/jobs/index_builder_cronjob.py`) se ejecuta periódicamente (e.g., cada 6 horas) como un Kubernetes CronJob.
+*   **Objetivo:** Para cada compañía (o para una específica si se invoca manualmente), construir/actualizar su índice BM25 y almacenarlo en GCS.
+*   **Pasos:**
+    1.  **Obtener Chunks:** Conecta a PostgreSQL (usando `PostgresChunkContentRepository`) y obtiene todos los `embedding_id` (usado como `chunk_id`) y `content` de los `document_chunks` que pertenecen a documentos con estado `processed` para la compañía.
+    2.  **Preparar Corpus:** Crea una lista de textos (`corpus_texts`) y una lista paralela de sus IDs (`id_map`).
+    3.  **Construir Índice BM25:** Utiliza `bm2s.BM25().index(corpus_texts)`.
+    4.  **Serializar:**
+        *   El índice BM25 se dumpea a un archivo local temporal (e.g., `bm25_index.bm2s`) usando `BM25Adapter.dump_bm2s_to_file()`.
+        *   El `id_map` se guarda como un archivo JSON local temporal (e.g., `id_map.json`).
+    5.  **Subir a GCS:** Los dos archivos generados se suben a `gs://{SPARSE_INDEX_GCS_BUCKET_NAME}/indices/{company_id}/` usando `GCSIndexStorageAdapter`, sobrescribiendo los existentes.
+
+## 7. API Endpoints
 
 ### `POST /api/v1/search`
 
-*   **Descripción:** Realiza una búsqueda dispersa (BM25) para la consulta y compañía dadas. Obtiene los chunks de la compañía desde PostgreSQL, construye un índice BM25 en memoria y ejecuta la búsqueda.
+*   **Descripción:** Realiza una búsqueda dispersa (BM25) para la consulta y compañía dadas, utilizando índices precalculados cargados desde GCS o un caché en memoria.
 *   **Request Body (`SparseSearchRequest`):**
     ```json
     {
@@ -1606,9 +1653,9 @@ sparse-search-service/
     }
     ```
 *   **Errores Comunes:**
-    *   `422 Unprocessable Entity`: Si el cuerpo de la solicitud es inválido (e.g., `query` vacío, `company_id` no es UUID, `top_k` fuera de rango).
-    *   `500 Internal Server Error`: Si ocurre un error inesperado durante la búsqueda, la construcción del índice, o un fallo no manejado en el código.
-    *   `503 Service Unavailable`: Si una dependencia crítica (como PostgreSQL) no está disponible o si el motor BM25 (`bm2s`) no pudo ser cargado/inicializado.
+    *   `422 Unprocessable Entity`: Cuerpo de solicitud inválido.
+    *   `503 Service Unavailable`: Si PostgreSQL no está disponible durante el inicio, o si GCS es inaccesible y no hay índice en caché, o el motor `bm2s` no está disponible.
+    *   `500 Internal Server Error`: Errores inesperados.
 
 ### `GET /health`
 
@@ -1617,171 +1664,110 @@ sparse-search-service/
     ```json
     {
       "status": "ok",
-      "service_name": "Atenex Sparse Search Service",
-      "service_version": "0.1.0",
+      "service": "Atenex Sparse Search Service",
+      "service_version": "1.0.0",
       "ready": true,
-      "dependencies": [
-        {"name": "PostgreSQL", "status": "ok", "details": null},
-        {"name": "BM2S_Engine", "status": "ok", "details": "ok (bm2s library loaded and adapter initialized)"}
-      ]
+      "dependencies": {
+        "PostgreSQL": "ok",
+        "BM2S_Engine": "ok (bm2s library loaded and adapter initialized)",
+        "GCS_Index_Storage": "ok (adapter initialized)"
+      }
     }
     ```
 *   **Response Body (503 Service Unavailable - Alguna dependencia crítica falló):**
     ```json
     {
       "status": "error",
-      "service_name": "Atenex Sparse Search Service",
-      "service_version": "0.1.0",
+      "service": "Atenex Sparse Search Service",
+      "service_version": "1.0.0",
       "ready": false,
-      "dependencies": [
-        {"name": "PostgreSQL", "status": "error", "details": null},
-        {"name": "BM2S_Engine", "status": "error", "details": "unavailable (bm2s library potentially missing or adapter init failed)"}
-      ]
+      "dependencies": {
+        "PostgreSQL": "error", // o el estado de otras dependencias
+        "BM2S_Engine": "unavailable (bm2s library potentially missing or adapter init failed)",
+        "GCS_Index_Storage": "unavailable"
+      }
     }
     ```
 
-## 6. Configuración
+## 8. Configuración (Variables de Entorno)
 
-El servicio se configura mediante variables de entorno, con el prefijo `SPARSE_`. Ver `.env.example` para una lista de variables clave y `app/core/config.py` para los defaults y validaciones.
+El servicio se configura mediante variables de entorno, con el prefijo `SPARSE_`.
 
 **Variables Críticas:**
 
-| Variable                     | Descripción                                               | Ejemplo (Valor Esperado en K8s)                       | Gestionado por |
-| :--------------------------- | :-------------------------------------------------------- | :---------------------------------------------------- | :------------- |
-| `SPARSE_LOG_LEVEL`           | Nivel de logging (DEBUG, INFO, WARNING, ERROR, CRITICAL). | `INFO`                                                | ConfigMap      |
-| `PORT`                       | Puerto interno del contenedor para Gunicorn.                | `8004` (Este valor es usado por Gunicorn)             | ConfigMap      |
-| `SPARSE_POSTGRES_USER`       | Usuario para conectar a PostgreSQL.                       | `postgres`                                            | ConfigMap      |
-| `SPARSE_POSTGRES_PASSWORD`   | Contraseña para el usuario PostgreSQL.                    | *Valor desde Kubernetes Secret*                       | **Secret**     |
-| `SPARSE_POSTGRES_SERVER`     | Host/Service name del servidor PostgreSQL en K8s.         | `postgresql-service.nyro-develop.svc.cluster.local` | ConfigMap      |
-| `SPARSE_POSTGRES_PORT`       | Puerto del servidor PostgreSQL.                           | `5432`                                                | ConfigMap      |
-| `SPARSE_POSTGRES_DB`         | Nombre de la base de datos PostgreSQL.                    | `atenex`                                              | ConfigMap      |
-| `SPARSE_DB_POOL_MIN_SIZE`    | Tamaño mínimo del pool de conexiones DB.                  | `2`                                                   | ConfigMap      |
-| `SPARSE_DB_POOL_MAX_SIZE`    | Tamaño máximo del pool de conexiones DB.                  | `10`                                                  | ConfigMap      |
-| `SPARSE_DB_CONNECT_TIMEOUT`  | Timeout (segundos) para conexión a DB.                    | `30`                                                  | ConfigMap      |
-| `SPARSE_DB_COMMAND_TIMEOUT`  | Timeout (segundos) para comandos DB.                      | `60`                                                  | ConfigMap      |
+| Variable                               | Descripción                                                                   | Ejemplo (Valor Esperado en K8s)                       | Gestionado por |
+| :------------------------------------- | :---------------------------------------------------------------------------- | :---------------------------------------------------- | :------------- |
+| `SPARSE_LOG_LEVEL`                     | Nivel de logging (DEBUG, INFO, WARNING, ERROR, CRITICAL).                     | `INFO`                                                | ConfigMap      |
+| `PORT`                                 | Puerto interno del contenedor para Gunicorn.                                    | `8004`                                                | ConfigMap      |
+| `SPARSE_SERVICE_VERSION`               | Versión del servicio (usada en health check).                                 | `1.0.0`                                               | ConfigMap      |
+| `SPARSE_POSTGRES_USER`                 | Usuario para conectar a PostgreSQL.                                           | `postgres`                                            | ConfigMap      |
+| `SPARSE_POSTGRES_PASSWORD`             | Contraseña para el usuario PostgreSQL.                                        | *Valor desde Kubernetes Secret*                       | **Secret**     |
+| `SPARSE_POSTGRES_SERVER`               | Host/Service name del servidor PostgreSQL en K8s.                             | `postgresql-service.nyro-develop.svc.cluster.local` | ConfigMap      |
+| `SPARSE_POSTGRES_PORT`                 | Puerto del servidor PostgreSQL.                                               | `5432`                                                | ConfigMap      |
+| `SPARSE_POSTGRES_DB`                   | Nombre de la base de datos PostgreSQL.                                        | `atenex`                                              | ConfigMap      |
+| `SPARSE_DB_POOL_MIN_SIZE`              | Tamaño mínimo del pool de conexiones DB.                                      | `2`                                                   | ConfigMap      |
+| `SPARSE_DB_POOL_MAX_SIZE`              | Tamaño máximo del pool de conexiones DB.                                      | `10`                                                  | ConfigMap      |
+| `SPARSE_DB_CONNECT_TIMEOUT`            | Timeout (segundos) para conexión a DB.                                        | `30`                                                  | ConfigMap      |
+| `SPARSE_DB_COMMAND_TIMEOUT`            | Timeout (segundos) para comandos DB.                                          | `60`                                                  | ConfigMap      |
+| **`SPARSE_INDEX_GCS_BUCKET_NAME`**     | **Bucket GCS para almacenar los índices BM25.**                             | `atenex-sparse-indices`                             | ConfigMap      |
+| **`SPARSE_INDEX_CACHE_MAX_ITEMS`**     | **Máximo número de índices de compañía en el caché LRU/TTL.**                 | `50`                                                  | ConfigMap      |
+| **`SPARSE_INDEX_CACHE_TTL_SECONDS`**   | **TTL (segundos) para los ítems en el caché de índices.**                     | `3600` (1 hora)                                       | ConfigMap      |
 
 **¡ADVERTENCIA DE SEGURIDAD!**
-*   **`SPARSE_POSTGRES_PASSWORD`**: Debe ser gestionada de forma segura a través de Kubernetes Secrets. El Deployment está configurado para leer esta variable desde un Secret.
+*   **`SPARSE_POSTGRES_PASSWORD`**: Debe ser gestionada de forma segura a través de Kubernetes Secrets.
 
-## 7. Ejecución Local (Desarrollo)
+## 9. Ejecución Local (Desarrollo)
 
-1.  Asegurar que Poetry esté instalado (`pip install poetry`).
-2.  Clonar el repositorio (o tener la estructura de archivos).
-3.  Desde el directorio raíz `sparse-search-service/`, ejecutar `poetry install` para instalar dependencias (esto instalará `bm2s`).
-4.  Crear un archivo `.env` en la raíz (`sparse-search-service/.env`) a partir de `.env.example`. Modificar las variables `SPARSE_POSTGRES_*` para apuntar a tu instancia local de PostgreSQL.
-    ```dotenv
-    # sparse-search-service/.env
-    SPARSE_LOG_LEVEL="DEBUG"
-    SPARSE_PORT="8004"
-
-    SPARSE_POSTGRES_USER="tu_usuario_pg"
-    SPARSE_POSTGRES_PASSWORD="tu_password_pg"
-    SPARSE_POSTGRES_SERVER="localhost" # O la IP de tu Docker host si PG corre en Docker
-    SPARSE_POSTGRES_PORT="5432"
-    SPARSE_POSTGRES_DB="atenex"
+1.  Asegurar Poetry, Python 3.10+.
+2.  `poetry install` (instalará `bm2s`, `google-cloud-storage`, `cachetools`).
+3.  Configurar `.env` con:
+    *   Variables `SPARSE_POSTGRES_*` para tu PostgreSQL local.
+    *   `SPARSE_INDEX_GCS_BUCKET_NAME`: Nombre de un bucket GCS al que tengas acceso de lectura/escritura para pruebas.
+    *   (Opcional) Credenciales de GCP: `GOOGLE_APPLICATION_CREDENTIALS` apuntando a tu archivo de clave JSON de SA, o asegúrate de estar autenticado con `gcloud auth application-default login`.
+4.  Asegurar que PostgreSQL local esté corriendo y tenga datos en `documents` y `document_chunks`.
+5.  **Para construir un índice localmente para pruebas:**
+    ```bash
+    python -m app.jobs.index_builder_cronjob --company-id TU_COMPANY_ID_DE_PRUEBA
     ```
-5.  Asegúrate que tu PostgreSQL local esté corriendo, tenga la base de datos `atenex` (o la configurada), el usuario y contraseña correctos, y que las tablas `documents` y `document_chunks` existan y contengan datos relevantes (especialmente `document_chunks.embedding_id` y `document_chunks.content`).
-6.  Ejecutar el servicio con Uvicorn para desarrollo:
+    Esto generará y subirá el índice a tu bucket GCS configurado.
+6.  **Ejecutar el servicio API:**
     ```bash
     poetry run uvicorn app.main:app --host 0.0.0.0 --port ${SPARSE_PORT:-8004} --reload
     ```
-    El servicio estará disponible en `http://localhost:8004` (o el puerto configurado).
+    El servicio estará en `http://localhost:8004`.
 
-## 8. Construcción y Despliegue Docker
+## 10. Construcción y Despliegue Docker
 
-1.  **Construir la Imagen Docker:**
-    Desde el directorio raíz `sparse-search-service/`:
+1.  **Construir Imagen:**
     ```bash
-    docker build -t tu-registro.io/tu-org/sparse-search-service:latest .
-    # Ejemplo con tag de git hash corto:
-    # docker build -t tu-registro.io/tu-org/sparse-search-service:$(git rev-parse --short HEAD) .
+    docker build -t tu-registro.io/tu-org/sparse-search-service:v1.0.0 .
     ```
-2.  **Ejecutar Localmente con Docker (para probar la imagen):**
-    Asegúrate de pasar las variables de entorno necesarias, especialmente las de PostgreSQL.
-    ```bash
-    docker run -d -p 8004:8004 \
-      --name sparse-search-service-container \
-      -e SPARSE_LOG_LEVEL="DEBUG" \
-      -e PORT="8004" \
-      -e SPARSE_POSTGRES_USER="tu_usuario_pg_local" \
-      -e SPARSE_POSTGRES_PASSWORD="tu_password_pg_local" \
-      -e SPARSE_POSTGRES_SERVER="host.docker.internal" `# Para macOS/Windows, o IP del host para Linux` \
-      -e SPARSE_POSTGRES_DB="atenex" \
-      tu-registro.io/tu-org/sparse-search-service:latest
-    ```
-3.  **Push a un Registro de Contenedores:**
-    Asegúrate de estar logueado a tu registro (e.g., `docker login tu-registro.io`).
-    ```bash
-    docker push tu-registro.io/tu-org/sparse-search-service:latest # o tu tag específico
-    ```
-4.  **Despliegue en Kubernetes:**
-    Los manifiestos de Kubernetes se encuentran en el directorio `k8s/`.
-    *   `k8s/sparse-search-service-configmap.yaml`: Contiene la configuración no sensible.
-    *   `k8s/sparse-search-service-secret.example.yaml`: **Ejemplo** de cómo debe ser el secret para `SPARSE_POSTGRES_PASSWORD`. **No versionar con valores reales.** Crear el secret directamente en el clúster.
-    *   `k8s/sparse-search-service-deployment.yaml`: Define el despliegue del servicio. Este manifest espera que el ConfigMap y el Secret (para la contraseña de la BD) existan en el clúster.
-    *   `k8s/sparse-search-service-svc.yaml`: Define el Service de Kubernetes para exponer el Deployment dentro del clúster.
+2.  **Push a Registro.**
+3.  **Despliegue en Kubernetes:**
+    *   Los manifiestos K8s (`configmap.yaml`, `deployment.yaml`, `service.yaml`, `cronjob.yaml`) se gestionan en un repositorio separado.
+    *   **Service Account para el CronJob (`sparse-search-builder-sa`):** Necesita permisos de lectura en PostgreSQL y escritura/lectura/borrado en el bucket GCS de índices.
+    *   **Service Account para el Deployment (`sparse-search-runtime-sa`):** Necesita permisos de lectura en PostgreSQL y lectura en el bucket GCS de índices. Configurar Workload Identity o montar claves de SA.
+    *   Asegurar que el ConfigMap y Secrets (para `SPARSE_POSTGRES_PASSWORD`) existan en el clúster.
 
-    **Pasos para el despliegue en K8s (namespace: `nyro-develop`):**
-    a.  **Crear el Namespace (si no existe):**
-        ```bash
-        kubectl create namespace nyro-develop
-        ```
-    b.  **Crear el Secret para la Contraseña de PostgreSQL:**
-        Si usas un secret específico para este servicio (recomendado para granularidad):
-        ```bash
-        kubectl create secret generic sparse-search-service-secrets \
-          --namespace nyro-develop \
-          --from-literal=SPARSE_POSTGRES_PASSWORD='TU_PASSWORD_POSTGRES_REAL_Y_SEGURA'
-        ```
-        Si usas un secret común como `atenex-db-secrets` con una clave `POSTGRES_PASSWORD_GLOBAL`, asegúrate que exista. El `Deployment` está configurado para usar este último por defecto como ejemplo.
-    c.  **Aplicar el ConfigMap:**
-        ```bash
-        kubectl apply -f k8s/sparse-search-service-configmap.yaml -n nyro-develop
-        ```
-    d.  **Aplicar el Deployment:**
-        Asegúrate que la `image` en `sparse-search-service-deployment.yaml` apunte a tu imagen correcta.
-        ```bash
-        kubectl apply -f k8s/sparse-search-service-deployment.yaml -n nyro-develop
-        ```
-    e.  **Aplicar el Service:**
-        ```bash
-        kubectl apply -f k8s/sparse-search-service-svc.yaml -n nyro-develop
-        ```
-    f.  **Verificar:**
-        ```bash
-        kubectl get pods -n nyro-develop -l app=sparse-search-service
-        kubectl logs -f <nombre-del-pod> -n nyro-develop
-        kubectl get svc sparse-search-service -n nyro-develop
-        ```
-    El servicio será accesible internamente en el clúster en la dirección DNS: `http://sparse-search-service.nyro-develop.svc.cluster.local:80` (el puerto 80 es el del Service K8s, que redirige al `targetPort` del Pod).
+## 11. CI/CD
 
-## 9. CI/CD
+Integrar en el pipeline CI/CD:
+*   Detectar cambios, construir/etiquetar/empujar imagen Docker.
+*   Actualizar tag de imagen en `deployment.yaml` y `cronjob.yaml` del repositorio de manifiestos.
 
-Este servicio debe integrarse en el pipeline de CI/CD existente. El pipeline se encargaría de:
-*   Detectar cambios en el directorio `sparse-search-service/`.
-*   Construir y etiquetar la imagen Docker con un tag único (e.g., hash de commit).
-*   Empujar la imagen al registro de contenedores configurado.
-*   Actualizar el tag de la imagen en el archivo `k8s/sparse-search-service-deployment.yaml` (si se usa GitOps) o aplicar el cambio directamente al clúster usando `kubectl set image` o herramientas similares.
+## 12. Consideraciones de Rendimiento y Escalabilidad
 
-## 10. Consideraciones de Rendimiento y Escalabilidad
+*   **Latencia de Búsqueda:** Mejorada significativamente al eliminar la indexación on-demand. La latencia ahora depende de:
+    *   **Cache Hit:** Muy rápida (solo búsqueda en memoria).
+    *   **Cache Miss:** Latencia de descarga de GCS + carga de índice en memoria + búsqueda.
+*   **Consumo de Memoria del Pod:** Determinado por `SPARSE_INDEX_CACHE_MAX_ITEMS` y el tamaño de los índices BM25 individuales. Ajustar los `resources.limits.memory` del Deployment.
+*   **Rendimiento del CronJob:** La construcción de índices para muchas compañías o compañías con muchos chunks puede ser intensiva. Ajustar recursos del pod del CronJob y su frecuencia.
+*   **Actualización de Índices:** La frecuencia del CronJob determina cuán "frescos" están los índices. Para actualizaciones más rápidas, se podría considerar un mecanismo de trigger (e.g., Pub/Sub desde `ingest-service`), pero el CronJob periódico es un buen punto de partida.
 
-*   **Construcción del Índice BM25:** La principal consideración es que el índice BM25 se construye en memoria para la totalidad de los chunks de una compañía **en cada solicitud**. Para compañías con un gran volumen de documentos/chunks, esto puede ser intensivo en CPU (tokenización, indexación) y memoria (almacenamiento del corpus y del índice).
-    *   **Impacto en Latencia:** El tiempo para obtener los chunks de la BD y construir el índice se suma a la latencia de cada búsqueda.
-*   **Consumo de Memoria del Pod:** El pod debe tener suficientes recursos de memoria asignados en Kubernetes para manejar el corpus y el índice BM25 más grande esperado.
-*   **Escalabilidad Horizontal:** Se pueden añadir más réplicas del servicio para manejar más solicitudes concurrentes, pero cada réplica realizará la misma operación de carga e indexación si se consulta la misma compañía.
-*   **Optimización de Carga de Datos:** La query a PostgreSQL para obtener los chunks debe ser eficiente. Asegurar índices adecuados en `document_chunks.document_id` y `documents.company_id`, `documents.status`.
+## 13. TODO / Mejoras Futuras
 
-## 11. TODO / Mejoras Futuras
-
-*   **Caché de Índices BM25:** Implementar un caché en memoria (e.g., LRU con TTL) para los objetos `bm2s.BM25()` indexados por `company_id`. Esto evitaría la reconstrucción del índice en solicitudes subsecuentes para la misma compañía dentro del TTL, mejorando significativamente la latencia para compañías activas.
-    *   **Desafío con Múltiples Réplicas:** Un caché en memoria es local a cada pod. Se podría considerar un caché distribuido (Redis, Memcached) pero añade complejidad.
-*   **Indexación Offline/Periódica (Plan Original):** Reevaluar la viabilidad de un sistema de indexación offline donde los índices BM25 se precalculan y almacenan (e.g., en GCS), y el servicio de búsqueda solo los carga. Esto requeriría un mecanismo de trigger (CronJob, Pub/Sub) y un `IndexCompanyDocumentsUseCase`.
-*   **Métricas Detalladas:** Implementar métricas Prometheus para:
-    *   Tiempo de carga de chunks desde PostgreSQL.
-    *   Tiempo de construcción del índice BM25.
-    *   Tiempo de ejecución de la búsqueda BM25.
-    *   Tamaño del corpus y del índice en memoria (si es posible estimarlo).
-    *   Tasas de acierto/fallo del caché (si se implementa).
-*   **Tests de Carga y Estrés:** Para identificar cuellos de botella y determinar límites de recursos adecuados.
-*   **Tests Unitarios y de Integración Exhaustivos:** Cubrir todos los componentes y casos de uso.
-*   **Versión del Servicio en Health Check:** Incluir la versión de la aplicación en la respuesta de `/health`.
+*   **Métricas Detalladas:** (Como se mencionó en el plan de refactorización) para tiempos de carga GCS, aciertos/fallos de caché, duración del builder.
+*   **Invalidación Selectiva del Caché:** Mecanismo para invalidar el caché de una compañía específica si su índice se reconstruye urgentemente fuera del ciclo del CronJob (e.g., vía un endpoint administrativo interno).
+*   **Optimización del `index_builder_cronjob.py`:** Paralelizar la construcción de índices para múltiples compañías si el script procesa "ALL".
+*   **Estrategia de Rollback de Índices:** Considerar cómo manejar/revertir a una versión anterior de un índice si una nueva construcción resulta corrupta.
+*   **Refinar `get_all_active_company_ids`:** Implementar una forma más robusta de obtener las compañías activas en el `index_builder_cronjob.py`.

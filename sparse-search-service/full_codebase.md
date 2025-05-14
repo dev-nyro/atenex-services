@@ -14,10 +14,11 @@ app/
 │   ├── ports
 │   │   ├── __init__.py
 │   │   ├── repository_ports.py
+│   │   ├── sparse_index_storage_port.py
 │   │   └── sparse_search_port.py
 │   └── use_cases
 │       ├── __init__.py
-│       └── sparse_search_use_case.py
+│       └── load_and_search_index_use_case.py
 ├── core
 │   ├── __init__.py
 │   ├── config.py
@@ -29,13 +30,22 @@ app/
 ├── gunicorn_conf.py
 ├── infrastructure
 │   ├── __init__.py
+│   ├── cache
+│   │   ├── __init__.py
+│   │   └── index_lru_cache.py
 │   ├── persistence
 │   │   ├── __init__.py
 │   │   ├── postgres_connector.py
 │   │   └── postgres_repositories.py
-│   └── sparse_retrieval
+│   ├── sparse_retrieval
+│   │   ├── __init__.py
+│   │   └── bm25_adapter.py
+│   └── storage
 │       ├── __init__.py
-│       └── bm25_adapter.py
+│       └── gcs_index_storage_adapter.py
+├── jobs
+│   ├── __init__.py
+│   └── index_builder_cronjob.py
 └── main.py
 ```
 
@@ -266,6 +276,53 @@ class ChunkContentRepositoryPort(abc.ABC):
         raise NotImplementedError
 ```
 
+## File: `app\application\ports\sparse_index_storage_port.py`
+```py
+# sparse-search-service/app/application/ports/sparse_index_storage_port.py
+import abc
+import uuid
+from typing import Tuple, Optional
+
+class SparseIndexStoragePort(abc.ABC):
+    """
+    Puerto abstracto para cargar y guardar archivos de índice BM25
+    (el índice serializado y el mapa de IDs) desde/hacia un almacenamiento persistente.
+    """
+
+    @abc.abstractmethod
+    async def load_index_files(self, company_id: uuid.UUID) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Descarga los archivos de índice (dump BM25 y mapa de IDs JSON)
+        desde el almacenamiento para una compañía específica.
+
+        Args:
+            company_id: El UUID de la compañía.
+
+        Returns:
+            Una tupla conteniendo las rutas a los archivos locales temporales:
+            (local_bm2s_dump_path, local_id_map_path).
+            Retorna (None, None) si los archivos no se encuentran, no se pueden descargar,
+            o si ocurre cualquier error durante el proceso.
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    async def save_index_files(self, company_id: uuid.UUID, local_bm2s_dump_path: str, local_id_map_path: str) -> None:
+        """
+        Guarda los archivos de índice locales (dump BM25 y mapa de IDs JSON)
+        en el almacenamiento persistente para una compañía específica.
+
+        Args:
+            company_id: El UUID de la compañía.
+            local_bm2s_dump_path: Ruta al archivo local del dump BM25.
+            local_id_map_path: Ruta al archivo local del mapa de IDs JSON.
+
+        Raises:
+            Exception: Si ocurre un error durante la subida de los archivos.
+        """
+        raise NotImplementedError
+```
+
 ## File: `app\application\ports\sparse_search_port.py`
 ```py
 # sparse-search-service/app/application/ports/sparse_search_port.py
@@ -322,31 +379,43 @@ class SparseSearchPort(abc.ABC):
 
 ```
 
-## File: `app\application\use_cases\sparse_search_use_case.py`
+## File: `app\application\use_cases\load_and_search_index_use_case.py`
 ```py
-# sparse-search-service/app/application/use_cases/sparse_search_use_case.py
+# sparse-search-service/app/application/use_cases/load_and_search_index_use_case.py
 import uuid
+import json
 import structlog
-from typing import List, Dict, Any, Optional
+from typing import List, Optional, Any
+from pathlib import Path
+import asyncio
 
 from app.domain.models import SparseSearchResultItem
-from app.application.ports.repository_ports import ChunkContentRepositoryPort
-from app.application.ports.sparse_search_port import SparseSearchPort
-from app.core.config import settings # Si se necesita algún ajuste del use case
+from app.application.ports.sparse_index_storage_port import SparseIndexStoragePort
+from app.application.ports.sparse_search_port import SparseSearchPort 
+from app.infrastructure.cache.index_lru_cache import IndexLRUCache, CachedIndexData
+from app.infrastructure.sparse_retrieval.bm25_adapter import BM25Adapter 
+
+try:
+    import bm2s
+except ImportError:
+    bm2s = None
 
 log = structlog.get_logger(__name__)
 
-class SparseSearchUseCase:
+class LoadAndSearchIndexUseCase:
     def __init__(
         self,
-        chunk_content_repo: ChunkContentRepositoryPort,
-        sparse_search_engine: SparseSearchPort # e.g., BM25Adapter
+        index_cache: IndexLRUCache,
+        index_storage: SparseIndexStoragePort,
+        sparse_search_engine: SparseSearchPort 
     ):
-        self.chunk_content_repo = chunk_content_repo
-        self.sparse_search_engine = sparse_search_engine
+        self.index_cache = index_cache
+        self.index_storage = index_storage
+        self.sparse_search_engine = sparse_search_engine 
         log.info(
-            "SparseSearchUseCase initialized",
-            chunk_repo_type=type(chunk_content_repo).__name__,
+            "LoadAndSearchIndexUseCase initialized",
+            cache_type=type(index_cache).__name__,
+            storage_type=type(index_storage).__name__,
             search_engine_type=type(sparse_search_engine).__name__
         )
 
@@ -357,54 +426,81 @@ class SparseSearchUseCase:
         top_k: int
     ) -> List[SparseSearchResultItem]:
         use_case_log = log.bind(
-            use_case="SparseSearchUseCase",
+            use_case="LoadAndSearchIndexUseCase",
             action="execute",
             company_id=str(company_id),
             query_preview=query[:50] + "...",
             requested_top_k=top_k
         )
-        use_case_log.info("Executing sparse search.")
+        use_case_log.info("Executing load-and-search for sparse index.")
 
-        try:
-            # 1. Obtener el corpus de chunks para la compañía.
-            # El repositorio debe devolver una lista de diccionarios, cada uno con 'id' y 'content'.
-            use_case_log.debug("Fetching corpus chunks for company from repository...")
-            corpus_chunks: List[Dict[str, Any]] = await self.chunk_content_repo.get_chunks_with_metadata_by_company(company_id)
+        cached_data: Optional[CachedIndexData] = self.index_cache.get(company_id)
+        bm25_instance: Optional[Any] = None 
+        id_map: Optional[List[str]] = None
 
-            if not corpus_chunks:
-                use_case_log.warning("No corpus chunks found for the company. Returning empty results.")
-                return []
+        if cached_data:
+            bm25_instance, id_map = cached_data
+            use_case_log.info("BM25 index found in LRU cache.")
+        else:
+            use_case_log.info("BM25 index not in cache. Attempting to load from GCS.")
             
-            use_case_log.info(f"Retrieved {len(corpus_chunks)} chunks for company to search.")
+            local_bm2s_path_str, local_id_map_path_str = await self.index_storage.load_index_files(company_id)
 
-            # 2. Realizar la búsqueda usando el motor de búsqueda dispersa (BM25Adapter).
-            use_case_log.debug("Performing search with sparse search engine...")
+            if local_bm2s_path_str and local_id_map_path_str:
+                local_bm2s_path = Path(local_bm2s_path_str)
+                local_id_map_path = Path(local_id_map_path_str)
+                try:
+                    use_case_log.debug("Loading BM25 instance from local file...", file_path=str(local_bm2s_path))
+                    bm25_instance = BM25Adapter.load_bm2s_from_file(str(local_bm2s_path))
+                    
+                    use_case_log.debug("Loading ID map from local JSON file...", file_path=str(local_id_map_path))
+                    with open(local_id_map_path, 'r') as f:
+                        id_map = json.load(f)
+                    
+                    if not isinstance(id_map, list):
+                        use_case_log.error("ID map loaded from JSON is not a list.", id_map_type=type(id_map).__name__)
+                        raise ValueError("ID map must be a list.")
+
+                    use_case_log.info("BM25 index and ID map loaded successfully from GCS files.")
+                    
+                    self.index_cache.put(company_id, bm25_instance, id_map)
+                    use_case_log.info("BM25 index and ID map stored in LRU cache.")
+
+                except Exception as e_load:
+                    use_case_log.error("Failed to load index/id_map from downloaded files.", error=str(e_load), exc_info=True)
+                    bm25_instance = None
+                    id_map = None
+                finally:
+                    try:
+                        if local_bm2s_path.exists(): local_bm2s_path.unlink()
+                        if local_id_map_path.exists(): local_id_map_path.unlink()
+                        temp_dir = local_bm2s_path.parent
+                        if temp_dir.is_dir() and not any(temp_dir.iterdir()):
+                            temp_dir.rmdir()
+                    except OSError as e_clean:
+                        use_case_log.error("Error cleaning up temporary index files.", error=str(e_clean))
+            else:
+                use_case_log.warning("Index files not found in GCS or download failed. Cannot perform search.")
+                return [] 
+
+        if not bm25_instance or not id_map:
+            use_case_log.error("BM25 instance or ID map is not available after cache/GCS lookup. Cannot search.")
+            return []
+
+        use_case_log.debug("Performing search with loaded BM25 instance and ID map...")
+        try:
             search_results: List[SparseSearchResultItem] = await self.sparse_search_engine.search(
                 query=query,
-                company_id=company_id, # Pasa company_id para logging en el adapter
-                corpus_chunks=corpus_chunks,
-                top_k=top_k
+                bm25_instance=bm25_instance,
+                id_map=id_map,
+                top_k=top_k,
+                company_id=company_id # Pasar company_id para logging interno en el adapter
             )
-
-            use_case_log.info(f"Sparse search executed. Found {len(search_results)} results.")
+            use_case_log.info(f"Search executed. Found {len(search_results)} results.")
             return search_results
-
-        except ConnectionError as e: # Específicamente para errores de DB al obtener el corpus
-            use_case_log.error(
-                "Database connection error while fetching corpus for sparse search.",
-                error_details=str(e),
-                exc_info=False # No incluir traceback completo para ConnectionError
-            )
-            # Esto debería resultar en una respuesta 503 Service Unavailable en el endpoint.
-            raise # Re-lanzar para que el endpoint lo maneje.
-        except ValueError as ve: # Errores de validación (e.g., del motor de búsqueda si el input es malo)
-            use_case_log.warning("Value error during sparse search execution.", error_details=str(ve), exc_info=True)
-            # Esto podría ser un 400 Bad Request si el error es por la query, o 500 si es interno.
-            raise # Re-lanzar
-        except Exception as e:
-            use_case_log.exception("An unexpected error occurred during sparse search execution.")
-            # Esto debería ser un 500 Internal Server Error.
-            raise # Re-lanzar
+        except Exception as e_search:
+            use_case_log.exception("An unexpected error occurred during search execution with loaded index.")
+            raise RuntimeError(f"Search with loaded index failed: {e_search}") from e_search
 ```
 
 ## File: `app\core\__init__.py`
@@ -430,10 +526,9 @@ POSTGRES_K8S_DB_DEFAULT = "atenex"
 POSTGRES_K8S_USER_DEFAULT = "postgres"
 
 DEFAULT_SERVICE_PORT = 8004
-
-# BM25 Default Parameters (bm2s usa sus propios defaults si no se especifican)
-# k1 ≈ 1.2-2.0, b ≈ 0.75
-# No los configuraremos aquí explícitamente a menos que sea necesario anular los de bm2s.
+DEFAULT_GCS_INDEX_BUCKET = "atenex-sparse-indices" 
+DEFAULT_INDEX_CACHE_MAX_ITEMS = 50
+DEFAULT_INDEX_CACHE_TTL_SECONDS = 3600 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -449,9 +544,9 @@ class Settings(BaseSettings):
     API_V1_STR: str = "/api/v1"
     LOG_LEVEL: str = Field(default="INFO")
     PORT: int = Field(default=DEFAULT_SERVICE_PORT)
+    SERVICE_VERSION: str = "1.0.0" 
 
     # --- Database (PostgreSQL) ---
-    # Requerido para obtener el contenido de los chunks para indexar con BM25
     POSTGRES_USER: str = Field(default=POSTGRES_K8S_USER_DEFAULT)
     POSTGRES_PASSWORD: SecretStr
     POSTGRES_SERVER: str = Field(default=POSTGRES_K8S_HOST_DEFAULT)
@@ -459,14 +554,29 @@ class Settings(BaseSettings):
     POSTGRES_DB: str = Field(default=POSTGRES_K8S_DB_DEFAULT)
     DB_POOL_MIN_SIZE: int = Field(default=2)
     DB_POOL_MAX_SIZE: int = Field(default=10)
-    DB_CONNECT_TIMEOUT: int = Field(default=30) # segundos
-    DB_COMMAND_TIMEOUT: int = Field(default=60) # segundos
+    DB_CONNECT_TIMEOUT: int = Field(default=30) 
+    DB_COMMAND_TIMEOUT: int = Field(default=60) 
 
+    # --- GCS Index Storage ---
+    SPARSE_INDEX_GCS_BUCKET_NAME: str = Field(
+        default=DEFAULT_GCS_INDEX_BUCKET,
+        description="GCS bucket name for storing precomputed BM25 indexes."
+    )
 
-    # --- Cache for BM25 Indexes (Opcional, podría implementarse más adelante) ---
-    # INDEX_CACHE_ENABLED: bool = Field(default=False)
-    # INDEX_CACHE_TTL_SECONDS: int = Field(default=3600) # 1 hora
-    # INDEX_CACHE_MAX_SIZE: int = Field(default=100)    # Max 100 company indexes
+    # --- LRU/TTL Cache for BM25 Instances ---
+    SPARSE_INDEX_CACHE_MAX_ITEMS: int = Field(
+        default=DEFAULT_INDEX_CACHE_MAX_ITEMS,
+        description="Maximum number of company BM25 indexes to keep in the LRU cache."
+    )
+    SPARSE_INDEX_CACHE_TTL_SECONDS: int = Field(
+        default=DEFAULT_INDEX_CACHE_TTL_SECONDS,
+        description="Time-to-live in seconds for items in the BM25 index cache."
+    )
+    
+    # --- BM25 Parameters (Opcional, bm2s usa sus propios defaults) ---
+    # SPARSE_BM2S_K1: float = Field(default=1.5)
+    # SPARSE_BM2S_B: float = Field(default=0.75)
+
 
     @field_validator('LOG_LEVEL', mode='before')
     @classmethod
@@ -491,20 +601,27 @@ class Settings(BaseSettings):
         elif v is None or v == "":
             raise ValueError(f"Required secret field 'SPARSE_POSTGRES_PASSWORD' cannot be empty.")
         return v
+    
+    @field_validator('SPARSE_INDEX_GCS_BUCKET_NAME', mode='before')
+    @classmethod
+    def check_gcs_bucket_name(cls, v: Any, info: ValidationInfo) -> Any:
+        if v is None or v == "":
+            raise ValueError(f"Required field '{info.field_name}' (SPARSE_INDEX_GCS_BUCKET_NAME) cannot be empty.")
+        return v
 
 # --- Global Settings Instance ---
 temp_log = logging.getLogger("sparse_search_service.config.loader")
-if not temp_log.handlers: # Evitar duplicar handlers si se recarga
+if not temp_log.handlers: 
     handler = logging.StreamHandler(sys.stdout)
     formatter = logging.Formatter('%(levelname)s: [%(asctime)s] [%(name)s] %(message)s')
     handler.setFormatter(formatter)
     temp_log.addHandler(handler)
-    temp_log.setLevel(logging.INFO) # Default to INFO for config loading phase
+    temp_log.setLevel(logging.INFO) 
 
 try:
     temp_log.info("Loading Sparse Search Service settings...")
     settings = Settings()
-    temp_log.info("--- Sparse Search Service Settings Loaded ---")
+    temp_log.info("--- Sparse Search Service Settings Loaded (v1.0.0) ---")
 
     excluded_fields = {'POSTGRES_PASSWORD'}
     log_data = settings.model_dump(exclude=excluded_fields)
@@ -615,45 +732,46 @@ def setup_logging():
 ## File: `app\dependencies.py`
 ```py
 # sparse-search-service/app/dependencies.py
-"""
-Centralized dependency injection for the Sparse Search Service.
-Instances are initialized during application startup (lifespan).
-"""
 from fastapi import HTTPException, status
 from typing import Optional
 import structlog
 
-# Ports
 from app.application.ports.repository_ports import ChunkContentRepositoryPort
 from app.application.ports.sparse_search_port import SparseSearchPort
+from app.application.ports.sparse_index_storage_port import SparseIndexStoragePort
+from app.infrastructure.cache.index_lru_cache import IndexLRUCache
+from app.application.use_cases.load_and_search_index_use_case import LoadAndSearchIndexUseCase
 
-# Use Cases
-from app.application.use_cases.sparse_search_use_case import SparseSearchUseCase
 
 log = structlog.get_logger(__name__)
 
-# Global instances to be populated at startup
 _chunk_content_repo_instance: Optional[ChunkContentRepositoryPort] = None
-_sparse_search_engine_instance: Optional[SparseSearchPort] = None
-_sparse_search_use_case_instance: Optional[SparseSearchUseCase] = None
+_sparse_search_engine_instance: Optional[SparseSearchPort] = None 
+_gcs_index_storage_instance: Optional[SparseIndexStoragePort] = None
+_index_cache_instance: Optional[IndexLRUCache] = None
+_load_and_search_use_case_instance: Optional[LoadAndSearchIndexUseCase] = None
 _service_ready_flag: bool = False
 
 def set_global_dependencies(
-    chunk_repo: ChunkContentRepositoryPort,
-    search_engine: SparseSearchPort,
-    use_case: SparseSearchUseCase,
+    chunk_repo: Optional[ChunkContentRepositoryPort],
+    search_engine: Optional[SparseSearchPort],
+    gcs_storage: Optional[SparseIndexStoragePort],
+    index_cache: Optional[IndexLRUCache],
+    use_case: Optional[LoadAndSearchIndexUseCase], 
     service_ready: bool
 ):
     global _chunk_content_repo_instance, _sparse_search_engine_instance
-    global _sparse_search_use_case_instance, _service_ready_flag
+    global _gcs_index_storage_instance, _index_cache_instance
+    global _load_and_search_use_case_instance, _service_ready_flag
 
     _chunk_content_repo_instance = chunk_repo
     _sparse_search_engine_instance = search_engine
-    _sparse_search_use_case_instance = use_case
+    _gcs_index_storage_instance = gcs_storage
+    _index_cache_instance = index_cache
+    _load_and_search_use_case_instance = use_case
     _service_ready_flag = service_ready
     log.debug("Global dependencies set in sparse-search-service.dependencies", service_ready=_service_ready_flag)
 
-# --- Getter functions for FastAPI Depends ---
 
 def get_chunk_content_repository() -> ChunkContentRepositoryPort:
     if not _service_ready_flag or not _chunk_content_repo_instance:
@@ -673,17 +791,34 @@ def get_sparse_search_engine() -> SparseSearchPort:
         )
     return _sparse_search_engine_instance
 
-def get_sparse_search_use_case() -> SparseSearchUseCase:
-    if not _service_ready_flag or not _sparse_search_use_case_instance:
-        log.critical("Attempted to get SparseSearchUseCase before service is ready or instance is None.")
+def get_gcs_index_storage() -> SparseIndexStoragePort:
+    if not _service_ready_flag or not _gcs_index_storage_instance:
+        log.critical("Attempted to get GCSIndexStorage before service is ready or instance is None.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="GCS index storage is not available at the moment."
+        )
+    return _gcs_index_storage_instance
+
+def get_index_cache() -> IndexLRUCache:
+    if not _service_ready_flag or not _index_cache_instance:
+        log.critical("Attempted to get IndexCache before service is ready or instance is None.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Index cache is not available at the moment."
+        )
+    return _index_cache_instance
+    
+def get_sparse_search_use_case() -> LoadAndSearchIndexUseCase: 
+    if not _service_ready_flag or not _load_and_search_use_case_instance:
+        log.critical("Attempted to get LoadAndSearchIndexUseCase before service is ready or instance is None.")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Sparse search processing service is not ready."
         )
-    return _sparse_search_use_case_instance
+    return _load_and_search_use_case_instance
 
 def get_service_status() -> bool:
-    """Returns the current readiness status of the service."""
     return _service_ready_flag
 ```
 
@@ -780,6 +915,67 @@ print(f"[Gunicorn Config] App Log Level (SPARSE_LOG_LEVEL for Uvicorn worker): {
 ## File: `app\infrastructure\__init__.py`
 ```py
 
+```
+
+## File: `app\infrastructure\cache\__init__.py`
+```py
+
+```
+
+## File: `app\infrastructure\cache\index_lru_cache.py`
+```py
+# sparse-search-service/app/infrastructure/cache/index_lru_cache.py
+import uuid
+from typing import Tuple, Optional, List, Any
+import sys
+import structlog
+from cachetools import TTLCache
+
+try:
+    import bm2s 
+except ImportError:
+    bm2s = None
+
+
+log = structlog.get_logger(__name__)
+
+CachedIndexData = Tuple[Any, List[str]] 
+
+class IndexLRUCache:
+    def __init__(self, max_items: int, ttl_seconds: int):
+        self.cache: TTLCache[str, CachedIndexData] = TTLCache(maxsize=max_items, ttl=ttl_seconds)
+        self.max_items = max_items
+        self.ttl_seconds = ttl_seconds
+        self.log = log.bind(cache_type="IndexLRUCache", max_items=max_items, ttl_seconds=ttl_seconds)
+        self.log.info("IndexLRUCache initialized.")
+
+    def get(self, company_id: uuid.UUID) -> Optional[CachedIndexData]:
+        cache_log = self.log.bind(company_id=str(company_id), action="cache_get")
+        key = str(company_id)
+        cached_item = self.cache.get(key)
+        if cached_item:
+            cache_log.info("Cache hit.")
+            return cached_item
+        else:
+            cache_log.info("Cache miss.")
+            return None
+
+    def put(self, company_id: uuid.UUID, bm25_instance: Any, id_map: List[str]) -> None:
+        cache_log = self.log.bind(company_id=str(company_id), action="cache_put")
+        key = str(company_id)
+        
+        try:
+            self.cache[key] = (bm25_instance, id_map)
+            cache_log.info("Item added/updated in cache.", current_cache_size=self.cache.currsize)
+        except Exception as e:
+            cache_log.error("Failed to put item into cache.", error=str(e), exc_info=True)
+
+    def clear(self) -> None:
+        self.log.info("Clearing all items from cache.")
+        self.cache.clear()
+
+    def __len__(self) -> int:
+        return len(self.cache)
 ```
 
 ## File: `app\infrastructure\persistence\__init__.py`
@@ -1018,24 +1214,24 @@ import asyncio
 import time
 import uuid
 from typing import List, Tuple, Dict, Any, Optional
+from pathlib import Path
+
 
 try:
     import bm2s
 except ImportError:
-    bm2s = None # Manejar dependencia opcional
+    bm2s = None 
 
 from app.application.ports.sparse_search_port import SparseSearchPort
 from app.domain.models import SparseSearchResultItem
-from app.core.config import settings # Si se necesita alguna config específica de BM25
+from app.core.config import settings 
 
 log = structlog.get_logger(__name__)
 
 class BM25Adapter(SparseSearchPort):
     """
     Implementación de SparseSearchPort usando la librería bm2s.
-    Este adaptador construye un índice BM25 en memoria basado en el `corpus_chunks`
-    proporcionado en cada llamada a `search`. Es sin estado entre llamadas
-    con respecto a los índices.
+    Esta versión espera un índice BM25 pre-cargado.
     """
 
     def __init__(self):
@@ -1050,149 +1246,425 @@ class BM25Adapter(SparseSearchPort):
             log.info("BM25Adapter initialized. bm2s library is available.")
 
     async def initialize_engine(self) -> None:
-        """
-        Verifica la disponibilidad de la librería bm2s.
-        No hay una inicialización pesada del motor BM25 en este adaptador
-        ya que los índices se construyen por solicitud.
-        """
         if not self._bm2s_available:
-            log.warning("BM25 engine (bm2s library) not available. Search will fail.")
+            log.warning("BM25 engine (bm2s library) not available. Search will fail if attempted.")
         else:
             log.info("BM25 engine (bm2s library) available and ready.")
 
     def is_available(self) -> bool:
-        """Retorna True si la librería bm2s está disponible."""
         return self._bm2s_available
+
+    @staticmethod
+    def load_bm2s_from_file(file_path: str) -> Any: 
+        load_log = log.bind(action="load_bm2s_from_file", file_path=file_path)
+        if not bm2s:
+            load_log.error("bm2s library not available, cannot load index.")
+            raise RuntimeError("bm2s library is not installed.")
+        try:
+            loaded_retriever = bm2s.BM25.load(file_path, anserini_path=None) 
+            load_log.info("BM25 index loaded successfully from file.")
+            return loaded_retriever
+        except Exception as e:
+            load_log.exception("Failed to load BM25 index from file.")
+            raise RuntimeError(f"Failed to load BM25 index from {file_path}: {e}") from e
+
+    @staticmethod
+    def dump_bm2s_to_file(instance: Any, file_path: str): 
+        dump_log = log.bind(action="dump_bm2s_to_file", file_path=file_path)
+        if not bm2s:
+            dump_log.error("bm2s library not available, cannot dump index.")
+            raise RuntimeError("bm2s library is not installed.")
+        if not isinstance(instance, bm2s.BM25):
+            dump_log.error("Invalid instance type provided for dumping.", instance_type=type(instance).__name__)
+            raise TypeError("Instance to dump must be a bm2s.BM25 object.")
+        try:
+            instance.dump(file_path)
+            dump_log.info("BM25 index dumped successfully to file.")
+        except Exception as e:
+            dump_log.exception("Failed to dump BM25 index to file.")
+            raise RuntimeError(f"Failed to dump BM25 index to {file_path}: {e}") from e
 
     async def search(
         self,
         query: str,
-        company_id: uuid.UUID, # Se usa para logging
-        corpus_chunks: List[Dict[str, Any]], # Formato: [{'id': str, 'content': str}, ...]
-        top_k: int
+        bm25_instance: Any, 
+        id_map: List[str],  
+        top_k: int,
+        company_id: Optional[uuid.UUID] = None # Añadido para logging
     ) -> List[SparseSearchResultItem]:
-        """
-        Busca chunks usando BM25s. El corpus se proporciona directamente.
-        """
         adapter_log = log.bind(
             adapter="BM25Adapter",
-            action="search",
-            company_id=str(company_id),
+            action="search_with_instance",
+            company_id=str(company_id) if company_id else "N/A",
             query_preview=query[:50] + "...",
-            num_corpus_chunks=len(corpus_chunks),
+            num_ids_in_map=len(id_map),
             top_k=top_k
         )
 
         if not self._bm2s_available:
             adapter_log.error("bm2s library not available. Cannot perform BM25 search.")
-            # Devuelve una lista vacía para indicar fallo pero no detener el flujo completo
-            # si el servicio consumidor puede manejarlo (e.g., solo usar búsqueda densa).
-            # Sin embargo, para un servicio dedicado a búsqueda dispersa, esto podría ser un error 503.
-            # Por ahora, se alinea con cómo lo manejaría el query_service (omitiría resultados BM25).
+            return []
+        
+        if not bm25_instance or not isinstance(bm25_instance, bm2s.BM25):
+            adapter_log.error("Invalid or no BM25 instance provided for search.")
             return []
 
-        if not corpus_chunks:
-            adapter_log.warning("Corpus_chunks is empty. No data to search.")
+        if not id_map:
+            adapter_log.warning("ID map is empty. No way to map results to original chunk IDs.")
             return []
-
+            
         if not query.strip():
             adapter_log.warning("Query is empty. Returning no results.")
             return []
 
         start_time = time.monotonic()
-        adapter_log.debug("Starting BM25 search...")
+        adapter_log.debug("Starting BM25 search with pre-loaded instance...")
 
         try:
-            # 1. Preparar corpus y mapeo de IDs
-            # Los IDs son los `embedding_id` que vienen de la DB
-            chunk_ids_list: List[str] = []
-            corpus_texts: List[str] = []
-
-            for chunk_data in corpus_chunks:
-                chunk_id = chunk_data.get("id")
-                content = chunk_data.get("content")
-                if chunk_id and content and isinstance(content, str) and content.strip():
-                    chunk_ids_list.append(str(chunk_id)) # Asegurar que el ID es string
-                    corpus_texts.append(content)
-                else:
-                    adapter_log.warning(
-                        "Skipping chunk due to missing ID, content, or invalid content type.",
-                        chunk_data_preview={k: (str(v)[:30] + "..." if isinstance(v, str) and len(v)>30 else v) for k,v in chunk_data.items()}
-                    )
-
-            if not corpus_texts:
-                adapter_log.warning("Corpus is empty after filtering invalid chunks. No search performed.")
-                return []
-
-            # 2. Tokenizar corpus y consulta usando bm2s
-            # bm2s.tokenize maneja una lista de strings para el corpus
-            # y un solo string para la consulta.
-            # bm2s internamente usa tokenización por espacios y pasa a minúsculas por defecto.
-            # Se pueden pasar parámetros de tokenización a `bm2s.BM25(...)` si es necesario.
-            adapter_log.debug("Tokenizing query and corpus with bm2s defaults...")
-            # No necesitamos tokenizar explícitamente antes si usamos los métodos de bm2s que aceptan strings.
-            # query_tokens = bm2s.tokenize(query) # bm2s.tokenize puede tokenizar una sola cadena
-            # corpus_tokens = bm2s.tokenize(corpus_texts) # o una lista de cadenas
-
-            # 3. Crear el índice BM25s e indexar el corpus
-            # Los parámetros k1 y b pueden ajustarse, usando los defaults de bm2s por ahora.
-            # bm2s.BM25(corpus=corpus_texts) también es una opción para indexar directamente.
-            retriever = bm2s.BM25() # O bm2s.BM25(k1=..., b=...)
-            retriever.index(corpus_texts) # Indexa los textos directamente (bm2s tokeniza internamente)
-            
-            index_build_time = time.monotonic()
-            adapter_log.debug(f"BM25s index built for {len(corpus_texts)} texts.",
-                              duration_ms=(index_build_time - start_time) * 1000)
-
-            # 4. Realizar la búsqueda
-            # `retriever.retrieve` toma la consulta tokenizada (o string y la tokeniza) y el corpus tokenizado.
-            # Alternativamente, si se indexaron strings, `retrieve` también puede tomar un string de consulta.
-            # El método `retrieve` espera una lista de consultas tokenizadas (o una lista con una sola consulta).
-            # Devolverá una tupla (indices, scores) donde cada elemento es una lista (una por consulta).
-            
-            # Pasar la consulta como string, bm2s la tokenizará.
-            # El corpus ya está indexado.
-            results_indices_per_query, results_scores_per_query = retriever.retrieve(
-                query, # Pasar la consulta como string
+            results_indices_per_query, results_scores_per_query = bm25_instance.retrieve(
+                query, 
                 k=top_k
             )
-
-            # Como solo hay una consulta, tomamos el primer (y único) elemento de cada lista
+            
             doc_indices: List[int] = results_indices_per_query[0]
             scores: List[float] = results_scores_per_query[0]
             
-            retrieval_time = time.monotonic()
+            retrieval_time_ms = (time.monotonic() - start_time) * 1000
             adapter_log.debug(f"BM25s retrieval complete. Hits found: {len(doc_indices)}.",
-                              duration_ms=(retrieval_time - index_build_time) * 1000)
+                              duration_ms=round(retrieval_time_ms,2))
 
-            # 5. Mapear resultados a SparseSearchResultItem
             final_results: List[SparseSearchResultItem] = []
             for i, score_val in zip(doc_indices, scores):
-                if 0 <= i < len(chunk_ids_list):
-                    original_chunk_id = chunk_ids_list[i]
+                if 0 <= i < len(id_map):
+                    original_chunk_id = id_map[i]
                     final_results.append(
                         SparseSearchResultItem(chunk_id=original_chunk_id, score=float(score_val))
                     )
                 else:
                     adapter_log.error(
-                        "BM25s returned index out of bounds.",
+                        "BM25s returned index out of bounds for the provided id_map.",
                         returned_index=i,
-                        corpus_size=len(chunk_ids_list)
+                        id_map_size=len(id_map)
                     )
             
-            total_duration_ms = (time.monotonic() - start_time) * 1000
             adapter_log.info(
                 f"BM25 search finished. Returning {len(final_results)} results.",
-                total_duration_ms=round(total_duration_ms, 2)
+                total_duration_ms=round(retrieval_time_ms, 2)
             )
             return final_results
 
         except Exception as e:
-            adapter_log.exception("Error during BM25 search processing.")
-            # En un servicio dedicado, un error aquí podría justificar un 500.
-            # Por ahora, devolvemos lista vacía para consistencia con la falta de bm2s.
-            # raise RuntimeError(f"BM25 search failed unexpectedly: {e}") from e
+            adapter_log.exception("Error during BM25 search processing with pre-loaded instance.")
             return []
+```
+
+## File: `app\infrastructure\storage\__init__.py`
+```py
+
+```
+
+## File: `app\infrastructure\storage\gcs_index_storage_adapter.py`
+```py
+# sparse-search-service/app/infrastructure/storage/gcs_index_storage_adapter.py
+import asyncio
+import json
+import tempfile
+import uuid
+from pathlib import Path
+from typing import Tuple, Optional
+
+import structlog
+from google.cloud import storage
+from google.api_core.exceptions import NotFound, GoogleAPIError
+
+from app.application.ports.sparse_index_storage_port import SparseIndexStoragePort
+from app.core.config import settings
+
+log = structlog.get_logger(__name__)
+
+BM25_DUMP_FILENAME = "bm25_index.bm2s"
+ID_MAP_FILENAME = "id_map.json"
+GCS_INDEX_ROOT_PATH = "indices" 
+
+class GCSIndexStorageError(Exception):
+    pass
+
+class GCSIndexStorageAdapter(SparseIndexStoragePort):
+    def __init__(self, bucket_name: Optional[str] = None):
+        self.bucket_name = bucket_name or settings.SPARSE_INDEX_GCS_BUCKET_NAME
+        try:
+            self._client = storage.Client()
+            self._bucket = self._client.bucket(self.bucket_name)
+        except Exception as e:
+            log.critical("Failed to initialize GCS client or bucket handle.", error=str(e), exc_info=True)
+            raise GCSIndexStorageError(f"Failed to initialize GCS client for bucket '{self.bucket_name}': {e}") from e
+        self.log = log.bind(gcs_bucket=self.bucket_name, adapter="GCSIndexStorageAdapter")
+
+    def _get_gcs_object_path(self, company_id: uuid.UUID, filename: str) -> str:
+        return f"{GCS_INDEX_ROOT_PATH}/{str(company_id)}/{filename}"
+
+    async def load_index_files(self, company_id: uuid.UUID) -> Tuple[Optional[str], Optional[str]]:
+        adapter_log = self.log.bind(company_id=str(company_id), action="load_index_files")
+        adapter_log.info("Attempting to load index files from GCS.")
+
+        temp_dir = tempfile.mkdtemp(prefix=f"sparse_idx_{company_id}_")
+        local_bm2s_path = Path(temp_dir) / BM25_DUMP_FILENAME
+        local_id_map_path = Path(temp_dir) / ID_MAP_FILENAME
+
+        gcs_bm2s_object_path = self._get_gcs_object_path(company_id, BM25_DUMP_FILENAME)
+        gcs_id_map_object_path = self._get_gcs_object_path(company_id, ID_MAP_FILENAME)
+
+        loop = asyncio.get_running_loop()
+
+        async def _download_file(gcs_path: str, local_path: Path) -> bool:
+            try:
+                blob = self._bucket.blob(gcs_path)
+                await loop.run_in_executor(None, blob.download_to_filename, str(local_path))
+                adapter_log.debug(f"Successfully downloaded GCS object to local file.", gcs_object=gcs_path, local_file=str(local_path))
+                return True
+            except NotFound:
+                adapter_log.warning(f"GCS object not found.", gcs_object=gcs_path)
+                return False
+            except GoogleAPIError as e:
+                adapter_log.error(f"GCS API error downloading object.", gcs_object=gcs_path, error=str(e))
+                return False
+            except Exception as e:
+                adapter_log.exception(f"Unexpected error downloading GCS object.", gcs_object=gcs_path)
+                return False
+
+        bm2s_downloaded = await _download_file(gcs_bm2s_object_path, local_bm2s_path)
+        id_map_downloaded = await _download_file(gcs_id_map_object_path, local_id_map_path)
+
+        if bm2s_downloaded and id_map_downloaded:
+            adapter_log.info("Both index files downloaded successfully from GCS.")
+            return str(local_bm2s_path), str(local_id_map_path)
+        else:
+            adapter_log.warning("Failed to download one or both index files from GCS. Cleaning up temporary files.")
+            try:
+                if local_bm2s_path.exists(): local_bm2s_path.unlink()
+                if local_id_map_path.exists(): local_id_map_path.unlink()
+                Path(temp_dir).rmdir()
+            except OSError as e_clean:
+                adapter_log.error("Error cleaning up temporary directory.", temp_dir=temp_dir, error=str(e_clean))
+            return None, None
+
+    async def save_index_files(self, company_id: uuid.UUID, local_bm2s_dump_path: str, local_id_map_path: str) -> None:
+        adapter_log = self.log.bind(company_id=str(company_id), action="save_index_files")
+        adapter_log.info("Attempting to save index files to GCS.")
+
+        gcs_bm2s_object_path = self._get_gcs_object_path(company_id, BM25_DUMP_FILENAME)
+        gcs_id_map_object_path = self._get_gcs_object_path(company_id, ID_MAP_FILENAME)
+
+        loop = asyncio.get_running_loop()
+
+        async def _upload_file(local_path: str, gcs_path: str, content_type: Optional[str] = None):
+            try:
+                blob = self._bucket.blob(gcs_path)
+                await loop.run_in_executor(None, blob.upload_from_filename, local_path, content_type=content_type)
+                adapter_log.debug(f"Successfully uploaded local file to GCS object.", local_file=local_path, gcs_object=gcs_path)
+            except GoogleAPIError as e:
+                adapter_log.error(f"GCS API error uploading file.", local_file=local_path, gcs_object=gcs_path, error=str(e))
+                raise GCSIndexStorageError(f"GCS API error uploading {local_path} to {gcs_path}: {e}") from e
+            except Exception as e:
+                adapter_log.exception(f"Unexpected error uploading file to GCS.", local_file=local_path, gcs_object=gcs_path)
+                raise GCSIndexStorageError(f"Unexpected error uploading {local_path} to {gcs_path}: {e}") from e
+
+        try:
+            await _upload_file(local_bm2s_dump_path, gcs_bm2s_object_path, content_type="application/octet-stream")
+            await _upload_file(local_id_map_path, gcs_id_map_object_path, content_type="application/json")
+            adapter_log.info("Both index files uploaded successfully to GCS.")
+        except GCSIndexStorageError: 
+            raise
+        except Exception as e: 
+            adapter_log.exception("Unexpected failure during save_index_files orchestration.")
+            raise GCSIndexStorageError(f"Orchestration failure in save_index_files: {e}") from e
+```
+
+## File: `app\jobs\__init__.py`
+```py
+
+```
+
+## File: `app\jobs\index_builder_cronjob.py`
+```py
+# sparse-search-service/app/jobs/index_builder_cronjob.py
+import argparse
+import asyncio
+import json
+import os
+import tempfile
+import uuid
+from pathlib import Path
+import sys
+
+try:
+    import bm2s
+except ImportError:
+    bm2s = None
+    print("ERROR: bm2s library not found. Please install it: poetry add bm2s", file=sys.stderr)
+    sys.exit(1)
+
+import structlog
+
+if __name__ == '__main__':
+    SCRIPT_DIR = Path(__file__).resolve().parent
+    PROJECT_ROOT = SCRIPT_DIR.parent.parent 
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
+from app.core.config import settings as app_settings 
+from app.core.logging_config import setup_logging as app_setup_logging
+from app.infrastructure.persistence.postgres_repositories import PostgresChunkContentRepository
+from app.infrastructure.persistence import postgres_connector
+from app.infrastructure.storage.gcs_index_storage_adapter import GCSIndexStorageAdapter, GCSIndexStorageError
+from app.infrastructure.sparse_retrieval.bm25_adapter import BM25Adapter 
+
+app_setup_logging() 
+log = structlog.get_logger("index_builder_cronjob")
+
+
+async def build_and_upload_index_for_company(
+    company_id_str: str,
+    repo: PostgresChunkContentRepository,
+    gcs_adapter: GCSIndexStorageAdapter
+):
+    builder_log = log.bind(company_id=company_id_str, job_action="build_and_upload_index")
+    builder_log.info("Starting index build process for company.")
+    
+    try:
+        company_uuid = uuid.UUID(company_id_str)
+    except ValueError:
+        builder_log.error("Invalid company_id format. Skipping.", company_id_input=company_id_str)
+        return
+
+    builder_log.debug("Fetching chunks from PostgreSQL...")
+    try:
+        chunks_data = await repo.get_chunks_with_metadata_by_company(company_uuid)
+    except ConnectionError as e_db_conn:
+        builder_log.error("Database connection error while fetching chunks. Skipping company.", error=str(e_db_conn))
+        return
+    except Exception as e_db_fetch:
+        builder_log.exception("Failed to fetch chunks from PostgreSQL. Skipping company.")
+        return
+        
+    if not chunks_data:
+        builder_log.warning("No processable chunks found for company. Skipping index build.")
+        return
+
+    corpus_texts = [chunk['content'] for chunk in chunks_data if chunk.get('content','').strip()]
+    id_map = [chunk['id'] for chunk in chunks_data if chunk.get('content','').strip()] 
+
+    if not corpus_texts:
+        builder_log.warning("Corpus is empty after filtering content. Skipping index build.")
+        return
+
+    builder_log.info(f"Building BM25 index for {len(corpus_texts)} chunks...")
+    try:
+        retriever = bm2s.BM25() 
+        retriever.index(corpus_texts)
+        builder_log.info("BM25 index built successfully.")
+    except Exception as e_bm2s_index:
+        builder_log.exception("Error during BM25 index building.")
+        return
+
+
+    with tempfile.TemporaryDirectory(prefix=f"bm25_build_{company_id_str}_") as tmpdir_str:
+        tmpdir = Path(tmpdir_str)
+        bm2s_file_path = tmpdir / "bm25_index.bm2s"
+        id_map_file_path = tmpdir / "id_map.json"
+
+        builder_log.debug("Dumping BM25 index to temporary file.", file_path=str(bm2s_file_path))
+        try:
+            BM25Adapter.dump_bm2s_to_file(retriever, str(bm2s_file_path))
+        except Exception as e_dump:
+            builder_log.exception("Failed to dump BM25 index.")
+            return
+
+        builder_log.debug("Saving ID map to temporary JSON file.", file_path=str(id_map_file_path))
+        try:
+            with open(id_map_file_path, 'w') as f:
+                json.dump(id_map, f)
+        except IOError as e_json_io:
+            builder_log.exception("Failed to save ID map JSON.")
+            return
+        
+        builder_log.info("Index and ID map saved to temporary local files. Uploading to GCS...")
+        try:
+            await gcs_adapter.save_index_files(company_uuid, str(bm2s_file_path), str(id_map_file_path))
+            builder_log.info("Index and ID map uploaded to GCS successfully.")
+        except GCSIndexStorageError as e_gcs_upload:
+            builder_log.error("Failed to upload index files to GCS.", error=str(e_gcs_upload), exc_info=True)
+        except Exception as e_gcs_generic:
+            builder_log.exception("Unexpected error during GCS upload.")
+
+async def get_all_active_company_ids(repo: PostgresChunkContentRepository) -> List[uuid.UUID]:
+    fetch_log = log.bind(job_action="fetch_active_companies")
+    fetch_log.info("Fetching active company IDs from database...")
+    query = "SELECT DISTINCT company_id FROM documents WHERE status = 'processed';" # Asumiendo que esto es suficiente
+    pool = await postgres_connector.get_db_pool()
+    conn = None
+    try:
+        conn = await pool.acquire()
+        rows = await conn.fetch(query)
+        company_ids = [row['company_id'] for row in rows if row['company_id']]
+        fetch_log.info(f"Found {len(company_ids)} active company IDs with processed documents.")
+        return company_ids
+    except Exception as e:
+        fetch_log.exception("Failed to fetch active company IDs.")
+        return []
+    finally:
+        if conn:
+            await pool.release(conn)
+
+
+async def main_builder_logic(target_company_id_str: Optional[str]):
+    log.info("Index Builder CronJob starting...", target_company=target_company_id_str or "ALL")
+    
+    await postgres_connector.get_db_pool() 
+    repo = PostgresChunkContentRepository()
+    
+    gcs_bucket_for_indices = app_settings.SPARSE_INDEX_GCS_BUCKET_NAME
+    if not gcs_bucket_for_indices:
+        log.critical("SPARSE_INDEX_GCS_BUCKET_NAME is not configured. Cannot proceed.")
+        await postgres_connector.close_db_pool()
+        return
+        
+    gcs_adapter = GCSIndexStorageAdapter(bucket_name=gcs_bucket_for_indices)
+
+    companies_to_process: List[str] = []
+
+    if target_company_id_str and target_company_id_str.upper() != "ALL":
+        companies_to_process.append(target_company_id_str)
+    else:
+        log.info("Target is ALL companies. Fetching list of active company IDs...")
+        active_company_uuids = await get_all_active_company_ids(repo)
+        companies_to_process = [str(uid) for uid in active_company_uuids]
+        if not companies_to_process:
+            log.info("No active companies found to process.")
+
+    log.info(f"Will process indices for {len(companies_to_process)} companies.", companies_list_preview=companies_to_process[:5])
+
+    for comp_id_str in companies_to_process:
+        await build_and_upload_index_for_company(comp_id_str, repo, gcs_adapter)
+
+    await postgres_connector.close_db_pool()
+    log.info("Index Builder CronJob finished.")
+
+if __name__ == "__main__":
+    if not bm2s: 
+        print("FATAL: bm2s library is required but not found.", file=sys.stderr)
+        sys.exit(1)
+
+    parser = argparse.ArgumentParser(description="BM25 Index Builder for Sparse Search Service.")
+    parser.add_argument(
+        "--company-id",
+        type=str,
+        default="ALL", 
+        help="UUID of the company to build index for, or 'ALL' for all active companies."
+    )
+    args = parser.parse_args()
+
+    asyncio.run(main_builder_logic(args.company_id))
 ```
 
 ## File: `app\main.py`
@@ -1202,172 +1674,167 @@ from fastapi import FastAPI, HTTPException, status as fastapi_status, Request
 from fastapi.exceptions import RequestValidationError, ResponseValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 import structlog
-import uvicorn # Para ejecución local
-import logging # Para configuración inicial
+import uvicorn 
+import logging 
 import sys
 import asyncio
 import json
-import uuid # Para X-Request-ID
+import uuid 
 from contextlib import asynccontextmanager
-from typing import Optional, Annotated
+from typing import Optional, Dict # Agregado Dict
 
-from app.core.config import settings # Importar settings primero
+from app.core.config import settings 
 from app.core.logging_config import setup_logging
 
-# --- Setup Logging ---
-# Es crucial que setup_logging se llame ANTES de que otros módulos intenten usar structlog
-# y ANTES de que se cargue 'settings' completamente si logging_config depende de ello.
-# En este caso, config.py carga settings, y logging_config.py usa settings.
-# El orden de importación en Python generalmente maneja esto, pero ser explícito es bueno.
-# setup_logging() se llamará después de que 'settings' esté disponible.
-setup_logging() # Configura el logging basado en 'settings' ya cargado
-main_log = structlog.get_logger("sparse_search_service.main") # Logger específico para main
+setup_logging() 
+main_log = structlog.get_logger("sparse_search_service.main") 
 
 
-# --- Import Routers ---
 from app.api.v1.endpoints import search_endpoint
 
-# --- Import Ports, Adapters, and Use Cases for Lifespan ---
 from app.application.ports.repository_ports import ChunkContentRepositoryPort
 from app.application.ports.sparse_search_port import SparseSearchPort
+from app.application.ports.sparse_index_storage_port import SparseIndexStoragePort
 from app.infrastructure.persistence.postgres_repositories import PostgresChunkContentRepository
 from app.infrastructure.sparse_retrieval.bm25_adapter import BM25Adapter
-from app.application.use_cases.sparse_search_use_case import SparseSearchUseCase
+from app.infrastructure.storage.gcs_index_storage_adapter import GCSIndexStorageAdapter, GCSIndexStorageError
+from app.infrastructure.cache.index_lru_cache import IndexLRUCache
+from app.application.use_cases.load_and_search_index_use_case import LoadAndSearchIndexUseCase
 
-# --- Database Connector ---
+
 from app.infrastructure.persistence import postgres_connector
-
-# --- Dependency Management ---
 from app.dependencies import set_global_dependencies, get_service_status
 
-# --- Global State (Application lifespan will manage these) ---
-# Se usan las funciones de app.dependencies para setear/obtener estas instancias.
 
 SERVICE_NAME = settings.PROJECT_NAME
+SERVICE_VERSION = settings.SERVICE_VERSION
 
-# --- Lifespan Manager (Startup and Shutdown) ---
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    main_log.info(f"Starting up {SERVICE_NAME}...")
-    service_ready = False
-    critical_failure_message = ""
+    main_log.info(f"Starting up {SERVICE_NAME} v{SERVICE_VERSION}...")
+    service_ready_final = False
+    critical_startup_error_message = ""
 
-    # Instancias a inicializar
+    db_pool_ok: bool = False
     chunk_repo: Optional[ChunkContentRepositoryPort] = None
-    search_engine: Optional[SparseSearchPort] = None
-    search_use_case: Optional[SparseSearchUseCase] = None
+    bm25_engine: Optional[SparseSearchPort] = None
+    gcs_adapter: Optional[SparseIndexStoragePort] = None
+    index_cache: Optional[IndexLRUCache] = None
+    load_search_uc: Optional[LoadAndSearchIndexUseCase] = None
 
-    # 1. Initialize PostgreSQL Connection Pool
     try:
-        await postgres_connector.get_db_pool() # Crea el pool si no existe
-        db_ready = await postgres_connector.check_db_connection()
-        if db_ready:
+        await postgres_connector.get_db_pool() 
+        db_pool_ok = await postgres_connector.check_db_connection()
+        if db_pool_ok:
             main_log.info("PostgreSQL connection pool initialized and verified.")
-            chunk_repo = PostgresChunkContentRepository()
+            chunk_repo = PostgresChunkContentRepository() 
         else:
-            critical_failure_message = "Failed PostgreSQL connection verification during startup."
-            main_log.critical(critical_failure_message)
-            # No salir todavía, permitir que el health check falle
-    except ConnectionError as e_pg_conn: # Específico para fallos de conexión al crear el pool
-        critical_failure_message = f"CRITICAL: Failed to connect to PostgreSQL during startup: {e_pg_conn}"
-        main_log.critical(critical_failure_message, error_details=str(e_pg_conn))
-    except Exception as e_pg_init:
-        critical_failure_message = f"CRITICAL: Failed PostgreSQL pool initialization: {e_pg_init}"
-        main_log.critical(critical_failure_message, error_details=str(e_pg_init), exc_info=True)
+            critical_startup_error_message = "Failed PostgreSQL connection verification during startup."
+            main_log.critical(critical_startup_error_message)
+    except ConnectionError as e:
+        critical_startup_error_message = f"CRITICAL: Failed to connect to PostgreSQL: {e}"
+        main_log.critical(critical_startup_error_message, error_details=str(e))
+    except Exception as e:
+        critical_startup_error_message = f"CRITICAL: Unexpected error initializing PostgreSQL pool: {e}"
+        main_log.critical(critical_startup_error_message, error_details=str(e), exc_info=True)
 
-    if critical_failure_message: # Si la DB falló, no continuar con componentes dependientes
-        main_log.error("Aborting further initialization due to database failure.")
-        set_global_dependencies(None, None, None, False) # Marcar servicio como no listo
-        # yield # Permitir que FastAPI inicie para que los health checks fallen correctamente
-        # Se comenta el yield aquí para que no intente correr la app si la DB es crítica.
-        # Sin embargo, para K8s, es mejor que el pod inicie y falle el health check.
-        # Así que, permitimos que el lifespan continúe y el health check se encargue.
-    else: # Si la DB está OK, continuar
-        # 2. Initialize Sparse Search Engine (BM25 Adapter)
-        try:
-            search_engine = BM25Adapter()
-            await search_engine.initialize_engine() # Verifica bm2s
-            if not search_engine.is_available(): # BM25Adapter tiene este método
-                 # Esto no es un fallo crítico del servicio si bm2s no está,
-                 # pero el health check debe reportarlo.
-                 main_log.warning("BM25 engine (bm2s) not available. Search functionality will be impaired.")
-                 # No se considera error crítico para el arranque del servicio, el health check lo indicará.
-            main_log.info("Sparse Search Engine (BM25Adapter) initialized.")
-        except Exception as e_search_engine:
-            # Si BM25 es crítico, esto podría ser un error fatal.
-            # Por ahora, lo logueamos pero permitimos que el servicio intente iniciar.
-            # El use case fallará si el search_engine no es usable.
-            critical_failure_message = f"Failed to initialize Sparse Search Engine: {e_search_engine}"
-            main_log.error(critical_failure_message, error_details=str(e_search_engine), exc_info=True)
-            search_engine = None # Asegurar que es None
-
-    # 3. Instantiate Use Case (solo si las dependencias críticas están listas)
-    if chunk_repo and search_engine: # Ambas deben estar disponibles
-        try:
-            search_use_case = SparseSearchUseCase(
-                chunk_content_repo=chunk_repo,
-                sparse_search_engine=search_engine
-            )
-            main_log.info("SparseSearchUseCase instantiated successfully.")
-            service_ready = True # El servicio principal está listo
-        except Exception as e_usecase:
-            critical_failure_message = f"Failed to instantiate SparseSearchUseCase: {e_usecase}"
-            main_log.critical(critical_failure_message, error_details=str(e_usecase), exc_info=True)
-            service_ready = False # Marcar como no listo si el use case falla
+    if not db_pool_ok: 
+        main_log.error("Aborting further service initialization due to PostgreSQL connection failure.")
     else:
-        if not chunk_repo:
-            critical_failure_message = critical_failure_message or "Chunk repository not available for use case."
-        if not search_engine: # No es error crítico si bm2s no está, pero se loguea.
-             main_log.warning("Search engine not fully available for use case (likely bm2s missing).")
-        # service_ready permanece False o lo que ya era.
+        try:
+            gcs_adapter = GCSIndexStorageAdapter(bucket_name=settings.SPARSE_INDEX_GCS_BUCKET_NAME)
+            main_log.info("GCSIndexStorageAdapter initialized.", bucket_name=settings.SPARSE_INDEX_GCS_BUCKET_NAME)
+        except GCSIndexStorageError as e_gcs: 
+            critical_startup_error_message = f"CRITICAL: Failed GCSIndexStorageAdapter initialization: {e_gcs}"
+            main_log.critical(critical_startup_error_message, error_details=str(e_gcs))
+            gcs_adapter = None
+        except Exception as e_gcs_other:
+            critical_startup_error_message = f"CRITICAL: Unexpected error initializing GCSIndexStorageAdapter: {e_gcs_other}"
+            main_log.critical(critical_startup_error_message, error_details=str(e_gcs_other), exc_info=True)
+            gcs_adapter = None
 
-    # 4. Set global dependencies for injection
+        try:
+            bm25_engine = BM25Adapter()
+            await bm25_engine.initialize_engine() 
+            if not bm25_engine.is_available():
+                 main_log.warning("BM25 engine (bm2s library) not available. Search functionality will be impaired/unavailable.")
+            main_log.info("BM25Adapter (SparseSearchPort) initialized.")
+        except Exception as e_bm25:
+            # This is not necessarily critical to stop startup if GCS part works, but good to log
+            main_log.error(f"Failed to initialize BM25Adapter: {e_bm25}", error_details=str(e_bm25), exc_info=True)
+            bm25_engine = None 
+        
+        try:
+            index_cache = IndexLRUCache(
+                max_items=settings.SPARSE_INDEX_CACHE_MAX_ITEMS,
+                ttl_seconds=settings.SPARSE_INDEX_CACHE_TTL_SECONDS
+            )
+            main_log.info("IndexLRUCache initialized.")
+        except Exception as e_cache:
+            main_log.error(f"Failed to initialize IndexLRUCache: {e_cache}", error_details=str(e_cache), exc_info=True)
+            index_cache = None 
+
+        if db_pool_ok and gcs_adapter and bm25_engine and index_cache:
+            try:
+                load_search_uc = LoadAndSearchIndexUseCase(
+                    index_cache=index_cache,
+                    index_storage=gcs_adapter,
+                    sparse_search_engine=bm25_engine 
+                )
+                main_log.info("LoadAndSearchIndexUseCase instantiated.")
+                service_ready_final = True 
+            except Exception as e_uc:
+                critical_startup_error_message = f"Failed to instantiate LoadAndSearchIndexUseCase: {e_uc}"
+                main_log.critical(critical_startup_error_message, error_details=str(e_uc), exc_info=True)
+                service_ready_final = False
+        else:
+            main_log.warning("Not all components ready for LoadAndSearchIndexUseCase instantiation.",
+                             db_ok=db_pool_ok, gcs_ok=bool(gcs_adapter), 
+                             bm25_ok=bool(bm25_engine), cache_ok=bool(index_cache))
+            service_ready_final = False 
+
     set_global_dependencies(
-        chunk_repo=chunk_repo,
-        search_engine=search_engine,
-        use_case=search_use_case,
-        service_ready=service_ready # La bandera final de preparación
+        chunk_repo=chunk_repo, 
+        search_engine=bm25_engine, 
+        gcs_storage=gcs_adapter,
+        index_cache=index_cache,
+        use_case=load_search_uc, 
+        service_ready=service_ready_final
     )
 
-    if service_ready:
+    if service_ready_final:
         main_log.info(f"{SERVICE_NAME} service components initialized. SERVICE IS READY.")
     else:
-        final_msg = critical_failure_message or "One or more critical components failed to initialize."
-        main_log.critical(f"{SERVICE_NAME} startup finished. {final_msg} SERVICE IS NOT READY.")
+        final_startup_error_msg = critical_startup_error_message or "One or more components failed to initialize."
+        main_log.critical(f"{SERVICE_NAME} startup finished. {final_startup_error_msg} SERVICE IS NOT READY.")
 
+    yield 
 
-    yield # Application runs here
-
-
-    # --- Shutdown Logic ---
     main_log.info(f"Shutting down {SERVICE_NAME}...")
     await postgres_connector.close_db_pool()
-    # No hay otros clientes externos que cerrar en este servicio por ahora.
+    if index_cache: index_cache.clear() 
     main_log.info(f"{SERVICE_NAME} shutdown complete.")
 
 
-# --- FastAPI Application Instance ---
 app = FastAPI(
     title=SERVICE_NAME,
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
-    version="0.1.0", # Actualizar según sea necesario
-    description="Atenex microservice for performing sparse (keyword-based) search using BM25.",
+    version=SERVICE_VERSION, 
+    description="Atenex microservice for performing sparse (keyword-based) search using BM25 with GCS-backed indexes.",
     lifespan=lifespan
 )
 
-# --- Middleware for Request ID, Timing, and Logging ---
 @app.middleware("http")
 async def request_context_middleware(request: Request, call_next):
     start_time = asyncio.get_event_loop().time()
     request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
 
-    # Bind variables to structlog context for this request
     structlog.contextvars.bind_contextvars(
         request_id=request_id,
         method=request.method,
         path=str(request.url.path),
         client_host=request.client.host if request.client else "unknown_client",
-        # company_id = request.headers.get("x-company-id", "N/A") # Si se pasa por header
     )
     middleware_log = structlog.get_logger("sparse_search_service.request")
     middleware_log.info("Request received")
@@ -1375,7 +1842,7 @@ async def request_context_middleware(request: Request, call_next):
     response = None
     try:
         response = await call_next(request)
-    except Exception as e_call_next: # Captura excepciones no manejadas por los handlers de FastAPI
+    except Exception as e_call_next: 
         process_time_ms = (asyncio.get_event_loop().time() - start_time) * 1000
         structlog.contextvars.bind_contextvars(duration_ms=round(process_time_ms, 2), status_code=500)
         middleware_log.exception("Unhandled exception during request processing pipeline.")
@@ -1384,7 +1851,7 @@ async def request_context_middleware(request: Request, call_next):
             content={"request_id": request_id, "detail": "Internal Server Error during request handling."}
         )
     finally:
-        if response: # Asegurar que el response existe antes de calcular tiempo y loguear
+        if response: 
             process_time_ms = (asyncio.get_event_loop().time() - start_time) * 1000
             structlog.contextvars.bind_contextvars(duration_ms=round(process_time_ms, 2), status_code=response.status_code)
             
@@ -1396,16 +1863,13 @@ async def request_context_middleware(request: Request, call_next):
             response.headers["X-Request-ID"] = request_id
             response.headers["X-Process-Time-Ms"] = f"{process_time_ms:.2f}"
         
-        structlog.contextvars.clear_contextvars() # Limpiar contexto para la siguiente solicitud
+        structlog.contextvars.clear_contextvars() 
 
     return response
 
 
-# --- Exception Handlers (Reutilizados de query-service, adaptados) ---
 @app.exception_handler(HTTPException)
 async def http_exception_handler_custom(request: Request, exc: HTTPException):
-    # El request_context_middleware ya habrá logueado la info básica y el status_code.
-    # Aquí podemos añadir detalles específicos de la excepción si es necesario.
     exc_log = structlog.get_logger("sparse_search_service.exception_handler")
     exc_log.error("HTTPException caught", detail=exc.detail, status_code=exc.status_code)
     return JSONResponse(
@@ -1418,7 +1882,7 @@ async def validation_exception_handler_custom(request: Request, exc: RequestVali
     exc_log = structlog.get_logger("sparse_search_service.exception_handler")
     try:
         errors = exc.errors()
-    except Exception: # Por si exc.errors() mismo falla
+    except Exception: 
         errors = [{"loc": ["unknown"], "msg": "Error parsing validation details.", "type": "internal_error"}]
     exc_log.warning("RequestValidationError caught", validation_errors=errors)
     return JSONResponse(
@@ -1430,7 +1894,7 @@ async def validation_exception_handler_custom(request: Request, exc: RequestVali
         },
     )
 
-@app.exception_handler(ResponseValidationError) # Si la respuesta del endpoint no cumple el schema
+@app.exception_handler(ResponseValidationError) 
 async def response_validation_exception_handler_custom(request: Request, exc: ResponseValidationError):
     exc_log = structlog.get_logger("sparse_search_service.exception_handler")
     exc_log.error("ResponseValidationError caught", validation_errors=exc.errors(), exc_info=True)
@@ -1442,10 +1906,10 @@ async def response_validation_exception_handler_custom(request: Request, exc: Re
         }
     )
 
-@app.exception_handler(Exception) # Handler genérico para cualquier otra excepción
+@app.exception_handler(Exception) 
 async def generic_exception_handler_custom(request: Request, exc: Exception):
     exc_log = structlog.get_logger("sparse_search_service.exception_handler")
-    exc_log.exception("Unhandled generic Exception caught") # Log con traceback completo
+    exc_log.exception("Unhandled generic Exception caught") 
     return JSONResponse(
         status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
@@ -1454,11 +1918,9 @@ async def generic_exception_handler_custom(request: Request, exc: Exception):
         }
     )
 
-# --- Include API Routers ---
 app.include_router(search_endpoint.router, prefix=settings.API_V1_STR, tags=["Sparse Search"])
 main_log.info(f"API router included under prefix '{settings.API_V1_STR}/search'")
 
-# --- Health Check Endpoint ---
 @app.get(
     "/health",
     response_model=schemas.HealthCheckResponse,
@@ -1467,68 +1929,93 @@ main_log.info(f"API router included under prefix '{settings.API_V1_STR}/search'"
 )
 async def health_check():
     health_log = structlog.get_logger("sparse_search_service.health_check")
-    is_ready = get_service_status() # Obtener el estado global de preparación
+    is_globally_ready = get_service_status() 
     
-    dependencies_status = {}
-    db_status = "ok" if await postgres_connector.check_db_connection() else "error"
-    dependencies_status["PostgreSQL"] = db_status
+    dependencies_status_dict: Dict[str, str] = {}
     
-    bm2s_adapter_available = False
-    # Intentar obtener el search engine para verificar bm2s (esto puede fallar si el servicio no está listo)
+    db_ok = await postgres_connector.check_db_connection()
+    dependencies_status_dict["PostgreSQL"] = "ok" if db_ok else "error"
+    
+    bm2s_engine_available = False
+    bm2s_adapter_details = "unavailable"
     try:
         from app.dependencies import get_sparse_search_engine
-        engine = get_sparse_search_engine()
-        if engine and hasattr(engine, 'is_available'):
-            bm2s_adapter_available = engine.is_available()
-    except HTTPException: # Si get_sparse_search_engine lanza 503 porque no está listo
-        bm2s_adapter_available = False # Asumir no disponible
-    except AttributeError: # Si el engine no tiene 'is_available'
-        bm2s_adapter_available = False
-        health_log.warning("Sparse search engine adapter does not have 'is_available' method.")
+        engine_adapter = get_sparse_search_engine() 
+        if engine_adapter and hasattr(engine_adapter, 'is_available'):
+            bm2s_engine_available = engine_adapter.is_available()
+            bm2s_adapter_details = "ok (bm2s library loaded and adapter initialized)" if bm2s_engine_available else "unavailable (bm2s library potentially missing)"
+        else:
+             bm2s_adapter_details = "adapter not fully initialized or is_available method missing"
+    except HTTPException as http_exc_dep: 
+        bm2s_adapter_details = f"adapter not ready ({http_exc_dep.status_code})"
+        health_log.warning("Could not get search engine adapter for health check.", detail=str(http_exc_dep.detail))
+    except Exception as e_bm2s_check:
+        bm2s_adapter_details = f"error checking adapter: {type(e_bm2s_check).__name__}"
+        health_log.error("Error checking BM2S engine adapter status.", error=str(e_bm2s_check))
 
-    dependencies_status["BM2S_Engine"] = "ok" if bm2s_adapter_available else "unavailable (bm2s library potentially missing or adapter init failed)"
+    dependencies_status_dict["BM2S_Engine"] = bm2s_adapter_details
 
-    if not is_ready or db_status == "error": # Si el servicio global no está listo o la DB falla
-        overall_status = "error"
-        is_ready_final = False # Asegurar que 'ready' es False si hay fallos críticos
-        http_status_code = fastapi_status.HTTP_503_SERVICE_UNAVAILABLE
-        health_log.error(
-            "Health check failed.",
-            service_ready_flag=is_ready,
-            dependencies=dependencies_status
+    gcs_adapter_ready = False
+    gcs_adapter_details = "unavailable"
+    try:
+        from app.dependencies import get_gcs_index_storage
+        gcs_storage_adapter = get_gcs_index_storage() 
+        if gcs_storage_adapter: 
+            gcs_adapter_ready = True 
+            gcs_adapter_details = "ok (adapter initialized)"
+        else:
+            gcs_adapter_details = "adapter not initialized"
+    except HTTPException as http_exc_gcs:
+        gcs_adapter_details = f"adapter not ready ({http_exc_gcs.status_code})"
+        health_log.warning("Could not get GCS storage adapter for health check.", detail=str(http_exc_gcs.detail))
+    except Exception as e_gcs_check:
+        gcs_adapter_details = f"error checking adapter: {type(e_gcs_check).__name__}"
+        health_log.error("Error checking GCS adapter status.", error=str(e_gcs_check))
+        
+    dependencies_status_dict["GCS_Index_Storage"] = gcs_adapter_details
+    
+    final_http_status: int
+    response_content: schemas.HealthCheckResponse
+
+    if is_globally_ready and db_ok and gcs_adapter_ready : 
+        final_http_status = fastapi_status.HTTP_200_OK
+        response_content = schemas.HealthCheckResponse(
+            status="ok",
+            service=SERVICE_NAME,
+            ready=True, 
+            dependencies=dependencies_status_dict
         )
+        health_log.debug("Health check successful.", **response_content.model_dump())
     else:
-        overall_status = "ok"
-        is_ready_final = True
-        http_status_code = fastapi_status.HTTP_200_OK
-        health_log.debug("Health check successful.", dependencies=dependencies_status)
+        final_http_status = fastapi_status.HTTP_503_SERVICE_UNAVAILABLE
+        response_content = schemas.HealthCheckResponse(
+            status="error",
+            service=SERVICE_NAME,
+            ready=False, 
+            dependencies=dependencies_status_dict
+        )
+        health_log.error("Health check failed.", **response_content.model_dump())
 
     return JSONResponse(
-        status_code=http_status_code,
-        content=schemas.HealthCheckResponse(
-            status=overall_status,
-            service=SERVICE_NAME,
-            ready=is_ready_final,
-            dependencies=dependencies_status
-        ).model_dump()
+        status_code=final_http_status,
+        content=response_content.model_dump()
     )
 
 
-# --- Root Endpoint ---
 @app.get("/", include_in_schema=False)
 async def root():
-    return PlainTextResponse(f"{SERVICE_NAME} is running. Visit /docs for API documentation or /health for status.")
+    return PlainTextResponse(f"{SERVICE_NAME} v{SERVICE_VERSION} is running. Visit /docs for API documentation or /health for status.")
 
-# --- Uvicorn Runner (for local development) ---
+
 if __name__ == "__main__":
     port_to_use = settings.PORT
-    log_level_str = settings.LOG_LEVEL.lower() # Uvicorn espera minúsculas
-    print(f"----- Starting {SERVICE_NAME} locally on port {port_to_use} with log level {log_level_str} -----")
+    log_level_str = settings.LOG_LEVEL.lower() 
+    print(f"----- Starting {SERVICE_NAME} v{SERVICE_VERSION} locally on port {port_to_use} with log level {log_level_str} -----")
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
         port=port_to_use,
-        reload=True, # Habilitar reload para desarrollo
+        reload=True, 
         log_level=log_level_str
     )
 ```
@@ -1537,31 +2024,31 @@ if __name__ == "__main__":
 ```toml
 [tool.poetry]
 name = "sparse-search-service"
-version = "0.1.0"
-description = "Atenex Sparse Search Service using BM25 for keyword-based document retrieval."
-authors = ["Your Name <you@example.com>"] # Reemplaza con tu información
+version = "1.0.0" 
+description = "Atenex Sparse Search Service using BM25 with precomputed GCS indexes."
+authors = ["Atenex Backend Team <dev@atenex.com>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
 python = "^3.10"
-fastapi = "^0.110.0" # Mantener versiones consistentes con otros servicios si es posible
+fastapi = "^0.110.0"
 uvicorn = {extras = ["standard"], version = "^0.28.0"}
 gunicorn = "^21.2.0"
 pydantic = {extras = ["email"], version = "^2.6.4"}
 pydantic-settings = "^2.2.1"
 structlog = "^24.1.0"
-asyncpg = "^0.29.0" # Para conectar a PostgreSQL
-bm2s = "^0.3.2"      # Librería para BM25
-tenacity = "^8.2.3"  # Para reintentos en DB si es necesario
-
-# numpy es una dependencia de bm2s, pero se puede añadir explícitamente
+asyncpg = "^0.29.0"
+bm2s = "^0.3.2"
+tenacity = "^8.2.3"
 numpy = "1.26.4"
+google-cloud-storage = "^2.16.0" 
+cachetools = "^5.3.3"        
 
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"
 pytest-asyncio = "^0.21.1"
-httpx = "^0.27.0" # Para tests de API
+httpx = "^0.27.0" 
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
