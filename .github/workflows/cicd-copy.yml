@@ -1,0 +1,445 @@
+# LLM: NO COMMENTS unless absolutely necessary for processing logic.
+name: CI/CD Pipeline Docker -> Manifest Update (All Services - Selective Build)
+
+on:
+  push:
+    branches: [ "develop" ]
+
+env:
+  REGISTRY: ghcr.io
+  MANIFEST_REPO_OWNER: dev-nyro
+  MANIFEST_REPO_NAME: manifests-nyro
+  MANIFEST_REPO_BRANCH: develop
+
+  INGEST_SERVICE_DIR: ingest-service
+  INGEST_IMAGE_NAME: ghcr.io/dev-nyro/ingest-service
+  QUERY_SERVICE_DIR: query-service
+  QUERY_IMAGE_NAME: ghcr.io/dev-nyro/query-service
+  GATEWAY_SERVICE_DIR: api-gateway
+  GATEWAY_IMAGE_NAME: ghcr.io/dev-nyro/api-gateway
+  EMBEDDING_SERVICE_DIR: embedding-service
+  EMBEDDING_IMAGE_NAME: ghcr.io/dev-nyro/embedding-service
+  DOCPROC_SERVICE_DIR: docproc-service
+  DOCPROC_IMAGE_NAME: ghcr.io/dev-nyro/docproc-service
+  RERANKER_SERVICE_DIR: reranker-service
+  RERANKER_IMAGE_NAME: ghcr.io/dev-nyro/reranker-service
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      pull-requests: read
+
+    outputs:
+      ingest_built:   ${{ steps.build_ingest.outputs.digest   != '' && steps.build_ingest.outcome   == 'success' }}
+      query_built:    ${{ steps.build_query.outputs.digest    != '' && steps.build_query.outcome    == 'success' }}
+      gateway_built:  ${{ steps.build_gateway.outputs.digest  != '' && steps.build_gateway.outcome  == 'success' }}
+      embedding_built: ${{ steps.build_embedding.outputs.digest!= '' && steps.build_embedding.outcome== 'success' }}
+      docproc_built:  ${{ steps.build_docproc.outputs.digest  != '' && steps.build_docproc.outcome  == 'success' }}
+      reranker_built: ${{ steps.build_reranker.outputs.digest != '' && steps.build_reranker.outcome == 'success' }}
+      image_tag:      ${{ steps.image_tag_common.outputs.image_tag }}
+
+    steps:
+    - name: Checkout application code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Decide if we need to calculate changed files
+      id: diff_check
+      shell: bash
+      run: |
+        BEFORE_SHA="${{ github.event.before }}"
+        AFTER_SHA="${{ github.sha }}"
+        echo "before: $BEFORE_SHA"
+        echo "after : $AFTER_SHA"
+        if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+          echo "run_changed_files_action=true"  >> "$GITHUB_OUTPUT"
+          echo "base_sha_for_action="           >> "$GITHUB_OUTPUT"
+        elif [ "$BEFORE_SHA" != "$AFTER_SHA" ]; then
+          echo "run_changed_files_action=true"  >> "$GITHUB_OUTPUT"
+          echo "base_sha_for_action=$BEFORE_SHA" >> "$GITHUB_OUTPUT"
+        else
+          echo "run_changed_files_action=false" >> "$GITHUB_OUTPUT"
+          echo "base_sha_for_action="           >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Get changed files (tj-actions)
+      id: changed_files_action
+      if: steps.diff_check.outputs.run_changed_files_action == 'true'
+      uses: tj-actions/changed-files@v44
+      with:
+        base_sha: ${{ steps.diff_check.outputs.base_sha_for_action }}
+        files_yaml: |
+          ingest:
+            - '${{ env.INGEST_SERVICE_DIR }}/**'
+          query:
+            - '${{ env.QUERY_SERVICE_DIR }}/**'
+          gateway:
+            - '${{ env.GATEWAY_SERVICE_DIR }}/**'
+          embedding:
+            - '${{ env.EMBEDDING_SERVICE_DIR }}/**'
+          docproc:
+            - '${{ env.DOCPROC_SERVICE_DIR }}/**'
+          reranker:
+            - '${{ env.RERANKER_SERVICE_DIR }}/**'
+        fail_on_initial_diff_error: false
+
+    - name: Normalise changed-files outputs
+      id: changed_files
+      shell: bash
+      run: |
+        if [ "${{ steps.diff_check.outputs.run_changed_files_action }}" = "true" ]; then
+          echo "ingest_any_changed=${{ steps.changed_files_action.outputs.ingest_any_changed   == 'true' }}" >> "$GITHUB_OUTPUT"
+          echo "query_any_changed=${{ steps.changed_files_action.outputs.query_any_changed    == 'true' }}" >> "$GITHUB_OUTPUT"
+          echo "gateway_any_changed=${{ steps.changed_files_action.outputs.gateway_any_changed == 'true' }}" >> "$GITHUB_OUTPUT"
+          echo "embedding_any_changed=${{ steps.changed_files_action.outputs.embedding_any_changed == 'true' }}" >> "$GITHUB_OUTPUT"
+          echo "docproc_any_changed=${{ steps.changed_files_action.outputs.docproc_any_changed == 'true' }}" >> "$GITHUB_OUTPUT"
+          echo "reranker_any_changed=${{ steps.changed_files_action.outputs.reranker_any_changed == 'true' }}" >> "$GITHUB_OUTPUT"
+        else
+          echo "ingest_any_changed=false" >> "$GITHUB_OUTPUT"
+          echo "query_any_changed=false" >> "$GITHUB_OUTPUT"
+          echo "gateway_any_changed=false" >> "$GITHUB_OUTPUT"
+          echo "embedding_any_changed=false" >> "$GITHUB_OUTPUT"
+          echo "docproc_any_changed=false" >> "$GITHUB_OUTPUT"
+          echo "reranker_any_changed=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Set up Docker Buildx
+      if: |
+        steps.changed_files.outputs.ingest_any_changed   == 'true' ||
+        steps.changed_files.outputs.query_any_changed    == 'true' ||
+        steps.changed_files.outputs.gateway_any_changed  == 'true' ||
+        steps.changed_files.outputs.embedding_any_changed== 'true' ||
+        steps.changed_files.outputs.docproc_any_changed  == 'true' ||
+        steps.changed_files.outputs.reranker_any_changed == 'true'
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to GHCR
+      if: |
+        steps.changed_files.outputs.ingest_any_changed   == 'true' ||
+        steps.changed_files.outputs.query_any_changed    == 'true' ||
+        steps.changed_files.outputs.gateway_any_changed  == 'true' ||
+        steps.changed_files.outputs.embedding_any_changed== 'true' ||
+        steps.changed_files.outputs.docproc_any_changed  == 'true' ||
+        steps.changed_files.outputs.reranker_any_changed == 'true'
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Generate common image tag
+      id: image_tag_common
+      if: |
+        steps.changed_files.outputs.ingest_any_changed   == 'true' ||
+        steps.changed_files.outputs.query_any_changed    == 'true' ||
+        steps.changed_files.outputs.gateway_any_changed  == 'true' ||
+        steps.changed_files.outputs.embedding_any_changed== 'true' ||
+        steps.changed_files.outputs.docproc_any_changed  == 'true' ||
+        steps.changed_files.outputs.reranker_any_changed == 'true'
+      run: |
+        TAG="${{ github.ref_name }}-$(echo $GITHUB_SHA | cut -c1-7)"
+        TAG=$(echo "$TAG" | sed 's/[^a-zA-Z0-9.-]/-/g' | sed 's/^[.-]*//;s/[.-]*$//')
+        TAG=${TAG::128}
+        echo "image_tag=$TAG" >> "$GITHUB_OUTPUT"
+
+    - name: Build and push Ingest Service
+      id: build_ingest
+      if: steps.changed_files.outputs.ingest_any_changed == 'true'
+      continue-on-error: true
+      uses: docker/build-push-action@v5
+      with:
+        context: ${{ env.INGEST_SERVICE_DIR }}
+        file: ${{ env.INGEST_SERVICE_DIR }}/Dockerfile
+        push: ${{ github.event_name == 'push' }}
+        tags: ${{ env.INGEST_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
+        cache-from: type=gha
+        cache-to:   type=gha,mode=max
+        outputs:    type=registry
+
+    - name: Build and push Query Service
+      id: build_query
+      if: steps.changed_files.outputs.query_any_changed == 'true'
+      continue-on-error: true
+      uses: docker/build-push-action@v5
+      with:
+        context: ${{ env.QUERY_SERVICE_DIR }}
+        file: ${{ env.QUERY_SERVICE_DIR }}/Dockerfile
+        push: ${{ github.event_name == 'push' }}
+        tags: ${{ env.QUERY_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        outputs: type=registry
+
+    - name: Build and push API Gateway
+      id: build_gateway
+      if: steps.changed_files.outputs.gateway_any_changed == 'true'
+      continue-on-error: true
+      uses: docker/build-push-action@v5
+      with:
+        context: ${{ env.GATEWAY_SERVICE_DIR }}
+        file: ${{ env.GATEWAY_SERVICE_DIR }}/Dockerfile
+        push: ${{ github.event_name == 'push' }}
+        tags: ${{ env.GATEWAY_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        outputs: type=registry
+
+    - name: Build and push Embedding Service
+      id: build_embedding
+      if: steps.changed_files.outputs.embedding_any_changed == 'true'
+      continue-on-error: true
+      uses: docker/build-push-action@v5
+      with:
+        context: ${{ env.EMBEDDING_SERVICE_DIR }}
+        file: ${{ env.EMBEDDING_SERVICE_DIR }}/Dockerfile
+        push: ${{ github.event_name == 'push' }}
+        tags: ${{ env.EMBEDDING_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        outputs: type=registry
+
+    - name: Build and push DocProc Service
+      id: build_docproc
+      if: steps.changed_files.outputs.docproc_any_changed == 'true'
+      continue-on-error: true
+      uses: docker/build-push-action@v5
+      with:
+        context: ${{ env.DOCPROC_SERVICE_DIR }}
+        file: ${{ env.DOCPROC_SERVICE_DIR }}/Dockerfile
+        push: ${{ github.event_name == 'push' }}
+        tags: ${{ env.DOCPROC_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        outputs: type=registry
+
+    - name: Build and push Reranker Service
+      id: build_reranker
+      if: steps.changed_files.outputs.reranker_any_changed == 'true'
+      continue-on-error: true
+      uses: docker/build-push-action@v5
+      with:
+        context: ${{ env.RERANKER_SERVICE_DIR }}
+        file: ${{ env.RERANKER_SERVICE_DIR }}/Dockerfile
+        push: ${{ github.event_name == 'push' }}
+        tags: ${{ env.RERANKER_IMAGE_NAME }}:${{ steps.image_tag_common.outputs.image_tag }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        outputs: type=registry
+
+    - name: Debug build-push outputs
+      if: always()
+      run: |
+        echo "::group::Diff decision"
+        echo "run_changed_files_action -> ${{ steps.diff_check.outputs.run_changed_files_action }}"
+        echo "base_sha_for_action      -> ${{ steps.diff_check.outputs.base_sha_for_action }}"
+        echo "::endgroup::"
+        echo "::group::Changed Files Outputs (from step 'changed_files')"
+        echo "Ingest any_changed:   ${{ steps.changed_files.outputs.ingest_any_changed }}"
+        echo "Query any_changed:    ${{ steps.changed_files.outputs.query_any_changed }}"
+        echo "Gateway any_changed:  ${{ steps.changed_files.outputs.gateway_any_changed }}"
+        echo "Embedding any_changed:${{ steps.changed_files.outputs.embedding_any_changed }}"
+        echo "DocProc any_changed:  ${{ steps.changed_files.outputs.docproc_any_changed }}"
+        echo "Reranker any_changed: ${{ steps.changed_files.outputs.reranker_any_changed }}"
+        echo "::endgroup::"
+        echo "::group::Individual Build Step Details"
+        echo "build_ingest outcome:   ${{ steps.build_ingest.outcome }}, digest: '${{ steps.build_ingest.outputs.digest }}'"
+        echo "build_query outcome:    ${{ steps.build_query.outcome }}, digest: '${{ steps.build_query.outputs.digest }}'"
+        echo "build_gateway outcome:  ${{ steps.build_gateway.outcome }}, digest: '${{ steps.build_gateway.outputs.digest }}'"
+        echo "build_embedding outcome:${{ steps.build_embedding.outcome }}, digest: '${{ steps.build_embedding.outputs.digest }}'"
+        echo "build_docproc outcome:  ${{ steps.build_docproc.outcome }}, digest: '${{ steps.build_docproc.outputs.digest }}'"
+        echo "build_reranker outcome: ${{ steps.build_reranker.outcome }}, digest: '${{ steps.build_reranker.outputs.digest }}'"
+        echo "::endgroup::"
+        echo "::group::Job Outputs Evaluation"
+        echo "Output ingest_built:   ${{ steps.build_ingest.outputs.digest != '' && steps.build_ingest.outcome == 'success' }}"
+        echo "Output query_built:    ${{ steps.build_query.outputs.digest != '' && steps.build_query.outcome == 'success' }}"
+        echo "Output gateway_built:  ${{ steps.build_gateway.outputs.digest != '' && steps.build_gateway.outcome == 'success' }}"
+        echo "Output embedding_built:${{ steps.build_embedding.outputs.digest != '' && steps.build_embedding.outcome == 'success' }}"
+        echo "Output docproc_built:  ${{ steps.build_docproc.outputs.digest != '' && steps.build_docproc.outcome == 'success' }}"
+        echo "Output reranker_built: ${{ steps.build_reranker.outputs.digest != '' && steps.build_reranker.outcome == 'success' }}"
+        echo "Image Tag: ${{ steps.image_tag_common.outputs.image_tag }}"
+        echo "::endgroup::"
+
+  update-manifests:
+    needs: build-push
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'push' &&
+      (needs.build-push.outputs.ingest_built   == 'true' ||
+       needs.build-push.outputs.query_built    == 'true' ||
+       needs.build-push.outputs.gateway_built  == 'true' ||
+       needs.build-push.outputs.embedding_built== 'true' ||
+       needs.build-push.outputs.docproc_built  == 'true' ||
+       needs.build-push.outputs.reranker_built == 'true')
+
+    steps:
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: Debug Update Manifests Job Trigger
+        run: |
+          echo "::group::Debug Information for update-manifests job trigger"
+          echo "Job triggered because at least one service was built."
+          echo "needs.build-push.outputs.ingest_built: ${{ needs.build-push.outputs.ingest_built }}"
+          echo "needs.build-push.outputs.query_built: ${{ needs.build-push.outputs.query_built }}"
+          echo "needs.build-push.outputs.gateway_built: ${{ needs.build-push.outputs.gateway_built }}"
+          echo "needs.build-push.outputs.embedding_built: ${{ needs.build-push.outputs.embedding_built }}"
+          echo "needs.build-push.outputs.docproc_built: ${{ needs.build-push.outputs.docproc_built }}"
+          echo "needs.build-push.outputs.reranker_built: ${{ needs.build-push.outputs.reranker_built }}"
+          echo "needs.build-push.outputs.image_tag: ${{ needs.build-push.outputs.image_tag }}"
+          echo "::endgroup::"
+
+      - name: Checkout Manifests Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.MANIFEST_REPO_OWNER }}/${{ env.MANIFEST_REPO_NAME }}
+          ref: ${{ env.MANIFEST_REPO_BRANCH }}
+          token: ${{ secrets.MANIFEST_PAT }} # LLM: Ensure this PAT has write permissions to the manifest repo
+          path: manifests-repo
+
+      - name: Update Manifest Files Conditionally
+        id: update_manifest_files
+        env:
+          INGEST_BUILT: ${{ needs.build-push.outputs.ingest_built }}
+          QUERY_BUILT: ${{ needs.build-push.outputs.query_built }}
+          GATEWAY_BUILT: ${{ needs.build-push.outputs.gateway_built }}
+          EMBEDDING_BUILT: ${{ needs.build-push.outputs.embedding_built }}
+          DOCPROC_BUILT: ${{ needs.build-push.outputs.docproc_built }}
+          RERANKER_BUILT: ${{ needs.build-push.outputs.reranker_built }}
+          COMMON_TAG: ${{ needs.build-push.outputs.image_tag }}
+          INGEST_MANIFEST_PATH_API_REL: ${{ env.INGEST_SERVICE_DIR }}/deployment-api.yaml
+          INGEST_MANIFEST_PATH_WORKER_REL: ${{ env.INGEST_SERVICE_DIR }}/deployment-worker.yaml
+          QUERY_MANIFEST_PATH_REL: ${{ env.QUERY_SERVICE_DIR }}/deployment.yaml
+          GATEWAY_MANIFEST_PATH_REL: ${{ env.GATEWAY_SERVICE_DIR }}/deployment.yaml
+          EMBEDDING_MANIFEST_PATH_REL: ${{ env.EMBEDDING_SERVICE_DIR }}/deployment.yaml
+          DOCPROC_MANIFEST_PATH_REL: ${{ env.DOCPROC_SERVICE_DIR }}/deployment.yaml
+          RERANKER_MANIFEST_PATH_REL: ${{ env.RERANKER_SERVICE_DIR }}/deployment.yaml
+          INGEST_IMAGE_NAME_BASE: ${{ env.INGEST_IMAGE_NAME }}
+          QUERY_IMAGE_NAME_BASE: ${{ env.QUERY_IMAGE_NAME }}
+          GATEWAY_IMAGE_NAME_BASE: ${{ env.GATEWAY_IMAGE_NAME }}
+          EMBEDDING_IMAGE_NAME_BASE: ${{ env.EMBEDDING_IMAGE_NAME }}
+          DOCPROC_IMAGE_NAME_BASE: ${{ env.DOCPROC_IMAGE_NAME }}
+          RERANKER_IMAGE_NAME_BASE: ${{ env.RERANKER_IMAGE_NAME }}
+        run: |
+          cd manifests-repo
+          if [ -z "$COMMON_TAG" ]; then
+            echo "::error::COMMON_TAG is empty in update_manifest_files step. Aborting."
+            exit 1
+          fi
+
+          update_single_manifest() {
+            local SERVICE_DISPLAY_NAME="$1"
+            local BUILT_FLAG="$2"
+            local IMAGE_BASE_NAME_ENV_VAR_SUFFIX="$3"
+            local MANIFEST_PATH_REL="$4"
+            
+            local IMAGE_BASE_NAME_VAR_NAME="${IMAGE_BASE_NAME_ENV_VAR_SUFFIX}_IMAGE_NAME_BASE"
+            local IMAGE_BASE_NAME="${!IMAGE_BASE_NAME_VAR_NAME}"
+
+            local K8S_CONTAINER_NAME
+            # --- START CORRECTION ---
+            # Determine the correct container name based on the specific service display name
+            if [[ "$SERVICE_DISPLAY_NAME" == "Ingest API" ]]; then
+                K8S_CONTAINER_NAME="ingest-api" 
+            elif [[ "$SERVICE_DISPLAY_NAME" == "Ingest Worker" ]]; then
+                 K8S_CONTAINER_NAME="ingest-worker"
+            else
+                # Fallback/default logic for other services (assuming display name matches k8s name structure)
+                K8S_CONTAINER_NAME=$(echo "$SERVICE_DISPLAY_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/ /-/g')
+            fi
+            # --- END CORRECTION ---
+
+            if [ "$BUILT_FLAG" = "true" ]; then
+              TARGET_IMAGE="${IMAGE_BASE_NAME}:${COMMON_TAG}"
+              echo "Attempting to update $SERVICE_DISPLAY_NAME (container: $K8S_CONTAINER_NAME) image to: $TARGET_IMAGE in $MANIFEST_PATH_REL"
+              if [ -f "$MANIFEST_PATH_REL" ]; then
+                # Attempt update using the determined container name
+                if yq -i '(.spec.template.spec.containers[] | select(.name == "'"$K8S_CONTAINER_NAME"'") ).image = "'"$TARGET_IMAGE"'"' "$MANIFEST_PATH_REL"; then
+                  # Check if the command actually modified the file (yq might exit 0 even if no match)
+                  if ! git diff --quiet "$MANIFEST_PATH_REL"; then
+                     echo "Successfully updated image for container '$K8S_CONTAINER_NAME' in $MANIFEST_PATH_REL"
+                  else
+                     echo "::warning::yq command executed for container '$K8S_CONTAINER_NAME' in $MANIFEST_PATH_REL but the file content did not change. Check yq expression or file structure."
+                     # Attempting fallback just in case the name logic was correct but yq failed silently before
+                     if yq -i '(.spec.template.spec.containers[0].image) = "'"$TARGET_IMAGE"'"' "$MANIFEST_PATH_REL"; then
+                        if ! git diff --quiet "$MANIFEST_PATH_REL"; then
+                           echo "Successfully updated image for the first container in $MANIFEST_PATH_REL as fallback."
+                        else
+                           echo "::error::Fallback yq command executed for $MANIFEST_PATH_REL but the file content did not change."
+                        fi
+                     else
+                        echo "::error::Fallback yq command failed for $MANIFEST_PATH_REL for $SERVICE_DISPLAY_NAME."
+                     fi
+                  fi
+                else
+                  # The yq command itself failed (non-zero exit code)
+                  echo "::warning::Could not update image for container '$K8S_CONTAINER_NAME' by name in $MANIFEST_PATH_REL (yq command failed). Attempting to update the first container as fallback."
+                  if yq -i '(.spec.template.spec.containers[0].image) = "'"$TARGET_IMAGE"'"' "$MANIFEST_PATH_REL"; then
+                     if ! git diff --quiet "$MANIFEST_PATH_REL"; then
+                        echo "Successfully updated image for the first container in $MANIFEST_PATH_REL as fallback."
+                     else
+                        echo "::error::Fallback yq command executed for $MANIFEST_PATH_REL but the file content did not change."
+                     fi
+                  else
+                     echo "::error::Failed to update image in $MANIFEST_PATH_REL for $SERVICE_DISPLAY_NAME using yq (both by name and fallback failed)."
+                  fi
+                fi
+              else
+                echo "::error::$SERVICE_DISPLAY_NAME manifest file '$MANIFEST_PATH_REL' not found!"
+              fi
+            fi
+          }
+          
+          # Call the function with the correct display names
+          update_single_manifest "Ingest API"        "$INGEST_BUILT"   "INGEST"    "$INGEST_MANIFEST_PATH_API_REL"
+          # Check if worker manifest path is defined and exists before calling update
+          if [ -n "$INGEST_MANIFEST_PATH_WORKER_REL" ] && [ -f "$INGEST_MANIFEST_PATH_WORKER_REL" ]; then
+            update_single_manifest "Ingest Worker"     "$INGEST_BUILT"   "INGEST"    "$INGEST_MANIFEST_PATH_WORKER_REL"
+          elif [ "$INGEST_BUILT" = "true" ]; then
+             echo "::warning::Ingest service was built, but worker manifest '$INGEST_MANIFEST_PATH_WORKER_REL' not found or path is empty."
+          fi
+          update_single_manifest "Query Service"     "$QUERY_BUILT"    "QUERY"     "$QUERY_MANIFEST_PATH_REL"
+          update_single_manifest "API Gateway"       "$GATEWAY_BUILT"  "GATEWAY"   "$GATEWAY_MANIFEST_PATH_REL"
+          update_single_manifest "Embedding Service" "$EMBEDDING_BUILT" "EMBEDDING" "$EMBEDDING_MANIFEST_PATH_REL"
+          update_single_manifest "DocProc Service"   "$DOCPROC_BUILT"  "DOCPROC"   "$DOCPROC_MANIFEST_PATH_REL"
+          update_single_manifest "Reranker Service"  "$RERANKER_BUILT" "RERANKER"  "$RERANKER_MANIFEST_PATH_REL"
+          
+          # Stage all potential changes before diffing
+          git add .
+          
+          # Check if any files were actually modified and staged
+          if git diff --staged --quiet; then
+            echo "No manifest files were modified."
+            echo "manifest_actually_changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "Manifest files were modified."
+            echo "manifest_actually_changed=true" >> $GITHUB_OUTPUT
+            # Optional: Show which files changed
+            echo "Modified files:"
+            git diff --staged --name-only
+          fi
+
+      - name: Commit and Push Manifest Changes
+        if: steps.update_manifest_files.outputs.manifest_actually_changed == 'true'
+        env:
+          IMAGE_TAG_FOR_COMMIT: ${{ needs.build-push.outputs.image_tag }}
+        run: |
+          cd manifests-repo
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          COMMIT_MSG="Update service image(s) to tag $IMAGE_TAG_FOR_COMMIT [CI]"
+          echo "Committing changes with message: $COMMIT_MSG"
+          git commit -m "$COMMIT_MSG"
+          echo "Pushing changes to branch ${{ env.MANIFEST_REPO_BRANCH }}..."
+          if git push origin ${{ env.MANIFEST_REPO_BRANCH }}; then
+              echo "Push successful."
+          else
+              echo "::error::Push failed. Check PAT permissions (${{ secrets.MANIFEST_PAT != '' }}) and branch protection rules for '${{ env.MANIFEST_REPO_BRANCH }}' in repo '${{ env.MANIFEST_REPO_OWNER }}/${{ env.MANIFEST_REPO_NAME }}'."
+              exit 1
+          fi
