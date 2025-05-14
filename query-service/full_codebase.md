@@ -2027,6 +2027,15 @@ class RespuestaEstructurada(BaseModel):
     siguiente_pregunta_sugerida: Optional[str] = Field(None, description="Una pregunta de seguimiento relevante que el usuario podría hacer, si aplica.")
     
     model_config = ConfigDict(extra='ignore') 
+
+class SparseSearchResultItem(BaseModel):
+    """
+    Representa un ítem de resultado de búsqueda dispersa devuelto por el sparse-search-service.
+    Este modelo se utiliza en el query-service para tipar la respuesta del cliente
+    de dicho servicio.
+    """
+    chunk_id: str = Field(..., description="El ID del chunk (usualmente el embedding_id de la tabla document_chunks).")
+    score: float = Field(..., description="El score BM25 asignado al chunk.")
 ```
 
 ## File: `app\infrastructure\__init__.py`

@@ -2018,6 +2018,8 @@ if __name__ == "__main__":
         reload=True, 
         log_level=log_level_str
     )
+
+# JFU 2
 ```
 
 ## File: `pyproject.toml`
@@ -2038,7 +2040,7 @@ pydantic = {extras = ["email"], version = "^2.6.4"}
 pydantic-settings = "^2.2.1"
 structlog = "^24.1.0"
 asyncpg = "^0.29.0"
-bm2s = "^0.3.2"
+rank_bm25 = "^0.2.2"
 tenacity = "^8.2.3"
 numpy = "1.26.4"
 google-cloud-storage = "^2.16.0" 
