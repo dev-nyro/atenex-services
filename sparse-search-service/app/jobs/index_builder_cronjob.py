@@ -7,12 +7,15 @@ import tempfile
 import uuid
 from pathlib import Path
 import sys
+import pickle # Para serializar
 
 try:
-    import bm2s
+    # LLM: CORRECTION - Importar de rank_bm25
+    from rank_bm25 import BM25Okapi, BM25Plus
 except ImportError:
-    bm2s = None
-    print("ERROR: bm2s library not found. Please install it: poetry add bm2s", file=sys.stderr)
+    BM25Okapi = None
+    BM25Plus = None
+    print("ERROR: rank_bm25 library not found. Please install it: poetry add rank_bm25", file=sys.stderr)
     sys.exit(1)
 
 import structlog
@@ -28,7 +31,10 @@ from app.core.logging_config import setup_logging as app_setup_logging
 from app.infrastructure.persistence.postgres_repositories import PostgresChunkContentRepository
 from app.infrastructure.persistence import postgres_connector
 from app.infrastructure.storage.gcs_index_storage_adapter import GCSIndexStorageAdapter, GCSIndexStorageError
-from app.infrastructure.sparse_retrieval.bm25_adapter import BM25Adapter 
+from app.infrastructure.sparse_retrieval.bm25_adapter import BM25Adapter # Sigue siendo útil para dump/load
+
+# LLM: CORRECTION - Usar la implementación definida en bm25_adapter o una aquí
+BM25_IMPLEMENTATION_FOR_BUILDER = BM25Okapi 
 
 app_setup_logging() 
 log = structlog.get_logger("index_builder_cronjob")
@@ -62,30 +68,38 @@ async def build_and_upload_index_for_company(
         builder_log.warning("No processable chunks found for company. Skipping index build.")
         return
 
-    corpus_texts = [chunk['content'] for chunk in chunks_data if chunk.get('content','').strip()]
+    corpus_texts_full = [chunk['content'] for chunk in chunks_data if chunk.get('content','').strip()]
+    # LLM: CORRECTION - Tokenizar el corpus para rank_bm25
+    corpus_texts_tokenized = [text.lower().split() for text in corpus_texts_full]
     id_map = [chunk['id'] for chunk in chunks_data if chunk.get('content','').strip()] 
 
-    if not corpus_texts:
-        builder_log.warning("Corpus is empty after filtering content. Skipping index build.")
+    if not corpus_texts_tokenized: # LLM: CORRECTION - Verificar corpus tokenizado
+        builder_log.warning("Corpus is empty after filtering and tokenizing content. Skipping index build.")
         return
 
-    builder_log.info(f"Building BM25 index for {len(corpus_texts)} chunks...")
+    builder_log.info(f"Building BM25 index for {len(corpus_texts_tokenized)} chunks...")
     try:
-        retriever = bm2s.BM25() 
-        retriever.index(corpus_texts)
-        builder_log.info("BM25 index built successfully.")
-    except Exception as e_bm2s_index:
+        # LLM: CORRECTION - Instanciar y usar rank_bm25
+        if not BM25_IMPLEMENTATION_FOR_BUILDER:
+            raise RuntimeError("rank_bm25 is not available for building index.")
+        
+        # BM25Okapi(corpus_tokenizado)
+        retriever = BM25_IMPLEMENTATION_FOR_BUILDER(corpus_texts_tokenized)
+        # El método .index() no existe en rank_bm25 de la misma forma. La indexación ocurre al instanciar.
+        builder_log.info(f"BM25 index ({BM25_IMPLEMENTATION_FOR_BUILDER.__name__}) built successfully.")
+    except Exception as e_bm25_index:
         builder_log.exception("Error during BM25 index building.")
         return
 
 
     with tempfile.TemporaryDirectory(prefix=f"bm25_build_{company_id_str}_") as tmpdir_str:
         tmpdir = Path(tmpdir_str)
-        bm2s_file_path = tmpdir / "bm25_index.bm2s"
+        bm2s_file_path = tmpdir / "bm25_index.bm2s" # El nombre del archivo puede mantenerse por consistencia
         id_map_file_path = tmpdir / "id_map.json"
 
         builder_log.debug("Dumping BM25 index to temporary file.", file_path=str(bm2s_file_path))
         try:
+            # LLM: CORRECTION - BM25Adapter ahora usa pickle, y su método estático es útil aquí
             BM25Adapter.dump_bm2s_to_file(retriever, str(bm2s_file_path))
         except Exception as e_dump:
             builder_log.exception("Failed to dump BM25 index.")
@@ -111,7 +125,7 @@ async def build_and_upload_index_for_company(
 async def get_all_active_company_ids(repo: PostgresChunkContentRepository) -> List[uuid.UUID]:
     fetch_log = log.bind(job_action="fetch_active_companies")
     fetch_log.info("Fetching active company IDs from database...")
-    query = "SELECT DISTINCT company_id FROM documents WHERE status = 'processed';" # Asumiendo que esto es suficiente
+    query = "SELECT DISTINCT company_id FROM documents WHERE status = 'processed';" 
     pool = await postgres_connector.get_db_pool()
     conn = None
     try:
@@ -131,6 +145,11 @@ async def get_all_active_company_ids(repo: PostgresChunkContentRepository) -> Li
 async def main_builder_logic(target_company_id_str: Optional[str]):
     log.info("Index Builder CronJob starting...", target_company=target_company_id_str or "ALL")
     
+    # LLM: CORRECTION - Verificar si la librería está disponible
+    if not BM25Okapi and not BM25Plus: # Si ninguna implementación está disponible
+        log.critical("rank_bm25 library or its classes (BM25Okapi, BM25Plus) are not available. Index builder cannot run.")
+        return
+
     await postgres_connector.get_db_pool() 
     repo = PostgresChunkContentRepository()
     
@@ -162,8 +181,9 @@ async def main_builder_logic(target_company_id_str: Optional[str]):
     log.info("Index Builder CronJob finished.")
 
 if __name__ == "__main__":
-    if not bm2s: 
-        print("FATAL: bm2s library is required but not found.", file=sys.stderr)
+    # LLM: CORRECTION - Verificar disponibilidad antes de parsear args
+    if not BM25Okapi and not BM25Plus:
+        print("FATAL: rank_bm25 library (BM25Okapi or BM25Plus) is required but not found.", file=sys.stderr)
         sys.exit(1)
 
     parser = argparse.ArgumentParser(description="BM25 Index Builder for Sparse Search Service.")

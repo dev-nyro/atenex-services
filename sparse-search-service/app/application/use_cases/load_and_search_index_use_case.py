@@ -12,10 +12,11 @@ from app.application.ports.sparse_search_port import SparseSearchPort
 from app.infrastructure.cache.index_lru_cache import IndexLRUCache, CachedIndexData
 from app.infrastructure.sparse_retrieval.bm25_adapter import BM25Adapter 
 
-try:
-    import bm2s
-except ImportError:
-    bm2s = None
+# LLM: REMOVED - No es necesario importar bm2s aquí
+# try:
+#     import bm2s
+# except ImportError:
+#     bm2s = None
 
 log = structlog.get_logger(__name__)
 
@@ -68,6 +69,7 @@ class LoadAndSearchIndexUseCase:
                 local_id_map_path = Path(local_id_map_path_str)
                 try:
                     use_case_log.debug("Loading BM25 instance from local file...", file_path=str(local_bm2s_path))
+                    # LLM: La carga ahora es manejada por el adapter
                     bm25_instance = BM25Adapter.load_bm2s_from_file(str(local_bm2s_path))
                     
                     use_case_log.debug("Loading ID map from local JSON file...", file_path=str(local_id_map_path))
@@ -92,7 +94,7 @@ class LoadAndSearchIndexUseCase:
                         if local_bm2s_path.exists(): local_bm2s_path.unlink()
                         if local_id_map_path.exists(): local_id_map_path.unlink()
                         temp_dir = local_bm2s_path.parent
-                        if temp_dir.is_dir() and not any(temp_dir.iterdir()):
+                        if temp_dir.is_dir() and not any(temp_dir.iterdir()): # Solo borrar si está vacío
                             temp_dir.rmdir()
                     except OSError as e_clean:
                         use_case_log.error("Error cleaning up temporary index files.", error=str(e_clean))
@@ -106,12 +108,13 @@ class LoadAndSearchIndexUseCase:
 
         use_case_log.debug("Performing search with loaded BM25 instance and ID map...")
         try:
+            # LLM: El adapter ahora espera la instancia bm25 y el id_map
             search_results: List[SparseSearchResultItem] = await self.sparse_search_engine.search(
                 query=query,
                 bm25_instance=bm25_instance,
                 id_map=id_map,
                 top_k=top_k,
-                company_id=company_id # Pasar company_id para logging interno en el adapter
+                company_id=company_id 
             )
             use_case_log.info(f"Search executed. Found {len(search_results)} results.")
             return search_results
