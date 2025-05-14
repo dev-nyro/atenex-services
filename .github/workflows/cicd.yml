@@ -135,10 +135,6 @@ jobs:
         if [[ "${{ steps.diff_check.outputs.run_changed_files_action }}" == 'true' && "${{ steps.changed_files_for_service.outputs.any_changed }}" == 'true' ]]; then
           NEEDS_BUILD="true"
         elif [[ "${{ steps.diff_check.outputs.run_changed_files_action }}" == 'true' && -z "${{ steps.diff_check.outputs.base_sha_for_action }}" ]]; then
-          # This handles the first push to a new branch where base_sha is empty, tj-actions should list all files as changed.
-          # If changed_files_for_service.outputs.any_changed is true, the first condition already covers it.
-          # This is more of a safeguard specific to the "first push" scenario.
-          # For sparse-search-service, it means it will be built if its files changed or it's a new branch push.
           if [[ "${{ steps.changed_files_for_service.outputs.any_changed }}" == 'true' ]]; then
              NEEDS_BUILD="true"
           fi
@@ -228,7 +224,6 @@ jobs:
           exit 1
         fi
         TARGET_IMAGE_WITH_TAG="${FULL_IMAGE_NAME_BASE}:${NEW_IMAGE_TAG}"
-        ANY_FILE_CHANGED_THIS_SERVICE="false"
 
         echo "Manifest configs JSON for ${{ matrix.service.name }}: ${MANIFEST_CONFIGS_JSON_STRING}"
         echo "Target image with tag for ${{ matrix.service.name }}: ${TARGET_IMAGE_WITH_TAG}"
@@ -238,7 +233,6 @@ jobs:
 
           if [ ! -f "${manifest_file_rel_path}" ]; then
             echo "::error::Manifest file '${manifest_file_rel_path}' not found in manifest repo for service ${{ matrix.service.name }}!"
-            # Continue to allow other manifest updates for the same service if defined, though typically one config error is enough.
             continue
           fi
 
@@ -251,7 +245,6 @@ jobs:
             if [[ "${original_content}" != "${updated_content}" ]]; then
               echo "Successfully updated image for container '${k8s_container_name}' in ${manifest_file_rel_path}"
               git add "${manifest_file_rel_path}"
-              ANY_FILE_CHANGED_THIS_SERVICE="true"
             else
               echo "::warning::yq command for container '${k8s_container_name}' in ${manifest_file_rel_path} (service: ${{ matrix.service.name }}) executed but the file content did not change. Image might be already up-to-date or yq expression found no match (e.g. wrong container name: '${k8s_container_name}')."
             fi
@@ -260,11 +253,14 @@ jobs:
           fi
         done
 
-        if [ "$ANY_FILE_CHANGED_THIS_SERVICE" = "true" ]; then
-          echo "Manifest file(s) were modified for ${{ matrix.service.name }}."
+        # Check if git has any staged changes
+        if ! git diff --staged --quiet; then
+          echo "Manifest file(s) were modified and staged for ${{ matrix.service.name }}."
           echo "manifest_actually_changed=true" >> $GITHUB_OUTPUT
+          echo "Staged files:"
+          git diff --staged --name-only
         else
-          echo "No manifest files were modified by this update for ${{ matrix.service.name }}."
+          echo "No manifest files were modified or staged by this update for ${{ matrix.service.name }}."
           echo "manifest_actually_changed=false" >> $GITHUB_OUTPUT
         fi
 
@@ -278,18 +274,17 @@ jobs:
         git config --global user.email 'github-actions[bot]@users.noreply.github.com'
         COMMIT_MSG="Update ${{ matrix.service.name }} image to tag $IMAGE_TAG_FOR_COMMIT [CI]"
         echo "Committing changes with message: $COMMIT_MSG"
-        # git status # Optional: to see what's staged
         git commit -m "$COMMIT_MSG"
         echo "Pushing changes to branch ${{ env.MANIFEST_REPO_BRANCH }}..."
         if git push origin ${{ env.MANIFEST_REPO_BRANCH }}; then
             echo "Push successful for ${{ matrix.service.name }}."
         else
             echo "::error::Push failed for ${{ matrix.service.name }}. Check PAT permissions and branch protection rules for '${{ env.MANIFEST_REPO_BRANCH }}' in repo '${{ env.MANIFEST_REPO_OWNER }}/${{ env.MANIFEST_REPO_NAME }}'."
-            exit 1 # Fail the step
+            exit 1
         fi
 
     - name: Debug Job Information for ${{ matrix.service.name }}
-      if: always() # Run even if previous steps fail, to help debug
+      if: always()
       shell: bash
       run: |
         echo "::group::Debug Information for ${{ matrix.service.name }}"
