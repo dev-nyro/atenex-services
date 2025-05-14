@@ -1694,7 +1694,7 @@ import asyncio
 import json
 import uuid 
 from contextlib import asynccontextmanager
-from typing import Optional, Dict # Agregado Dict
+from typing import Optional, Dict 
 
 from app.core.config import settings 
 from app.core.logging_config import setup_logging
@@ -1776,7 +1776,6 @@ async def lifespan(app: FastAPI):
                  main_log.warning("BM25 engine (bm2s library) not available. Search functionality will be impaired/unavailable.")
             main_log.info("BM25Adapter (SparseSearchPort) initialized.")
         except Exception as e_bm25:
-            # This is not necessarily critical to stop startup if GCS part works, but good to log
             main_log.error(f"Failed to initialize BM25Adapter: {e_bm25}", error_details=str(e_bm25), exc_info=True)
             bm25_engine = None 
         
@@ -1790,7 +1789,7 @@ async def lifespan(app: FastAPI):
             main_log.error(f"Failed to initialize IndexLRUCache: {e_cache}", error_details=str(e_cache), exc_info=True)
             index_cache = None 
 
-        if db_pool_ok and gcs_adapter and bm25_engine and index_cache:
+        if db_pool_ok and gcs_adapter is not None and bm25_engine is not None and index_cache is not None:
             try:
                 load_search_uc = LoadAndSearchIndexUseCase(
                     index_cache=index_cache,
@@ -1806,7 +1805,7 @@ async def lifespan(app: FastAPI):
         else:
             main_log.warning("Not all components ready for LoadAndSearchIndexUseCase instantiation.",
                              db_ok=db_pool_ok, gcs_ok=bool(gcs_adapter), 
-                             bm25_ok=bool(bm25_engine), cache_ok=bool(index_cache))
+                             bm25_ok=bool(bm25_engine), cache_ok=(index_cache is not None))
             service_ready_final = False 
 
     set_global_dependencies(
