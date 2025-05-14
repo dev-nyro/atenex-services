@@ -1200,17 +1200,14 @@ import time
 import uuid
 from typing import List, Tuple, Dict, Any, Optional
 from pathlib import Path
-import pickle # Para serializar/deserializar el objeto BM25
+import pickle 
 
 
 try:
-    # LLM: CORRECTION - Importar la clase correcta desde rank_bm25
     from rank_bm25 import BM25Okapi, BM25Plus 
 except ImportError:
     BM25Okapi = None
     BM25Plus = None
-    # Podríamos elegir uno por defecto o hacerlo configurable si se quiere.
-    # Por simplicidad, usaremos BM25Okapi como default si ambos están disponibles.
 
 from app.application.ports.sparse_search_port import SparseSearchPort
 from app.domain.models import SparseSearchResultItem
@@ -1218,22 +1215,15 @@ from app.core.config import settings
 
 log = structlog.get_logger(__name__)
 
-# Podríamos hacer configurable qué implementación de BM25 usar
-# BM25_IMPLEMENTATION = BM25Plus # o BM25Okapi
-BM25_IMPLEMENTATION = BM25Okapi # Usar BM25Okapi por defecto, es común
+BM25_IMPLEMENTATION = BM25Okapi 
 
 class BM25Adapter(SparseSearchPort):
-    """
-    Implementación de SparseSearchPort usando la librería rank_bm25.
-    Esta versión espera un índice BM25 pre-cargado.
-    """
-
     def __init__(self):
         self._bm25_available = False
-        # LLM: CORRECTION - Verificar la disponibilidad de la clase importada
         if BM25_IMPLEMENTATION is None:
             log.error(
-                "rank_bm25 library not installed or BM25Okapi/BM25Plus not found. BM25 search functionality will be UNAVAILABLE. "
+                # LLM: CORRECTION - Mensaje de log
+                "rank_bm25 library not installed or its classes (BM25Okapi/BM25Plus) not found. BM25 search functionality will be UNAVAILABLE. "
                 "Install with: poetry add rank_bm25"
             )
         else:
@@ -1242,7 +1232,7 @@ class BM25Adapter(SparseSearchPort):
 
     async def initialize_engine(self) -> None:
         if not self._bm25_available:
-            log.warning("BM25 engine (rank_bm25 library) not available. Search will fail if attempted.")
+            log.warning(f"BM25 engine (rank_bm25 library - {BM25_IMPLEMENTATION.__name__ if BM25_IMPLEMENTATION else 'N/A'}) not available. Search will fail if attempted.")
         else:
             log.info(f"BM25 engine (rank_bm25 library - {BM25_IMPLEMENTATION.__name__}) available and ready.")
 
@@ -1252,7 +1242,6 @@ class BM25Adapter(SparseSearchPort):
     @staticmethod
     def load_bm2s_from_file(file_path: str) -> Any: 
         load_log = log.bind(action="load_bm25_from_file", file_path=file_path)
-        # LLM: CORRECTION - Usar pickle para cargar el objeto
         if not BM25_IMPLEMENTATION:
             load_log.error("rank_bm25 library not available, cannot load index.")
             raise RuntimeError("rank_bm25 library is not installed.")
@@ -1260,7 +1249,6 @@ class BM25Adapter(SparseSearchPort):
             with open(file_path, 'rb') as f:
                 loaded_retriever = pickle.load(f)
             
-            # LLM: CORRECTION - Validar que el objeto cargado es de la clase esperada
             if not isinstance(loaded_retriever, BM25_IMPLEMENTATION):
                 load_log.error(f"Loaded object is not of type {BM25_IMPLEMENTATION.__name__}", loaded_type=type(loaded_retriever).__name__)
                 raise TypeError(f"Expected {BM25_IMPLEMENTATION.__name__}, got {type(loaded_retriever).__name__}")
@@ -1277,11 +1265,10 @@ class BM25Adapter(SparseSearchPort):
     @staticmethod
     def dump_bm2s_to_file(instance: Any, file_path: str): 
         dump_log = log.bind(action="dump_bm25_to_file", file_path=file_path)
-        # LLM: CORRECTION - Usar pickle para guardar el objeto
         if not BM25_IMPLEMENTATION:
             dump_log.error("rank_bm25 library not available, cannot dump index.")
             raise RuntimeError("rank_bm25 library is not installed.")
-        if not isinstance(instance, BM25_IMPLEMENTATION): # LLM: CORRECTION
+        if not isinstance(instance, BM25_IMPLEMENTATION): 
             dump_log.error(f"Invalid instance type provided for dumping. Expected {BM25_IMPLEMENTATION.__name__}", instance_type=type(instance).__name__)
             raise TypeError(f"Instance to dump must be a {BM25_IMPLEMENTATION.__name__} object.")
         try:
@@ -1309,11 +1296,10 @@ class BM25Adapter(SparseSearchPort):
             top_k=top_k
         )
 
-        if not self._bm25_available:
+        if not self._bm2s_available:
             adapter_log.error("rank_bm25 library not available. Cannot perform BM25 search.")
             return []
         
-        # LLM: CORRECTION - Verificar el tipo de instancia
         if not bm25_instance or not isinstance(bm25_instance, BM25_IMPLEMENTATION):
             adapter_log.error(f"Invalid or no BM25 instance provided. Expected {BM25_IMPLEMENTATION.__name__}, got {type(bm25_instance).__name__}")
             return []
@@ -1330,23 +1316,15 @@ class BM25Adapter(SparseSearchPort):
         adapter_log.debug("Starting BM25 search with pre-loaded instance...")
 
         try:
-            tokenized_query = query.lower().split() # rank_bm25 espera tokens
-            # LLM: CORRECTION - Usar el método get_top_n de rank_bm25
-            # El corpus para get_top_n debe ser el corpus original sobre el que se indexó.
-            # Sin embargo, el objeto bm25_instance ya está indexado.
-            # Necesitamos un "documento señuelo" para obtener los scores para los índices internos.
-            # La forma correcta es usar `get_scores` y luego mapear.
+            tokenized_query = query.lower().split() 
             
             doc_scores = bm25_instance.get_scores(tokenized_query)
             
-            # Obtener los top_k índices y scores
-            # Crear una lista de tuplas (score, index_original_en_id_map)
             scored_indices = []
             for i, score in enumerate(doc_scores):
-                if i < len(id_map): # Asegurar que el índice es válido para id_map
+                if i < len(id_map): 
                     scored_indices.append((score, i))
             
-            # Ordenar por score descendente
             scored_indices.sort(key=lambda x: x[0], reverse=True)
             
             top_n_results = scored_indices[:top_k]
