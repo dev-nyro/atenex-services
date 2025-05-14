@@ -1,7 +1,7 @@
 # sparse-search-service/app/application/ports/repository_ports.py
 import abc
 import uuid
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any # LLM: CORRECTION - Añadir Any
 
 class ChunkContentRepositoryPort(abc.ABC):
     """
@@ -32,7 +32,7 @@ class ChunkContentRepositoryPort(abc.ABC):
     @abc.abstractmethod
     async def get_chunks_with_metadata_by_company(
         self, company_id: uuid.UUID
-    ) -> List[Dict[str, Any]]:
+    ) -> List[Dict[str, Any]]: # El uso de Any aquí es correcto ahora
         """
         Obtiene una lista de chunks para una compañía, cada uno como un diccionario
         que incluye 'id' (el embedding_id/pk_id), 'content', y opcionalmente
