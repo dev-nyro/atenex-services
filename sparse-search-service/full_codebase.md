@@ -377,10 +377,11 @@ from app.application.ports.sparse_search_port import SparseSearchPort
 from app.infrastructure.cache.index_lru_cache import IndexLRUCache, CachedIndexData
 from app.infrastructure.sparse_retrieval.bm25_adapter import BM25Adapter 
 
-try:
-    import bm2s
-except ImportError:
-    bm2s = None
+# LLM: REMOVED - No es necesario importar bm2s aquí
+# try:
+#     import bm2s
+# except ImportError:
+#     bm2s = None
 
 log = structlog.get_logger(__name__)
 
@@ -433,6 +434,7 @@ class LoadAndSearchIndexUseCase:
                 local_id_map_path = Path(local_id_map_path_str)
                 try:
                     use_case_log.debug("Loading BM25 instance from local file...", file_path=str(local_bm2s_path))
+                    # LLM: La carga ahora es manejada por el adapter
                     bm25_instance = BM25Adapter.load_bm2s_from_file(str(local_bm2s_path))
                     
                     use_case_log.debug("Loading ID map from local JSON file...", file_path=str(local_id_map_path))
@@ -457,7 +459,7 @@ class LoadAndSearchIndexUseCase:
                         if local_bm2s_path.exists(): local_bm2s_path.unlink()
                         if local_id_map_path.exists(): local_id_map_path.unlink()
                         temp_dir = local_bm2s_path.parent
-                        if temp_dir.is_dir() and not any(temp_dir.iterdir()):
+                        if temp_dir.is_dir() and not any(temp_dir.iterdir()): # Solo borrar si está vacío
                             temp_dir.rmdir()
                     except OSError as e_clean:
                         use_case_log.error("Error cleaning up temporary index files.", error=str(e_clean))
@@ -471,12 +473,13 @@ class LoadAndSearchIndexUseCase:
 
         use_case_log.debug("Performing search with loaded BM25 instance and ID map...")
         try:
+            # LLM: El adapter ahora espera la instancia bm25 y el id_map
             search_results: List[SparseSearchResultItem] = await self.sparse_search_engine.search(
                 query=query,
                 bm25_instance=bm25_instance,
                 id_map=id_map,
                 top_k=top_k,
-                company_id=company_id # Pasar company_id para logging interno en el adapter
+                company_id=company_id 
             )
             use_case_log.info(f"Search executed. Found {len(search_results)} results.")
             return search_results
@@ -1197,12 +1200,17 @@ import time
 import uuid
 from typing import List, Tuple, Dict, Any, Optional
 from pathlib import Path
+import pickle # Para serializar/deserializar el objeto BM25
 
 
 try:
-    import bm2s
+    # LLM: CORRECTION - Importar la clase correcta desde rank_bm25
+    from rank_bm25 import BM25Okapi, BM25Plus 
 except ImportError:
-    bm2s = None 
+    BM25Okapi = None
+    BM25Plus = None
+    # Podríamos elegir uno por defecto o hacerlo configurable si se quiere.
+    # Por simplicidad, usaremos BM25Okapi como default si ambos están disponibles.
 
 from app.application.ports.sparse_search_port import SparseSearchPort
 from app.domain.models import SparseSearchResultItem
@@ -1210,58 +1218,76 @@ from app.core.config import settings
 
 log = structlog.get_logger(__name__)
 
+# Podríamos hacer configurable qué implementación de BM25 usar
+# BM25_IMPLEMENTATION = BM25Plus # o BM25Okapi
+BM25_IMPLEMENTATION = BM25Okapi # Usar BM25Okapi por defecto, es común
+
 class BM25Adapter(SparseSearchPort):
     """
-    Implementación de SparseSearchPort usando la librería bm2s.
+    Implementación de SparseSearchPort usando la librería rank_bm25.
     Esta versión espera un índice BM25 pre-cargado.
     """
 
     def __init__(self):
-        self._bm2s_available = False
-        if bm2s is None:
+        self._bm25_available = False
+        # LLM: CORRECTION - Verificar la disponibilidad de la clase importada
+        if BM25_IMPLEMENTATION is None:
             log.error(
-                "bm2s library not installed. BM25 search functionality will be UNAVAILABLE. "
-                "Install with: poetry add bm2s"
+                "rank_bm25 library not installed or BM25Okapi/BM25Plus not found. BM25 search functionality will be UNAVAILABLE. "
+                "Install with: poetry add rank_bm25"
             )
         else:
-            self._bm2s_available = True
-            log.info("BM25Adapter initialized. bm2s library is available.")
+            self._bm25_available = True
+            log.info(f"BM25Adapter initialized. rank_bm25 library ({BM25_IMPLEMENTATION.__name__}) is available.")
 
     async def initialize_engine(self) -> None:
-        if not self._bm2s_available:
-            log.warning("BM25 engine (bm2s library) not available. Search will fail if attempted.")
+        if not self._bm25_available:
+            log.warning("BM25 engine (rank_bm25 library) not available. Search will fail if attempted.")
         else:
-            log.info("BM25 engine (bm2s library) available and ready.")
+            log.info(f"BM25 engine (rank_bm25 library - {BM25_IMPLEMENTATION.__name__}) available and ready.")
 
     def is_available(self) -> bool:
-        return self._bm2s_available
+        return self._bm25_available
 
     @staticmethod
     def load_bm2s_from_file(file_path: str) -> Any: 
-        load_log = log.bind(action="load_bm2s_from_file", file_path=file_path)
-        if not bm2s:
-            load_log.error("bm2s library not available, cannot load index.")
-            raise RuntimeError("bm2s library is not installed.")
+        load_log = log.bind(action="load_bm25_from_file", file_path=file_path)
+        # LLM: CORRECTION - Usar pickle para cargar el objeto
+        if not BM25_IMPLEMENTATION:
+            load_log.error("rank_bm25 library not available, cannot load index.")
+            raise RuntimeError("rank_bm25 library is not installed.")
         try:
-            loaded_retriever = bm2s.BM25.load(file_path, anserini_path=None) 
-            load_log.info("BM25 index loaded successfully from file.")
+            with open(file_path, 'rb') as f:
+                loaded_retriever = pickle.load(f)
+            
+            # LLM: CORRECTION - Validar que el objeto cargado es de la clase esperada
+            if not isinstance(loaded_retriever, BM25_IMPLEMENTATION):
+                load_log.error(f"Loaded object is not of type {BM25_IMPLEMENTATION.__name__}", loaded_type=type(loaded_retriever).__name__)
+                raise TypeError(f"Expected {BM25_IMPLEMENTATION.__name__}, got {type(loaded_retriever).__name__}")
+
+            load_log.info(f"BM25 index ({BM25_IMPLEMENTATION.__name__}) loaded successfully from file.")
             return loaded_retriever
+        except FileNotFoundError:
+            load_log.error("BM25 index file not found.")
+            raise
         except Exception as e:
             load_log.exception("Failed to load BM25 index from file.")
             raise RuntimeError(f"Failed to load BM25 index from {file_path}: {e}") from e
 
     @staticmethod
     def dump_bm2s_to_file(instance: Any, file_path: str): 
-        dump_log = log.bind(action="dump_bm2s_to_file", file_path=file_path)
-        if not bm2s:
-            dump_log.error("bm2s library not available, cannot dump index.")
-            raise RuntimeError("bm2s library is not installed.")
-        if not isinstance(instance, bm2s.BM25):
-            dump_log.error("Invalid instance type provided for dumping.", instance_type=type(instance).__name__)
-            raise TypeError("Instance to dump must be a bm2s.BM25 object.")
+        dump_log = log.bind(action="dump_bm25_to_file", file_path=file_path)
+        # LLM: CORRECTION - Usar pickle para guardar el objeto
+        if not BM25_IMPLEMENTATION:
+            dump_log.error("rank_bm25 library not available, cannot dump index.")
+            raise RuntimeError("rank_bm25 library is not installed.")
+        if not isinstance(instance, BM25_IMPLEMENTATION): # LLM: CORRECTION
+            dump_log.error(f"Invalid instance type provided for dumping. Expected {BM25_IMPLEMENTATION.__name__}", instance_type=type(instance).__name__)
+            raise TypeError(f"Instance to dump must be a {BM25_IMPLEMENTATION.__name__} object.")
         try:
-            instance.dump(file_path)
-            dump_log.info("BM25 index dumped successfully to file.")
+            with open(file_path, 'wb') as f:
+                pickle.dump(instance, f)
+            dump_log.info(f"BM25 index ({BM25_IMPLEMENTATION.__name__}) dumped successfully to file.")
         except Exception as e:
             dump_log.exception("Failed to dump BM25 index to file.")
             raise RuntimeError(f"Failed to dump BM25 index to {file_path}: {e}") from e
@@ -1272,7 +1298,7 @@ class BM25Adapter(SparseSearchPort):
         bm25_instance: Any, 
         id_map: List[str],  
         top_k: int,
-        company_id: Optional[uuid.UUID] = None # Añadido para logging
+        company_id: Optional[uuid.UUID] = None 
     ) -> List[SparseSearchResultItem]:
         adapter_log = log.bind(
             adapter="BM25Adapter",
@@ -1283,12 +1309,13 @@ class BM25Adapter(SparseSearchPort):
             top_k=top_k
         )
 
-        if not self._bm2s_available:
-            adapter_log.error("bm2s library not available. Cannot perform BM25 search.")
+        if not self._bm25_available:
+            adapter_log.error("rank_bm25 library not available. Cannot perform BM25 search.")
             return []
         
-        if not bm25_instance or not isinstance(bm25_instance, bm2s.BM25):
-            adapter_log.error("Invalid or no BM25 instance provided for search.")
+        # LLM: CORRECTION - Verificar el tipo de instancia
+        if not bm25_instance or not isinstance(bm25_instance, BM25_IMPLEMENTATION):
+            adapter_log.error(f"Invalid or no BM25 instance provided. Expected {BM25_IMPLEMENTATION.__name__}, got {type(bm25_instance).__name__}")
             return []
 
         if not id_map:
@@ -1303,31 +1330,37 @@ class BM25Adapter(SparseSearchPort):
         adapter_log.debug("Starting BM25 search with pre-loaded instance...")
 
         try:
-            results_indices_per_query, results_scores_per_query = bm25_instance.retrieve(
-                query, 
-                k=top_k
-            )
+            tokenized_query = query.lower().split() # rank_bm25 espera tokens
+            # LLM: CORRECTION - Usar el método get_top_n de rank_bm25
+            # El corpus para get_top_n debe ser el corpus original sobre el que se indexó.
+            # Sin embargo, el objeto bm25_instance ya está indexado.
+            # Necesitamos un "documento señuelo" para obtener los scores para los índices internos.
+            # La forma correcta es usar `get_scores` y luego mapear.
             
-            doc_indices: List[int] = results_indices_per_query[0]
-            scores: List[float] = results_scores_per_query[0]
+            doc_scores = bm25_instance.get_scores(tokenized_query)
             
+            # Obtener los top_k índices y scores
+            # Crear una lista de tuplas (score, index_original_en_id_map)
+            scored_indices = []
+            for i, score in enumerate(doc_scores):
+                if i < len(id_map): # Asegurar que el índice es válido para id_map
+                    scored_indices.append((score, i))
+            
+            # Ordenar por score descendente
+            scored_indices.sort(key=lambda x: x[0], reverse=True)
+            
+            top_n_results = scored_indices[:top_k]
+
             retrieval_time_ms = (time.monotonic() - start_time) * 1000
-            adapter_log.debug(f"BM25s retrieval complete. Hits found: {len(doc_indices)}.",
+            adapter_log.debug(f"BM25 retrieval complete. Hits considered: {len(doc_scores)}, Top_k requested: {top_k}.",
                               duration_ms=round(retrieval_time_ms,2))
 
             final_results: List[SparseSearchResultItem] = []
-            for i, score_val in zip(doc_indices, scores):
-                if 0 <= i < len(id_map):
-                    original_chunk_id = id_map[i]
-                    final_results.append(
-                        SparseSearchResultItem(chunk_id=original_chunk_id, score=float(score_val))
-                    )
-                else:
-                    adapter_log.error(
-                        "BM25s returned index out of bounds for the provided id_map.",
-                        returned_index=i,
-                        id_map_size=len(id_map)
-                    )
+            for score_val, original_index in top_n_results:
+                original_chunk_id = id_map[original_index]
+                final_results.append(
+                    SparseSearchResultItem(chunk_id=original_chunk_id, score=float(score_val))
+                )
             
             adapter_log.info(
                 f"BM25 search finished. Returning {len(final_results)} results.",
@@ -1478,12 +1511,15 @@ import tempfile
 import uuid
 from pathlib import Path
 import sys
+import pickle # Para serializar
 
 try:
-    import bm2s
+    # LLM: CORRECTION - Importar de rank_bm25
+    from rank_bm25 import BM25Okapi, BM25Plus
 except ImportError:
-    bm2s = None
-    print("ERROR: bm2s library not found. Please install it: poetry add bm2s", file=sys.stderr)
+    BM25Okapi = None
+    BM25Plus = None
+    print("ERROR: rank_bm25 library not found. Please install it: poetry add rank_bm25", file=sys.stderr)
     sys.exit(1)
 
 import structlog
@@ -1499,7 +1535,10 @@ from app.core.logging_config import setup_logging as app_setup_logging
 from app.infrastructure.persistence.postgres_repositories import PostgresChunkContentRepository
 from app.infrastructure.persistence import postgres_connector
 from app.infrastructure.storage.gcs_index_storage_adapter import GCSIndexStorageAdapter, GCSIndexStorageError
-from app.infrastructure.sparse_retrieval.bm25_adapter import BM25Adapter 
+from app.infrastructure.sparse_retrieval.bm25_adapter import BM25Adapter # Sigue siendo útil para dump/load
+
+# LLM: CORRECTION - Usar la implementación definida en bm25_adapter o una aquí
+BM25_IMPLEMENTATION_FOR_BUILDER = BM25Okapi 
 
 app_setup_logging() 
 log = structlog.get_logger("index_builder_cronjob")
@@ -1533,30 +1572,38 @@ async def build_and_upload_index_for_company(
         builder_log.warning("No processable chunks found for company. Skipping index build.")
         return
 
-    corpus_texts = [chunk['content'] for chunk in chunks_data if chunk.get('content','').strip()]
+    corpus_texts_full = [chunk['content'] for chunk in chunks_data if chunk.get('content','').strip()]
+    # LLM: CORRECTION - Tokenizar el corpus para rank_bm25
+    corpus_texts_tokenized = [text.lower().split() for text in corpus_texts_full]
     id_map = [chunk['id'] for chunk in chunks_data if chunk.get('content','').strip()] 
 
-    if not corpus_texts:
-        builder_log.warning("Corpus is empty after filtering content. Skipping index build.")
+    if not corpus_texts_tokenized: # LLM: CORRECTION - Verificar corpus tokenizado
+        builder_log.warning("Corpus is empty after filtering and tokenizing content. Skipping index build.")
         return
 
-    builder_log.info(f"Building BM25 index for {len(corpus_texts)} chunks...")
+    builder_log.info(f"Building BM25 index for {len(corpus_texts_tokenized)} chunks...")
     try:
-        retriever = bm2s.BM25() 
-        retriever.index(corpus_texts)
-        builder_log.info("BM25 index built successfully.")
-    except Exception as e_bm2s_index:
+        # LLM: CORRECTION - Instanciar y usar rank_bm25
+        if not BM25_IMPLEMENTATION_FOR_BUILDER:
+            raise RuntimeError("rank_bm25 is not available for building index.")
+        
+        # BM25Okapi(corpus_tokenizado)
+        retriever = BM25_IMPLEMENTATION_FOR_BUILDER(corpus_texts_tokenized)
+        # El método .index() no existe en rank_bm25 de la misma forma. La indexación ocurre al instanciar.
+        builder_log.info(f"BM25 index ({BM25_IMPLEMENTATION_FOR_BUILDER.__name__}) built successfully.")
+    except Exception as e_bm25_index:
         builder_log.exception("Error during BM25 index building.")
         return
 
 
     with tempfile.TemporaryDirectory(prefix=f"bm25_build_{company_id_str}_") as tmpdir_str:
         tmpdir = Path(tmpdir_str)
-        bm2s_file_path = tmpdir / "bm25_index.bm2s"
+        bm2s_file_path = tmpdir / "bm25_index.bm2s" # El nombre del archivo puede mantenerse por consistencia
         id_map_file_path = tmpdir / "id_map.json"
 
         builder_log.debug("Dumping BM25 index to temporary file.", file_path=str(bm2s_file_path))
         try:
+            # LLM: CORRECTION - BM25Adapter ahora usa pickle, y su método estático es útil aquí
             BM25Adapter.dump_bm2s_to_file(retriever, str(bm2s_file_path))
         except Exception as e_dump:
             builder_log.exception("Failed to dump BM25 index.")
@@ -1582,7 +1629,7 @@ async def build_and_upload_index_for_company(
 async def get_all_active_company_ids(repo: PostgresChunkContentRepository) -> List[uuid.UUID]:
     fetch_log = log.bind(job_action="fetch_active_companies")
     fetch_log.info("Fetching active company IDs from database...")
-    query = "SELECT DISTINCT company_id FROM documents WHERE status = 'processed';" # Asumiendo que esto es suficiente
+    query = "SELECT DISTINCT company_id FROM documents WHERE status = 'processed';" 
     pool = await postgres_connector.get_db_pool()
     conn = None
     try:
@@ -1602,6 +1649,11 @@ async def get_all_active_company_ids(repo: PostgresChunkContentRepository) -> Li
 async def main_builder_logic(target_company_id_str: Optional[str]):
     log.info("Index Builder CronJob starting...", target_company=target_company_id_str or "ALL")
     
+    # LLM: CORRECTION - Verificar si la librería está disponible
+    if not BM25Okapi and not BM25Plus: # Si ninguna implementación está disponible
+        log.critical("rank_bm25 library or its classes (BM25Okapi, BM25Plus) are not available. Index builder cannot run.")
+        return
+
     await postgres_connector.get_db_pool() 
     repo = PostgresChunkContentRepository()
     
@@ -1633,8 +1685,9 @@ async def main_builder_logic(target_company_id_str: Optional[str]):
     log.info("Index Builder CronJob finished.")
 
 if __name__ == "__main__":
-    if not bm2s: 
-        print("FATAL: bm2s library is required but not found.", file=sys.stderr)
+    # LLM: CORRECTION - Verificar disponibilidad antes de parsear args
+    if not BM25Okapi and not BM25Plus:
+        print("FATAL: rank_bm25 library (BM25Okapi or BM25Plus) is required but not found.", file=sys.stderr)
         sys.exit(1)
 
     parser = argparse.ArgumentParser(description="BM25 Index Builder for Sparse Search Service.")
