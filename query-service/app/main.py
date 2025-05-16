@@ -27,7 +27,7 @@ from app.api.v1.endpoints import chat as chat_router_module
 from app.application.ports import (
     ChatRepositoryPort, LogRepositoryPort, VectorStorePort, LLMPort,
     SparseRetrieverPort, DiversityFilterPort, ChunkContentRepositoryPort,
-    EmbeddingPort # RerankerPort not directly used here anymore for local reranker
+    EmbeddingPort 
 )
 from app.infrastructure.persistence.postgres_repositories import (
     PostgresChatRepository, PostgresLogRepository, PostgresChunkContentRepository
@@ -56,9 +56,8 @@ log_repo_instance: Optional[LogRepositoryPort] = None
 chunk_content_repo_instance: Optional[ChunkContentRepositoryPort] = None
 vector_store_instance: Optional[VectorStorePort] = None
 llm_instance: Optional[LLMPort] = None
-# MODIFICADO: sparse_retriever_instance ahora puede ser RemoteSparseRetrieverAdapter
 sparse_retriever_instance: Optional[SparseRetrieverPort] = None
-sparse_search_service_client_instance: Optional[SparseSearchServiceClient] = None # NUEVO
+sparse_search_service_client_instance: Optional[SparseSearchServiceClient] = None 
 
 diversity_filter_instance: Optional[DiversityFilterPort] = None
 embedding_service_client_instance: Optional[EmbeddingServiceClient] = None
@@ -85,7 +84,7 @@ async def lifespan(app: FastAPI):
     try:
         http_client_instance = httpx.AsyncClient(
             timeout=settings.HTTP_CLIENT_TIMEOUT,
-            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20) # Sensible defaults
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20) 
         )
         log.info("Global HTTP client initialized.")
     except Exception as e_http_client:
@@ -103,7 +102,7 @@ async def lifespan(app: FastAPI):
                 log.info("PostgreSQL connection pool initialized and verified.")
                 chat_repo_instance = PostgresChatRepository()
                 log_repo_instance = PostgresLogRepository()
-                chunk_content_repo_instance = PostgresChunkContentRepository() # Necesario para fusión
+                chunk_content_repo_instance = PostgresChunkContentRepository() 
             else:
                 critical_failure_message = "Failed PostgreSQL connection verification during startup."
                 log.critical(f"CRITICAL: {critical_failure_message}")
@@ -136,26 +135,22 @@ async def lifespan(app: FastAPI):
             dependencies_ok = False
 
     # 2.B. Initialize Sparse Search Service Client & Adapter
-    if dependencies_ok and settings.BM25_ENABLED: # Solo si BM25 está habilitado en config
+    if dependencies_ok and settings.BM25_ENABLED: 
         try:
             sparse_search_service_client_instance = SparseSearchServiceClient(
                 base_url=str(settings.SPARSE_SEARCH_SERVICE_URL),
                 timeout=settings.SPARSE_SEARCH_CLIENT_TIMEOUT
             )
-            # El adaptador para SparseRetrieverPort
             sparse_retriever_instance = RemoteSparseRetrieverAdapter(client=sparse_search_service_client_instance)
             
-            sparse_service_healthy = await sparse_search_service_client_instance.check_health() # El cliente tiene health_check
+            sparse_service_healthy = await sparse_search_service_client_instance.check_health() 
             if sparse_service_healthy:
                 log.info("Sparse Search Service client and adapter initialized, health check passed.")
             else:
-                # Si BM25 está habilitado pero el servicio no está sano, es un warning, el pipeline puede continuar sin él.
                 log.warning(f"Sparse Search Service health check failed during startup. URL: {settings.SPARSE_SEARCH_SERVICE_URL}. Sparse search may be unavailable.")
-                # No marcamos dependencies_ok = False aquí, ya que BM25 es opcional en el pipeline
-                # Si sparse_retriever_instance es None, el use case lo manejará.
         except Exception as e_sparse:
             log.error(f"Failed to initialize Sparse Search Service client/adapter. Sparse search will be unavailable.", error=str(e_sparse), exc_info=True, url=str(settings.SPARSE_SEARCH_SERVICE_URL))
-            sparse_retriever_instance = None # Asegurar que es None si falla la inicialización
+            sparse_retriever_instance = None 
 
     # 3. Initialize Milvus Adapter
     if dependencies_ok:
@@ -188,9 +183,6 @@ async def lifespan(app: FastAPI):
     
     # Initialize optional components (Diversity Filter)
     if dependencies_ok:
-        # BM25/Sparse Retriever local ya no se inicializa aquí
-        # ELIMINADO: Código de inicialización de BM25sRetriever local
-
         if settings.DIVERSITY_FILTER_ENABLED:
             try:
                 if embedding_adapter_instance and embedding_adapter_instance.get_embedding_dimension() > 0 :
@@ -219,9 +211,8 @@ async def lifespan(app: FastAPI):
                  llm=llm_instance,
                  embedding_adapter=embedding_adapter_instance,
                  http_client=http_client_instance,
-                 # Pasar la instancia del adaptador de sparse retriever (puede ser None si BM25_ENABLED=false o falló la init)
                  sparse_retriever=sparse_retriever_instance,
-                 chunk_content_repo=chunk_content_repo_instance, # Sigue siendo necesario para la fusión
+                 chunk_content_repo=chunk_content_repo_instance, 
                  diversity_filter=diversity_filter_instance
              )
              log.info("AskQueryUseCase instantiated successfully.")
@@ -261,7 +252,7 @@ async def lifespan(app: FastAPI):
         try: await embedding_service_client_instance.close()
         except Exception as e_emb_client_close: log.error("Error closing EmbeddingServiceClient", error=str(e_emb_client_close), exc_info=True)
     
-    if sparse_search_service_client_instance: # NUEVO
+    if sparse_search_service_client_instance: 
         try: await sparse_search_service_client_instance.close()
         except Exception as e_sparse_client_close: log.error("Error closing SparseSearchServiceClient", error=str(e_sparse_client_close), exc_info=True)
         
@@ -270,7 +261,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.PROJECT_NAME,
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
-    version="0.3.3", # Incrementado por refactor
+    version="0.3.3", 
     description="Microservice to handle user queries using RAG pipeline, chat history, remote embedding, remote reranking, and remote sparse search.",
     lifespan=lifespan
 )
@@ -353,46 +344,20 @@ async def read_root():
         health_log.error("Health check (root) warning: Embedding Adapter instance not available, inconsistent with SERVICE_READY state.")
         raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service inconsistency: Embedding adapter missing.")
 
-    # Check Reranker Service Health (if enabled)
-    if settings.RERANKER_ENABLED:
-        if not http_client_instance: 
-            health_log.error("Health check (root) warning: HTTP client instance not available for Reranker health check.")
-            raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service inconsistency: HTTP client missing.")
-        try:
-            reranker_health_url = str(settings.RERANKER_SERVICE_URL).rstrip('/') + "/health"
-            response = await http_client_instance.get(reranker_health_url, timeout=5) 
-            if response.status_code == 200:
-                 reranker_data = response.json()
-                 if reranker_data.get("status") == "ok" and reranker_data.get("model_status") == "loaded":
-                     health_log.debug("Reranker service health check successful via root.")
-                 else:
-                     health_log.error("Health check (root) failed: Reranker service reported unhealthy.", status=response.status_code, details=reranker_data)
-                     raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Critical dependency (Reranker Service) is unhealthy.")
-            else:
-                 health_log.error("Health check (root) failed: Reranker service unresponsive.", status=response.status_code, response_text=response.text)
-                 raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Critical dependency (Reranker Service) is unresponsive.")
-        except httpx.RequestError as e_rerank_health:
-             health_log.error("Health check (root) failed: Error connecting to Reranker service.", error=str(e_rerank_health))
-             raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Critical dependency (Reranker Service) connection failed.")
-        except Exception as e_rerank_health_generic: 
-            health_log.error("Health check (root) failed: Error processing Reranker service health response.", error=str(e_rerank_health_generic))
-            raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Critical dependency (Reranker Service) health check processing error.")
+    # ELIMINADO: Health check al reranker-service.
+    # El query-service ahora no dependerá del health del reranker para su propia salud.
+    # Manejará errores de reranker en tiempo de ejecución si es necesario.
     
     # Check Sparse Search Service Health (if enabled)
-    if settings.BM25_ENABLED: # El flag BM25_ENABLED ahora controla si se usa el servicio remoto
-        if sparse_search_service_client_instance: # Cliente para sparse-search-service
+    if settings.BM25_ENABLED: 
+        if sparse_search_service_client_instance: 
             sparse_service_healthy = await sparse_search_service_client_instance.check_health()
             if not sparse_service_healthy:
                 health_log.warning("Health check (root) warning: Sparse Search Service reports unhealthy. Sparse search functionality may be impaired but service can continue.")
-                # No lanzar HTTPException 503 aquí si se considera opcional, pero sí loguear.
-                # Si es crítico, sí lanzar:
-                # raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Dependency (Sparse Search Service) is unhealthy.")
             else:
                 health_log.debug("Sparse Search Service health check successful via root.")
-        elif settings.BM25_ENABLED: # Si está habilitado en config pero el cliente no se inicializó
+        elif settings.BM25_ENABLED: 
             health_log.error("Health check (root) failed: BM25_ENABLED is true, but Sparse Search Service client is not available.")
-            # Podría ser un 503 si es un componente esperado
-            # raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service inconsistency: Sparse Search Service client missing.")
 
 
     health_log.debug("Health check (root) passed.")

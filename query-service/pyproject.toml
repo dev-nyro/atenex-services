@@ -23,11 +23,10 @@ haystack-ai = "^2.0.1"
 pymilvus = "==2.5.3" 
 
 # --- LLM Dependency ---
-google-generativeai = "^0.6.0" 
+google-generativeai = "^0.6.0" # MODIFICADO: Actualizado a 0.6.0 o superior
 
 # --- RAG Component Dependencies ---
 numpy = "1.26.4" 
-# rank-bm25 fue eliminado porque la búsqueda dispersa ahora es un servicio remoto
 
 
 [tool.poetry.group.dev.dependencies]

@@ -1,11 +1,11 @@
 # reranker-service/app/infrastructure/rerankers/sentence_transformer_adapter.py
 import asyncio
-import functools # IMPORTACIÓN AÑADIDA
+import functools 
 from typing import List, Tuple, Optional
 from sentence_transformers import CrossEncoder # type: ignore
 import structlog
 import time
-import os # For Hugging Face cache directory environment variable
+import os 
 
 from app.application.ports.reranker_model_port import RerankerModelPort
 from app.domain.models import DocumentToRerank, RerankedDocument
@@ -22,7 +22,7 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
     """
     _model: Optional[CrossEncoder] = None
     _model_name_loaded: Optional[str] = None
-    _model_status: str = "unloaded" # States: unloaded, loading, loaded, error
+    _model_status: str = "unloaded" 
 
     def __init__(self):
         logger.debug("SentenceTransformerRerankerAdapter instance created.")
@@ -31,7 +31,6 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
     def load_model(cls):
         """
         Loads the CrossEncoder model based on settings.
-        This method is intended to be called once, e.g., during application startup.
         """
         if cls._model_status == "loaded" and cls._model_name_loaded == settings.MODEL_NAME:
             logger.info("Reranker model already loaded and configured.", model_name=settings.MODEL_NAME)
@@ -77,37 +76,33 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
             raise RuntimeError("Reranker model is not available for prediction.")
 
         predict_log = logger.bind(adapter_action="_predict_scores_async", num_pairs=len(query_doc_pairs))
+        # MODIFICADO: Cambiado a DEBUG
         predict_log.debug("Starting asynchronous prediction.")
         
         loop = asyncio.get_event_loop()
         try:
-            # MODIFICACIÓN: Usar functools.partial para envolver la llamada al método del modelo
-            # con sus argumentos de palabra clave.
-            # 'query_doc_pairs' es el argumento posicional 'sentences' para el método predict.
             predict_task_with_args = functools.partial(
                 SentenceTransformerRerankerAdapter._model.predict,
-                query_doc_pairs,  # Este es el argumento 'sentences'
+                query_doc_pairs,  
                 batch_size=settings.BATCH_SIZE,
                 show_progress_bar=False,
-                num_workers=0,  # Tokenization se hará en el mismo hilo/proceso de predicción
-                activation_fct=None, # Devuelve logits/scores brutos, no probabilidades
-                apply_softmax=False, # No aplicar softmax si activation_fct es None
-                convert_to_numpy=True, # Asegurar que la salida sea un array numpy
-                convert_to_tensor=False # No convertir a tensor de PyTorch
+                num_workers=0,  
+                activation_fct=None, 
+                apply_softmax=False, 
+                convert_to_numpy=True, 
+                convert_to_tensor=False 
             )
             
             scores_numpy_array = await loop.run_in_executor(
-                None,  # Usar el ThreadPoolExecutor por defecto de asyncio
-                predict_task_with_args # La función pre-configurada para ser ejecutada
+                None,  
+                predict_task_with_args 
             )
             
-            scores = scores_numpy_array.tolist() # Convertir array numpy a lista Python de floats
-            predict_log.debug("Prediction successful.")
+            scores = scores_numpy_array.tolist() 
+            predict_log.debug("Prediction successful.") # MODIFICADO: Cambiado a DEBUG
             return scores
         except Exception as e:
-            # El log ya tiene exc_info=True, por lo que la traza completa se registrará.
             predict_log.error("Error during reranker model prediction.", error_message=str(e), exc_info=True)
-            # Propagar la excepción original como causa para mantener el contexto del error.
             raise RuntimeError(f"Reranker prediction failed: {str(e)}") from e
 
     async def rerank(
@@ -121,7 +116,8 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
             query_preview=query[:50]+"..." if len(query) > 50 else query,
             num_documents_input=len(documents)
         )
-        rerank_log.info("Starting rerank operation.")
+        # MODIFICADO: Cambiado a DEBUG, el endpoint ya loguea INFO
+        rerank_log.debug("Starting rerank operation in adapter.")
 
         if not documents:
             rerank_log.debug("No documents provided for reranking.")
@@ -161,7 +157,8 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
         
         reranked_docs_with_scores.sort(key=lambda x: x.score, reverse=True)
         
-        rerank_log.info("Rerank operation completed.", num_documents_output=len(reranked_docs_with_scores))
+        # MODIFICADO: Cambiado a DEBUG, el use case/endpoint logueará INFO
+        rerank_log.debug("Rerank operation completed by adapter.", num_documents_output=len(reranked_docs_with_scores))
         return reranked_docs_with_scores
 
     def get_model_name(self) -> str:

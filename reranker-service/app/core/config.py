@@ -8,13 +8,13 @@ import json
 
 # --- Default Values ---
 DEFAULT_MODEL_NAME = "BAAI/bge-reranker-base"
-DEFAULT_MODEL_DEVICE = "cpu"
+DEFAULT_MODEL_DEVICE = "cpu" # Cambiar a "cuda" si hay GPU disponible y se quiere usar
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_PORT = 8004
 DEFAULT_HF_CACHE_DIR = "/app/.cache/huggingface"
-DEFAULT_BATCH_SIZE = 32
+DEFAULT_BATCH_SIZE = 128 # MODIFICADO: Aumentado para potencialmente más throughput
 DEFAULT_MAX_SEQ_LENGTH = 512
-DEFAULT_GUNICORN_WORKERS = 2
+DEFAULT_GUNICORN_WORKERS = 4 # MODIFICADO: Aumentado (ajustar según CPUs disponibles)
 
 
 class Settings(BaseSettings):
@@ -34,7 +34,6 @@ class Settings(BaseSettings):
 
     MODEL_NAME: str = Field(default=DEFAULT_MODEL_NAME)
     MODEL_DEVICE: str = Field(default=DEFAULT_MODEL_DEVICE)
-    # Optional because HuggingFace libs have their own defaults if not set
     HF_CACHE_DIR: Optional[str] = Field(default=DEFAULT_HF_CACHE_DIR) 
     
     BATCH_SIZE: int = Field(default=DEFAULT_BATCH_SIZE, gt=0)
@@ -54,7 +53,6 @@ class Settings(BaseSettings):
     @field_validator('MODEL_DEVICE')
     @classmethod
     def check_model_device(cls, v: str) -> str:
-        # Basic validation for common device strings
         allowed_devices_prefixes = ["cpu", "cuda", "mps"]
         normalized_v = v.lower()
         if not any(normalized_v.startswith(prefix) for prefix in allowed_devices_prefixes):
@@ -63,8 +61,8 @@ class Settings(BaseSettings):
 
 
 # --- Global Settings Instance ---
-_temp_log = logging.getLogger("reranker_service.config.loader") # Use a distinct name
-if not _temp_log.handlers: # Avoid adding handlers multiple times
+_temp_log = logging.getLogger("reranker_service.config.loader") 
+if not _temp_log.handlers: 
     _handler = logging.StreamHandler(sys.stdout)
     _formatter = logging.Formatter('%(levelname)s: [%(name)s] %(message)s')
     _handler.setFormatter(_formatter)
@@ -75,7 +73,6 @@ try:
     _temp_log.info("Loading Reranker Service settings...")
     settings = Settings()
     _temp_log.info("Reranker Service Settings Loaded Successfully:")
-    # Use model_dump for Pydantic v2
     log_data = settings.model_dump() 
     for key, value in log_data.items():
         _temp_log.info(f"  {key.upper()}: {value}")
@@ -84,18 +81,17 @@ except (ValidationError, ValueError) as e:
     error_details_str = ""
     if isinstance(e, ValidationError):
         try:
-            # Attempt to get structured error details if Pydantic ValidationError
             error_details_str = f"\nValidation Errors:\n{json.dumps(e.errors(), indent=2)}"
-        except Exception: # Fallback for other error types or if e.errors() fails
+        except Exception: 
             error_details_str = f"\nRaw Errors: {e}"
-    else: # For generic ValueError
+    else: 
         error_details_str = f"\nError: {e}"
     
     _temp_log.critical(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     _temp_log.critical(f"! FATAL: Reranker Service configuration validation failed!{error_details_str}")
     _temp_log.critical(f"! Check environment variables (prefixed with RERANKER_) or .env file.")
     _temp_log.critical(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-    sys.exit(1) # Exit if configuration fails
+    sys.exit(1) 
 except Exception as e:
     _temp_log.critical(f"FATAL: Unexpected error loading Reranker Service settings: {e}", exc_info=True)
     sys.exit(1)
