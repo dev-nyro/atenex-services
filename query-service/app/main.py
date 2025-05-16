@@ -170,8 +170,9 @@ async def lifespan(app: FastAPI):
     if dependencies_ok:
         try:
             llm_instance = GeminiAdapter()
-            if not llm_instance.model:
-                 critical_failure_message = "Gemini Adapter initialized but model failed to load (check API key)."
+            # --- CORRECTION: Access _model (internal attribute) instead of model ---
+            if not llm_instance._model: 
+                 critical_failure_message = "Gemini Adapter initialized but model failed to load (check API key or adapter's _configure_client)."
                  log.critical(f"CRITICAL: {critical_failure_message}")
                  dependencies_ok = False
             else:
@@ -369,4 +370,4 @@ if __name__ == "__main__":
     print(f"----- Starting {settings.PROJECT_NAME} locally on port {port} -----")
     uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True, log_level=log_level_str)
 
-# jfu 2
+# jfu
