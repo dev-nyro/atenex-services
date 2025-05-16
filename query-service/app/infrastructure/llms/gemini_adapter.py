@@ -14,15 +14,7 @@ from app.utils.helpers import truncate_text
 
 log = structlog.get_logger(__name__)
 
-# --- MODIFICATION: Direct imports from google.generativeai.types ---
-from google.generativeai.types import (
-    ToolConfig,
-    FunctionCallingConfig,
-    FunctionDeclaration,
-    Tool,
-    GenerationConfig as GenConfigGemini # Alias para evitar colisión con el nombre de nuestra clase
-)
-# --- END MODIFICATION ---
+
 
 
 def _clean_pydantic_schema_for_gemini(pydantic_schema: Dict[str, Any]) -> Dict[str, Any]:
@@ -170,7 +162,7 @@ class GeminiAdapter(LLMPort):
             expecting_json=bool(response_pydantic_schema)
         )
 
-        tools_config_gemini_arg: Optional[List[Tool]] = None
+        tools_config_gemini_arg: Optional[List[Any]] = None
         generation_config_dict: Dict[str, Any] = {
             "temperature": 0.6,
             "top_p": 0.9,
@@ -182,35 +174,26 @@ class GeminiAdapter(LLMPort):
                 cleaned_schema_for_gemini_params = _clean_pydantic_schema_for_gemini(pydantic_schema_dict)
                 generate_log.debug("Cleaned JSON Schema for Gemini Function Calling", schema_final=cleaned_schema_for_gemini_params)
 
-                # --- MODIFICATION: Use directly imported FunctionDeclaration ---
-                function_declaration = FunctionDeclaration(
+                # Usar los tipos desde genai.types (acceso indirecto, no import directa)
+                function_declaration = genai.types.FunctionDeclaration(
                     name="format_structured_response",
                     description=f"Formats the response according to the {response_pydantic_schema.__name__} schema. Ensure all required fields are present.",
                     parameters=cleaned_schema_for_gemini_params
                 )
-                # --- END MODIFICATION ---
-
-                # --- MODIFICATION: Use directly imported Tool ---
-                tools_config_gemini_arg = [Tool(function_declarations=[function_declaration])]
-                # --- END MODIFICATION ---
-                
-                # --- MODIFICATION: Use directly imported ToolConfig and FunctionCallingConfig ---
-                generation_config_dict["tool_config"] = ToolConfig(
-                    function_calling_config=FunctionCallingConfig(
-                        mode=FunctionCallingConfig.Mode.FUNCTION,
+                tools_config_gemini_arg = [genai.types.Tool(function_declarations=[function_declaration])]
+                generation_config_dict["tool_config"] = genai.types.ToolConfig(
+                    function_calling_config=genai.types.FunctionCallingConfig(
+                        mode=genai.types.FunctionCallingConfig.Mode.FUNCTION,
                         allowed_function_names=["format_structured_response"]
                     )
                 )
-                # --- END MODIFICATION ---
             except Exception as e_schema_gen:
                 generate_log.error("Failed to generate or prepare JSON schema for Gemini function calling.",
                                    pydantic_model_name=response_pydantic_schema.__name__,
                                    error_details=str(e_schema_gen), exc_info=True)
                 raise ValueError(f"Schema generation for {response_pydantic_schema.__name__} failed: {e_schema_gen}") from e_schema_gen
-        
-        # --- MODIFICATION: Use directly imported GenConfigGemini ---
-        final_generation_config = GenConfigGemini(**generation_config_dict)
-        # --- END MODIFICATION ---
+
+        final_generation_config = genai.types.GenerationConfig(**generation_config_dict)
 
         try:
             response = await self.model.generate_content_async(

@@ -2546,13 +2546,23 @@ import json
 from app.core.config import settings
 from app.application.ports.llm_port import LLMPort
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from app.domain.models import RespuestaEstructurada # Aunque no se usa directamente aquí, es el target
-from app.utils.helpers import truncate_text # Importado para logging
+from app.domain.models import RespuestaEstructurada 
+from app.utils.helpers import truncate_text
 
 
 log = structlog.get_logger(__name__)
 
-# FLAG_CORRECTION_PYDANTIC_TO_GEMINI_SCHEMA
+# --- MODIFICATION: Direct imports from google.generativeai.types ---
+from google.generativeai.types import (
+    ToolConfig,
+    FunctionCallingConfig,
+    FunctionDeclaration,
+    Tool,
+    GenerationConfig as GenConfigGemini # Alias para evitar colisión con el nombre de nuestra clase
+)
+# --- END MODIFICATION ---
+
+
 def _clean_pydantic_schema_for_gemini(pydantic_schema: Dict[str, Any]) -> Dict[str, Any]:
     """
     Transforms a Pydantic-generated JSON schema into a format more
@@ -2566,11 +2576,8 @@ def _clean_pydantic_schema_for_gemini(pydantic_schema: Dict[str, Any]) -> Dict[s
       takes these from the FunctionDeclaration's name and description.
     - Removes other unsupported keys like "default", "examples", "const".
     """
-    # log.debug("Original Pydantic Schema for cleaning: %s", pydantic_schema) # Can be very verbose
-
 
     definitions = pydantic_schema.get("$defs", {})
-    # además de $defs, quitamos también title, description y $schema del root
     schema_copy = {
         k: v
         for k, v in pydantic_schema.items()
@@ -2594,7 +2601,6 @@ def _clean_pydantic_schema_for_gemini(pydantic_schema: Dict[str, Any]) -> Dict[s
         transformed_node = {}
 
         for key, value in node.items():
-            # quitamos también title/description en cualquier nodo
             if key in {"default", "examples", "example", "const", "title", "description"}:
                 continue
 
@@ -2675,17 +2681,17 @@ class GeminiAdapter(LLMPort):
         stop=stop_after_attempt(settings.HTTP_CLIENT_MAX_RETRIES + 1),
         wait=wait_exponential(multiplier=settings.HTTP_CLIENT_BACKOFF_FACTOR, min=2, max=10),
         retry=retry_if_exception_type((
-            genai.types.generation_types.StopCandidateException,
-            genai.types.generation_types.BlockedPromptException,
+            genai.types.generation_types.StopCandidateException, # type: ignore
+            genai.types.generation_types.BlockedPromptException, # type: ignore
             TimeoutError,
         )),
         reraise=True,
         before_sleep=lambda retry_state: log.warning(
             "Retrying Gemini API call",
             attempt=retry_state.attempt_number,
-            wait_time=f"{retry_state.next_action.sleep:.2f}s",
-            error_type=type(retry_state.outcome.exception()).__name__ if retry_state.outcome else "N/A",
-            error_message=str(retry_state.outcome.exception()) if retry_state.outcome else "N/A"
+            wait_time=f"{retry_state.next_action.sleep:.2f}s", # type: ignore
+            error_type=type(retry_state.outcome.exception()).__name__ if retry_state.outcome else "N/A", # type: ignore
+            error_message=str(retry_state.outcome.exception()) if retry_state.outcome else "N/A" # type: ignore
         )
     )
     async def generate(self, prompt: str,
@@ -2702,7 +2708,7 @@ class GeminiAdapter(LLMPort):
             expecting_json=bool(response_pydantic_schema)
         )
 
-        tools_config_gemini: Optional[List[genai.types.Tool]] = None
+        tools_config_gemini_arg: Optional[List[Tool]] = None
         generation_config_dict: Dict[str, Any] = {
             "temperature": 0.6,
             "top_p": 0.9,
@@ -2714,40 +2720,48 @@ class GeminiAdapter(LLMPort):
                 cleaned_schema_for_gemini_params = _clean_pydantic_schema_for_gemini(pydantic_schema_dict)
                 generate_log.debug("Cleaned JSON Schema for Gemini Function Calling", schema_final=cleaned_schema_for_gemini_params)
 
-                function_declaration = genai.types.FunctionDeclaration(
+                # --- MODIFICATION: Use directly imported FunctionDeclaration ---
+                function_declaration = FunctionDeclaration(
                     name="format_structured_response",
                     description=f"Formats the response according to the {response_pydantic_schema.__name__} schema. Ensure all required fields are present.",
                     parameters=cleaned_schema_for_gemini_params
                 )
+                # --- END MODIFICATION ---
 
-                tools_config_gemini = [genai.types.Tool(function_declarations=[function_declaration])]
-
-                generation_config_dict["tool_config"] = genai.types.ToolConfig(
-                    function_calling_config=genai.types.FunctionCallingConfig(
-                        mode=genai.types.FunctionCallingConfig.Mode.FUNCTION,
+                # --- MODIFICATION: Use directly imported Tool ---
+                tools_config_gemini_arg = [Tool(function_declarations=[function_declaration])]
+                # --- END MODIFICATION ---
+                
+                # --- MODIFICATION: Use directly imported ToolConfig and FunctionCallingConfig ---
+                generation_config_dict["tool_config"] = ToolConfig(
+                    function_calling_config=FunctionCallingConfig(
+                        mode=FunctionCallingConfig.Mode.FUNCTION,
                         allowed_function_names=["format_structured_response"]
                     )
                 )
+                # --- END MODIFICATION ---
             except Exception as e_schema_gen:
                 generate_log.error("Failed to generate or prepare JSON schema for Gemini function calling.",
                                    pydantic_model_name=response_pydantic_schema.__name__,
                                    error_details=str(e_schema_gen), exc_info=True)
                 raise ValueError(f"Schema generation for {response_pydantic_schema.__name__} failed: {e_schema_gen}") from e_schema_gen
-
-        final_generation_config = genai.types.GenerationConfig(**generation_config_dict)
+        
+        # --- MODIFICATION: Use directly imported GenConfigGemini ---
+        final_generation_config = GenConfigGemini(**generation_config_dict)
+        # --- END MODIFICATION ---
 
         try:
             response = await self.model.generate_content_async(
                 prompt,
                 generation_config=final_generation_config,
-                tools=tools_config_gemini
+                tools=tools_config_gemini_arg # Pass the prepared tools list
             )
 
             generated_text = ""
 
             if not response.candidates:
-                 finish_reason_str = getattr(response.prompt_feedback, 'block_reason', "UNKNOWN_REASON")
-                 safety_ratings_str = str(getattr(response.prompt_feedback, 'safety_ratings', "N/A"))
+                 finish_reason_str = getattr(response.prompt_feedback, 'block_reason', "UNKNOWN_REASON") # type: ignore
+                 safety_ratings_str = str(getattr(response.prompt_feedback, 'safety_ratings', "N/A")) # type: ignore
                  generate_log.warning("Gemini response potentially blocked (no candidates)",
                                       finish_reason=finish_reason_str, safety_ratings=safety_ratings_str)
                  if response_pydantic_schema:
@@ -2808,7 +2822,7 @@ class GeminiAdapter(LLMPort):
 
             if response_pydantic_schema:
                 try:
-                    json.loads(generated_text)
+                    json.loads(generated_text) # Validate if it's actually JSON string
                 except json.JSONDecodeError as json_err:
                     generate_log.error("Gemini response content is not valid JSON despite expectation.",
                                        raw_response_preview=truncate_text(generated_text, 500),
@@ -2822,7 +2836,7 @@ class GeminiAdapter(LLMPort):
 
             return generated_text.strip()
 
-        except (genai.types.generation_types.BlockedPromptException, genai.types.generation_types.StopCandidateException) as security_err:
+        except (genai.types.generation_types.BlockedPromptException, genai.types.generation_types.StopCandidateException) as security_err: # type: ignore
              finish_reason_err_str = getattr(security_err, 'finish_reason', 'N/A')
              generate_log.warning("Gemini request blocked or stopped due to safety/policy.",
                                   error_type=type(security_err).__name__,
