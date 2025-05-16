@@ -180,12 +180,12 @@ class GeminiAdapter(LLMPort):
                     description=f"Formats the response according to the {response_pydantic_schema.__name__} schema. Ensure all required fields are present.",
                     parameters=cleaned_schema_for_gemini_params
                 )
+                # Empaquetamos la definición de función para Gemini
                 tools_config_gemini_arg = [genai.types.Tool(function_declarations=[function_declaration])]
-                generation_config_dict["tool_config"] = genai.types.ToolConfig(
-                    function_calling_config=genai.types.FunctionCallingConfig(
-                        mode=genai.types.FunctionCallingConfig.Mode.FUNCTION,
-                        allowed_function_names=["format_structured_response"]
-                    )
+                # En lugar de ToolConfig, pasamos directamente FunctionCallingConfig
+                generation_config_dict["function_calling_config"] = genai.types.FunctionCallingConfig(
+                    mode=genai.types.FunctionCallingConfig.Mode.FUNCTION,
+                    allowed_function_names=["format_structured_response"]
                 )
             except Exception as e_schema_gen:
                 generate_log.error("Failed to generate or prepare JSON schema for Gemini function calling.",
