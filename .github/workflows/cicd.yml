@@ -1,4 +1,4 @@
-# LLM: NO COMMENTS unless absolutely necessary for processing logic.
+# .github/workflows/cicd.yml
 name: CI/CD Pipeline Docker -> Manifest Update (Per Service)
 
 on:
@@ -22,13 +22,125 @@ env:
   MANIFEST_REPO_BRANCH: develop
 
 jobs:
+  detect-changed-services:
+    name: Detect Changed Services
+    runs-on: ubuntu-latest
+    outputs:
+      changed_services_json: ${{ steps.set-changed-services.outputs.changed_services_json }}
+      any_service_changed: ${{ steps.set-changed-services.outputs.any_service_changed }}
+    permissions:
+      contents: read 
+      pull-requests: read 
+      
+    steps:
+      - name: Checkout application code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decide if we need to calculate changed files
+        id: diff_check
+        shell: bash
+        run: |
+          BEFORE_SHA="${{ github.event.before }}"
+          AFTER_SHA="${{ github.sha }}"
+          echo "Before SHA: $BEFORE_SHA"
+          echo "After SHA : $AFTER_SHA"
+          if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "Initial push detected or history not available, assuming all services require check (tj-actions will compare against latest commit)."
+            echo "run_changed_files_action=true"  >> "$GITHUB_OUTPUT"
+            echo "base_sha_for_action="           >> "$GITHUB_OUTPUT" 
+          elif [ "$BEFORE_SHA" != "$AFTER_SHA" ]; then
+            echo "Changes detected, will run diff."
+            echo "run_changed_files_action=true"  >> "$GITHUB_OUTPUT"
+            echo "base_sha_for_action=$BEFORE_SHA" >> "$GITHUB_OUTPUT"
+          else
+            echo "No diff between BEFORE and AFTER SHA, likely a direct push to branch head or workflow re-run."
+            echo "run_changed_files_action=false" >> "$GITHUB_OUTPUT"
+            echo "base_sha_for_action="           >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get changed files per service (tj-actions)
+        id: changed_files
+        if: steps.diff_check.outputs.run_changed_files_action == 'true'
+        uses: tj-actions/changed-files@v44
+        with:
+          base_sha: ${{ steps.diff_check.outputs.base_sha_for_action }}
+          files_yaml: |
+            api-gateway:
+              - 'api-gateway/**'
+            docproc-service:
+              - 'docproc-service/**'
+            embedding-service:
+              - 'embedding-service/**'
+            ingest-service:
+              - 'ingest-service/**'
+            query-service:
+              - 'query-service/**'
+            reranker-service:
+              - 'reranker-service/**'
+            sparse-search-service:
+              - 'sparse-search-service/**'
+            workflow-itself: 
+              - '.github/workflows/cicd.yml'
+          fail_on_initial_diff_error: false
+          escape_json: false
+
+
+      - name: Set changed services output as JSON
+        id: set-changed-services
+        shell: bash
+        run: |
+          declare -a changed_service_ids
+          ANY_CHANGED="false"
+          
+          echo "--- Checking changed files outputs from tj-actions ---"
+          echo "api-gateway_any_changed: ${{ steps.changed_files.outputs.api-gateway_any_changed }}"
+          echo "docproc-service_any_changed: ${{ steps.changed_files.outputs.docproc-service_any_changed }}"
+          echo "embedding-service_any_changed: ${{ steps.changed_files.outputs.embedding-service_any_changed }}"
+          echo "ingest-service_any_changed: ${{ steps.changed_files.outputs.ingest-service_any_changed }}"
+          echo "query-service_any_changed: ${{ steps.changed_files.outputs.query-service_any_changed }}"
+          echo "reranker-service_any_changed: ${{ steps.changed_files.outputs.reranker-service_any_changed }}"
+          echo "sparse-search-service_any_changed: ${{ steps.changed_files.outputs.sparse-search-service_any_changed }}"
+          echo "workflow-itself_any_changed: ${{ steps.changed_files.outputs.workflow-itself_any_changed }}"
+          echo "-------------------------------------------------------"
+
+          if [[ "${{ steps.changed_files.outputs.workflow-itself_any_changed }}" == "true" ]]; then
+            echo "Workflow file changed. Marking all services as changed."
+            changed_service_ids=("api-gateway" "docproc-service" "embedding-service" "ingest-service" "query-service" "reranker-service" "sparse-search-service")
+            ANY_CHANGED="true"
+          else
+            [ "${{ steps.changed_files.outputs.api-gateway_any_changed }}" == "true" ] && changed_service_ids+=("api-gateway") && ANY_CHANGED="true"
+            [ "${{ steps.changed_files.outputs.docproc-service_any_changed }}" == "true" ] && changed_service_ids+=("docproc-service") && ANY_CHANGED="true"
+            [ "${{ steps.changed_files.outputs.embedding-service_any_changed }}" == "true" ] && changed_service_ids+=("embedding-service") && ANY_CHANGED="true"
+            [ "${{ steps.changed_files.outputs.ingest-service_any_changed }}" == "true" ] && changed_service_ids+=("ingest-service") && ANY_CHANGED="true"
+            [ "${{ steps.changed_files.outputs.query-service_any_changed }}" == "true" ] && changed_service_ids+=("query-service") && ANY_CHANGED="true"
+            [ "${{ steps.changed_files.outputs.reranker-service_any_changed }}" == "true" ] && changed_service_ids+=("reranker-service") && ANY_CHANGED="true"
+            [ "${{ steps.changed_files.outputs.sparse-search-service_any_changed }}" == "true" ] && changed_service_ids+=("sparse-search-service") && ANY_CHANGED="true"
+          fi
+          
+          JSON_OUTPUT=$(printf '%s\n' "${changed_service_ids[@]}" | jq -R . | jq -s .)
+          
+          echo "Changed service IDs: ${changed_service_ids[*]}"
+          echo "Generated JSON: $JSON_OUTPUT"
+          echo "Any service changed flag: $ANY_CHANGED"
+
+          # Corrección: Usar here document para salidas multilínea
+          echo "changed_services_json<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$JSON_OUTPUT" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          
+          echo "any_service_changed=$ANY_CHANGED" >> "$GITHUB_OUTPUT"
+
   build-and-update-service:
     name: Build and Update ${{ matrix.service.name }}
+    needs: detect-changed-services
+    if: needs.detect-changed-services.outputs.any_service_changed == 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      packages: write
-      pull-requests: read
+      contents: read 
+      packages: write 
+      pull-requests: read 
 
     strategy:
       fail-fast: false
@@ -94,55 +206,24 @@ jobs:
               ]
 
     steps:
-    - name: Checkout application code
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-
-    - name: Decide if we need to calculate changed files
-      id: diff_check
-      shell: bash
-      run: |
-        BEFORE_SHA="${{ github.event.before }}"
-        AFTER_SHA="${{ github.sha }}"
-        echo "before: $BEFORE_SHA"
-        echo "after : $AFTER_SHA"
-        if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
-          echo "run_changed_files_action=true"  >> "$GITHUB_OUTPUT"
-          echo "base_sha_for_action="           >> "$GITHUB_OUTPUT"
-        elif [ "$BEFORE_SHA" != "$AFTER_SHA" ]; then
-          echo "run_changed_files_action=true"  >> "$GITHUB_OUTPUT"
-          echo "base_sha_for_action=$BEFORE_SHA" >> "$GITHUB_OUTPUT"
-        else
-          echo "run_changed_files_action=false" >> "$GITHUB_OUTPUT"
-          echo "base_sha_for_action="           >> "$GITHUB_OUTPUT"
-        fi
-
-    - name: Get changed files for ${{ matrix.service.name }}
-      id: changed_files_for_service
-      if: steps.diff_check.outputs.run_changed_files_action == 'true'
-      uses: tj-actions/changed-files@v44
-      with:
-        base_sha: ${{ steps.diff_check.outputs.base_sha_for_action }}
-        files: |
-          ${{ matrix.service.dir }}/**
-        fail_on_initial_diff_error: false
-
     - name: Determine if build is required for ${{ matrix.service.name }}
       id: service_build_needed
       shell: bash
       run: |
-        NEEDS_BUILD="false"
-        if [[ "${{ steps.diff_check.outputs.run_changed_files_action }}" == 'true' && "${{ steps.changed_files_for_service.outputs.any_changed }}" == 'true' ]]; then
-          NEEDS_BUILD="true"
-        elif [[ "${{ steps.diff_check.outputs.run_changed_files_action }}" == 'true' && -z "${{ steps.diff_check.outputs.base_sha_for_action }}" ]]; then
-          if [[ "${{ steps.changed_files_for_service.outputs.any_changed }}" == 'true' ]]; then
-             NEEDS_BUILD="true"
-          fi
+        echo "Checking if ${{ matrix.service.id }} is in '${{ needs.detect-changed-services.outputs.changed_services_json }}'"
+        is_changed=$(echo '${{ needs.detect-changed-services.outputs.changed_services_json }}' | jq --arg id_to_check "${{ matrix.service.id }}" 'any(. == $id_to_check)')
+        
+        if [[ "$is_changed" == "true" ]]; then
+          echo "build_required=true" >> "$GITHUB_OUTPUT"
+          echo "Service ${{ matrix.service.name }} needs to be built."
+        else
+          echo "build_required=false" >> "$GITHUB_OUTPUT"
+          echo "Service ${{ matrix.service.name }} does NOT need to be built."
         fi
-        echo "build_required=${NEEDS_BUILD}" >> "$GITHUB_OUTPUT"
-        echo "Service ${{ matrix.service.name }} - Changed files output: ${{ steps.changed_files_for_service.outputs.any_changed }}"
-        echo "Service ${{ matrix.service.name }} - Build required: ${NEEDS_BUILD}"
+
+    - name: Checkout application code
+      if: steps.service_build_needed.outputs.build_required == 'true'
+      uses: actions/checkout@v4
 
     - name: Set up Docker Buildx
       if: steps.service_build_needed.outputs.build_required == 'true'
@@ -164,7 +245,7 @@ jobs:
         TAG=$(echo "$TAG" | sed 's/[^a-zA-Z0-9.-]/-/g' | sed 's/^[.-]*//;s/[.-]*$//')
         TAG=${TAG::128}
         echo "image_tag=$TAG" >> "$GITHUB_OUTPUT"
-        echo "Generated image tag: $TAG"
+        echo "Generated image tag for ${{ matrix.service.name }}: $TAG"
 
     - name: Build and push ${{ matrix.service.name }}
       id: build_and_push_service
@@ -173,11 +254,11 @@ jobs:
       with:
         context: ${{ matrix.service.dir }}
         file: ${{ matrix.service.dir }}/Dockerfile
-        push: ${{ github.event_name == 'push' }}
+        push: ${{ github.event_name == 'push' }} 
         tags: ${{ env.REGISTRY }}/${{ env.IMAGE_REPO_OWNER }}/${{ matrix.service.image_repo_name }}:${{ steps.image_tag_generator.outputs.image_tag }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
-        outputs: type=registry
+        outputs: type=registry 
 
     - name: Evaluate build result
       id: build_evaluation
@@ -206,8 +287,8 @@ jobs:
       with:
         repository: ${{ env.MANIFEST_REPO_OWNER }}/${{ env.MANIFEST_REPO_NAME }}
         ref: ${{ env.MANIFEST_REPO_BRANCH }}
-        token: ${{ secrets.MANIFEST_PAT }}
-        path: manifests-repo
+        token: ${{ secrets.MANIFEST_PAT }} 
+        path: manifests-repo 
 
     - name: Update Manifest Files for ${{ matrix.service.name }}
       id: update_manifests_script
@@ -234,16 +315,13 @@ jobs:
 
           if [ ! -f "${manifest_file_rel_path}" ]; then
             echo "::error::Manifest file '${manifest_file_rel_path}' not found in manifest repo for service ${{ matrix.service.name }}!"
-            continue
+            continue 
           fi
           
           yq_expression=""
-          # Adapt yq expression based on manifest type (Deployment vs CronJob)
           if [[ "${manifest_file_rel_path}" == *"/cronjob.yaml" ]]; then
-            # CronJob: .spec.jobTemplate.spec.template.spec.containers[]
             yq_expression="(.spec.jobTemplate.spec.template.spec.containers[] | select(.name == \"${k8s_container_name}\") ).image = \"${TARGET_IMAGE_WITH_TAG}\""
           else
-            # Deployment (default)
             yq_expression="(.spec.template.spec.containers[] | select(.name == \"${k8s_container_name}\") ).image = \"${TARGET_IMAGE_WITH_TAG}\""
           fi
 
@@ -254,7 +332,7 @@ jobs:
             updated_content=$(cat "${manifest_file_rel_path}")
             if [[ "${original_content}" != "${updated_content}" ]]; then
               echo "Successfully updated image for container '${k8s_container_name}' in ${manifest_file_rel_path}"
-              git add "${manifest_file_rel_path}"
+              git add "${manifest_file_rel_path}" 
             else
               echo "::warning::yq command for container '${k8s_container_name}' in ${manifest_file_rel_path} (service: ${{ matrix.service.name }}) executed but the file content did not change. Image might be already up-to-date or yq expression found no match (e.g. wrong container name: '${k8s_container_name}')."
             fi
@@ -263,7 +341,6 @@ jobs:
           fi
         done
 
-        # Check if git has any staged changes
         if ! git diff --staged --quiet; then
           echo "Manifest file(s) were modified and staged for ${{ matrix.service.name }}."
           echo "manifest_actually_changed=true" >> $GITHUB_OUTPUT
@@ -286,34 +363,38 @@ jobs:
         echo "Committing changes with message: $COMMIT_MSG"
         git commit -m "$COMMIT_MSG"
         echo "Pushing changes to branch ${{ env.MANIFEST_REPO_BRANCH }}..."
-        if git push origin ${{ env.MANIFEST_REPO_BRANCH }}; then
-            echo "Push successful for ${{ matrix.service.name }}."
-        else
-            echo "::error::Push failed for ${{ matrix.service.name }}. Check PAT permissions and branch protection rules for '${{ env.MANIFEST_REPO_BRANCH }}' in repo '${{ env.MANIFEST_REPO_OWNER }}/${{ env.MANIFEST_REPO_NAME }}'."
-            exit 1
-        fi
+        for i in 1 2 3; do
+          if git push origin ${{ env.MANIFEST_REPO_BRANCH }}; then
+            echo "Push successful for ${{ matrix.service.name }} on attempt $i."
+            break 
+          fi
+          if [ $i -lt 3 ]; then
+            echo "::warning::Push attempt $i failed for ${{ matrix.service.name }}. Retrying in 10 seconds..."
+            sleep 10
+          else
+            echo "::error::Push failed for ${{ matrix.service.name }} after $i attempts. Check PAT permissions and branch protection rules for '${{ env.MANIFEST_REPO_BRANCH }}' in repo '${{ env.MANIFEST_REPO_OWNER }}/${{ env.MANIFEST_REPO_NAME }}'."
+            exit 1 
+          fi
+        done
 
     - name: Debug Job Information for ${{ matrix.service.name }}
-      if: always()
-      shell: bash
+      if: always() 
+      shell: bash 
       run: |
-        echo "::group::Debug Information for ${{ matrix.service.name }}"
-        echo "Service ID: ${{ matrix.service.id }}"
+        echo "::group::Debug Information for ${{ matrix.service.name }} (ID: ${{ matrix.service.id }})"
         echo "Service Directory: ${{ matrix.service.dir }}"
         echo "Image Repo Name: ${{ matrix.service.image_repo_name }}"
-        echo "--- Diff Check ---"
-        echo "Run Changed Files Action: ${{ steps.diff_check.outputs.run_changed_files_action }}"
-        echo "Base SHA for Action: ${{ steps.diff_check.outputs.base_sha_for_action }}"
-        echo "--- Changed Files for Service ---"
-        echo "Any Changed (tj-actions): ${{ steps.changed_files_for_service.outputs.any_changed }}"
-        echo "--- Build Trigger ---"
-        echo "Build Required: ${{ steps.service_build_needed.outputs.build_required }}"
+        echo "--- Needs Check ---"
+        echo "Output from detect-changed-services (all changed): ${{ needs.detect-changed-services.outputs.changed_services_json }}"
+        echo "Any service changed flag from detect-changed-services: ${{ needs.detect-changed-services.outputs.any_service_changed }}"
+        echo "--- Build Trigger for this service instance ---"
+        echo "Build Required (this instance): ${{ steps.service_build_needed.outputs.build_required }}"
         echo "--- Image Tag ---"
-        echo "Generated Image Tag: ${{ steps.image_tag_generator.outputs.image_tag }}"
-        echo "--- Build & Push ---"
+        echo "Generated Image Tag (this instance): ${{ steps.image_tag_generator.outputs.image_tag }}"
+        echo "--- Build & Push (this instance) ---"
         echo "Build Outcome: ${{ steps.build_and_push_service.outcome }}"
         echo "Build Digest: ${{ steps.build_and_push_service.outputs.digest }}"
         echo "Image Successfully Built (evaluation): ${{ steps.build_evaluation.outputs.image_successfully_built }}"
-        echo "--- Manifest Update ---"
+        echo "--- Manifest Update (this instance) ---"
         echo "Manifest Actually Changed: ${{ steps.update_manifests_script.outputs.manifest_actually_changed }}"
         echo "::endgroup::"
