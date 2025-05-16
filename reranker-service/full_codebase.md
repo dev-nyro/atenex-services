@@ -644,6 +644,7 @@ __all__ = ["SentenceTransformerRerankerAdapter"]
 ```py
 # reranker-service/app/infrastructure/rerankers/sentence_transformer_adapter.py
 import asyncio
+import functools # IMPORTACIÓN AÑADIDA
 from typing import List, Tuple, Optional
 from sentence_transformers import CrossEncoder # type: ignore
 import structlog
@@ -724,24 +725,34 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
         
         loop = asyncio.get_event_loop()
         try:
-            scores_numpy_array = await loop.run_in_executor(
-                None, 
+            # MODIFICACIÓN: Usar functools.partial para envolver la llamada al método del modelo
+            # con sus argumentos de palabra clave.
+            # 'query_doc_pairs' es el argumento posicional 'sentences' para el método predict.
+            predict_task_with_args = functools.partial(
                 SentenceTransformerRerankerAdapter._model.predict,
-                query_doc_pairs,
+                query_doc_pairs,  # Este es el argumento 'sentences'
                 batch_size=settings.BATCH_SIZE,
                 show_progress_bar=False,
-                num_workers=0,  # Explicitly set num_workers
-                activation_fct=None,
-                apply_softmax=False,
-                convert_to_numpy=True, # Ensure output is numpy array
-                convert_to_tensor=False
+                num_workers=0,  # Tokenization se hará en el mismo hilo/proceso de predicción
+                activation_fct=None, # Devuelve logits/scores brutos, no probabilidades
+                apply_softmax=False, # No aplicar softmax si activation_fct es None
+                convert_to_numpy=True, # Asegurar que la salida sea un array numpy
+                convert_to_tensor=False # No convertir a tensor de PyTorch
             )
-            scores = scores_numpy_array.tolist() # Convert numpy array to Python list of floats
+            
+            scores_numpy_array = await loop.run_in_executor(
+                None,  # Usar el ThreadPoolExecutor por defecto de asyncio
+                predict_task_with_args # La función pre-configurada para ser ejecutada
+            )
+            
+            scores = scores_numpy_array.tolist() # Convertir array numpy a lista Python de floats
             predict_log.debug("Prediction successful.")
             return scores
         except Exception as e:
+            # El log ya tiene exc_info=True, por lo que la traza completa se registrará.
             predict_log.error("Error during reranker model prediction.", error_message=str(e), exc_info=True)
-            raise RuntimeError(f"Reranker prediction failed: {e}") from e
+            # Propagar la excepción original como causa para mantener el contexto del error.
+            raise RuntimeError(f"Reranker prediction failed: {str(e)}") from e
 
     async def rerank(
         self, query: str, documents: List[DocumentToRerank]
