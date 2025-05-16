@@ -2,18 +2,56 @@
 import google.generativeai as genai
 import structlog
 from typing import Optional, List, Type, Any, Dict 
-from pydantic import BaseModel, RootModel 
+from pydantic import BaseModel
 import json 
 
 from app.core.config import settings
 from app.application.ports.llm_port import LLMPort 
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from app.domain.models import RespuestaEstructurada # Tu modelo Pydantic
+from app.domain.models import RespuestaEstructurada 
 
-# Para generar el JSON Schema compatible con Gemini FunctionDeclaration desde Pydantic v2
-from pydantic.json_schema import GenerateJsonSchema, JsonSchemaMode
+from pydantic.json_schema import GenerateJsonSchema 
+# from pydantic_core.core_schema import CoreSchema # No es necesario si usamos model_json_schema
+
 
 log = structlog.get_logger(__name__)
+
+def _remove_top_level_titles_and_descriptions(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Remueve 'title' y 'description' del nivel raíz del schema si están presentes,
+    ya que Gemini los toma de la FunctionDeclaration.
+    También intenta manejar el problema de '$defs'.
+    """
+    cleaned_schema = schema.copy()
+    if "title" in cleaned_schema:
+        del cleaned_schema["title"]
+    # La descripción a nivel de raíz del esquema de parámetros es manejada por FunctionDeclaration.description
+    if "description" in cleaned_schema:
+        # Potencialmente eliminarlo solo si es el docstring del modelo Pydantic raíz,
+        # pero por seguridad, si Gemini no lo quiere, lo quitamos.
+        del cleaned_schema["description"]
+
+    # El error "Unknown field for Schema: $defs" sugiere que Gemini no quiere `$defs`
+    # en el schema que se le pasa a `parameters`.
+    # Pydantic v2 usa `$defs` para definiciones.
+    # Una solución simple si las definiciones son para tipos anidados directos
+    # es intentar eliminarlas si el resto del schema es autocontenido o si Gemini
+    # puede inferir tipos anidados sin la sección `$defs` explícita a este nivel.
+    # Esto es una simplificación; un aplanamiento real de $defs sería más complejo.
+    if "$defs" in cleaned_schema:
+        log.warning("'$defs' found in generated Pydantic schema. Removing for Gemini compatibility. "
+                    "If complex $defs are used, this might lead to issues. Schema before: %s", cleaned_schema)
+        # Esta es una suposición de que Gemini podría no necesitar/querer `$defs` a este nivel.
+        # Es crucial que la estructura de `properties` sea completa para los tipos anidados.
+        # Si `FuenteCitada` se define bien dentro de `properties` de `RespuestaEstructurada`
+        # al generar el schema, puede que `$defs` no sea crucial para Gemini aquí.
+        del cleaned_schema["$defs"] # Intenta eliminarla y ver si Gemini lo procesa mejor.
+                                   # ¡Esto puede ser demasiado agresivo si hay referencias $ref reales!
+                                   # Sin embargo, el error es explícito sobre "$defs".
+        log.debug("Schema after attempting to remove $defs: %s", cleaned_schema)
+
+
+    return cleaned_schema
 
 class GeminiAdapter(LLMPort):
     """Adaptador concreto para interactuar con la API de Google Gemini."""
@@ -43,16 +81,15 @@ class GeminiAdapter(LLMPort):
         retry=retry_if_exception_type((
             genai.types.generation_types.StopCandidateException,
             genai.types.generation_types.BlockedPromptException,
-            TimeoutError, # Para timeouts de red genéricos
-            # Podrías añadir más excepciones específicas de google.api_core si las encuentras
+            TimeoutError,
         )),
         reraise=True,
         before_sleep=lambda retry_state: log.warning(
             "Retrying Gemini API call",
             attempt=retry_state.attempt_number,
-            wait_time=f"{retry_state.next_action.sleep:.2f}s", # type: ignore
-            error_type=type(retry_state.outcome.exception()).__name__ if retry_state.outcome else "N/A", # type: ignore
-            error_message=str(retry_state.outcome.exception()) if retry_state.outcome else "N/A" # type: ignore
+            wait_time=f"{retry_state.next_action.sleep:.2f}s", 
+            error_type=type(retry_state.outcome.exception()).__name__ if retry_state.outcome else "N/A", 
+            error_message=str(retry_state.outcome.exception()) if retry_state.outcome else "N/A" 
         )
     )
     async def generate(self, prompt: str, 
@@ -74,84 +111,45 @@ class GeminiAdapter(LLMPort):
         generation_config_dict: Dict[str, Any] = {
             "temperature": 0.6, 
             "top_p": 0.9,
-            # "max_output_tokens": 8192, # Descomentar si necesitas limitar explícitamente
         }
-
-        # FLAG_GEMINI_FUNCTION_CALLING_SCHEMA_FIX
+        
         if response_pydantic_schema:
-            # Generar el schema JSON desde el modelo Pydantic usando el método recomendado para Pydantic v2
-            # La documentación de google-generativeai 0.5.x indica que se puede pasar la clase Pydantic directamente.
-            # Sin embargo, el error `BaseModel.model_json_schema() got an unexpected keyword argument 'json_schema_generator'`
-            # sugiere un problema en cómo la librería de Gemini intenta convertir internamente ese modelo Pydantic
-            # a un JSON Schema, o una incompatibilidad de versiones/métodos de Pydantic.
-            # Para forzar la generación correcta del schema JSON *antes* de pasarlo a Gemini,
-            # lo generamos explícitamente aquí y lo pasamos como un diccionario.
-
             try:
-                # Usar Pydantic v2 para generar el schema JSON.
-                # `GenerateJsonSchema` permite personalizar la generación si es necesario.
-                json_schema_generator = GenerateJsonSchema(
-                    by_alias=True, # Usa alias de campos si están definidos en el modelo Pydantic
-                    ref_template="#/components/schemas/{model}" # Estilo de referencia común, aunque para Gemini no es tan relevante
-                )
-                # `model_json_schema` es el método correcto en Pydantic v2.
-                # No se pasa `json_schema_generator` como argumento a model_json_schema,
-                # sino que se usa como argumento en el constructor de GenerateJsonSchema si se necesitan configuraciones especiales.
-                # El método es simplemente `response_pydantic_schema.model_json_schema()`
+                # Generar el schema JSON desde el modelo Pydantic
+                # Pydantic V2: model_json_schema()
+                # Usar ref_template personalizado puede no ser necesario si no hay refs complejas no deseadas
+                # o si el aplanamiento de $defs no es la solución.
+                # La documentación de Gemini sugiere pasar la clase directamente,
+                # pero dado el error anterior, generar el schema como dict y limpiarlo es más robusto.
                 
-                # OJO: Para Gemini, el `parameters` de FunctionDeclaration espera un OpenAPI Schema Object.
-                # Pydantic's `model_json_schema()` produce un JSON Schema, que es muy similar y a menudo compatible.
-                # Lo crucial es la estructura de `type`, `properties`, `required`, `description`.
+                # FLAG_CORRECTION_PYDANTIC_TO_GEMINI_SCHEMA
+                # Genera el schema usando Pydantic V2
+                # El `JsonSchemaMode.validation` es el default y generalmente correcto.
+                generated_schema_dict = response_pydantic_schema.model_json_schema()
 
-                openapi_schema_dict = response_pydantic_schema.model_json_schema(
-                     # Puedes usar `JsonSchemaMode.validation` o `JsonSchemaMode.serialization`
-                     # `validation` es más común para entradas.
-                )
+                # Limpiar el schema de campos que podrían causar problemas con Gemini
+                cleaned_schema_for_gemini = _remove_top_level_titles_and_descriptions(generated_schema_dict)
                 
-                # Gemini espera que el `parameters` no tenga el título raíz "RespuestaEstructurada" que Pydantic puede añadir.
-                # Se asegura que el schema pasado solo contenga 'type', 'properties', 'required', 'description' a nivel raíz.
-                if "title" in openapi_schema_dict: # El título general del modelo no es parte del schema de parámetros
-                    del openapi_schema_dict["title"]
-                if "description" in openapi_schema_dict and openapi_schema_dict["description"] == response_pydantic_schema.__doc__:
-                    # La descripción a nivel raíz del schema de parámetros, si es solo el docstring del modelo, puede ser redundante.
-                    # Gemini toma la descripción de la FunctionDeclaration.
-                    del openapi_schema_dict["description"]
-                
-                # Ajustes para asegurar compatibilidad con OpenAPI schema esperado por Gemini
-                # A veces Pydantic puede añadir `$defs` o `definitions` que no son directamente parte
-                # del schema de parámetros de una función para Gemini si es simple.
-                # Si el schema es complejo con referencias internas, puede ser necesario aplanarlo o
-                # asegurarse de que las referencias sean entendidas. Para RespuestaEstructurada y FuenteCitada,
-                # Pydantic debería generar un schema anidado dentro de 'properties' sin `$defs` complejos
-                # si no hay auto-referencias complejas.
-                
-                generate_log.debug("Generated JSON Schema for Gemini Function Calling", schema_generated=openapi_schema_dict)
+                generate_log.debug("Cleaned JSON Schema for Gemini Function Calling", schema_final=cleaned_schema_for_gemini)
 
                 function_declaration = genai.types.FunctionDeclaration(
-                    name="format_structured_response", # Nombre de la función que el LLM "llamará"
-                    description=f"Formats the response according to the {response_pydantic_schema.__name__} schema.",
-                    parameters=openapi_schema_dict # El schema JSON generado
+                    name="format_structured_response", 
+                    description=f"Formats the response according to the {response_pydantic_schema.__name__} schema. Ensure all required fields are present.",
+                    parameters=cleaned_schema_for_gemini 
                 )
                 
                 tools_config_gemini = [genai.types.Tool(function_declarations=[function_declaration])]
                 
-                # Forzar al modelo a llamar a esta función para estructurar su salida
                 generation_config_dict["tool_config"] = genai.types.ToolConfig(
                     function_calling_config=genai.types.FunctionCallingConfig(
-                        mode=genai.types.FunctionCallingConfig.Mode.FUNCTION, # FORZAR la llamada a la función
+                        mode=genai.types.FunctionCallingConfig.Mode.FUNCTION, 
                         allowed_function_names=["format_structured_response"] 
                     )
                 )
-                # Ya no se usa response_mime_type ni response_schema directamente si usamos tools/function_calling
-                # para forzar el output JSON.
-
             except Exception as e_schema_gen:
                 generate_log.error("Failed to generate or prepare JSON schema for Gemini function calling.",
                                    pydantic_model_name=response_pydantic_schema.__name__,
                                    error_details=str(e_schema_gen), exc_info=True)
-                # Si falla la generación del schema, no se podrá forzar JSON estructurado de esta manera.
-                # Se podría caer a un modo de generación de texto simple, o re-lanzar.
-                # Por ahora, se re-lanza para indicar un problema de configuración/código.
                 raise ValueError(f"Schema generation for {response_pydantic_schema.__name__} failed: {e_schema_gen}") from e_schema_gen
         
         final_generation_config = genai.types.GenerationConfig(**generation_config_dict)
@@ -160,7 +158,7 @@ class GeminiAdapter(LLMPort):
             response = await self.model.generate_content_async(
                 prompt,
                 generation_config=final_generation_config,
-                tools=tools_config_gemini # Pasar las herramientas (puede ser None)
+                tools=tools_config_gemini 
             )
             
             generated_text = "" 
@@ -193,36 +191,30 @@ class GeminiAdapter(LLMPort):
                      })
                 return f"[Respuesta vacía de Gemini. Razón: {finish_reason}]"
             
-            # Verificar si se llamó a la función para formatear la respuesta
             if response_pydantic_schema and candidate.content.parts[0].function_call:
                 function_call = candidate.content.parts[0].function_call
                 if function_call.name == "format_structured_response":
                     args_dict = {key: value for key, value in function_call.args.items()}
                     generated_text = json.dumps(args_dict) 
                     generate_log.debug("Received JSON via function call from Gemini API", response_length=len(generated_text))
-                else: # Se llamó a otra función o ninguna, inesperado si se forzó.
+                else: 
                     generate_log.warning("Gemini called an unexpected function or no function when one was forced.",
                                          called_function_name=getattr(function_call, 'name', 'N/A'))
-                    # Fallback a texto plano o error JSON
-                    generated_text = "".join(part.text for part in candidate.content.parts if hasattr(part, 'text')) # Fallback a texto
-                    if not generated_text.strip(): # Si el texto también está vacío
+                    generated_text = "".join(part.text for part in candidate.content.parts if hasattr(part, 'text')) 
+                    if not generated_text.strip(): 
                         return json.dumps({
                              "error_message": "LLM did not call the formatting function and returned no text.",
                              "respuesta_detallada": "Error: El asistente no pudo estructurar la respuesta correctamente.",
                              "fuentes_citadas": []
                         })
-            else: # Respuesta de texto normal (si no se esperaba JSON o el LLM no hizo la llamada de función)
+            else: 
                 generated_text = "".join(part.text for part in candidate.content.parts if hasattr(part, 'text'))
                 generate_log.debug("Received text response (or non-function-call) from Gemini API", response_length=len(generated_text))
-                # Si esperábamos JSON pero no lo obtuvimos como function call, esto es un problema.
                 if response_pydantic_schema:
                     generate_log.warning("Expected JSON via function call, but received plain text or no function call part. Attempting to parse text as JSON.")
-                    # Se intentará parsear `generated_text` como JSON más abajo.
 
             if response_pydantic_schema:
                 try:
-                    # Intentar parsear el texto (ya sea de function_call.args o de la respuesta directa)
-                    # como JSON. Esto valida que sea parseable, la validación del schema Pydantic se hace después.
                     json.loads(generated_text) 
                 except json.JSONDecodeError as json_err:
                     generate_log.error("Gemini response content is not valid JSON", 
