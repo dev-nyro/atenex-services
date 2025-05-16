@@ -24,9 +24,6 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
     _model_status: str = "unloaded" # States: unloaded, loading, loaded, error
 
     def __init__(self):
-        # Initialization logic (if any beyond model loading) can go here.
-        # Model loading is handled by the static `load_model` method,
-        # typically called during application lifespan.
         logger.debug("SentenceTransformerRerankerAdapter instance created.")
 
     @classmethod
@@ -40,7 +37,7 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
             return
 
         cls._model_status = "loading"
-        cls._model = None # Ensure model is None while loading a new one or retrying
+        cls._model = None 
         init_log = logger.bind(
             adapter_action="load_model",
             model_name=settings.MODEL_NAME,
@@ -49,7 +46,6 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
         )
         init_log.info("Attempting to load CrossEncoder model...")
         
-        # Set Hugging Face cache directory if specified
         if settings.HF_CACHE_DIR:
             os.environ['HF_HOME'] = settings.HF_CACHE_DIR
             os.environ['TRANSFORMERS_CACHE'] = settings.HF_CACHE_DIR
@@ -61,7 +57,6 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
                 model_name=settings.MODEL_NAME,
                 max_length=settings.MAX_SEQ_LENGTH,
                 device=settings.MODEL_DEVICE,
-                # trust_remote_code=True # Might be needed for some models, use with caution
             )
             load_time = time.time() - start_time
             cls._model_name_loaded = settings.MODEL_NAME
@@ -69,11 +64,8 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
             init_log.info("CrossEncoder model loaded successfully.", duration_seconds=round(load_time, 3))
         except Exception as e:
             cls._model_status = "error"
-            cls._model = None # Ensure model is None on error
+            cls._model = None 
             init_log.error("Failed to load CrossEncoder model.", error_message=str(e), exc_info=True)
-            # Depending on application requirements, this could raise an error
-            # to prevent the service from starting in a non-functional state.
-            # For now, it logs the error and the health check will reflect this.
 
     async def _predict_scores_async(self, query_doc_pairs: List[Tuple[str, str]]) -> List[float]:
         """
@@ -88,19 +80,19 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
         
         loop = asyncio.get_event_loop()
         try:
-            # model.predict is CPU/GPU bound, so run it in the default executor (ThreadPoolExecutor)
-            scores_tensor = await loop.run_in_executor(
+            scores_numpy_array = await loop.run_in_executor(
                 None, 
-                SentenceTransformerRerankerAdapter._model.predict, # Call the class-level model
+                SentenceTransformerRerankerAdapter._model.predict,
                 query_doc_pairs,
-                settings.BATCH_SIZE,
-                False,  # show_progress_bar
-                None,   # activation_fct (default is fine for most rerankers)
-                False,  # convert_to_numpy (scores are usually numpy arrays)
-                False   # convert_to_tensor (predict returns numpy by default)
+                batch_size=settings.BATCH_SIZE,
+                show_progress_bar=False,
+                num_workers=0,  # Explicitly set num_workers
+                activation_fct=None,
+                apply_softmax=False,
+                convert_to_numpy=True, # Ensure output is numpy array
+                convert_to_tensor=False
             )
-            # Ensure scores are Python floats
-            scores = [float(score) for score in scores_tensor]
+            scores = scores_numpy_array.tolist() # Convert numpy array to Python list of floats
             predict_log.debug("Prediction successful.")
             return scores
         except Exception as e:
@@ -151,26 +143,23 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
                 RerankedDocument(
                     id=doc.id,
                     text=doc.text, 
-                    score=score, # Score from the reranker
-                    metadata=doc.metadata # Preserve original metadata
+                    score=score, 
+                    metadata=doc.metadata 
                 )
             )
         
-        # Sort by the new reranker score in descending order
         reranked_docs_with_scores.sort(key=lambda x: x.score, reverse=True)
         
         rerank_log.info("Rerank operation completed.", num_documents_output=len(reranked_docs_with_scores))
         return reranked_docs_with_scores
 
     def get_model_name(self) -> str:
-        return settings.MODEL_NAME # Returns the configured model name
+        return settings.MODEL_NAME 
 
     def is_ready(self) -> bool:
-        # Check the class-level status
         return SentenceTransformerRerankerAdapter._model is not None and \
                SentenceTransformerRerankerAdapter._model_status == "loaded"
 
     @classmethod
     def get_model_status(cls) -> str:
-        """Class method to get the current model loading status."""
         return cls._model_status
