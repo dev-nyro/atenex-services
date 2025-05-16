@@ -23,7 +23,7 @@ haystack-ai = "^2.0.1"
 pymilvus = "==2.5.3" 
 
 # --- LLM Dependency ---
-google-generativeai = "^0.5.4" 
+google-generativeai = "^0.6.0" 
 
 # --- RAG Component Dependencies ---
 numpy = "1.26.4" 
