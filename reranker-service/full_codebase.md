@@ -367,13 +367,13 @@ import json
 
 # --- Default Values ---
 DEFAULT_MODEL_NAME = "BAAI/bge-reranker-base"
-DEFAULT_MODEL_DEVICE = "cpu"
+DEFAULT_MODEL_DEVICE = "cpu" # Cambiar a "cuda" si hay GPU disponible y se quiere usar
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_PORT = 8004
 DEFAULT_HF_CACHE_DIR = "/app/.cache/huggingface"
-DEFAULT_BATCH_SIZE = 32
+DEFAULT_BATCH_SIZE = 128 # MODIFICADO: Aumentado para potencialmente más throughput
 DEFAULT_MAX_SEQ_LENGTH = 512
-DEFAULT_GUNICORN_WORKERS = 2
+DEFAULT_GUNICORN_WORKERS = 4 # MODIFICADO: Aumentado (ajustar según CPUs disponibles)
 
 
 class Settings(BaseSettings):
@@ -393,7 +393,6 @@ class Settings(BaseSettings):
 
     MODEL_NAME: str = Field(default=DEFAULT_MODEL_NAME)
     MODEL_DEVICE: str = Field(default=DEFAULT_MODEL_DEVICE)
-    # Optional because HuggingFace libs have their own defaults if not set
     HF_CACHE_DIR: Optional[str] = Field(default=DEFAULT_HF_CACHE_DIR) 
     
     BATCH_SIZE: int = Field(default=DEFAULT_BATCH_SIZE, gt=0)
@@ -413,7 +412,6 @@ class Settings(BaseSettings):
     @field_validator('MODEL_DEVICE')
     @classmethod
     def check_model_device(cls, v: str) -> str:
-        # Basic validation for common device strings
         allowed_devices_prefixes = ["cpu", "cuda", "mps"]
         normalized_v = v.lower()
         if not any(normalized_v.startswith(prefix) for prefix in allowed_devices_prefixes):
@@ -422,8 +420,8 @@ class Settings(BaseSettings):
 
 
 # --- Global Settings Instance ---
-_temp_log = logging.getLogger("reranker_service.config.loader") # Use a distinct name
-if not _temp_log.handlers: # Avoid adding handlers multiple times
+_temp_log = logging.getLogger("reranker_service.config.loader") 
+if not _temp_log.handlers: 
     _handler = logging.StreamHandler(sys.stdout)
     _formatter = logging.Formatter('%(levelname)s: [%(name)s] %(message)s')
     _handler.setFormatter(_formatter)
@@ -434,7 +432,6 @@ try:
     _temp_log.info("Loading Reranker Service settings...")
     settings = Settings()
     _temp_log.info("Reranker Service Settings Loaded Successfully:")
-    # Use model_dump for Pydantic v2
     log_data = settings.model_dump() 
     for key, value in log_data.items():
         _temp_log.info(f"  {key.upper()}: {value}")
@@ -443,18 +440,17 @@ except (ValidationError, ValueError) as e:
     error_details_str = ""
     if isinstance(e, ValidationError):
         try:
-            # Attempt to get structured error details if Pydantic ValidationError
             error_details_str = f"\nValidation Errors:\n{json.dumps(e.errors(), indent=2)}"
-        except Exception: # Fallback for other error types or if e.errors() fails
+        except Exception: 
             error_details_str = f"\nRaw Errors: {e}"
-    else: # For generic ValueError
+    else: 
         error_details_str = f"\nError: {e}"
     
     _temp_log.critical(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     _temp_log.critical(f"! FATAL: Reranker Service configuration validation failed!{error_details_str}")
     _temp_log.critical(f"! Check environment variables (prefixed with RERANKER_) or .env file.")
     _temp_log.critical(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-    sys.exit(1) # Exit if configuration fails
+    sys.exit(1) 
 except Exception as e:
     _temp_log.critical(f"FATAL: Unexpected error loading Reranker Service settings: {e}", exc_info=True)
     sys.exit(1)
@@ -466,9 +462,8 @@ except Exception as e:
 import logging
 import sys
 import structlog
-import os # Import os to check for Gunicorn environment
+import os 
 
-# Import settings from the current service's config module
 from app.core.config import settings
 
 def setup_logging():
@@ -477,17 +472,15 @@ def setup_logging():
     log_level_str = settings.LOG_LEVEL.upper()
     log_level_int = getattr(logging, log_level_str, logging.INFO)
 
-    # Common processors for structlog
     shared_processors = [
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_logger_name,
         structlog.stdlib.add_log_level,
-        structlog.processors.StackInfoRenderer(), # For tracebacks
-        structlog.dev.set_exc_info, # Add exception info if present
-        structlog.processors.TimeStamper(fmt="iso", utc=True), # ISO format timestamps in UTC
+        structlog.processors.StackInfoRenderer(), 
+        structlog.dev.set_exc_info, 
+        structlog.processors.TimeStamper(fmt="iso", utc=True), 
     ]
 
-    # Add callsite parameters only if log level is DEBUG for performance
     if log_level_int <= logging.DEBUG:
         shared_processors.append(
             structlog.processors.CallsiteParameterAdder(
@@ -499,56 +492,47 @@ def setup_logging():
             )
         )
 
-    # Configure structlog
     structlog.configure(
         processors=shared_processors + [
             structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
         ],
         logger_factory=structlog.stdlib.LoggerFactory(),
-        wrapper_class=structlog.stdlib.BoundLogger, # Standard bound logger
+        wrapper_class=structlog.stdlib.BoundLogger, 
         cache_logger_on_first_use=True,
     )
 
-    # Configure the stdlib formatter for output
-    # This formatter will process the already structured log records from structlog
     formatter = structlog.stdlib.ProcessorFormatter(
-        # Processor for formatting the records from structlog before rendering.
-        foreign_pre_chain=shared_processors, # Apply shared processors to non-structlog records too
+        foreign_pre_chain=shared_processors, 
         processors=[
-            structlog.stdlib.ProcessorFormatter.remove_processors_meta, # Remove structlog's internal keys
-            structlog.processors.JSONRenderer(), # Render the final log record as JSON
-            # For development, you might prefer:
-            # structlog.dev.ConsoleRenderer(colors=True),
+            structlog.stdlib.ProcessorFormatter.remove_processors_meta, 
+            structlog.processors.JSONRenderer(), 
         ],
     )
 
-    # Get the root logger
     root_logger = logging.getLogger()
-    # Clear any existing handlers to avoid duplicate logs, especially in Gunicorn/Uvicorn
     if root_logger.hasHandlers():
         root_logger.handlers.clear()
 
-    # Add a new StreamHandler with our configured formatter
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(formatter)
     root_logger.addHandler(handler)
     root_logger.setLevel(log_level_int)
 
-    # Configure levels for noisy libraries
+    # MODIFICADO: Aumentar niveles de log para librerías ruidosas
     logging.getLogger("uvicorn").setLevel(logging.WARNING)
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING) # Access logs can be very verbose
-    logging.getLogger("gunicorn.error").setLevel(logging.INFO) # Gunicorn's own error logs
-    logging.getLogger("httpx").setLevel(logging.WARNING) # HTTP client library
-    logging.getLogger("sentence_transformers").setLevel(logging.INFO) # Can be verbose
-    logging.getLogger("torch").setLevel(logging.INFO) # PyTorch
-    logging.getLogger("transformers.modeling_utils").setLevel(logging.WARNING) # Suppress download messages unless error
+    logging.getLogger("uvicorn.access").setLevel(logging.ERROR) # Muy verboso, solo errores
+    logging.getLogger("gunicorn.error").setLevel(logging.INFO) 
+    logging.getLogger("httpx").setLevel(logging.WARNING) 
+    logging.getLogger("sentence_transformers").setLevel(logging.WARNING) # Menos logs de sentence-transformers
+    logging.getLogger("torch").setLevel(logging.WARNING) # Menos logs de PyTorch
+    logging.getLogger("transformers").setLevel(logging.WARNING) # Menos logs de Hugging Face Transformers
+    logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR) 
 
-    # Get a logger specific to this service after configuration
     log = structlog.get_logger(settings.PROJECT_NAME.lower().replace(" ", "-"))
     log.info(
         "Logging configured for Reranker Service",
         log_level=log_level_str,
-        json_logs_enabled=True # Assuming JSONRenderer is used
+        json_logs_enabled=True 
     )
 ```
 
@@ -644,12 +628,12 @@ __all__ = ["SentenceTransformerRerankerAdapter"]
 ```py
 # reranker-service/app/infrastructure/rerankers/sentence_transformer_adapter.py
 import asyncio
-import functools # IMPORTACIÓN AÑADIDA
+import functools 
 from typing import List, Tuple, Optional
 from sentence_transformers import CrossEncoder # type: ignore
 import structlog
 import time
-import os # For Hugging Face cache directory environment variable
+import os 
 
 from app.application.ports.reranker_model_port import RerankerModelPort
 from app.domain.models import DocumentToRerank, RerankedDocument
@@ -666,7 +650,7 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
     """
     _model: Optional[CrossEncoder] = None
     _model_name_loaded: Optional[str] = None
-    _model_status: str = "unloaded" # States: unloaded, loading, loaded, error
+    _model_status: str = "unloaded" 
 
     def __init__(self):
         logger.debug("SentenceTransformerRerankerAdapter instance created.")
@@ -675,7 +659,6 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
     def load_model(cls):
         """
         Loads the CrossEncoder model based on settings.
-        This method is intended to be called once, e.g., during application startup.
         """
         if cls._model_status == "loaded" and cls._model_name_loaded == settings.MODEL_NAME:
             logger.info("Reranker model already loaded and configured.", model_name=settings.MODEL_NAME)
@@ -721,37 +704,33 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
             raise RuntimeError("Reranker model is not available for prediction.")
 
         predict_log = logger.bind(adapter_action="_predict_scores_async", num_pairs=len(query_doc_pairs))
+        # MODIFICADO: Cambiado a DEBUG
         predict_log.debug("Starting asynchronous prediction.")
         
         loop = asyncio.get_event_loop()
         try:
-            # MODIFICACIÓN: Usar functools.partial para envolver la llamada al método del modelo
-            # con sus argumentos de palabra clave.
-            # 'query_doc_pairs' es el argumento posicional 'sentences' para el método predict.
             predict_task_with_args = functools.partial(
                 SentenceTransformerRerankerAdapter._model.predict,
-                query_doc_pairs,  # Este es el argumento 'sentences'
+                query_doc_pairs,  
                 batch_size=settings.BATCH_SIZE,
                 show_progress_bar=False,
-                num_workers=0,  # Tokenization se hará en el mismo hilo/proceso de predicción
-                activation_fct=None, # Devuelve logits/scores brutos, no probabilidades
-                apply_softmax=False, # No aplicar softmax si activation_fct es None
-                convert_to_numpy=True, # Asegurar que la salida sea un array numpy
-                convert_to_tensor=False # No convertir a tensor de PyTorch
+                num_workers=0,  
+                activation_fct=None, 
+                apply_softmax=False, 
+                convert_to_numpy=True, 
+                convert_to_tensor=False 
             )
             
             scores_numpy_array = await loop.run_in_executor(
-                None,  # Usar el ThreadPoolExecutor por defecto de asyncio
-                predict_task_with_args # La función pre-configurada para ser ejecutada
+                None,  
+                predict_task_with_args 
             )
             
-            scores = scores_numpy_array.tolist() # Convertir array numpy a lista Python de floats
-            predict_log.debug("Prediction successful.")
+            scores = scores_numpy_array.tolist() 
+            predict_log.debug("Prediction successful.") # MODIFICADO: Cambiado a DEBUG
             return scores
         except Exception as e:
-            # El log ya tiene exc_info=True, por lo que la traza completa se registrará.
             predict_log.error("Error during reranker model prediction.", error_message=str(e), exc_info=True)
-            # Propagar la excepción original como causa para mantener el contexto del error.
             raise RuntimeError(f"Reranker prediction failed: {str(e)}") from e
 
     async def rerank(
@@ -765,7 +744,8 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
             query_preview=query[:50]+"..." if len(query) > 50 else query,
             num_documents_input=len(documents)
         )
-        rerank_log.info("Starting rerank operation.")
+        # MODIFICADO: Cambiado a DEBUG, el endpoint ya loguea INFO
+        rerank_log.debug("Starting rerank operation in adapter.")
 
         if not documents:
             rerank_log.debug("No documents provided for reranking.")
@@ -805,7 +785,8 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
         
         reranked_docs_with_scores.sort(key=lambda x: x.score, reverse=True)
         
-        rerank_log.info("Rerank operation completed.", num_documents_output=len(reranked_docs_with_scores))
+        # MODIFICADO: Cambiado a DEBUG, el use case/endpoint logueará INFO
+        rerank_log.debug("Rerank operation completed by adapter.", num_documents_output=len(reranked_docs_with_scores))
         return reranked_docs_with_scores
 
     def get_model_name(self) -> str:
@@ -828,73 +809,55 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.exceptions import RequestValidationError
 from contextlib import asynccontextmanager
 import structlog
-import uvicorn # For local execution if __name__ == "__main__"
+import uvicorn 
 import asyncio
-import uuid # For request IDs
+import uuid 
 
-# Import core components first
 from app.core.config import settings
 from app.core.logging_config import setup_logging
 
-# Initialize logging as the very first step
 setup_logging()
 logger = structlog.get_logger(settings.PROJECT_NAME.lower().replace(" ", "-") + ".main")
 
-# Import API router
 from app.api.v1.endpoints import rerank_endpoint
 
-# Import components for dependency setup during lifespan
 from app.infrastructure.rerankers.sentence_transformer_adapter import SentenceTransformerRerankerAdapter
 from app.application.use_cases.rerank_documents_use_case import RerankDocumentsUseCase
-from app.dependencies import set_dependencies # Import setter for dependencies
-from app.api.v1.schemas import HealthCheckResponse # For health check response model
+from app.dependencies import set_dependencies 
+from app.api.v1.schemas import HealthCheckResponse 
 
-# Global state for service readiness, managed by lifespan
 SERVICE_IS_READY = False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Handles application startup and shutdown events.
-    - Loads the reranker model.
-    - Sets up shared dependencies.
-    - Manages service readiness state.
-    """
     global SERVICE_IS_READY
     logger.info(
         f"{settings.PROJECT_NAME} service starting up...", 
-        version="0.1.0", # Consider moving version to config if it changes often
+        version="0.1.0", 
         port=settings.PORT,
         log_level=settings.LOG_LEVEL
     )
     
-    # Instantiate the concrete adapter. Model loading is a class method.
     model_adapter = SentenceTransformerRerankerAdapter()
     
     try:
-        # Trigger model loading. This is a class method that updates static/class variables.
-        # Running synchronous model loading in a thread to avoid blocking lifespan.
         await asyncio.to_thread(SentenceTransformerRerankerAdapter.load_model) 
         
-        if model_adapter.is_ready(): # is_ready() checks the class-level status
+        if model_adapter.is_ready(): 
             logger.info(
                 "Reranker model adapter initialized and model loaded successfully.",
                 model_name=model_adapter.get_model_name()
             )
-            # Instantiate use case with the (now ready) adapter
             rerank_use_case = RerankDocumentsUseCase(reranker_model=model_adapter)
-            
-            # Set shared instances for dependency injection
             set_dependencies(model_adapter=model_adapter, use_case=rerank_use_case)
             SERVICE_IS_READY = True
             logger.info(f"{settings.PROJECT_NAME} is ready to serve requests.")
         else:
             logger.error(
                 "Reranker model failed to load during startup. Service will be unhealthy.",
-                model_name=settings.MODEL_NAME # Log configured name even if load failed
+                model_name=settings.MODEL_NAME 
             )
             SERVICE_IS_READY = False
-            # Ensure dependencies reflect unready state if use_case requires a ready model
             set_dependencies(model_adapter=model_adapter, use_case=None) 
 
     except Exception as e:
@@ -906,18 +869,13 @@ async def lifespan(app: FastAPI):
         SERVICE_IS_READY = False
         set_dependencies(model_adapter=model_adapter if 'model_adapter' in locals() else None, use_case=None)
 
-    yield # Application runs here
-
-    # --- Shutdown Logic ---
+    yield 
     logger.info(f"{settings.PROJECT_NAME} service shutting down...")
-    # Add any cleanup logic here if necessary (e.g., releasing GPU resources explicitly, though PyTorch usually handles this)
-    # For this service, model cleanup is not explicitly managed by instance, but by Python's GC when process ends.
     logger.info(f"{settings.PROJECT_NAME} has been shut down.")
 
-# Create FastAPI application instance
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    version="0.1.0", # Should match pyproject.toml
+    version="0.1.0", 
     description="Microservice for reranking documents based on query relevance using CrossEncoder models.",
     lifespan=lifespan,
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
@@ -925,13 +883,9 @@ app = FastAPI(
     redoc_url=f"{settings.API_V1_STR}/redoc"
 )
 
-# Middleware for request ID, timing, and logging
 @app.middleware("http")
 async def request_context_middleware(request: Request, call_next):
-    # Clear contextvars at the beginning of each request
     structlog.contextvars.clear_contextvars()
-    
-    # Bind request-specific information for all logs within this request's scope
     request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
     structlog.contextvars.bind_contextvars(request_id=request_id)
 
@@ -941,43 +895,45 @@ async def request_context_middleware(request: Request, call_next):
     try:
         response = await call_next(request)
     except Exception as e:
-        # This will catch unhandled exceptions from routes/dependencies
-        logger.exception("Unhandled exception during request processing by middleware.") # Log with full traceback
+        logger.exception("Unhandled exception during request processing by middleware.") 
         response = JSONResponse(
             status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"detail": "An unexpected internal server error occurred."}
         )
     finally:
         process_time_ms = (asyncio.get_event_loop().time() - start_time) * 1000
-        status_code_for_log = response.status_code if response else 500 # Default to 500 if no response
+        status_code_for_log = response.status_code if response else 500 
         
+        # Reducir logs de health checks exitosos a DEBUG
         log_method = logger.info
-        if status_code_for_log >= 500:
+        is_health_check = request.url.path == "/health"
+        if is_health_check and status_code_for_log == 200:
+            log_method = logger.debug # Loguear health checks OK en DEBUG
+        elif status_code_for_log >= 500:
             log_method = logger.error
         elif status_code_for_log >= 400:
             log_method = logger.warning
-
-        log_method(
-            "Request finished",
-            http_method=request.method,
-            http_path=str(request.url.path),
-            http_status_code=status_code_for_log,
-            http_duration_ms=round(process_time_ms, 2),
-            client_host=request.client.host if request.client else "unknown_client"
-        )
-        if response: # Ensure headers are added only if a response object exists
+        
+        # Para otros endpoints que no sean /health o si /health falla, usar el nivel correspondiente
+        if not (is_health_check and status_code_for_log == 200 and log_method == logger.debug):
+             log_method(
+                "Request finished",
+                http_method=request.method,
+                http_path=str(request.url.path),
+                http_status_code=status_code_for_log,
+                http_duration_ms=round(process_time_ms, 2),
+                client_host=request.client.host if request.client else "unknown_client"
+            )
+        
+        if response: 
             response.headers["X-Request-ID"] = request_id
             response.headers["X-Process-Time-Ms"] = f"{process_time_ms:.2f}"
         
-        # Clear contextvars after the request is fully processed
         structlog.contextvars.clear_contextvars()
     return response
 
-# Custom Exception Handlers
 @app.exception_handler(HTTPException)
 async def http_exception_handler_custom(request: Request, exc: HTTPException):
-    # Logged by middleware already if it bubbles up
-    # logger.error("HTTP Exception handled", status_code=exc.status_code, detail=exc.detail)
     return JSONResponse(
         status_code=exc.status_code,
         content={"detail": exc.detail}
@@ -985,28 +941,21 @@ async def http_exception_handler_custom(request: Request, exc: HTTPException):
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler_custom(request: Request, exc: RequestValidationError):
-    # Logged by middleware already
-    # logger.warning("Request Validation Error handled", errors=exc.errors())
     return JSONResponse(
         status_code=fastapi_status.HTTP_422_UNPROCESSABLE_ENTITY,
-        # Provide structured error details from Pydantic
         content={"detail": exc.errors()} 
     )
 
-@app.exception_handler(Exception) # Catch-all for any other unhandled exceptions
+@app.exception_handler(Exception) 
 async def generic_exception_handler_custom(request: Request, exc: Exception):
-    # Logged by middleware already
-    # logger.error("Generic Unhandled Exception handled", error_type=type(exc).__name__, error_message=str(exc), exc_info=True)
     return JSONResponse(
         status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"detail": "An unexpected internal server error occurred."}
     )
 
-# Include API router
 app.include_router(rerank_endpoint.router, prefix=settings.API_V1_STR, tags=["Reranking Operations"])
 logger.info("API routers included.", prefix=settings.API_V1_STR)
 
-# Health Check Endpoint
 @app.get(
     "/health", 
     response_model=HealthCheckResponse, 
@@ -1014,14 +963,13 @@ logger.info("API routers included.", prefix=settings.API_V1_STR)
     summary="Service Health and Model Status Check"
 )
 async def health_check():
-    # Access model status via the class method of the adapter
     model_status = SentenceTransformerRerankerAdapter.get_model_status()
-    current_model_name = settings.MODEL_NAME # Get configured model name
+    current_model_name = settings.MODEL_NAME 
 
     health_log = logger.bind(service_ready_flag=SERVICE_IS_READY, model_actual_status=model_status)
 
     if SERVICE_IS_READY and model_status == "loaded":
-        health_log.debug("Health check: OK")
+        # No loguear INFO para health checks OK aquí; el middleware lo hará en DEBUG
         return HealthCheckResponse(
             status="ok",
             service=settings.PROJECT_NAME,
@@ -1034,7 +982,6 @@ async def health_check():
             unhealthy_reason = f"Model status is '{model_status}'."
         
         health_log.warning("Health check: FAILED", reason=unhealthy_reason)
-        # Return 503 with JSON body as per schema
         return JSONResponse(
             status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE,
             content={
@@ -1046,25 +993,23 @@ async def health_check():
             }
         )
 
-# Root endpoint for basic "is it alive" check or simple info
 @app.get("/", include_in_schema=False)
 async def root_redirect():
     return PlainTextResponse(
         f"{settings.PROJECT_NAME} is running. See {settings.API_V1_STR}/docs for API documentation."
     )
 
-# For local development: uvicorn app.main:app --reload --port 8004
 if __name__ == "__main__":
     logger.info(f"Starting {settings.PROJECT_NAME} locally with Uvicorn...")
     uvicorn.run(
         "app.main:app",
-        host="0.0.0.0", # Listen on all available IPs
+        host="0.0.0.0", 
         port=settings.PORT,
-        log_level=settings.LOG_LEVEL.lower(), # Uvicorn's own log level
-        reload=True # Enable auto-reload for development
+        log_level=settings.LOG_LEVEL.lower(), 
+        reload=True 
     )
 
-# jfu
+# JFU
 ```
 
 ## File: `app\utils\__init__.py`
