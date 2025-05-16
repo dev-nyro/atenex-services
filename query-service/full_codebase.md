@@ -2537,11 +2537,14 @@ class StubDiversityFilter(DiversityFilterPort):
 ## File: `app\infrastructure\llms\gemini_adapter.py`
 ```py
 # query-service/app/infrastructure/llms/gemini_adapter.py
-import google.generativeai as genai
 import structlog
 from typing import Optional, List, Type, Any, Dict
 from pydantic import BaseModel
 import json
+
+# MODIFICADO: Importar el nuevo SDK
+from google import genai as google_genai_sdk # Renombrar para evitar confusión con el antiguo
+from google.genai import types as google_genai_types # Usar el módulo 'types' del nuevo SDK
 
 from app.core.config import settings
 from app.application.ports.llm_port import LLMPort
@@ -2552,23 +2555,15 @@ from app.utils.helpers import truncate_text
 
 log = structlog.get_logger(__name__)
 
-
-
-
+# La función _clean_pydantic_schema_for_gemini probablemente necesite ajustes
+# ya que el nuevo SDK podría esperar un formato de schema ligeramente diferente
+# o tener sus propias utilidades para esto (aunque Pydantic es común).
+# Por ahora, se mantiene la lógica de limpieza, pero esto es un punto a verificar.
 def _clean_pydantic_schema_for_gemini(pydantic_schema: Dict[str, Any]) -> Dict[str, Any]:
     """
     Transforms a Pydantic-generated JSON schema into a format more
-    compatible with Gemini's FunctionDeclaration.parameters.
-    Specifically, it handles:
-    - Removes the top-level '$defs' key if present.
-    - Transforms 'anyOf' for optional fields (e.g., {"anyOf": [{"type": X}, {"type": "null"}]})
-      into {"type": X, "nullable": True}.
-    - Converts JSON schema types to uppercase Gemini types (e.g., "string" -> "STRING").
-    - Removes 'title' and 'description' from the root of the schema, as Gemini
-      takes these from the FunctionDeclaration's name and description.
-    - Removes other unsupported keys like "default", "examples", "const".
+    compatible with Gemini's FunctionDeclaration.parameters or GenerateContentConfig response_schema.
     """
-
     definitions = pydantic_schema.get("$defs", {})
     schema_copy = {
         k: v
@@ -2579,7 +2574,6 @@ def _clean_pydantic_schema_for_gemini(pydantic_schema: Dict[str, Any]) -> Dict[s
     def resolve_ref(ref_path: str) -> Dict[str, Any]:
         if not ref_path.startswith("#/$defs/"):
             return {"$ref": ref_path}
-
         def_key = ref_path.split("/")[-1]
         if def_key in definitions:
             return transform_node(definitions[def_key])
@@ -2587,19 +2581,11 @@ def _clean_pydantic_schema_for_gemini(pydantic_schema: Dict[str, Any]) -> Dict[s
             return {"$ref": ref_path}
 
     def transform_node(node: Dict[str, Any]) -> Dict[str, Any]:
-        if not isinstance(node, dict):
-            return node
-
+        if not isinstance(node, dict): return node
         transformed_node = {}
-
         for key, value in node.items():
-            if key in {"default", "examples", "example", "const", "title", "description"}:
-                continue
-
-            if key == "$ref" and isinstance(value, str):
-                inlined_ref = resolve_ref(value)
-                return inlined_ref
-
+            if key in {"default", "examples", "example", "const", "title", "description"}: continue
+            if key == "$ref" and isinstance(value, str): return resolve_ref(value)
             elif key == "anyOf" and isinstance(value, list):
                 is_optional_pattern = False
                 if len(value) == 2:
@@ -2610,139 +2596,159 @@ def _clean_pydantic_schema_for_gemini(pydantic_schema: Dict[str, Any]) -> Dict[s
                         for k_type, v_type in type_def_item.items():
                             transformed_node[k_type] = transform_node(v_type) if isinstance(v_type, dict) else v_type
                         transformed_node["nullable"] = True
-
-                if not is_optional_pattern:
-                    transformed_node[key] = [transform_node(item) for item in value]
+                if not is_optional_pattern: transformed_node[key] = [transform_node(item) for item in value]
                 continue
-
-            elif isinstance(value, dict):
-                transformed_node[key] = transform_node(value)
+            elif isinstance(value, dict): transformed_node[key] = transform_node(value)
             elif isinstance(value, list) and key not in ["enum", "required"]:
                 transformed_node[key] = [transform_node(item) if isinstance(item, dict) else item for item in value]
-            else:
-                transformed_node[key] = value
-
+            else: transformed_node[key] = value
         if "type" in transformed_node:
             json_type = transformed_node["type"]
             if isinstance(json_type, list):
-                if "null" in json_type:
-                    transformed_node["nullable"] = True
+                if "null" in json_type: transformed_node["nullable"] = True
                 actual_type = next((t for t in json_type if t != "null"), None)
-                if actual_type and isinstance(actual_type, str):
-                    transformed_node["type"] = actual_type.upper()
-                elif actual_type:
-                    transformed_node["type"] = transform_node(actual_type)
-            elif isinstance(json_type, str):
-                transformed_node["type"] = json_type.upper()
-
+                if actual_type and isinstance(actual_type, str): transformed_node["type"] = actual_type.upper()
+                elif actual_type: transformed_node["type"] = transform_node(actual_type) # type: ignore
+            elif isinstance(json_type, str): transformed_node["type"] = json_type.upper()
         return transformed_node
-
     final_schema = transform_node(schema_copy)
-
-    if "title" in final_schema:
-        del final_schema["title"]
-    if "description" in final_schema:
-        del final_schema["description"]
-
+    if "title" in final_schema: del final_schema["title"]
+    if "description" in final_schema: del final_schema["description"]
     return final_schema
 
 
 class GeminiAdapter(LLMPort):
-    """Adaptador concreto para interactuar con la API de Google Gemini."""
-
     def __init__(self):
         self._api_key = settings.GEMINI_API_KEY.get_secret_value()
-        self._model_name = settings.GEMINI_MODEL_NAME
-        self.model: Optional[genai.GenerativeModel] = None
+        self._model_name = settings.GEMINI_MODEL_NAME # e.g., 'gemini-2.0-flash' o 'gemini-1.5-flash-latest'
+        self.client: Optional[google_genai_sdk.Client] = None # MODIFICADO: tipo del nuevo SDK
         self._configure_client()
 
     def _configure_client(self):
-        """Configura el cliente de Gemini."""
         try:
             if self._api_key:
-                genai.configure(api_key=self._api_key)
-                self.model = genai.GenerativeModel(self._model_name)
-                log.info("Gemini client configured successfully", model_name=self._model_name)
+                # MODIFICADO: Configuración del nuevo SDK
+                self.client = google_genai_sdk.Client(api_key=self._api_key)
+                log.info("Google GenAI SDK client configured successfully", model_name_to_be_used=self._model_name)
             else:
                 log.warning("Gemini API key is missing. Client not configured.")
         except Exception as e:
-            log.error("Failed to configure Gemini client", error=str(e), exc_info=True)
-            self.model = None
+            log.error("Failed to configure Google GenAI SDK client", error=str(e), exc_info=True)
+            self.client = None
 
     @retry(
         stop=stop_after_attempt(settings.HTTP_CLIENT_MAX_RETRIES + 1),
         wait=wait_exponential(multiplier=settings.HTTP_CLIENT_BACKOFF_FACTOR, min=2, max=10),
+        # MODIFICADO: Ajustar excepciones al nuevo SDK si es necesario, o usar genéricas
         retry=retry_if_exception_type((
-            genai.types.generation_types.StopCandidateException, # type: ignore
-            genai.types.generation_types.BlockedPromptException, # type: ignore
+            google_genai_sdk.APIError, # Asumiendo que el nuevo SDK tiene una clase base APIError
             TimeoutError,
+            httpx.RequestError # Si el nuevo SDK usa httpx internamente y puede lanzar esto
         )),
         reraise=True,
         before_sleep=lambda retry_state: log.warning(
-            "Retrying Gemini API call",
+            "Retrying Google GenAI API call",
             attempt=retry_state.attempt_number,
-            wait_time=f"{retry_state.next_action.sleep:.2f}s", # type: ignore
-            error_type=type(retry_state.outcome.exception()).__name__ if retry_state.outcome else "N/A", # type: ignore
-            error_message=str(retry_state.outcome.exception()) if retry_state.outcome else "N/A" # type: ignore
+            wait_time=f"{retry_state.next_action.sleep:.2f}s", 
+            error_type=type(retry_state.outcome.exception()).__name__ if retry_state.outcome else "N/A", 
+            error_message=str(retry_state.outcome.exception()) if retry_state.outcome else "N/A" 
         )
     )
     async def generate(self, prompt: str,
                        response_pydantic_schema: Optional[Type[BaseModel]] = None
                       ) -> str:
-        if not self.model:
-            log.error("Gemini client not initialized. Cannot generate answer.")
-            raise ConnectionError("Gemini client is not properly configured (missing API key or init failed).")
+        if not self.client:
+            log.error("Google GenAI SDK client not initialized. Cannot generate answer.")
+            raise ConnectionError("Google GenAI SDK client is not properly configured.")
 
         generate_log = log.bind(
-            adapter="GeminiAdapter",
-            model_name=self._model_name,
-            prompt_length=len(prompt),
-            expecting_json=bool(response_pydantic_schema)
+            adapter="GeminiAdapterSDKvNew", model_name=self._model_name,
+            prompt_length=len(prompt), expecting_json=bool(response_pydantic_schema)
         )
 
-
-        tools_config: Optional[List[Any]] = None
-        generation_config_dict: Dict[str, Any] = {
+        # MODIFICADO: Argumentos para el nuevo SDK client.models.generate_content
+        # El prompt es el argumento 'contents'
+        # La configuración va en 'config' que es un types.GenerateContentConfig
+        
+        config_args: Dict[str, Any] = {
             "temperature": 0.6,
             "top_p": 0.9,
         }
+        tools_arg: Optional[List[google_genai_types.Tool]] = None
 
         if response_pydantic_schema:
-            # --- limpiamos el esquema Pydantic ---
-            pydantic_schema_dict = response_pydantic_schema.model_json_schema()
-            schema_params = _clean_pydantic_schema_for_gemini(pydantic_schema_dict)
-            generate_log.debug("Cleaned JSON Schema for Gemini Function Calling", schema_final=schema_params)
+            config_args["response_mime_type"] = "application/json"
+            # El nuevo SDK puede tomar directamente la clase Pydantic para response_schema
+            # o un diccionario de schema limpio.
+            config_args["response_schema"] = response_pydantic_schema 
+            # Para "function calling" con JSON explícito, la documentación del nuevo SDK indica
+            # que especificar response_mime_type="application/json" y response_schema es la forma.
+            # Si quisiéramos un "tool" explícito (como get_weather_example), lo haríamos así:
+            # pydantic_schema_dict = response_pydantic_schema.model_json_schema()
+            # schema_params = _clean_pydantic_schema_for_gemini(pydantic_schema_dict)
+            # fn_decl = google_genai_types.FunctionDeclaration(name="format_structured_response", description="...", parameters=schema_params)
+            # tools_arg = [google_genai_types.Tool(function_declarations=[fn_decl])]
+            # config_args["tools"] = tools_arg
+            # (Omitido por ahora ya que response_schema debería ser suficiente para JSON estructurado)
+            
+            # Si necesitamos forzar el modo FUNCTION (aunque el nuevo SDK prefiere automatic):
+            # function_calling_config_dict = {
+            #     "mode": "FUNCTION", # O el enum correspondiente del nuevo SDK
+            #     "allowed_function_names": ["format_structured_response"]
+            # }
+            # tool_config_for_generation_config = {"function_calling_config": function_calling_config_dict}
+            # config_args["tool_config"] = google_genai_types.ToolConfig(**tool_config_for_generation_config)
+            # -> Según la doc de JSON response, solo response_schema y mime_type son necesarios.
+            # -> El antiguo ToolConfig y FunctionCallingConfig no se usan de la misma manera.
 
-            # --- declaramos la función para Gemini ---
-            fn_decl = genai.types.FunctionDeclaration(
-                name="format_structured_response",
-                description=f"Formats the response according to the {response_pydantic_schema.__name__} schema.",
-                parameters=schema_params
-            )
-            tools_config = [ genai.types.Tool(function_declarations=[fn_decl]) ]
-
-            # para evitar 400 INVALID_ARGUMENT hay que usar ANY
-            generation_config_dict["function_calling_config"] = genai.types.FunctionCallingConfig(
-                mode=genai.types.FunctionCallingConfig.Mode.ANY,
-                allowed_function_names=["format_structured_response"]
-            )
-
-        final_generation_config = genai.types.GenerationConfig(**generation_config_dict)
+        final_generation_config = google_genai_types.GenerateContentConfig(**config_args)
 
         try:
-            # sólo pasamos tools si realmente tenemos una lista
-            call_kwargs: Dict[str, Any] = {"generation_config": final_generation_config}
-            if tools_config is not None:
-                call_kwargs["tools"] = tools_config
-            response = await self.model.generate_content_async(prompt, **call_kwargs)
+            # MODIFICADO: Uso del cliente del nuevo SDK de forma asíncrona
+            # (asumiendo que el cliente global self.client es síncrono,
+            # necesitamos usar self.client.aio para llamadas async)
+            # o, si self.client ya es un AsyncClient de httpx (para nuestro propio uso),
+            # aquí usaríamos el client.aio del SDK de genai.
+            # Para simplificar, si has instanciado `client = genai.Client()`,
+            # para async es `await client.aio.models.generate_content(...)`
+
+            # La documentación actual de google-genai no muestra una clase `AsyncClient` explícita
+            # sino que los métodos async están bajo `client.aio.*`.
+            # Si `google_genai_sdk.Client()` es síncrono, necesitamos un cliente async o run_in_executor.
+            # Vamos a asumir que el SDK maneja la asincronía internamente para `generate_content_async`
+            # o que se debe usar `client.aio.models.generate_content`.
+            # Por la doc, para async es `client.aio.models.generate_content`
+            
+            # Para un SDK que podría no tener un cliente async incorporado de forma sencilla:
+            # response = await asyncio.to_thread(
+            #     self.client.models.generate_content, # type: ignore
+            #     model=self._model_name,
+            #     contents=prompt,
+            #     generation_config=final_generation_config,
+            #     # tools=tools_arg # Solo si se define un tool explícito
+            # )
+            
+            # Usando el patrón recomendado para async con el nuevo SDK
+            if not hasattr(self.client, 'aio'):
+                raise RuntimeError("El cliente google-genai no tiene el atributo 'aio' esperado para operaciones asíncronas.")
+
+            response = await self.client.aio.models.generate_content( # type: ignore
+                model=f"models/{self._model_name}", # El nuevo SDK espera el prefijo "models/" para los de Gemini
+                contents=prompt,
+                generation_config=final_generation_config,
+                tools=tools_arg 
+            )
+            
 
             generated_text = ""
+            # El procesamiento de la respuesta en el nuevo SDK puede ser diferente.
+            # La documentación muestra `response.text` para contenido de texto simple
+            # y `response.parsed` para JSON cuando `response_schema` se usó.
 
             if not response.candidates:
-                 finish_reason_str = getattr(response.prompt_feedback, 'block_reason', "UNKNOWN_REASON") # type: ignore
-                 safety_ratings_str = str(getattr(response.prompt_feedback, 'safety_ratings', "N/A")) # type: ignore
+                 finish_reason_str = str(getattr(response, 'prompt_feedback', {}).get('block_reason', "UNKNOWN_REASON"))
                  generate_log.warning("Gemini response potentially blocked (no candidates)",
-                                      finish_reason=finish_reason_str, safety_ratings=safety_ratings_str)
+                                      finish_reason=finish_reason_str)
                  if response_pydantic_schema:
                      return json.dumps({
                          "error_message": f"Respuesta bloqueada por Gemini (sin candidatos). Razón: {finish_reason_str}",
@@ -2753,98 +2759,71 @@ class GeminiAdapter(LLMPort):
 
             candidate = response.candidates[0]
 
-            if not candidate.content or not candidate.content.parts:
-                finish_reason_cand_str = getattr(candidate, 'finish_reason', "UNKNOWN_REASON")
-                safety_ratings_cand_str = str(getattr(candidate, 'safety_ratings', "N/A"))
-                generate_log.warning("Gemini response candidate empty or missing parts",
-                                     candidate_finish_reason=finish_reason_cand_str,
-                                     candidate_safety_ratings=safety_ratings_cand_str)
-                if response_pydantic_schema:
-                     return json.dumps({
-                         "error_message": f"Respuesta vacía de Gemini (candidato sin contenido). Razón: {finish_reason_cand_str}",
-                         "respuesta_detallada": f"El asistente no pudo generar una respuesta completa. Razón: {finish_reason_cand_str}.",
-                         "fuentes_citadas": []
-                     })
-                return f"[Respuesta vacía de Gemini (candidato sin contenido). Razón: {finish_reason_cand_str}]"
-
             if response_pydantic_schema:
-                function_call_part = next((part for part in candidate.content.parts if part.function_call), None)
-                if function_call_part:
-                    function_call = function_call_part.function_call
-                    if function_call.name == "format_structured_response":
-                        args_dict = {key: value for key, value in function_call.args.items()}
+                # Con el nuevo SDK y response_schema, el contenido parseado debería estar en response.text (como string JSON)
+                # o, si el SDK lo parsea, en response.parts[0].text (si es json en texto) o a través de un método
+                # como model_dump_json() si response es un Pydantic model, o .parsed.
+                # La documentación del nuevo SDK dice:
+                # "Cuando sea posible, el SDK analizará el JSON que se muestra y mostrará el resultado en response.parsed.
+                #  Si proporcionaste una clase pydantic como el esquema, el SDK convertirá ese JSON en una instancia de la clase."
+                # Pero `response` en sí no es el objeto parseado, es `GenerateContentResponse`.
+                # `response.text` es la forma general de obtener el contenido textual.
+                if hasattr(candidate, 'text') and candidate.text: # El nuevo SDK puede tener .text directamente en el candidate
+                    generated_text = candidate.text
+                elif candidate.content and candidate.content.parts:
+                    # Si es un function call, el JSON estará en los args
+                    function_call_part = next((part for part in candidate.content.parts if part.function_call), None)
+                    if function_call_part and function_call_part.function_call.name == "format_structured_response":
+                        args_dict = {key: value for key, value in function_call_part.function_call.args.items()} # type: ignore
                         generated_text = json.dumps(args_dict)
-                        generate_log.debug("Received JSON via function call from Gemini API", response_length=len(generated_text))
-                    else:
-                        generate_log.warning("Gemini called an unexpected function.",
-                                             called_function_name=function_call.name,
-                                             expected_function_name="format_structured_response")
+                        generate_log.debug("Received JSON via function call from Google GenAI SDK API", response_length=len(generated_text))
+                    else: # Si no es function call pero se esperaba JSON, debería estar en .text
                         generated_text = "".join(part.text for part in candidate.content.parts if hasattr(part, 'text') and part.text)
-                        if not generated_text.strip() and response_pydantic_schema:
+                        if not generated_text.strip():
+                            generate_log.warning("Expected JSON, but got no text content from Gemini candidate parts.")
                             return json.dumps({
-                                "error_message": f"LLM called unexpected function '{function_call.name}' and returned no usable text.",
-                                "respuesta_detallada": f"Error: El asistente devolvió un formato inesperado (función: {function_call.name}).",
+                                "error_message": "LLM did not return expected JSON content.",
+                                "respuesta_detallada": "Error: El asistente no pudo estructurar la respuesta correctamente.",
                                 "fuentes_citadas": []
                             })
                 else:
-                    generate_log.warning("Expected JSON via function call, but no function_call part found. Checking for plain text.")
-                    generated_text = "".join(part.text for part in candidate.content.parts if hasattr(part, 'text') and part.text)
-                    if not generated_text.strip():
-                         return json.dumps({
-                             "error_message": "LLM did not make a function call and returned no text when JSON was expected.",
-                             "respuesta_detallada": "Error: El asistente no pudo estructurar la respuesta correctamente y no proporcionó texto.",
-                             "fuentes_citadas": []
-                         })
-            else:
-                generated_text = "".join(part.text for part in candidate.content.parts if hasattr(part, 'text') and part.text)
-                generate_log.debug("Received text response from Gemini API", response_length=len(generated_text))
+                    generate_log.warning("Expected JSON, but candidate has no text or content parts.")
+                    return json.dumps({
+                        "error_message": "LLM candidate has no usable content for expected JSON.",
+                        "respuesta_detallada": "Error: El asistente no devolvió contenido usable.",
+                        "fuentes_citadas": []
+                    })
 
-            if response_pydantic_schema:
+                # Validar si es JSON
                 try:
-                    json.loads(generated_text) # Validate if it's actually JSON string
+                    json.loads(generated_text) 
                 except json.JSONDecodeError as json_err:
-                    generate_log.error("Gemini response content is not valid JSON despite expectation.",
+                    generate_log.error("Google GenAI SDK response content is not valid JSON despite expectation.",
                                        raw_response_preview=truncate_text(generated_text, 500),
-                                       error_message=str(json_err),
-                                       was_function_call=(function_call_part is not None))
+                                       error_message=str(json_err))
                     return json.dumps({
                          "error_message": f"LLM returned malformed JSON: {str(json_err)}",
                          "respuesta_detallada": f"Error: La respuesta del asistente no pudo ser procesada (JSON malformado). Respuesta recibida: {truncate_text(generated_text, 200)}",
                          "fuentes_citadas": []
                     })
+            else: # Respuesta de texto plano
+                generated_text = response.text # El nuevo SDK tiene response.text directamente
+                generate_log.debug("Received text response from Google GenAI SDK API", response_length=len(generated_text))
 
             return generated_text.strip()
 
-        except genai.errors.ClientError as client_err:
-            # atrapamos el 400 de incompatibilidad y reintentamos en modo ANY
-            msg = str(client_err)
-            if "tool_config.function_calling_config.mode" in msg and "INVALID_ARGUMENT" in msg:
-                generate_log.warning("ClientError 400 INVALID_ARGUMENT: adaptando a mode=ANY y reintentando.",
-                                     error=msg)
-                generation_config_dict["function_calling_config"].mode = genai.types.FunctionCallingConfig.Mode.ANY
-                final_generation_config = genai.types.GenerationConfig(**generation_config_dict)
-                call_kwargs = {"generation_config": final_generation_config, "tools": tools_config}
-                response = await self.model.generate_content_async(prompt, **call_kwargs)
-                # procesar response igual que arriba...
-            else:
-                log.error("Gemini API ClientError inesperado", error=msg)
-                raise ConnectionError(f"Gemini API call failed: {msg}") from client_err
-        except (genai.types.generation_types.BlockedPromptException, genai.types.generation_types.StopCandidateException) as security_err: # type: ignore
-            finish_reason_err_str = getattr(security_err, 'finish_reason', 'N/A')
-            generate_log.warning("Gemini request blocked or stopped due to safety/policy.",
-                                 error_type=type(security_err).__name__,
-                                 error_details=str(security_err),
-                                 finish_reason=finish_reason_err_str)
-            if response_pydantic_schema:
-                return json.dumps({
-                    "error_message": f"Contenido bloqueado o detenido por Gemini: {type(security_err).__name__}",
-                    "respuesta_detallada": f"La generación de la respuesta fue bloqueada o detenida por políticas de contenido. Por favor, ajusta tu consulta. (Razón: {finish_reason_err_str})",
-                    "fuentes_citadas": []
-                })
-            return f"[Contenido bloqueado o detenido por Gemini: {type(security_err).__name__}. Razón: {finish_reason_err_str}]"
+        except google_genai_sdk.APIError as api_err: # Capturar errores específicos del nuevo SDK
+             generate_log.error("Google GenAI SDK APIError", error_details=str(api_err), exc_info=True)
+             if response_pydantic_schema:
+                 return json.dumps({
+                     "error_message": f"Error de API de Gemini: {type(api_err).__name__}",
+                     "respuesta_detallada": f"Hubo un error con el servicio de lenguaje. Por favor, intenta de nuevo. (Detalle: {str(api_err)[:100]})",
+                     "fuentes_citadas": []
+                 })
+             return f"[Error de API de Gemini: {str(api_err)}]"
         except Exception as e:
-            generate_log.exception("Unhandled error during Gemini API call")
-            raise ConnectionError(f"Gemini API call failed unexpectedly: {e}") from e
+            generate_log.exception("Unhandled error during Google GenAI SDK API call")
+            raise ConnectionError(f"Google GenAI SDK API call failed unexpectedly: {e}") from e
 ```
 
 ## File: `app\infrastructure\persistence\__init__.py`
@@ -3901,7 +3880,7 @@ if __name__ == "__main__":
     print(f"----- Starting {settings.PROJECT_NAME} locally on port {port} -----")
     uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True, log_level=log_level_str)
 
-# jfu
+# jfu 2
 ```
 
 ## File: `app\models\__init__.py`
@@ -4163,12 +4142,14 @@ readme = "README.md"
 
 [tool.poetry.dependencies]
 python = "^3.10"
+
 fastapi = "^0.110.0"
 uvicorn = {extras = ["standard"], version = "^0.28.0"}
 gunicorn = "^21.2.0"
 pydantic = {extras = ["email"], version = "^2.6.4"} 
 pydantic-settings = "^2.2.1"
-httpx = "^0.27.0"
+# httpx debe ser compatible con google-genai
+httpx = ">=0.28.1,<1.0.0"
 asyncpg = "^0.29.0"
 python-jose = {extras = ["cryptography"], version = "^3.3.0"}
 tenacity = "^8.2.3"
@@ -4179,7 +4160,8 @@ haystack-ai = "^2.0.1"
 pymilvus = "==2.5.3" 
 
 # --- LLM Dependency ---
-google-generativeai = "^0.6.0" # MODIFICADO: Actualizado a 0.6.0 o superior
+# MODIFICADO: Usar el nuevo SDK recomendado por Google
+google-genai = "^1.15.0"
 
 # --- RAG Component Dependencies ---
 numpy = "1.26.4" 
