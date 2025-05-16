@@ -105,19 +105,21 @@ jobs:
           echo "workflow-itself_any_changed: ${{ steps.changed_files.outputs.workflow-itself_any_changed }}"
           echo "-------------------------------------------------------"
 
+          # CORRECCIÓN: Ya no se marcan todos los servicios si solo el workflow cambia.
+          # Simplemente se verifica si el workflow cambió para la bandera ANY_CHANGED general.
           if [[ "${{ steps.changed_files.outputs.workflow-itself_any_changed }}" == "true" ]]; then
-            echo "Workflow file changed. Marking all services as changed."
-            changed_service_ids=("api-gateway" "docproc-service" "embedding-service" "ingest-service" "query-service" "reranker-service" "sparse-search-service")
-            ANY_CHANGED="true"
-          else
-            [ "${{ steps.changed_files.outputs.api-gateway_any_changed }}" == "true" ] && changed_service_ids+=("api-gateway") && ANY_CHANGED="true"
-            [ "${{ steps.changed_files.outputs.docproc-service_any_changed }}" == "true" ] && changed_service_ids+=("docproc-service") && ANY_CHANGED="true"
-            [ "${{ steps.changed_files.outputs.embedding-service_any_changed }}" == "true" ] && changed_service_ids+=("embedding-service") && ANY_CHANGED="true"
-            [ "${{ steps.changed_files.outputs.ingest-service_any_changed }}" == "true" ] && changed_service_ids+=("ingest-service") && ANY_CHANGED="true"
-            [ "${{ steps.changed_files.outputs.query-service_any_changed }}" == "true" ] && changed_service_ids+=("query-service") && ANY_CHANGED="true"
-            [ "${{ steps.changed_files.outputs.reranker-service_any_changed }}" == "true" ] && changed_service_ids+=("reranker-service") && ANY_CHANGED="true"
-            [ "${{ steps.changed_files.outputs.sparse-search-service_any_changed }}" == "true" ] && changed_service_ids+=("sparse-search-service") && ANY_CHANGED="true"
+            echo "Workflow file itself changed."
+            ANY_CHANGED="true" # Un cambio en el workflow significa que "algo" cambió.
           fi
+
+          # Construir la lista de servicios cambiados basándose en sus directorios.
+          [ "${{ steps.changed_files.outputs.api-gateway_any_changed }}" == "true" ] && changed_service_ids+=("api-gateway") && ANY_CHANGED="true"
+          [ "${{ steps.changed_files.outputs.docproc-service_any_changed }}" == "true" ] && changed_service_ids+=("docproc-service") && ANY_CHANGED="true"
+          [ "${{ steps.changed_files.outputs.embedding-service_any_changed }}" == "true" ] && changed_service_ids+=("embedding-service") && ANY_CHANGED="true"
+          [ "${{ steps.changed_files.outputs.ingest-service_any_changed }}" == "true" ] && changed_service_ids+=("ingest-service") && ANY_CHANGED="true"
+          [ "${{ steps.changed_files.outputs.query-service_any_changed }}" == "true" ] && changed_service_ids+=("query-service") && ANY_CHANGED="true"
+          [ "${{ steps.changed_files.outputs.reranker-service_any_changed }}" == "true" ] && changed_service_ids+=("reranker-service") && ANY_CHANGED="true"
+          [ "${{ steps.changed_files.outputs.sparse-search-service_any_changed }}" == "true" ] && changed_service_ids+=("sparse-search-service") && ANY_CHANGED="true"
           
           JSON_OUTPUT=$(printf '%s\n' "${changed_service_ids[@]}" | jq -R . | jq -s .)
           
@@ -125,7 +127,6 @@ jobs:
           echo "Generated JSON: $JSON_OUTPUT"
           echo "Any service changed flag: $ANY_CHANGED"
 
-          # Corrección: Usar here document para salidas multilínea
           echo "changed_services_json<<EOF" >> "$GITHUB_OUTPUT"
           echo "$JSON_OUTPUT" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
@@ -211,8 +212,13 @@ jobs:
       shell: bash
       run: |
         echo "Checking if ${{ matrix.service.id }} is in '${{ needs.detect-changed-services.outputs.changed_services_json }}'"
-        is_changed=$(echo '${{ needs.detect-changed-services.outputs.changed_services_json }}' | jq --arg id_to_check "${{ matrix.service.id }}" 'any(. == $id_to_check)')
-        
+        # Si changed_services_json está vacío (ej. solo cambió el workflow), is_changed será false.
+        if [[ -z "${{ needs.detect-changed-services.outputs.changed_services_json }}" || "${{ needs.detect-changed-services.outputs.changed_services_json }}" == "[]" ]]; then
+          is_changed="false"
+        else
+          is_changed=$(echo '${{ needs.detect-changed-services.outputs.changed_services_json }}' | jq --arg id_to_check "${{ matrix.service.id }}" 'any(. == $id_to_check)')
+        fi
+
         if [[ "$is_changed" == "true" ]]; then
           echo "build_required=true" >> "$GITHUB_OUTPUT"
           echo "Service ${{ matrix.service.name }} needs to be built."
