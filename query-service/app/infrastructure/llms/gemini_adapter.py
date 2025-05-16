@@ -30,8 +30,14 @@ def _clean_pydantic_schema_for_gemini(pydantic_schema: Dict[str, Any]) -> Dict[s
     """
     # log.debug("Original Pydantic Schema for cleaning: %s", pydantic_schema) # Can be very verbose
 
+
     definitions = pydantic_schema.get("$defs", {})
-    schema_copy = {k: v for k, v in pydantic_schema.items() if k != "$defs"}
+    # además de $defs, quitamos también title, description y $schema del root
+    schema_copy = {
+        k: v
+        for k, v in pydantic_schema.items()
+        if k not in {"$defs", "title", "description", "$schema"}
+    }
 
     def resolve_ref(ref_path: str) -> Dict[str, Any]:
         if not ref_path.startswith("#/$defs/"):
@@ -48,12 +54,11 @@ def _clean_pydantic_schema_for_gemini(pydantic_schema: Dict[str, Any]) -> Dict[s
             return node
 
         transformed_node = {}
+
         for key, value in node.items():
-            # --- Claves que Gemini no soporta o se manejan de otra forma ---
-            if key in {"default", "examples", "example", "const"}:
-                # Descartar silenciosamente
+            # quitamos también title/description en cualquier nodo
+            if key in {"default", "examples", "example", "const", "title", "description"}:
                 continue
-            # --- Fin de claves no soportadas ---
 
             if key == "$ref" and isinstance(value, str):
                 inlined_ref = resolve_ref(value)
