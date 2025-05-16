@@ -2539,7 +2539,7 @@ class StubDiversityFilter(DiversityFilterPort):
 # query-service/app/infrastructure/llms/gemini_adapter.py
 # LLM_CORRECTION_START: Correct imports for google-genai SDK
 from google import genai
-from google.genai import types as genai_types
+from google.generativeai import types as genai_types
 # LLM_CORRECTION_END
 import structlog
 from typing import Optional, List, Type, Any, Dict
@@ -2558,7 +2558,7 @@ log = structlog.get_logger(__name__)
 class GeminiAdapter(LLMPort):
     _api_key: str
     _model_name: str
-    _model: Optional[genai.GenerativeModel] = None # LLM_CORRECTION: Use GenerativeModel from the new SDK
+    _model: Optional[genai.GenerativeModel] = None 
 
     def __init__(self):
         self._api_key = settings.GEMINI_API_KEY.get_secret_value()
@@ -2569,7 +2569,6 @@ class GeminiAdapter(LLMPort):
         try:
             if self._api_key:
                 genai.configure(api_key=self._api_key)
-                # For google-genai SDK, GenerativeModel is the way to interact with specific models
                 self._model = genai.GenerativeModel(self._model_name)
                 log.info("Gemini client configured successfully using GenerativeModel", model_name=self._model_name)
             else:
@@ -2585,6 +2584,7 @@ class GeminiAdapter(LLMPort):
             genai_types.generation_types.StopCandidateException, 
             genai_types.generation_types.BlockedPromptException, 
             TimeoutError, 
+            # Potentially other google.api_core.exceptions for network issues
         )),
         reraise=True,
         before_sleep=lambda retry_state: log.warning(
@@ -2598,7 +2598,7 @@ class GeminiAdapter(LLMPort):
     async def generate(self, prompt: str,
                        response_pydantic_schema: Optional[Type[BaseModel]] = None
                       ) -> str:
-        if not self._model: # LLM_CORRECTION: Check self._model
+        if not self._model:
             log.error("Gemini client (GenerativeModel) not initialized. Cannot generate answer.")
             raise ConnectionError("Gemini client is not properly configured (missing API key or init failed).")
 
@@ -2615,22 +2615,33 @@ class GeminiAdapter(LLMPort):
         }
         tools_config: Optional[List[genai_types.Tool]] = None 
 
+        # LLM_CORRECTION_GEMINI_FUNCTION_CALLING: Explicitly use Function Calling for structured JSON
         if response_pydantic_schema:
+            # Pydantic v2 usa model_json_schema()
             pydantic_schema_dict = response_pydantic_schema.model_json_schema()
-            schema_params = _clean_pydantic_schema_for_gemini(pydantic_schema_dict)
-            generate_log.debug("Cleaned JSON Schema for Gemini Function Calling (Tool)", schema_final=schema_params)
+            
+            # Gemini necesita una limpieza del schema Pydantic estándar
+            schema_params_for_gemini = _clean_pydantic_schema_for_gemini_tool(pydantic_schema_dict)
+            
+            generate_log.debug("Cleaned Pydantic JSON Schema for Gemini Function Declaration", schema_used=schema_params_for_gemini)
 
+            # Define la declaración de la función para Gemini
             fn_decl = genai_types.FunctionDeclaration( 
-                name="format_structured_response",
+                name="format_structured_response", # Nombre arbitrario para la función que "generará" el JSON
                 description=f"Formats the response according to the {response_pydantic_schema.__name__} schema.",
-                parameters=schema_params
+                parameters=schema_params_for_gemini # El schema Pydantic limpio
             )
+            
+            # Configura la herramienta (Tool) que usa la declaración de función
             tools_config = [genai_types.Tool(function_declarations=[fn_decl])] 
             
+            # Indica a Gemini que use esta herramienta para generar la respuesta
+            # 'ANY' modo fuerza al modelo a llamar a la función especificada.
+            # 'AUTO' el modelo decide, 'NONE' no llama.
             generation_config_dict["tool_config"] = genai_types.ToolConfig( 
                 function_calling_config=genai_types.FunctionCallingConfig( 
-                    mode=genai_types.FunctionCallingConfig.Mode.ANY, 
-                    allowed_function_names=["format_structured_response"]
+                    mode=genai_types.FunctionCallingConfig.Mode.ANY, # Forzar la llamada a la función
+                    allowed_function_names=["format_structured_response"] # Asegurar que solo llame a esta
                 )
             )
         
@@ -2638,10 +2649,10 @@ class GeminiAdapter(LLMPort):
         
         try:
             call_kwargs: Dict[str, Any] = {"generation_config": final_generation_config}
-            if tools_config:
+            if tools_config: # Si se configuraron herramientas (para JSON estructurado)
                 call_kwargs["tools"] = tools_config
             
-            # LLM_CORRECTION: Use self._model to call generate_content_async
+            generate_log.debug("Sending request to Gemini API...", call_kwargs_keys=list(call_kwargs.keys()))
             response = await self._model.generate_content_async(prompt, **call_kwargs)
             generated_text = ""
 
@@ -2651,6 +2662,7 @@ class GeminiAdapter(LLMPort):
                  generate_log.warning("Gemini response potentially blocked (no candidates)",
                                       finish_reason=finish_reason_str, safety_ratings=safety_ratings_str)
                  if response_pydantic_schema:
+                     # Devuelve un JSON de error si se esperaba JSON
                      return json.dumps({
                          "error_message": f"Respuesta bloqueada por Gemini (sin candidatos). Razón: {finish_reason_str}",
                          "respuesta_detallada": f"La generación de la respuesta fue bloqueada. Por favor, reformula tu pregunta o contacta a soporte si el problema persiste. Razón: {finish_reason_str}.",
@@ -2674,60 +2686,64 @@ class GeminiAdapter(LLMPort):
                      })
                 return f"[Respuesta vacía de Gemini (candidato sin contenido). Razón: {finish_reason_cand_str}]"
             
-            function_call_part_found = False # LLM_CORRECTION: Flag to track if function call was processed
+            # LLM_CORRECTION_GEMINI_FUNCTION_CALLING: Extraer JSON de la llamada a función
+            function_call_part_found = False
             if response_pydantic_schema: 
                 function_call_part = next((part for part in candidate.content.parts if part.function_call), None)
                 if function_call_part:
-                    function_call_part_found = True # LLM_CORRECTION
+                    function_call_part_found = True
                     function_call = function_call_part.function_call
                     if function_call.name == "format_structured_response":
                         args_dict = {key: value for key, value in function_call.args.items()}
                         generated_text = json.dumps(args_dict) 
                         generate_log.debug("Received JSON via function call from Gemini API", response_length=len(generated_text))
                     else: 
-                        generate_log.warning("Gemini called an unexpected function.",
-                                             called_function_name=function_call.name,
-                                             expected_function_name="format_structured_response")
+                        generate_log.warning("Gemini called an unexpected function when JSON was expected.",
+                                             called_function_name=function_call.name)
+                        # Fallback a texto plano si la función no es la esperada.
                         generated_text = "".join(part.text for part in candidate.content.parts if hasattr(part, 'text') and part.text) 
                         if not generated_text.strip(): 
+                            # Si es un JSON vacío de error
                             return json.dumps({
                                 "error_message": f"LLM called unexpected function '{function_call.name}' and returned no usable text.",
                                 "respuesta_detallada": f"Error: El asistente devolvió un formato inesperado (función: {function_call.name}).",
                                 "fuentes_citadas": []
                             })
-                else: 
-                    generate_log.warning("Expected JSON via function call, but no function_call part found. Checking for plain text that might be JSON.")
+                else: # No se encontró FunctionCall, intentar parsear texto si existe
+                    generate_log.warning("Expected JSON via function call, but no function_call part found. Attempting to parse plain text output as JSON.")
                     generated_text = "".join(part.text for part in candidate.content.parts if hasattr(part, 'text') and part.text)
-                    if not generated_text.strip(): 
+                    if not generated_text.strip(): # Si el texto está vacío, es un error
                          return json.dumps({
                              "error_message": "LLM did not make a function call and returned no text when JSON was expected.",
                              "respuesta_detallada": "Error: El asistente no pudo estructurar la respuesta correctamente y no proporcionó texto.",
                              "fuentes_citadas": []
                          })
             
-            if not function_call_part_found and not response_pydantic_schema: # LLM_CORRECTION: Plain text expected and no function call was made
+            # Si no se esperaba JSON, o si se esperaba pero no hubo function call (y se parseó texto arriba)
+            if not function_call_part_found and not response_pydantic_schema:
                 generated_text = "".join(part.text for part in candidate.content.parts if hasattr(part, 'text') and part.text)
-                generate_log.debug("Received text response from Gemini API", response_length=len(generated_text))
-            elif not function_call_part_found and response_pydantic_schema and not generated_text: # LLM_CORRECTION: JSON expected, no function call, and no text parsed yet
-                # This case implies that a function call was expected but didn't happen, and generated_text is still empty.
-                # The previous logic for this path already set generated_text from parts if no function_call_part.
-                # This is a safety net or re-evaluation. If generated_text is truly empty here, it means no usable output.
-                generate_log.warning("JSON expected, no function call, and no usable text found in parts.")
+                generate_log.debug("Received plain text response from Gemini API", response_length=len(generated_text))
+            elif not function_call_part_found and response_pydantic_schema and not generated_text:
+                # Este caso ya debería estar cubierto por la lógica anterior si generated_text queda vacío
+                generate_log.error("JSON expected, no function call, and no usable text found in parts (final check).")
                 return json.dumps({
-                    "error_message": "LLM did not make a function call and returned no usable text when JSON was expected.",
-                    "respuesta_detallada": "Error: El asistente no pudo estructurar la respuesta correctamente y no proporcionó texto procesable.",
+                    "error_message": "LLM did not provide a structured JSON response as expected and returned no usable text.",
+                    "respuesta_detallada": "Error: El asistente no pudo estructurar la respuesta correctamente.",
                     "fuentes_citadas": []
                 })
 
-
+            # Validación final de JSON si se esperaba
             if response_pydantic_schema:
                 try:
+                    # Intentar validar el Pydantic model aquí mismo para asegurar que sea correcto antes de devolver
+                    # Esto es redundante si el use_case lo hace, pero puede ayudar a aislar errores.
+                    # En este caso, solo nos aseguramos que es un JSON válido, el UseCase hará el model_validate_json.
                     json.loads(generated_text) 
                 except json.JSONDecodeError as json_err:
                     generate_log.error("Gemini response content is not valid JSON despite expectation.",
                                        raw_response_preview=truncate_text(generated_text, 500),
                                        error_message=str(json_err),
-                                       was_function_call=function_call_part_found) # LLM_CORRECTION: Use flag
+                                       was_function_call=function_call_part_found)
                     return json.dumps({
                          "error_message": f"LLM returned malformed JSON: {str(json_err)}",
                          "respuesta_detallada": f"Error: La respuesta del asistente no pudo ser procesada (JSON malformado). Respuesta recibida: {truncate_text(generated_text, 200)}",
@@ -2751,7 +2767,7 @@ class GeminiAdapter(LLMPort):
             return f"[Contenido bloqueado o detenido por Gemini: {type(security_err).__name__}. Razón: {finish_reason_err_str}]"
         except Exception as e: 
             generate_log.exception("Unhandled error during Gemini API call")
-            if response_pydantic_schema:
+            if response_pydantic_schema: # Devuelve un JSON de error si se esperaba JSON
                 return json.dumps({
                     "error_message": f"Error inesperado en la API de Gemini: {type(e).__name__}",
                     "respuesta_detallada": f"Error interno al comunicarse con el asistente: {type(e).__name__} - {str(e)[:100]}.",
@@ -2759,60 +2775,114 @@ class GeminiAdapter(LLMPort):
                 })
             raise ConnectionError(f"Gemini API call failed unexpectedly: {e}") from e
 
-
-# Helper function (kept from original code, as it's used by the adapter logic above)
-def _clean_pydantic_schema_for_gemini(pydantic_schema: Dict[str, Any]) -> Dict[str, Any]:
+# LLM_CORRECTION_GEMINI_FUNCTION_CALLING: Helper para limpiar schema Pydantic para Gemini Tools
+def _clean_pydantic_schema_for_gemini_tool(pydantic_schema: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Limpia un esquema JSON generado por Pydantic v2 para que sea compatible
+    con las FunctionDeclaration de Gemini.
+    Elimina: '$defs', 'title', 'description' del nivel raíz.
+    Convierte tipos `array` con `anyOf` (para opcionales) a un tipo simple con `nullable: true`.
+    Convierte tipos a MAYÚSCULAS.
+    """
+    
+    # Referencias internas que Gemini podría no entender bien
     definitions = pydantic_schema.get("$defs", {})
+
+    # Copia el schema sin los campos problemáticos de nivel raíz
     schema_copy = {
         k: v
         for k, v in pydantic_schema.items()
-        if k not in {"$defs", "title", "description", "$schema"}
+        if k not in {"$defs", "title", "description", "$schema"} # Quitar $schema también por si acaso
     }
 
-    def resolve_ref(ref_path: str) -> Dict[str, Any]:
-        if not ref_path.startswith("#/$defs/"):
-            return {"$ref": ref_path}
+    def resolve_ref_and_clean(ref_path: str) -> Dict[str, Any]:
+        # Resuelve referencias internas y limpia el nodo referenciado
+        if not ref_path.startswith("#/$defs/"): # Si no es una ref interna, devolverla tal cual.
+            return {"$ref": ref_path} # Debería ser raro en esquemas Pydantic simples.
+        
         def_key = ref_path.split("/")[-1]
         if def_key in definitions:
-            return transform_node(definitions[def_key])
+            # Recursivamente limpiar la definición referenciada
+            return _transform_node_for_gemini(definitions[def_key])
         else:
-            return {"$ref": ref_path}
+            # Referencia rota, devolverla para que falle en otro lado o se ignore
+            log.warning(f"Broken JSON schema reference found and could not be resolved: {ref_path}")
+            return {"$ref": ref_path} 
 
-    def transform_node(node: Dict[str, Any]) -> Dict[str, Any]:
-        if not isinstance(node, dict): return node
+    def _transform_node_for_gemini(node: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(node, dict):
+            return node # No es un diccionario, no se transforma (e.g., un valor simple)
+
         transformed_node = {}
         for key, value in node.items():
-            if key in {"default", "examples", "example", "const", "title", "description"}: continue
-            if key == "$ref" and isinstance(value, str): return resolve_ref(value)
+            # Eliminar campos que Gemini no usa o que pueden causar problemas
+            if key in {"default", "examples", "example", "const", "title", "description"}: # Quitar 'title' y 'description' también de nodos internos
+                continue
+            
+            if key == "$ref" and isinstance(value, str):
+                 # Si es una referencia, resolverla y usar el resultado transformado
+                 return resolve_ref_and_clean(value) # Importante: esto reemplaza el nodo actual
+
             elif key == "anyOf" and isinstance(value, list):
+                # Manejar el patrón de Pydantic para campos opcionales: anyOf: [ <type>, {"type": "null"} ]
                 is_optional_pattern = False
                 if len(value) == 2:
                     type_def_item = next((item for item in value if isinstance(item, dict) and item.get("type") != "null"), None)
                     null_def_item = next((item for item in value if isinstance(item, dict) and item.get("type") == "null"), None)
+                    
                     if type_def_item and null_def_item:
                         is_optional_pattern = True
+                        # Copiar las propiedades del tipo real
                         for k_type, v_type in type_def_item.items():
-                            transformed_node[k_type] = transform_node(v_type) if isinstance(v_type, dict) else v_type
-                        transformed_node["nullable"] = True
-                if not is_optional_pattern: transformed_node[key] = [transform_node(item) for item in value]
-                continue
-            elif isinstance(value, dict): transformed_node[key] = transform_node(value)
-            elif isinstance(value, list) and key not in ["enum", "required"]:
-                transformed_node[key] = [transform_node(item) if isinstance(item, dict) else item for item in value]
-            else: transformed_node[key] = value
+                            transformed_node[k_type] = _transform_node_for_gemini(v_type) if isinstance(v_type, dict) else v_type
+                        transformed_node["nullable"] = True # Marcar como nullable para Gemini
+                
+                if not is_optional_pattern: # Si no es el patrón opcional, transformar los items de anyOf
+                    transformed_node[key] = [_transform_node_for_gemini(item) for item in value]
+                continue # Salta al siguiente key del nodo original
+
+            elif isinstance(value, dict):
+                transformed_node[key] = _transform_node_for_gemini(value)
+            elif isinstance(value, list) and key not in ["enum", "required"]: # 'enum' y 'required' deben mantener sus listas tal cual
+                transformed_node[key] = [_transform_node_for_gemini(item) if isinstance(item, dict) else item for item in value]
+            else:
+                transformed_node[key] = value
+        
+        # Convertir el campo 'type' a MAYÚSCULAS si es un string, como espera Gemini
         if "type" in transformed_node:
             json_type = transformed_node["type"]
-            if isinstance(json_type, list):
-                if "null" in json_type: transformed_node["nullable"] = True
+            if isinstance(json_type, list): # Casos como type: ["string", "null"]
+                if "null" in json_type:
+                    transformed_node["nullable"] = True # Marcar explícitamente
+                # Tomar el primer tipo no-null
                 actual_type = next((t for t in json_type if t != "null"), None)
-                if actual_type and isinstance(actual_type, str): transformed_node["type"] = actual_type.upper()
-                elif actual_type: transformed_node["type"] = transform_node(actual_type) 
-            elif isinstance(json_type, str): transformed_node["type"] = json_type.upper()
+                if actual_type and isinstance(actual_type, str):
+                    transformed_node["type"] = actual_type.upper() 
+                elif actual_type: # Si el tipo actual es un sub-esquema (raro para 'type')
+                     transformed_node["type"] = _transform_node_for_gemini(actual_type)
+                else: # Solo había "null" o lista vacía, problemático
+                    del transformed_node["type"] # Mejor quitarlo si es inválido
+                    log.warning("Unsupported type list found in Pydantic schema for Gemini, type removed.", original_type_list=json_type)
+            elif isinstance(json_type, str):
+                transformed_node["type"] = json_type.upper()
+
         return transformed_node
 
-    final_schema = transform_node(schema_copy)
-    if "title" in final_schema: del final_schema["title"]
-    if "description" in final_schema: del final_schema["description"]
+    final_schema = _transform_node_for_gemini(schema_copy)
+    
+    # Asegurar que 'properties' y 'required' estén al nivel correcto si no lo están
+    # (generalmente Pydantic lo hace bien para 'object')
+    if final_schema.get("type") == "OBJECT" and "properties" not in final_schema:
+        log.warning("Schema type is OBJECT but no 'properties' key. Moving root keys into 'properties'.", current_schema_keys=list(final_schema.keys()))
+        # Esto es un parche por si _transform_node_for_gemini devuelve un objeto plano
+        # en lugar de un objeto con una clave 'properties'. Es poco probable con Pydantic v2.
+        # properties_from_root = {k:v for k,v in final_schema.items() if k != "type"}
+        # final_schema["properties"] = properties_from_root
+        # for k_prop in list(properties_from_root.keys()): # Crear copia para iterar
+        #     if k_prop != "type" : del final_schema[k_prop]
+        pass
+
+
     return final_schema
 ```
 
@@ -4125,9 +4195,9 @@ def truncate_text(text: str, max_length: int) -> str:
 ```toml
 [tool.poetry]
 name = "query-service"
-version = "0.3.3" 
+version = "0.3.4" # Incrementar versión por corrección
 description = "Query service for SaaS B2B using Clean Architecture, PyMilvus, Haystack & Advanced RAG with remote embeddings, reranking, and sparse search."
-authors = ["Nyro <dev@nyro.com>"]
+authors = ["Nyro <dev@atenex.com>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
@@ -4138,8 +4208,8 @@ uvicorn = {extras = ["standard"], version = "^0.28.0"}
 gunicorn = "^21.2.0"
 pydantic = {extras = ["email"], version = "^2.6.4"} 
 pydantic-settings = "^2.2.1"
-# httpx debe ser compatible con google-genai
-httpx = ">=0.27.0,<1.0.0" # LLM_CORRECTION: Specify compatible range, previous ^0.27.0 is fine
+# httpx debe ser compatible con google-generativeai
+httpx = ">=0.27.0,<1.0.0" 
 asyncpg = "^0.29.0"
 python-jose = {extras = ["cryptography"], version = "^3.3.0"}
 tenacity = "^8.2.3"
@@ -4150,7 +4220,8 @@ haystack-ai = "^2.0.1"
 pymilvus = "==2.5.3" 
 
 # --- LLM Dependency ---
-google-genai = "^1.15.0"
+# LLM_CORRECTION: Asegurar nombre y versión correctos
+google-generativeai = "^0.7.0" # Usar una versión más reciente, 0.5.4 es la antigua, la más reciente a Mayo 2024 era ~0.7.x
 
 # --- RAG Component Dependencies ---
 numpy = "1.26.4" 

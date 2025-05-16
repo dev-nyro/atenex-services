@@ -25,8 +25,7 @@ haystack-ai = "^2.0.1"
 pymilvus = "==2.5.3" 
 
 # --- LLM Dependency ---
-# LLM_CORRECTION: Asegurar nombre y versión correctos
-google-generativeai = "^0.7.0" # Usar una versión más reciente, 0.5.4 es la antigua, la más reciente a Mayo 2024 era ~0.7.x
+google-generativeai = "^0.7.0"
 
 # --- RAG Component Dependencies ---
 numpy = "1.26.4" 
