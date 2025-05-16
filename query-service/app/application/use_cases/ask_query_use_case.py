@@ -221,7 +221,6 @@ class AskQueryUseCase:
         fetch_log = log.bind(action="fetch_content_for_fused", top_n=top_n, fused_count=len(fused_scores))
         if not fused_scores: return []
 
-        # Ordenar por score fusionado y tomar top_n
         sorted_chunk_ids_with_scores = sorted(fused_scores.items(), key=lambda item: item[1], reverse=True)
         top_ids_with_scores_tuples: List[Tuple[str, float]] = sorted_chunk_ids_with_scores[:top_n]
         
@@ -229,49 +228,31 @@ class AskQueryUseCase:
 
         chunks_with_content: List[RetrievedChunk] = []
         ids_needing_content: List[str] = []
-        
-        # Mapa para reconstruir RetrievedChunk para los que se busca contenido
-        # Esto es crucial porque el sparse_retriever solo devuelve (id, score)
-        # Necesitamos crear un RetrievedChunk placeholder.
         placeholder_map: Dict[str, RetrievedChunk] = {}
-
 
         for cid, fused_score_val in top_ids_with_scores_tuples:
             if not cid:
                  fetch_log.warning("Skipping invalid chunk ID found during fusion processing.")
                  continue
             
-            # Si el chunk ya tiene contenido (vino de la búsqueda densa)
-            if cid in dense_map and dense_map[cid].content:
-                chunk = dense_map[cid]
-                chunk.score = fused_score_val # Actualizar con el score fusionado
-                chunks_with_content.append(chunk)
-            else: # Chunk vino de la búsqueda dispersa o es un ID denso sin contenido precargado
-                # Crear un placeholder si no estaba en dense_map (vino de sparse)
-                # o si estaba en dense_map pero no tenía contenido.
-                # Para los chunks de sparse, no tenemos metadata original aquí.
-                # Esta es una limitación si no pasamos toda la metadata de sparse_search_service.
-                # El sparse-search-service devuelve chunk_id (embedding_id) y score.
-                # Si necesitamos más metadata de los chunks dispersos, el servicio debe devolverla,
-                # o hacemos otra query a la DB aquí (lo que es menos ideal).
-                # Por ahora, solo tendremos ID y score para los puramente dispersos.
-                original_metadata = dense_map.get(cid, RetrievedChunk(id=cid, score=None, metadata={})).metadata
-                document_id_val = dense_map.get(cid, RetrievedChunk(id=cid, score=None, document_id=None)).document_id
-                file_name_val = dense_map.get(cid, RetrievedChunk(id=cid, score=None, file_name=None)).file_name
-                company_id_val = dense_map.get(cid, RetrievedChunk(id=cid, score=None, company_id=None)).company_id
+            original_chunk_from_dense = dense_map.get(cid)
 
-
+            if original_chunk_from_dense and original_chunk_from_dense.content:
+                original_chunk_from_dense.score = fused_score_val 
+                chunks_with_content.append(original_chunk_from_dense)
+            else: 
                 chunk_placeholder = RetrievedChunk(
                     id=cid,
-                    score=fused_score_val, # Usar el score fusionado
-                    content=None, # Será llenado si es necesario
-                    metadata=original_metadata or {"retrieval_source": "sparse_or_fused_no_initial_meta"},
-                    document_id=document_id_val,
-                    file_name=file_name_val,
-                    company_id=company_id_val
+                    score=fused_score_val, 
+                    content=None, 
+                    metadata=original_chunk_from_dense.metadata if original_chunk_from_dense and original_chunk_from_dense.metadata else {"retrieval_source": "sparse_or_fused_no_initial_meta"},
+                    embedding=original_chunk_from_dense.embedding if original_chunk_from_dense and original_chunk_from_dense.embedding else None,
+                    document_id=original_chunk_from_dense.document_id if original_chunk_from_dense else None,
+                    file_name=original_chunk_from_dense.file_name if original_chunk_from_dense else None,
+                    company_id=original_chunk_from_dense.company_id if original_chunk_from_dense else None
                 )
-                chunks_with_content.append(chunk_placeholder) # Añadir placeholder a la lista principal
-                placeholder_map[cid] = chunk_placeholder # Guardar para actualizar contenido
+                chunks_with_content.append(chunk_placeholder) 
+                placeholder_map[cid] = chunk_placeholder 
                 ids_needing_content.append(cid)
 
         if ids_needing_content and self.chunk_content_repo:
@@ -279,9 +260,8 @@ class AskQueryUseCase:
              try:
                  content_map = await self.chunk_content_repo.get_chunk_contents_by_ids(ids_needing_content)
                  for cid_item, content_val in content_map.items():
-                     if cid_item in placeholder_map: # Si es un placeholder que creamos
+                     if cid_item in placeholder_map: 
                           placeholder_map[cid_item].content = content_val
-                          # Actualizamos metadata si el placeholder es "genérico"
                           if placeholder_map[cid_item].metadata.get("retrieval_source") == "sparse_or_fused_no_initial_meta":
                             placeholder_map[cid_item].metadata["content_fetched_for_sparse"] = True
                           else:
@@ -294,11 +274,9 @@ class AskQueryUseCase:
         elif ids_needing_content:
             fetch_log.warning("Cannot fetch content for sparse/fused results, ChunkContentRepository not available.")
 
-        # Filtrar los que finalmente no tienen contenido
         final_chunks_with_content = [c for c in chunks_with_content if c.content and c.content.strip()]
         fetch_log.debug("Chunks remaining after content check and fetch", count=len(final_chunks_with_content))
         
-        # Re-ordenar por el score fusionado después de tener todo el contenido
         final_chunks_with_content.sort(key=lambda c: c.score or 0.0, reverse=True)
         return final_chunks_with_content
         
@@ -362,7 +340,6 @@ class AskQueryUseCase:
                     if not found_by_name:
                          llm_handler_log.info("LLM cited source not found by filename either", cited_source_name=cited_source_by_llm.nombre_archivo)
             
-            # If still not enough sources from LLM's explicit citations, fill with top from original input if any.
             if len(retrieved_chunks_for_response) < self.settings.NUM_SOURCES_TO_SHOW and original_chunks_for_citation:
                 llm_handler_log.debug("Filling remaining source slots with top original chunks provided to LLM/MapReduce.")
                 for chunk in original_chunks_for_citation:
@@ -383,7 +360,6 @@ class AskQueryUseCase:
             assistant_sources_for_db = [{"error": "JSON decode error", "details": str(json_err)}]
             retrieved_chunks_for_response = original_chunks_for_citation[:self.settings.NUM_SOURCES_TO_SHOW] # Fallback
 
-        # Always save assistant message
         await self.chat_repo.save_message(
             chat_id=final_chat_id, role='assistant',
             content=answer_for_user, 
@@ -394,17 +370,17 @@ class AskQueryUseCase:
         try:
             docs_for_log_summary = [
                 RetrievedDocumentSchema(**chunk.model_dump(exclude={'embedding'}, exclude_none=True)).model_dump(exclude_none=True) 
-                for chunk in retrieved_chunks_for_response # Log based on what's returned to API
+                for chunk in retrieved_chunks_for_response 
             ]
             log_metadata_details = {
                 "pipeline_stages": pipeline_stages_used,
                 "map_reduce_used": map_reduce_used,
                 "retriever_k_initial": retriever_k_effective,
                 "fusion_fetch_k": fusion_fetch_k_effective,
-                "max_context_chunks_limit_for_llm": self.settings.MAX_CONTEXT_CHUNKS, # Config value
+                "max_context_chunks_limit_for_llm": self.settings.MAX_CONTEXT_CHUNKS, 
                 "num_chunks_after_rerank_or_fusion_content_fetch": num_chunks_after_rerank_or_fusion_fetch_effective,
                 "num_final_chunks_sent_to_llm": num_final_chunks_sent_to_llm_effective,
-                "num_sources_shown_to_user": len(assistant_sources_for_db), # Based on LLM's output
+                "num_sources_shown_to_user": len(assistant_sources_for_db), 
                 "num_retrieved_docs_in_api_response": len(retrieved_chunks_for_response),
                 "chat_history_messages_included_in_prompt": num_history_messages_effective,
                 "diversity_filter_enabled_in_settings": self.settings.DIVERSITY_FILTER_ENABLED,
@@ -462,53 +438,44 @@ class AskQueryUseCase:
                 answer = "¡Hola! ¿En qué puedo ayudarte hoy con la información de tus documentos?"
                 await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=None)
                 exec_log.info("Greeting detected, responded directly.")
-                # Log this simple interaction
                 simple_log_id = await self.log_repo.log_query_interaction(
                     user_id=user_id, company_id=company_id, query=query, answer=answer,
                     retrieved_documents_data=[], metadata={"type": "greeting"}, chat_id=final_chat_id
                 )
                 return answer, [], simple_log_id, final_chat_id
 
-            # --- RAG Pipeline Starts ---
             pipeline_stages_used.append("query_embedding (remote)")
             query_embedding = await self._embed_query(query)
 
-            # --- Retrieval (Dense + Sparse) ---
             pipeline_stages_used.append("dense_retrieval (milvus)")
             dense_task = self.vector_store.search(query_embedding, str(company_id), retriever_k_effective)
             
-            sparse_results_tuples: List[Tuple[str, float]] = [] # chunk_id, score
+            sparse_results_tuples: List[Tuple[str, float]] = [] 
             sparse_task_placeholder = asyncio.create_task(asyncio.sleep(0)) 
 
-            if self.sparse_retriever: # self.sparse_retriever es RemoteSparseRetrieverAdapter o None
+            if self.sparse_retriever: 
                  pipeline_stages_used.append("sparse_retrieval (remote_sparse_search_service)")
-                 # company_id debe ser UUID para el puerto SparseRetrieverPort
                  sparse_task = self.sparse_retriever.search(query, company_id, retriever_k_effective)
             else:
                  pipeline_stages_used.append(f"sparse_retrieval ({'disabled_no_adapter_instance' if self.settings.BM25_ENABLED else 'disabled_in_settings'})")
-                 sparse_task = sparse_task_placeholder # No-op
+                 sparse_task = sparse_task_placeholder 
 
-            # Ejecutar tareas de retrieval en paralelo
             dense_chunks_domain, sparse_results_maybe_tuples = await asyncio.gather(dense_task, sparse_task)
             
             if self.sparse_retriever and isinstance(sparse_results_maybe_tuples, list):
-                sparse_results_tuples = sparse_results_maybe_tuples # Ya es List[Tuple[str, float]]
+                sparse_results_tuples = sparse_results_maybe_tuples 
             
             exec_log.info("Retrieval phase done", dense_count=len(dense_chunks_domain), sparse_count=len(sparse_results_tuples))
 
-            # --- Fusion & Content Fetching ---
             pipeline_stages_used.append("fusion (rrf)")
-            # dense_chunks_domain ya es List[RetrievedChunk]
-            dense_map = {c.id: c for c in dense_chunks_domain if c.id} # Mapa de chunk_id a RetrievedChunk
+            dense_map = {c.id: c for c in dense_chunks_domain if c.id} 
             
-            # sparse_results_tuples es List[Tuple[str, float]]
             fused_scores: Dict[str, float] = self._reciprocal_rank_fusion(dense_chunks_domain, sparse_results_tuples)
             
             fusion_fetch_k_effective = self.settings.MAX_CONTEXT_CHUNKS 
             if self.settings.RERANKER_ENABLED or self.settings.DIVERSITY_FILTER_ENABLED : 
                  fusion_fetch_k_effective = max(self.settings.MAX_CONTEXT_CHUNKS + 20, int(self.settings.MAX_CONTEXT_CHUNKS * 1.2) ) 
             
-            # combined_chunks_with_content ahora es List[RetrievedChunk]
             combined_chunks_with_content: List[RetrievedChunk] = await self._fetch_content_for_fused_results(
                 fused_scores, dense_map, fusion_fetch_k_effective
             )
@@ -518,7 +485,7 @@ class AskQueryUseCase:
             if not combined_chunks_with_content:
                 exec_log.warning("No chunks with content after fusion/fetch. Using general prompt.")
                 general_prompt = await self._build_prompt(query, [], chat_history=chat_history_str, builder=self._prompt_builder_general)
-                answer_str = await self.llm.generate(general_prompt, response_pydantic_schema=None) 
+                answer_str = await self.llm.generate(general_prompt) # No schema for general
                 
                 await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer_str, sources=None)
                 no_docs_log_id = await self.log_repo.log_query_interaction(
@@ -528,35 +495,30 @@ class AskQueryUseCase:
                 )
                 return answer_str, [], no_docs_log_id, final_chat_id
             
-            # --- Reranking (Remote) ---
-            chunks_for_llm_or_mapreduce = combined_chunks_with_content # Ya son RetrievedChunk
+            chunks_for_llm_or_mapreduce = combined_chunks_with_content 
             if self.settings.RERANKER_ENABLED and chunks_for_llm_or_mapreduce:
                 pipeline_stages_used.append("reranking (remote_reranker_service)")
                 rerank_log = exec_log.bind(action="rerank_remote", num_chunks_to_rerank=len(chunks_for_llm_or_mapreduce))
                 
-                # Preparar datos para el servicio de reranking
-                # El servicio espera: {"query": str, "documents": [{"id": str, "text": str, "metadata": dict}], "top_n": int}
-                # RetrievedChunk tiene id, content, metadata.
                 documents_for_reranker = []
                 for chk in chunks_for_llm_or_mapreduce:
-                    if chk.content and chk.id: # Asegurar que hay contenido e ID
+                    if chk.content and chk.id: 
                         documents_for_reranker.append({
                             "id": chk.id,
                             "text": chk.content,
-                            "metadata": chk.metadata or {} # Usar metadata del chunk
+                            "metadata": chk.metadata or {} 
                         })
                 
                 if documents_for_reranker:
                     reranker_payload = {
                         "query": query,
                         "documents": documents_for_reranker,
-                        "top_n": self.settings.MAX_CONTEXT_CHUNKS # Reranker devuelve hasta este num
+                        "top_n": self.settings.MAX_CONTEXT_CHUNKS 
                     }
                     try:
                         rerank_log.debug("Sending request to reranker service...")
-                        reranker_url = str(self.settings.RERANKER_SERVICE_URL).rstrip('/') + "/api/v1/rerank"
+                        reranker_url = str(settings.RERANKER_SERVICE_URL).rstrip('/') + "/api/v1/rerank"
                         
-                        # Usar el http_client global del UseCase
                         reranker_response = await self.http_client.post(
                             reranker_url,
                             json=reranker_payload,
@@ -567,40 +529,43 @@ class AskQueryUseCase:
 
                         if "data" in reranked_data and "reranked_documents" in reranked_data["data"]:
                             reranked_docs_from_service = reranked_data["data"]["reranked_documents"]
-                            # Mapear de nuevo a RetrievedChunk, actualizando scores y manteniendo el orden
-                            # Crear un mapa de los chunks originales por ID para fácil acceso
                             original_chunks_map = {c.id: c for c in chunks_for_llm_or_mapreduce}
                             
                             updated_reranked_chunks = []
-                            for reranked_item in reranked_docs_from_service:
-                                chunk_id = reranked_item.get("id")
-                                new_score = reranked_item.get("score")
+                            for reranked_item_data in reranked_docs_from_service: 
+                                chunk_id = reranked_item_data.get("id")
+                                new_score = reranked_item_data.get("score")
+                                
                                 if chunk_id in original_chunks_map:
                                     original_chunk_obj = original_chunks_map[chunk_id]
-                                    original_chunk_obj.score = new_score # Actualizar el score
-                                    original_chunk_obj.metadata["reranked_score"] = new_score # Guardar también en metadata
-                                    updated_reranked_chunks.append(original_chunk_obj)
+                                    original_chunk_obj.score = new_score 
+                                    if original_chunk_obj.metadata:
+                                        original_chunk_obj.metadata["reranked_score"] = new_score
+                                    else:
+                                        original_chunk_obj.metadata = {"reranked_score": new_score}
+                                    updated_reranked_chunks.append(original_chunk_obj) 
                             
-                            chunks_for_llm_or_mapreduce = updated_reranked_chunks
-                            rerank_log.info(f"Reranking successful. {len(chunks_for_llm_or_mapreduce)} chunks after reranking.")
+                            if updated_reranked_chunks: 
+                                chunks_for_llm_or_mapreduce = updated_reranked_chunks
+                                rerank_log.info(f"Reranking successful. {len(chunks_for_llm_or_mapreduce)} chunks after reranking.")
+                            else:
+                                rerank_log.warning("Reranking seemed successful but no chunks could be mapped back. Using pre-reranked chunks.")
                         else:
                             rerank_log.warning("Reranker service response format invalid.", response_data=reranked_data)
                     except httpx.HTTPStatusError as http_err:
                         rerank_log.error("HTTP error from Reranker service", status_code=http_err.response.status_code, response_text=http_err.response.text, exc_info=False)
                     except httpx.RequestError as req_err:
                         rerank_log.error("Request error contacting Reranker service", error=str(req_err), exc_info=False)
-                        # No detener el pipeline, continuar con los chunks fusionados/sin rerankear
                     except Exception as e_rerank:
                         rerank_log.exception("Unexpected error during reranking call.")
                 else:
                     rerank_log.warning("No valid documents with content/id to send for reranking.")
 
-            else: # Reranking deshabilitado o no hay chunks
+            else: 
                 pipeline_stages_used.append(f"reranking ({'disabled' if not self.settings.RERANKER_ENABLED else 'skipped_no_chunks_or_content'})")
             
             num_chunks_after_rerank = len(chunks_for_llm_or_mapreduce)
 
-            # --- Diversity Filtering ---
             if self.diversity_filter and chunks_for_llm_or_mapreduce:
                  k_final_diversity = self.settings.MAX_CONTEXT_CHUNKS 
                  filter_type = type(self.diversity_filter).__name__
@@ -629,8 +594,6 @@ class AskQueryUseCase:
                 )
                 return answer_str, [], no_docs_final_log_id, final_chat_id
 
-
-            # --- MapReduce or Direct RAG ---
             map_reduce_active = False
             json_answer_str: str
 
@@ -639,18 +602,16 @@ class AskQueryUseCase:
                 pipeline_stages_used.append("map_reduce_flow")
                 map_reduce_active = True
 
-                # MAP PHASE
                 pipeline_stages_used.append("map_phase")
                 mapped_responses_parts = []
-                # RetrievedChunk a Haystack Document para el prompt builder
                 haystack_docs_for_map = [
                     Document(
                         id=c.id, 
                         content=c.content, 
-                        meta={ # Pasar metadata relevante para el prompt de mapeo
+                        meta={ 
                             "file_name": c.file_name, 
-                            "page": c.metadata.get("page"), # Asumimos 'page' en metadata
-                            "title": c.metadata.get("title") # Asumimos 'title' en metadata
+                            "page": c.metadata.get("page"), 
+                            "title": c.metadata.get("title") 
                         },
                         score=c.score
                     ) for c in final_chunks_for_processing
@@ -661,11 +622,10 @@ class AskQueryUseCase:
                     batch_docs = haystack_docs_for_map[i:i + self.settings.MAPREDUCE_CHUNK_BATCH_SIZE]
                     map_prompt_data = {
                         "original_query": query, 
-                        "documents": batch_docs, # Lista de Haystack Documents
+                        "documents": batch_docs, 
                         "document_index": i, 
                         "total_documents": len(haystack_docs_for_map) 
                     }
-                    # Aquí no se pasan `documents` directamente al builder sino a `prompt_data_override`
                     map_prompt_str_task = self._build_prompt(query="", documents=[], prompt_data_override=map_prompt_data, builder=self._prompt_builder_map)
                     map_tasks.append(map_prompt_str_task)
                 
@@ -673,7 +633,7 @@ class AskQueryUseCase:
                 
                 llm_map_tasks = []
                 for idx, map_prompt in enumerate(map_prompts):
-                    llm_map_tasks.append(self.llm.generate(map_prompt, response_pydantic_schema=None)) # Expect text
+                    llm_map_tasks.append(self.llm.generate(map_prompt, response_pydantic_schema=None)) 
                 
                 map_phase_results = await asyncio.gather(*[asyncio.shield(task) for task in llm_map_tasks], return_exceptions=True)
 
@@ -694,13 +654,11 @@ class AskQueryUseCase:
                 else:
                     concatenated_mapped_responses = "\n".join(mapped_responses_parts)
 
-                # REDUCE PHASE
                 pipeline_stages_used.append("reduce_phase")
                 reduce_prompt_data = {
                     "original_query": query,
                     "chat_history": chat_history_str,
                     "mapped_responses": concatenated_mapped_responses,
-                    # Pasar los Haystack Documents originales al prompt de reducción para citación
                     "original_documents_for_citation": haystack_docs_for_map 
                 }
                 reduce_prompt_str = await self._build_prompt(query="", documents=[], prompt_data_override=reduce_prompt_data, builder=self._prompt_builder_reduce)
@@ -708,16 +666,15 @@ class AskQueryUseCase:
                 exec_log.info("Sending reduce request to LLM for final JSON response.")
                 json_answer_str = await self.llm.generate(reduce_prompt_str, response_pydantic_schema=RespuestaEstructurada)
 
-            else: # Direct RAG
+            else: 
                 exec_log.info(f"Using Direct RAG strategy. Chunks: {len(final_chunks_for_processing)}", flow_type="DirectRAG")
                 pipeline_stages_used.append("direct_rag_flow")
                 
-                # Convertir RetrievedChunk a Haystack Document para el prompt builder
                 haystack_docs_for_prompt = [
                     Document(
                         id=c.id, 
                         content=c.content, 
-                        meta={ # Pasar metadata relevante para el prompt RAG
+                        meta={ 
                             "file_name": c.file_name, 
                             "page": c.metadata.get("page"),
                             "title": c.metadata.get("title")
@@ -730,19 +687,18 @@ class AskQueryUseCase:
                 exec_log.info("Sending direct RAG request to LLM for JSON response.")
                 json_answer_str = await self.llm.generate(direct_rag_prompt, response_pydantic_schema=RespuestaEstructurada)
 
-            # --- Handle LLM Response (Common for MapReduce and Direct RAG) ---
             answer_text, relevant_chunks_for_api, final_log_id = await self._handle_llm_response(
                 json_answer_str=json_answer_str,
                 query=query,
                 company_id=company_id,
                 user_id=user_id,
                 final_chat_id=final_chat_id,
-                original_chunks_for_citation=final_chunks_for_processing, # Usar los chunks que entraron a LLM/MapReduce
+                original_chunks_for_citation=final_chunks_for_processing, 
                 pipeline_stages_used=pipeline_stages_used,
                 map_reduce_used=map_reduce_active,
                 retriever_k_effective=retriever_k_effective,
                 fusion_fetch_k_effective=fusion_fetch_k_effective,
-                num_chunks_after_rerank_or_fusion_fetch_effective=num_chunks_after_rerank, # Antes de diversidad/truncamiento final
+                num_chunks_after_rerank_or_fusion_fetch_effective=num_chunks_after_rerank, 
                 num_final_chunks_sent_to_llm_effective=num_final_chunks_for_llm_or_mapreduce,
                 num_history_messages_effective=len(history_messages)
             )

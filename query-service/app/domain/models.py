@@ -74,17 +74,20 @@ class QueryLog(BaseModel):
 
 # --- Nuevos modelos para Respuesta Estructurada ---
 class FuenteCitada(BaseModel):
-    id_documento: Optional[str] = Field(None, description="El ID del chunk o documento original, si está disponible en la metadata del chunk.")
+    id_documento: Optional[str] = None
     nombre_archivo: str = Field(..., description="Nombre del archivo fuente.")
-    pagina: Optional[str] = Field(None, description="Número de página si está disponible.")
-    score: Optional[float] = Field(None, description="Score de relevancia original del chunk (si aplica).")
+    pagina: Optional[str] = None
+    score: Optional[float] = None
     cita_tag: str = Field(..., description="La etiqueta de cita usada en el texto, ej: '[Doc 1]'.")
+    
+    model_config = ConfigDict(extra='ignore')
+
 
 class RespuestaEstructurada(BaseModel):
-    resumen_ejecutivo: Optional[str] = Field(None, description="Un breve resumen de 1-2 frases, si la respuesta es larga y aplica.")
+    resumen_ejecutivo: Optional[str] = None
     respuesta_detallada: str = Field(..., description="La respuesta completa y elaborada, incluyendo citas [Doc N] donde corresponda.")
-    fuentes_citadas: List[FuenteCitada] = Field(default_factory=list, description="Lista de los documentos efectivamente utilizados y citados en la respuesta_detallada.")
-    siguiente_pregunta_sugerida: Optional[str] = Field(None, description="Una pregunta de seguimiento relevante que el usuario podría hacer, si aplica.")
+    fuentes_citadas: List[FuenteCitada] # El LLM debe devolverla, incluso vacía
+    siguiente_pregunta_sugerida: Optional[str] = None
     
     model_config = ConfigDict(extra='ignore') 
 
