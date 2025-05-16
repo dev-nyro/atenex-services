@@ -162,45 +162,41 @@ class GeminiAdapter(LLMPort):
             expecting_json=bool(response_pydantic_schema)
         )
 
-        tools_config_gemini_arg: Optional[List[Any]] = None
+
+        tools_config: Optional[List[Any]] = None
         generation_config_dict: Dict[str, Any] = {
             "temperature": 0.6,
             "top_p": 0.9,
         }
 
         if response_pydantic_schema:
-            try:
-                pydantic_schema_dict = response_pydantic_schema.model_json_schema()
-                cleaned_schema_for_gemini_params = _clean_pydantic_schema_for_gemini(pydantic_schema_dict)
-                generate_log.debug("Cleaned JSON Schema for Gemini Function Calling", schema_final=cleaned_schema_for_gemini_params)
+            # --- limpiamos el esquema Pydantic ---
+            pydantic_schema_dict = response_pydantic_schema.model_json_schema()
+            schema_params = _clean_pydantic_schema_for_gemini(pydantic_schema_dict)
+            generate_log.debug("Cleaned JSON Schema for Gemini Function Calling", schema_final=schema_params)
 
-                # Usar los tipos desde genai.types (acceso indirecto, no import directa)
-                function_declaration = genai.types.FunctionDeclaration(
-                    name="format_structured_response",
-                    description=f"Formats the response according to the {response_pydantic_schema.__name__} schema. Ensure all required fields are present.",
-                    parameters=cleaned_schema_for_gemini_params
-                )
-                # Empaquetamos la definición de función para Gemini
-                tools_config_gemini_arg = [genai.types.Tool(function_declarations=[function_declaration])]
-                # En lugar de ToolConfig, pasamos directamente FunctionCallingConfig
-                generation_config_dict["function_calling_config"] = genai.types.FunctionCallingConfig(
-                    mode=genai.types.FunctionCallingConfig.Mode.FUNCTION,
-                    allowed_function_names=["format_structured_response"]
-                )
-            except Exception as e_schema_gen:
-                generate_log.error("Failed to generate or prepare JSON schema for Gemini function calling.",
-                                   pydantic_model_name=response_pydantic_schema.__name__,
-                                   error_details=str(e_schema_gen), exc_info=True)
-                raise ValueError(f"Schema generation for {response_pydantic_schema.__name__} failed: {e_schema_gen}") from e_schema_gen
+            # --- declaramos la función para Gemini ---
+            fn_decl = genai.types.FunctionDeclaration(
+                name="format_structured_response",
+                description=f"Formats the response according to the {response_pydantic_schema.__name__} schema.",
+                parameters=schema_params
+            )
+            tools_config = [ genai.types.Tool(function_declarations=[fn_decl]) ]
+
+            # para evitar 400 INVALID_ARGUMENT hay que usar ANY
+            generation_config_dict["function_calling_config"] = genai.types.FunctionCallingConfig(
+                mode=genai.types.FunctionCallingConfig.Mode.ANY,
+                allowed_function_names=["format_structured_response"]
+            )
 
         final_generation_config = genai.types.GenerationConfig(**generation_config_dict)
 
         try:
-            response = await self.model.generate_content_async(
-                prompt,
-                generation_config=final_generation_config,
-                tools=tools_config_gemini_arg # Pass the prepared tools list
-            )
+            # sólo pasamos tools si realmente tenemos una lista
+            call_kwargs: Dict[str, Any] = {"generation_config": final_generation_config}
+            if tools_config is not None:
+                call_kwargs["tools"] = tools_config
+            response = await self.model.generate_content_async(prompt, **call_kwargs)
 
             generated_text = ""
 
@@ -281,19 +277,33 @@ class GeminiAdapter(LLMPort):
 
             return generated_text.strip()
 
+        except genai.errors.ClientError as client_err:
+            # atrapamos el 400 de incompatibilidad y reintentamos en modo ANY
+            msg = str(client_err)
+            if "tool_config.function_calling_config.mode" in msg and "INVALID_ARGUMENT" in msg:
+                generate_log.warning("ClientError 400 INVALID_ARGUMENT: adaptando a mode=ANY y reintentando.",
+                                     error=msg)
+                generation_config_dict["function_calling_config"].mode = genai.types.FunctionCallingConfig.Mode.ANY
+                final_generation_config = genai.types.GenerationConfig(**generation_config_dict)
+                call_kwargs = {"generation_config": final_generation_config, "tools": tools_config}
+                response = await self.model.generate_content_async(prompt, **call_kwargs)
+                # procesar response igual que arriba...
+            else:
+                log.error("Gemini API ClientError inesperado", error=msg)
+                raise ConnectionError(f"Gemini API call failed: {msg}") from client_err
         except (genai.types.generation_types.BlockedPromptException, genai.types.generation_types.StopCandidateException) as security_err: # type: ignore
-             finish_reason_err_str = getattr(security_err, 'finish_reason', 'N/A')
-             generate_log.warning("Gemini request blocked or stopped due to safety/policy.",
-                                  error_type=type(security_err).__name__,
-                                  error_details=str(security_err),
-                                  finish_reason=finish_reason_err_str)
-             if response_pydantic_schema:
-                 return json.dumps({
-                     "error_message": f"Contenido bloqueado o detenido por Gemini: {type(security_err).__name__}",
-                     "respuesta_detallada": f"La generación de la respuesta fue bloqueada o detenida por políticas de contenido. Por favor, ajusta tu consulta. (Razón: {finish_reason_err_str})",
-                     "fuentes_citadas": []
-                 })
-             return f"[Contenido bloqueado o detenido por Gemini: {type(security_err).__name__}. Razón: {finish_reason_err_str}]"
+            finish_reason_err_str = getattr(security_err, 'finish_reason', 'N/A')
+            generate_log.warning("Gemini request blocked or stopped due to safety/policy.",
+                                 error_type=type(security_err).__name__,
+                                 error_details=str(security_err),
+                                 finish_reason=finish_reason_err_str)
+            if response_pydantic_schema:
+                return json.dumps({
+                    "error_message": f"Contenido bloqueado o detenido por Gemini: {type(security_err).__name__}",
+                    "respuesta_detallada": f"La generación de la respuesta fue bloqueada o detenida por políticas de contenido. Por favor, ajusta tu consulta. (Razón: {finish_reason_err_str})",
+                    "fuentes_citadas": []
+                })
+            return f"[Contenido bloqueado o detenido por Gemini: {type(security_err).__name__}. Razón: {finish_reason_err_str}]"
         except Exception as e:
             generate_log.exception("Unhandled error during Gemini API call")
             raise ConnectionError(f"Gemini API call failed unexpectedly: {e}") from e
