@@ -31,6 +31,7 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
     def load_model(cls):
         """
         Loads the CrossEncoder model based on settings.
+        Applies FP16 optimization if on CUDA.
         """
         if cls._model_status == "loaded" and cls._model_name_loaded == settings.MODEL_NAME:
             logger.info("Reranker model already loaded and configured.", model_name=settings.MODEL_NAME)
@@ -57,7 +58,17 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
                 model_name=settings.MODEL_NAME,
                 max_length=settings.MAX_SEQ_LENGTH,
                 device=settings.MODEL_DEVICE,
+                # trust_remote_code=True # Solo si es necesario para modelos específicos
             )
+            
+            # Optimización en GPU: FP16
+            if settings.MODEL_DEVICE.startswith("cuda") and cls._model is not None:
+                try:
+                    cls._model.model.half() # type: ignore
+                    init_log.info("CrossEncoder model converted to FP16 for GPU optimization.")
+                except Exception as e_fp16:
+                    init_log.warning("Failed to convert CrossEncoder model to FP16.", error_message=str(e_fp16))
+
             load_time = time.time() - start_time
             cls._model_name_loaded = settings.MODEL_NAME
             cls._model_status = "loaded"
@@ -70,6 +81,7 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
     async def _predict_scores_async(self, query_doc_pairs: List[Tuple[str, str]]) -> List[float]:
         """
         Performs model prediction asynchronously in a thread pool.
+        Uses TOKENIZER_WORKERS from settings.
         """
         if not self.is_ready() or SentenceTransformerRerankerAdapter._model is None:
             logger.error("Reranker model not loaded or not ready for prediction.")
@@ -78,23 +90,23 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
         predict_log = logger.bind(
             adapter_action="_predict_scores_async", 
             num_pairs=len(query_doc_pairs),
-            tokenizer_workers=settings.TOKENIZER_WORKERS
+            tokenizer_workers_setting=settings.TOKENIZER_WORKERS # Log el valor de la config
             )
-        predict_log.debug("Starting asynchronous prediction.")
+        
+        # El número de workers para DataLoader vendrá directamente de la configuración.
+        # Si es 0, la tokenización es secuencial en el hilo principal.
+        # Si es >0 y mp.set_start_method('spawn') está activo para CUDA, funcionará.
+        num_dataloader_workers = settings.TOKENIZER_WORKERS
+        predict_log.debug(f"Starting asynchronous prediction with num_dataloader_workers={num_dataloader_workers}.")
         
         loop = asyncio.get_event_loop()
         try:
-            # Use settings.TOKENIZER_WORKERS for num_workers in model.predict
-            # 0 means tokenization runs in the main process used by run_in_executor.
-            # >=1 means it uses a torch.utils.data.DataLoader for parallel tokenization.
-            internal_num_workers = settings.TOKENIZER_WORKERS
-            
             predict_task_with_args = functools.partial(
                 SentenceTransformerRerankerAdapter._model.predict,
                 query_doc_pairs,  
                 batch_size=settings.BATCH_SIZE,
                 show_progress_bar=False,
-                num_workers=internal_num_workers,
+                num_workers=num_dataloader_workers, # Usar el valor de settings
                 activation_fct=None, 
                 apply_softmax=False, 
                 convert_to_numpy=True, 
@@ -116,9 +128,6 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
     async def rerank(
         self, query: str, documents: List[DocumentToRerank]
     ) -> List[RerankedDocument]:
-        """
-        Reranks documents based on the query using the loaded CrossEncoder model.
-        """
         rerank_log = logger.bind(
             adapter_action="rerank", 
             query_preview=query[:50]+"..." if len(query) > 50 else query,
@@ -168,7 +177,9 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
         return reranked_docs_with_scores
 
     def get_model_name(self) -> str:
-        return settings.MODEL_NAME 
+        # Devuelve el nombre del modelo que se intentó cargar según la configuración,
+        # o el nombre del modelo cargado si tuvo éxito.
+        return SentenceTransformerRerankerAdapter._model_name_loaded or settings.MODEL_NAME
 
     def is_ready(self) -> bool:
         return SentenceTransformerRerankerAdapter._model is not None and \

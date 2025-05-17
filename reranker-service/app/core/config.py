@@ -5,6 +5,7 @@ from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, field_validator, ValidationInfo, ValidationError, AnyHttpUrl
 import json
+import torch # Para verificar IS_CUDA
 
 # --- Default Values ---
 DEFAULT_MODEL_NAME = "BAAI/bge-reranker-base"
@@ -12,12 +13,18 @@ DEFAULT_MODEL_DEVICE = "cpu"
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_PORT = 8004
 DEFAULT_HF_CACHE_DIR = "/app/.cache/huggingface"
-DEFAULT_BATCH_SIZE = 128 
 DEFAULT_MAX_SEQ_LENGTH = 512
-# Para GPU, empezar con 1 o 2 workers es a menudo óptimo.
-# Puedes aumentar y monitorear el rendimiento y uso de VRAM.
-DEFAULT_GUNICORN_WORKERS = 2 
-DEFAULT_TOKENIZER_WORKERS = 1 # Workers para la tokenización en CPU
+
+# Ajustes dinámicos basados en disponibilidad de CUDA
+IS_CUDA_AVAILABLE = torch.cuda.is_available()
+
+DEFAULT_BATCH_SIZE = 64 if IS_CUDA_AVAILABLE else 128
+# Con mp.set_start_method('spawn'), podemos usar workers para tokenización incluso con CUDA.
+# 0 significa tokenización secuencial. >0 para paralelizar en CPU.
+DEFAULT_TOKENIZER_WORKERS = 2 if IS_CUDA_AVAILABLE else 2 # Ajustar según CPUs disponibles
+# Para GPU, 1 worker Gunicorn suele ser un buen punto de partida para evitar contención de GPU.
+# Para CPU, podemos usar más, basado en cores.
+DEFAULT_GUNICORN_WORKERS = 1 if IS_CUDA_AVAILABLE else 2
 
 
 class Settings(BaseSettings):
@@ -43,7 +50,8 @@ class Settings(BaseSettings):
     MAX_SEQ_LENGTH: int = Field(default=DEFAULT_MAX_SEQ_LENGTH, gt=0)
 
     WORKERS: int = Field(default=DEFAULT_GUNICORN_WORKERS, gt=0)
-    TOKENIZER_WORKERS: int = Field(default=DEFAULT_TOKENIZER_WORKERS, ge=0) # 0 para secuencial, >=1 para paralelo
+    # TOKENIZER_WORKERS: ge=0 (0 para secuencial, >=1 para paralelo)
+    TOKENIZER_WORKERS: int = Field(default=DEFAULT_TOKENIZER_WORKERS, ge=0)
 
     @field_validator('LOG_LEVEL')
     @classmethod
@@ -57,8 +65,12 @@ class Settings(BaseSettings):
     @field_validator('MODEL_DEVICE')
     @classmethod
     def check_model_device(cls, v: str) -> str:
-        allowed_devices_prefixes = ["cpu", "cuda", "mps"]
         normalized_v = v.lower()
+        if normalized_v == "cuda" and not IS_CUDA_AVAILABLE:
+            logging.warning("MODEL_DEVICE set to 'cuda' but CUDA is not available. Falling back to 'cpu'.")
+            return "cpu"
+        
+        allowed_devices_prefixes = ["cpu", "cuda", "mps"]
         if not any(normalized_v.startswith(prefix) for prefix in allowed_devices_prefixes):
             logging.warning(f"MODEL_DEVICE '{v}' is unusual. Ensure it's a valid device string for PyTorch/sentence-transformers.")
         return normalized_v
@@ -75,6 +87,7 @@ if not _temp_log.handlers:
 
 try:
     _temp_log.info("Loading Reranker Service settings...")
+    _temp_log.info(f"CUDA Available Check: {IS_CUDA_AVAILABLE}")
     settings = Settings()
     _temp_log.info("Reranker Service Settings Loaded Successfully:")
     log_data = settings.model_dump() 
