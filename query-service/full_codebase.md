@@ -766,7 +766,7 @@ from fastapi import HTTPException, status
 log = structlog.get_logger(__name__)
 
 GREETING_REGEX = re.compile(r"^\s*(hola|hello|hi|buenos días|buenas tardes|buenas noches|hey|qué tal|hi there)\s*[\.,!?]*\s*$", re.IGNORECASE)
-RRF_K = 60 # Constante para Reciprocal Rank Fusion
+RRF_K = 60 
 
 MAP_REDUCE_NO_RELEVANT_INFO = "No hay información relevante en este fragmento."
 
@@ -972,9 +972,12 @@ class AskQueryUseCase:
             original_chunk_from_dense = dense_map.get(cid)
 
             if original_chunk_from_dense and original_chunk_from_dense.content:
+                # Crucial: Ensure embedding from dense result is preserved
                 original_chunk_from_dense.score = fused_score_val 
                 chunks_with_content.append(original_chunk_from_dense)
             else: 
+                # If chunk was not in dense_map or had no content, it's a placeholder
+                # Its embedding will be None unless it was in dense_map but content was missing.
                 chunk_placeholder = RetrievedChunk(
                     id=cid,
                     score=fused_score_val, 
@@ -1200,7 +1203,7 @@ class AskQueryUseCase:
             exec_log.info("Retrieval phase done", dense_count=len(dense_chunks_domain), sparse_count=len(sparse_results_tuples))
 
             pipeline_stages_used.append("fusion (rrf)")
-            dense_map = {c.id: c for c in dense_chunks_domain if c.id} 
+            dense_map = {c.id: c for c in dense_chunks_domain if c.id and c.embedding is not None} # Ensure embedding exists for dense_map entries used in MMR
             
             fused_scores: Dict[str, float] = self._reciprocal_rank_fusion(dense_chunks_domain, sparse_results_tuples)
             
@@ -1233,12 +1236,18 @@ class AskQueryUseCase:
                 rerank_log = exec_log.bind(action="rerank_remote", num_chunks_to_rerank=len(chunks_for_llm_or_mapreduce))
                 
                 documents_for_reranker = []
-                for chk in chunks_for_llm_or_mapreduce:
-                    if chk.content and chk.id: 
+                # Map to keep track of original RetrievedChunk objects by their ID
+                # This is crucial for preserving embeddings and other original metadata.
+                # Ensure this map contains objects that *have* embeddings if they came from dense search.
+                map_id_to_original_chunk_before_rerank = {c.id: c for c in chunks_for_llm_or_mapreduce}
+
+
+                for chk_id, original_chunk_obj in map_id_to_original_chunk_before_rerank.items():
+                    if original_chunk_obj.content and original_chunk_obj.id: 
                         documents_for_reranker.append({
-                            "id": chk.id,
-                            "text": chk.content,
-                            "metadata": chk.metadata or {} 
+                            "id": original_chunk_obj.id,
+                            "text": original_chunk_obj.content, # Use content from RetrievedChunk
+                            "metadata": original_chunk_obj.metadata or {} 
                         })
                 
                 if documents_for_reranker:
@@ -1249,8 +1258,18 @@ class AskQueryUseCase:
                     }
                     try:
                         rerank_log.debug("Sending request to reranker service...")
-                        reranker_url = str(settings.RERANKER_SERVICE_URL).rstrip('/') + "/api/v1/rerank"
-                        
+                        # Asegurarse que RERANKER_SERVICE_URL no tenga un "/" al final si el endpoint ya lo tiene
+                        base_reranker_url = str(settings.RERANKER_SERVICE_URL).rstrip('/')
+                        reranker_url = f"{base_reranker_url}/api/v1/rerank"
+                         # Si la URL base ya es .../api/v1, entonces sería base_reranker_url + "/rerank"
+                        if base_reranker_url.endswith("/api/v1"):
+                            reranker_url = f"{base_reranker_url.rsplit('/api/v1',1)[0]}/api/v1/rerank"
+                        elif base_reranker_url.endswith("/api"): # Menos probable pero por si acaso
+                            reranker_url = f"{base_reranker_url.rsplit('/api',1)[0]}/api/v1/rerank"
+
+
+                        rerank_log.debug(f"Final Reranker URL: {reranker_url}")
+
                         reranker_response = await self.http_client.post(
                             reranker_url,
                             json=reranker_payload,
@@ -1261,35 +1280,36 @@ class AskQueryUseCase:
 
                         if "data" in reranked_data and "reranked_documents" in reranked_data["data"]:
                             reranked_docs_from_service = reranked_data["data"]["reranked_documents"]
-                            original_chunks_map = {c.id: c for c in chunks_for_llm_or_mapreduce}
-                            
+                                                        
                             updated_reranked_chunks = []
                             for reranked_item_data in reranked_docs_from_service: 
                                 chunk_id = reranked_item_data.get("id")
                                 new_score = reranked_item_data.get("score")
                                 
-                                if chunk_id in original_chunks_map:
-                                    original_chunk_obj = original_chunks_map[chunk_id]
-                                    # --- CORRECTION: Preserve original embedding ---
-                                    preserved_embedding = original_chunk_obj.embedding
+                                # Recuperar el objeto RetrievedChunk original completo usando el ID
+                                if chunk_id in map_id_to_original_chunk_before_rerank:
+                                    original_retrieved_chunk = map_id_to_original_chunk_before_rerank[chunk_id]
                                     
-                                    # Rebuild the chunk object or update in place
+                                    # Crear un nuevo RetrievedChunk o actualizar el existente,
+                                    # asegurándose de mantener el embedding y otra metadata vital.
                                     updated_chunk = RetrievedChunk(
-                                        id=original_chunk_obj.id,
-                                        content=original_chunk_obj.content, # Content should already be there
-                                        score=new_score, # New score from reranker
-                                        metadata={ # Merge metadata, prioritizing reranker's if any, add reranked_score
-                                            **(original_chunk_obj.metadata or {}),
-                                            **(reranked_item_data.get("metadata", {})),
-                                            "reranked_score": new_score
+                                        id=original_retrieved_chunk.id,
+                                        content=original_retrieved_chunk.content, 
+                                        score=new_score, # Score actualizado del reranker
+                                        metadata={
+                                            **(original_retrieved_chunk.metadata or {}),
+                                            **(reranked_item_data.get("metadata", {})), # Merge metadata del reranker si la hay
+                                            "reranked_score": new_score # Guardar el score del reranker
                                         },
-                                        embedding=preserved_embedding, # Crucial: use original embedding
-                                        document_id=original_chunk_obj.document_id,
-                                        file_name=original_chunk_obj.file_name,
-                                        company_id=original_chunk_obj.company_id
+                                        embedding=original_retrieved_chunk.embedding, # Mantener embedding original
+                                        document_id=original_retrieved_chunk.document_id,
+                                        file_name=original_retrieved_chunk.file_name,
+                                        company_id=original_retrieved_chunk.company_id
                                     )
                                     updated_reranked_chunks.append(updated_chunk)
-                            
+                                else:
+                                    rerank_log.warning("Reranked chunk ID not found in original map.", reranked_id=chunk_id)
+
                             if updated_reranked_chunks: 
                                 chunks_for_llm_or_mapreduce = updated_reranked_chunks
                                 rerank_log.info(f"Reranking successful. {len(chunks_for_llm_or_mapreduce)} chunks after reranking.")
@@ -1299,8 +1319,9 @@ class AskQueryUseCase:
                             rerank_log.warning("Reranker service response format invalid.", response_data=reranked_data)
                     except httpx.HTTPStatusError as http_err:
                         rerank_log.error("HTTP error from Reranker service", status_code=http_err.response.status_code, response_text=http_err.response.text, exc_info=False)
-                    except httpx.RequestError as req_err:
-                        rerank_log.error("Request error contacting Reranker service", error=str(req_err), exc_info=False)
+                    except httpx.RequestError as req_err: # Incluye ConnectError, Timeout, etc.
+                        rerank_log.error("Request error contacting Reranker service", error_details=str(req_err), exc_info=False) # No traceback para errores de red comunes
+                        # El pipeline continuará con los chunks fusionados pero no reranqueados
                     except Exception as e_rerank:
                         rerank_log.exception("Unexpected error during reranking call.")
                 else:
@@ -1310,6 +1331,15 @@ class AskQueryUseCase:
                 pipeline_stages_used.append(f"reranking ({'disabled' if not self.settings.RERANKER_ENABLED else 'skipped_no_chunks_or_content'})")
             
             num_chunks_after_rerank = len(chunks_for_llm_or_mapreduce)
+
+            # Log para depurar embeddings antes del filtro MMR
+            num_with_embeddings_before_mmr = sum(1 for c_chk in chunks_for_llm_or_mapreduce if c_chk.embedding is not None)
+            exec_log.debug(
+                "Chunks before diversity filter",
+                total_chunks=len(chunks_for_llm_or_mapreduce),
+                chunks_with_embeddings=num_with_embeddings_before_mmr,
+                first_few_ids_and_embedding_status=[(c.id, c.embedding is not None) for c in chunks_for_llm_or_mapreduce[:min(5, len(chunks_for_llm_or_mapreduce))]]
+            )
 
             if self.diversity_filter and chunks_for_llm_or_mapreduce:
                  k_final_diversity = self.settings.MAX_CONTEXT_CHUNKS 
@@ -4147,7 +4177,7 @@ def truncate_text(text: str, max_length: int) -> str:
 ```toml
 [tool.poetry]
 name = "query-service"
-version = "0.3.4" # Incrementar versión por corrección
+version = "0.3.5" # Incrementar versión por corrección
 description = "Query service for SaaS B2B using Clean Architecture, PyMilvus, Haystack & Advanced RAG with remote embeddings, reranking, and sparse search."
 authors = ["Nyro <dev@atenex.com>"]
 readme = "README.md"

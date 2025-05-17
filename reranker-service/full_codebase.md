@@ -367,13 +367,16 @@ import json
 
 # --- Default Values ---
 DEFAULT_MODEL_NAME = "BAAI/bge-reranker-base"
-DEFAULT_MODEL_DEVICE = "cpu" # Cambiar a "cuda" si hay GPU disponible y se quiere usar
+DEFAULT_MODEL_DEVICE = "cpu" 
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_PORT = 8004
 DEFAULT_HF_CACHE_DIR = "/app/.cache/huggingface"
-DEFAULT_BATCH_SIZE = 128 # MODIFICADO: Aumentado para potencialmente más throughput
+DEFAULT_BATCH_SIZE = 128 
 DEFAULT_MAX_SEQ_LENGTH = 512
-DEFAULT_GUNICORN_WORKERS = 4 # MODIFICADO: Aumentado (ajustar según CPUs disponibles)
+# Para GPU, empezar con 1 o 2 workers es a menudo óptimo.
+# Puedes aumentar y monitorear el rendimiento y uso de VRAM.
+DEFAULT_GUNICORN_WORKERS = 2 
+DEFAULT_TOKENIZER_WORKERS = 1 # Workers para la tokenización en CPU
 
 
 class Settings(BaseSettings):
@@ -399,6 +402,7 @@ class Settings(BaseSettings):
     MAX_SEQ_LENGTH: int = Field(default=DEFAULT_MAX_SEQ_LENGTH, gt=0)
 
     WORKERS: int = Field(default=DEFAULT_GUNICORN_WORKERS, gt=0)
+    TOKENIZER_WORKERS: int = Field(default=DEFAULT_TOKENIZER_WORKERS, ge=0) # 0 para secuencial, >=1 para paralelo
 
     @field_validator('LOG_LEVEL')
     @classmethod
@@ -703,23 +707,26 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
             logger.error("Reranker model not loaded or not ready for prediction.")
             raise RuntimeError("Reranker model is not available for prediction.")
 
-        predict_log = logger.bind(adapter_action="_predict_scores_async", num_pairs=len(query_doc_pairs))
+        predict_log = logger.bind(
+            adapter_action="_predict_scores_async", 
+            num_pairs=len(query_doc_pairs),
+            tokenizer_workers=settings.TOKENIZER_WORKERS
+            )
         predict_log.debug("Starting asynchronous prediction.")
         
         loop = asyncio.get_event_loop()
         try:
-            # Determine the number of workers for internal tokenization by sentence-transformers.
-            # With 2 Gunicorn workers and a pod limit of 2 CPUs, each Gunicorn worker effectively has 1 CPU.
-            # Using num_workers=1 for internal tokenization allows some parallelism without oversubscribing CPUs.
-            # This was previously num_workers=0, causing sequential tokenization.
-            internal_num_workers = 1
+            # Use settings.TOKENIZER_WORKERS for num_workers in model.predict
+            # 0 means tokenization runs in the main process used by run_in_executor.
+            # >=1 means it uses a torch.utils.data.DataLoader for parallel tokenization.
+            internal_num_workers = settings.TOKENIZER_WORKERS
             
             predict_task_with_args = functools.partial(
                 SentenceTransformerRerankerAdapter._model.predict,
                 query_doc_pairs,  
                 batch_size=settings.BATCH_SIZE,
                 show_progress_bar=False,
-                num_workers=internal_num_workers, # MODIFIED: Changed from 0 to internal_num_workers
+                num_workers=internal_num_workers,
                 activation_fct=None, 
                 apply_softmax=False, 
                 convert_to_numpy=True, 
@@ -861,6 +868,7 @@ async def lifespan(app: FastAPI):
                 model_name=settings.MODEL_NAME 
             )
             SERVICE_IS_READY = False
+            # Pass the adapter even if not ready, so health check can report its status
             set_dependencies(model_adapter=model_adapter, use_case=None) 
 
     except Exception as e:
@@ -898,6 +906,7 @@ async def request_context_middleware(request: Request, call_next):
     try:
         response = await call_next(request)
     except Exception as e:
+        # Log con el logger principal, que ya tiene request_id en su contexto
         logger.exception("Unhandled exception during request processing by middleware.") 
         response = JSONResponse(
             status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -907,26 +916,24 @@ async def request_context_middleware(request: Request, call_next):
         process_time_ms = (asyncio.get_event_loop().time() - start_time) * 1000
         status_code_for_log = response.status_code if response else 500 
         
-        # Reducir logs de health checks exitosos a DEBUG
-        log_method = logger.info
         is_health_check = request.url.path == "/health"
+        
+        log_method = logger.info # Default log level for requests
         if is_health_check and status_code_for_log == 200:
-            log_method = logger.debug # Loguear health checks OK en DEBUG
+            log_method = logger.debug # Log successful health checks at DEBUG
         elif status_code_for_log >= 500:
             log_method = logger.error
         elif status_code_for_log >= 400:
             log_method = logger.warning
         
-        # Para otros endpoints que no sean /health o si /health falla, usar el nivel correspondiente
-        if not (is_health_check and status_code_for_log == 200 and log_method == logger.debug):
-             log_method(
-                "Request finished",
-                http_method=request.method,
-                http_path=str(request.url.path),
-                http_status_code=status_code_for_log,
-                http_duration_ms=round(process_time_ms, 2),
-                client_host=request.client.host if request.client else "unknown_client"
-            )
+        log_method(
+            "Request finished", # Evento siempre se loguea
+            http_method=request.method,
+            http_path=str(request.url.path),
+            http_status_code=status_code_for_log,
+            http_duration_ms=round(process_time_ms, 2),
+            client_host=request.client.host if request.client else "unknown_client"
+        )
         
         if response: 
             response.headers["X-Request-ID"] = request_id
@@ -937,6 +944,7 @@ async def request_context_middleware(request: Request, call_next):
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler_custom(request: Request, exc: HTTPException):
+    # El middleware ya logueará esta solicitud con el status_code de la excepción.
     return JSONResponse(
         status_code=exc.status_code,
         content={"detail": exc.detail}
@@ -944,6 +952,7 @@ async def http_exception_handler_custom(request: Request, exc: HTTPException):
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler_custom(request: Request, exc: RequestValidationError):
+    # El middleware ya logueará esta solicitud con el status_code 422.
     return JSONResponse(
         status_code=fastapi_status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={"detail": exc.errors()} 
@@ -951,6 +960,7 @@ async def validation_exception_handler_custom(request: Request, exc: RequestVali
 
 @app.exception_handler(Exception) 
 async def generic_exception_handler_custom(request: Request, exc: Exception):
+    # El middleware ya logueará esta solicitud con el status_code 500.
     return JSONResponse(
         status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"detail": "An unexpected internal server error occurred."}
@@ -966,13 +976,14 @@ logger.info("API routers included.", prefix=settings.API_V1_STR)
     summary="Service Health and Model Status Check"
 )
 async def health_check():
+    # El estado del modelo se obtiene directamente de la clase Adapter
     model_status = SentenceTransformerRerankerAdapter.get_model_status()
-    current_model_name = settings.MODEL_NAME 
+    current_model_name = settings.MODEL_NAME # Usar el configurado, ya que es lo que intentó cargar
 
     health_log = logger.bind(service_ready_flag=SERVICE_IS_READY, model_actual_status=model_status)
 
     if SERVICE_IS_READY and model_status == "loaded":
-        # No loguear INFO para health checks OK aquí; el middleware lo hará en DEBUG
+        # No es necesario loguear aquí, el middleware lo hará en DEBUG
         return HealthCheckResponse(
             status="ok",
             service=settings.PROJECT_NAME,
@@ -980,11 +991,13 @@ async def health_check():
             model_name=current_model_name
         )
     else:
-        unhealthy_reason = "Service dependencies not fully initialized."
-        if model_status != "loaded":
-            unhealthy_reason = f"Model status is '{model_status}'."
+        unhealthy_reason = "Service dependencies not fully initialized or model load failed."
+        if not SERVICE_IS_READY: # SERVICE_IS_READY es el indicador principal del lifespan
+             unhealthy_reason = "Lifespan initialization incomplete or failed."
+        elif model_status != "loaded": # Si el lifespan completó pero el modelo no está 'loaded'
+            unhealthy_reason = f"Model status is '{model_status}' (expected 'loaded')."
         
-        health_log.warning("Health check: FAILED", reason=unhealthy_reason)
+        health_log.warning("Health check: FAILED", reason=unhealthy_reason) # Loguea aquí si falla
         return JSONResponse(
             status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE,
             content={
