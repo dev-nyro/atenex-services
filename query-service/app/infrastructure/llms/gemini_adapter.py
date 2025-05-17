@@ -42,7 +42,9 @@ class GeminiAdapter(LLMPort):
         wait=wait_exponential(multiplier=settings.HTTP_CLIENT_BACKOFF_FACTOR, min=2, max=10),
         retry=retry_if_exception_type((
             TimeoutError,
-            # google.api_core.exceptions.GoogleAPIError u otras específicas de la librería si se identifican
+            # Se pueden agregar aquí errores específicos de google.api_core.exceptions si se identifican
+            # como errores de red o servicio transitorios que justifiquen un reintento.
+            # genai_types.generation_types.BlockedPromptException y StopCandidateException NO deberían reintentarse.
         )),
         reraise=True,
         before_sleep=lambda retry_state: log.warning(
@@ -70,20 +72,22 @@ class GeminiAdapter(LLMPort):
         generation_config_parts: Dict[str, Any] = {
             "temperature": 0.6, 
             "top_p": 0.9,
-            # "max_output_tokens": settings.MAX_PROMPT_TOKENS // Si se necesita limitar la salida del LLM directamente
+            # "max_output_tokens": ..., # Considerar si se necesita
+            # "stop_sequences": ... , # Considerar si se necesita
         }
         
         if response_pydantic_schema:
+            # Usar el mecanismo recomendado por Google para forzar una respuesta JSON
+            # basada en un esquema Pydantic.
             generation_config_parts["response_mime_type"] = "application/json"
-            generation_config_parts["response_schema"] = response_pydantic_schema
+            generation_config_parts["response_schema"] = response_pydantic_schema 
             generate_log.debug("Configured Gemini for JSON output using response_schema.", schema_name=response_pydantic_schema.__name__)
         
         final_generation_config = genai_types.GenerationConfig(**generation_config_parts)
         
         try:
-            # No se pasa 'tools' ni 'tool_config' aquí si solo se usa response_schema para forzar JSON.
-            # Si se necesitaran otras function calls, se agregarían a 'tools'.
             call_kwargs: Dict[str, Any] = {"generation_config": final_generation_config}
+            # No se necesita 'tools' ni 'tool_config' para forzar JSON con response_schema
             
             generate_log.debug("Sending request to Gemini API...")
             response = await self._model.generate_content_async(prompt, **call_kwargs)
@@ -95,7 +99,7 @@ class GeminiAdapter(LLMPort):
                  safety_ratings_str = str(getattr(response.prompt_feedback, 'safety_ratings', "N/A")) 
                  generate_log.warning("Gemini response potentially blocked (no candidates)",
                                       finish_reason=finish_reason_str, safety_ratings=safety_ratings_str)
-                 if response_pydantic_schema:
+                 if response_pydantic_schema: # Si se esperaba JSON, devolver un JSON de error
                      return json.dumps({
                          "error_message": f"Respuesta bloqueada por Gemini (sin candidatos). Razón: {finish_reason_str}",
                          "respuesta_detallada": f"La generación de la respuesta fue bloqueada. Por favor, reformula tu pregunta o contacta a soporte si el problema persiste. Razón: {finish_reason_str}.",
@@ -111,7 +115,7 @@ class GeminiAdapter(LLMPort):
                 generate_log.warning("Gemini response candidate empty or missing parts",
                                      candidate_finish_reason=finish_reason_cand_str,
                                      candidate_safety_ratings=safety_ratings_cand_str)
-                if response_pydantic_schema:
+                if response_pydantic_schema: # Si se esperaba JSON, devolver un JSON de error
                      return json.dumps({
                          "error_message": f"Respuesta vacía de Gemini (candidato sin contenido). Razón: {finish_reason_cand_str}",
                          "respuesta_detallada": f"El asistente no pudo generar una respuesta completa. Razón: {finish_reason_cand_str}.",
@@ -119,22 +123,27 @@ class GeminiAdapter(LLMPort):
                      })
                 return f"[Respuesta vacía de Gemini (candidato sin contenido). Razón: {finish_reason_cand_str}]"
             
-            if response_pydantic_schema:
-                # Cuando se usa response_mime_type="application/json" y response_schema,
-                # el SDK de Gemini (versiones recientes) debería devolver el texto ya como un string JSON.
-                if candidate.content.parts[0].text:
-                    generated_text = candidate.content.parts[0].text
-                    generate_log.debug("Received potential JSON text from Gemini API.", response_length=len(generated_text))
-                    # La validación Pydantic (model_validate_json) se hará en el UseCase
-                else:
-                    generate_log.error("Expected JSON response, but no text found in the first part of candidate content.")
+            # Extraer el texto de la respuesta.
+            # Si se usó response_schema, el SDK ya debería haber parseado el JSON en `candidate.content.parts[0].text`.
+            # Si fue una respuesta de texto plano, también estará aquí.
+            if candidate.content.parts[0].text:
+                generated_text = candidate.content.parts[0].text
+            else:
+                # Esto sería inesperado si hay partes pero ninguna tiene texto
+                generate_log.error("Gemini response part exists but has no text content.")
+                if response_pydantic_schema:
                     return json.dumps({
-                         "error_message": "Respuesta JSON esperada pero no se encontró texto en la respuesta del LLM.",
-                         "respuesta_detallada": "Error: El asistente no devolvió una respuesta en el formato JSON esperado.",
-                         "fuentes_citadas": []
+                        "error_message": "Respuesta del LLM incompleta o en formato inesperado.",
+                        "respuesta_detallada": "Error: El asistente devolvió una respuesta sin contenido textual.",
+                        "fuentes_citadas": []
                     })
+                return "[Respuesta del LLM incompleta o sin contenido textual]"
+
+            if response_pydantic_schema:
+                generate_log.debug("Received potential JSON text from Gemini API.", response_length=len(generated_text))
+                # La validación del JSON contra el Pydantic schema se hará en el UseCase (`_handle_llm_response`)
+                # Aquí solo nos aseguramos de que es un string.
             else: 
-                generated_text = "".join(part.text for part in candidate.content.parts if hasattr(part, 'text') and part.text)
                 generate_log.debug("Received plain text response from Gemini API", response_length=len(generated_text))
                 
             return generated_text.strip()
@@ -145,7 +154,7 @@ class GeminiAdapter(LLMPort):
                                  error_type=type(security_err).__name__,
                                  error_details=str(security_err),
                                  finish_reason=finish_reason_err_str)
-            if response_pydantic_schema:
+            if response_pydantic_schema: # Si se esperaba JSON, devolver un JSON de error
                 return json.dumps({
                     "error_message": f"Contenido bloqueado o detenido por Gemini: {type(security_err).__name__}",
                     "respuesta_detallada": f"La generación de la respuesta fue bloqueada o detenida por políticas de contenido. Por favor, ajusta tu consulta. (Razón: {finish_reason_err_str})",
@@ -154,13 +163,15 @@ class GeminiAdapter(LLMPort):
             return f"[Contenido bloqueado o detenido por Gemini: {type(security_err).__name__}. Razón: {finish_reason_err_str}]"
         except Exception as e: 
             generate_log.exception("Unhandled error during Gemini API call")
-            if response_pydantic_schema: 
+            if response_pydantic_schema: # Si se esperaba JSON, devolver un JSON de error
                 return json.dumps({
                     "error_message": f"Error inesperado en la API de Gemini: {type(e).__name__}",
                     "respuesta_detallada": f"Error interno al comunicarse con el asistente: {type(e).__name__} - {str(e)[:100]}.",
                     "fuentes_citadas": []
                 })
+            # Si no se esperaba JSON, relanzar como ConnectionError para que el UseCase lo maneje
             raise ConnectionError(f"Gemini API call failed unexpectedly: {e}") from e
 
-# La función _clean_pydantic_schema_for_gemini_tool se elimina ya que no se usa con response_schema.
-# Si se necesitaran 'tools' para otras cosas, se reintroduciría.
+# La función _clean_pydantic_schema_for_gemini_tool ya no es necesaria para este flujo.
+# Se elimina para simplificar, ya que el SDK de Gemini maneja Pydantic models directamente
+# cuando se usa `response_schema`.
