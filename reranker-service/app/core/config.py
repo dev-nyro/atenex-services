@@ -8,13 +8,16 @@ import json
 
 # --- Default Values ---
 DEFAULT_MODEL_NAME = "BAAI/bge-reranker-base"
-DEFAULT_MODEL_DEVICE = "cpu" # Cambiar a "cuda" si hay GPU disponible y se quiere usar
+DEFAULT_MODEL_DEVICE = "cpu" 
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_PORT = 8004
 DEFAULT_HF_CACHE_DIR = "/app/.cache/huggingface"
-DEFAULT_BATCH_SIZE = 128 # MODIFICADO: Aumentado para potencialmente más throughput
+DEFAULT_BATCH_SIZE = 128 
 DEFAULT_MAX_SEQ_LENGTH = 512
-DEFAULT_GUNICORN_WORKERS = 4 # MODIFICADO: Aumentado (ajustar según CPUs disponibles)
+# Para GPU, empezar con 1 o 2 workers es a menudo óptimo.
+# Puedes aumentar y monitorear el rendimiento y uso de VRAM.
+DEFAULT_GUNICORN_WORKERS = 2 
+DEFAULT_TOKENIZER_WORKERS = 1 # Workers para la tokenización en CPU
 
 
 class Settings(BaseSettings):
@@ -40,6 +43,7 @@ class Settings(BaseSettings):
     MAX_SEQ_LENGTH: int = Field(default=DEFAULT_MAX_SEQ_LENGTH, gt=0)
 
     WORKERS: int = Field(default=DEFAULT_GUNICORN_WORKERS, gt=0)
+    TOKENIZER_WORKERS: int = Field(default=DEFAULT_TOKENIZER_WORKERS, ge=0) # 0 para secuencial, >=1 para paralelo
 
     @field_validator('LOG_LEVEL')
     @classmethod

@@ -75,23 +75,26 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
             logger.error("Reranker model not loaded or not ready for prediction.")
             raise RuntimeError("Reranker model is not available for prediction.")
 
-        predict_log = logger.bind(adapter_action="_predict_scores_async", num_pairs=len(query_doc_pairs))
+        predict_log = logger.bind(
+            adapter_action="_predict_scores_async", 
+            num_pairs=len(query_doc_pairs),
+            tokenizer_workers=settings.TOKENIZER_WORKERS
+            )
         predict_log.debug("Starting asynchronous prediction.")
         
         loop = asyncio.get_event_loop()
         try:
-            # Determine the number of workers for internal tokenization by sentence-transformers.
-            # With 2 Gunicorn workers and a pod limit of 2 CPUs, each Gunicorn worker effectively has 1 CPU.
-            # Using num_workers=1 for internal tokenization allows some parallelism without oversubscribing CPUs.
-            # This was previously num_workers=0, causing sequential tokenization.
-            internal_num_workers = 1
+            # Use settings.TOKENIZER_WORKERS for num_workers in model.predict
+            # 0 means tokenization runs in the main process used by run_in_executor.
+            # >=1 means it uses a torch.utils.data.DataLoader for parallel tokenization.
+            internal_num_workers = settings.TOKENIZER_WORKERS
             
             predict_task_with_args = functools.partial(
                 SentenceTransformerRerankerAdapter._model.predict,
                 query_doc_pairs,  
                 batch_size=settings.BATCH_SIZE,
                 show_progress_bar=False,
-                num_workers=internal_num_workers, # MODIFIED: Changed from 0 to internal_num_workers
+                num_workers=internal_num_workers,
                 activation_fct=None, 
                 apply_softmax=False, 
                 convert_to_numpy=True, 
