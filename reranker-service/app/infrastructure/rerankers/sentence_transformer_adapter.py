@@ -76,17 +76,22 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
             raise RuntimeError("Reranker model is not available for prediction.")
 
         predict_log = logger.bind(adapter_action="_predict_scores_async", num_pairs=len(query_doc_pairs))
-        # MODIFICADO: Cambiado a DEBUG
         predict_log.debug("Starting asynchronous prediction.")
         
         loop = asyncio.get_event_loop()
         try:
+            # Determine the number of workers for internal tokenization by sentence-transformers.
+            # With 2 Gunicorn workers and a pod limit of 2 CPUs, each Gunicorn worker effectively has 1 CPU.
+            # Using num_workers=1 for internal tokenization allows some parallelism without oversubscribing CPUs.
+            # This was previously num_workers=0, causing sequential tokenization.
+            internal_num_workers = 1
+            
             predict_task_with_args = functools.partial(
                 SentenceTransformerRerankerAdapter._model.predict,
                 query_doc_pairs,  
                 batch_size=settings.BATCH_SIZE,
                 show_progress_bar=False,
-                num_workers=0,  
+                num_workers=internal_num_workers, # MODIFIED: Changed from 0 to internal_num_workers
                 activation_fct=None, 
                 apply_softmax=False, 
                 convert_to_numpy=True, 
@@ -99,7 +104,7 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
             )
             
             scores = scores_numpy_array.tolist() 
-            predict_log.debug("Prediction successful.") # MODIFICADO: Cambiado a DEBUG
+            predict_log.debug("Prediction successful.")
             return scores
         except Exception as e:
             predict_log.error("Error during reranker model prediction.", error_message=str(e), exc_info=True)
@@ -116,7 +121,6 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
             query_preview=query[:50]+"..." if len(query) > 50 else query,
             num_documents_input=len(documents)
         )
-        # MODIFICADO: Cambiado a DEBUG, el endpoint ya loguea INFO
         rerank_log.debug("Starting rerank operation in adapter.")
 
         if not documents:
@@ -157,7 +161,6 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
         
         reranked_docs_with_scores.sort(key=lambda x: x.score, reverse=True)
         
-        # MODIFICADO: Cambiado a DEBUG, el use case/endpoint logueará INFO
         rerank_log.debug("Rerank operation completed by adapter.", num_documents_output=len(reranked_docs_with_scores))
         return reranked_docs_with_scores
 
