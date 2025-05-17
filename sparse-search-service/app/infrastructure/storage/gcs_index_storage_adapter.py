@@ -5,6 +5,7 @@ import tempfile
 import uuid
 from pathlib import Path
 from typing import Tuple, Optional
+import functools # <--- CORRECCIÓN: Importación añadida
 
 import structlog
 from google.cloud import storage
@@ -93,7 +94,10 @@ class GCSIndexStorageAdapter(SparseIndexStoragePort):
         async def _upload_file(local_path: str, gcs_path: str, content_type: Optional[str] = None):
             try:
                 blob = self._bucket.blob(gcs_path)
-                await loop.run_in_executor(None, blob.upload_from_filename, local_path, content_type=content_type)
+                # <--- CORRECCIÓN: Usar functools.partial para pasar content_type ---
+                upload_func = functools.partial(blob.upload_from_filename, local_path, content_type=content_type)
+                await loop.run_in_executor(None, upload_func)
+                # --- Fin de la corrección ---
                 adapter_log.debug(f"Successfully uploaded local file to GCS object.", local_file=local_path, gcs_object=gcs_path)
             except GoogleAPIError as e:
                 adapter_log.error(f"GCS API error uploading file.", local_file=local_path, gcs_object=gcs_path, error=str(e))

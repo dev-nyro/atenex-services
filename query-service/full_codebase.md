@@ -2552,6 +2552,120 @@ from app.utils.helpers import truncate_text
 
 log = structlog.get_logger(__name__)
 
+def _clean_pydantic_schema_for_gemini_response(pydantic_schema: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Limpia un esquema JSON generado por Pydantic para que sea compatible con
+    el parámetro `response_schema` de Gemini `GenerationConfig`.
+    Principalmente, elimina campos "default" y ajusta tipos.
+    """
+    
+    # Referencias internas que Gemini podría no entender bien, aunque para response_schema
+    # Pydantic suele aplanar bastante bien.
+    definitions = pydantic_schema.get("$defs", {})
+
+    schema_copy = {
+        k: v
+        for k, v in pydantic_schema.items()
+        # Quitar $defs y title/description del nivel raíz, ya que response_schema es el tipo mismo
+        if k not in {"$defs", "title", "description", "$schema"} 
+    }
+
+    def resolve_ref(ref_path: str) -> Dict[str, Any]:
+        if not ref_path.startswith("#/$defs/"):
+            return {"type": "OBJECT"} # Fallback si es una referencia externa no esperada
+        
+        def_key = ref_path.split("/")[-1]
+        if def_key in definitions:
+            return _transform_node(definitions[def_key])
+        else:
+            log.warning(f"Broken JSON schema reference found and could not be resolved: {ref_path}")
+            return {"type": "OBJECT"} # Fallback
+
+    def _transform_node(node: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(node, dict):
+            return node
+
+        transformed_node = {}
+        for key, value in node.items():
+            # Eliminar campos problemáticos como 'default' o que no son parte del schema de OpenAPI que Gemini usa
+            if key in {"default", "examples", "example", "const", "title", "description"}:
+                continue
+            
+            if key == "$ref" and isinstance(value, str):
+                 # Si es una referencia, resolverla y usar el resultado transformado.
+                 # El esquema de respuesta para Gemini no usa $ref, espera el objeto anidado.
+                 return resolve_ref(value)
+
+            elif key == "anyOf" and isinstance(value, list):
+                # Simplificar anyOf para opcionales: anyOf: [ <type>, {"type": "null"} ] a <type> con nullable: true
+                is_optional_pattern = False
+                if len(value) == 2:
+                    type_def_item = next((item for item in value if isinstance(item, dict) and item.get("type") != "null"), None)
+                    null_def_item = next((item for item in value if isinstance(item, dict) and item.get("type") == "null"), None)
+                    
+                    if type_def_item and null_def_item:
+                        is_optional_pattern = True
+                        # Tomar el tipo no nulo y transformarlo
+                        transformed_type_def = _transform_node(type_def_item)
+                        # Copiar las propiedades del tipo real al nodo actual
+                        for k_type, v_type in transformed_type_def.items():
+                             transformed_node[k_type] = v_type
+                        transformed_node["nullable"] = True 
+                
+                if not is_optional_pattern: 
+                    # Si no es el patrón opcional, es más complejo y podría no ser soportado directamente.
+                    # Por simplicidad, podríamos tomar el primer tipo o loguear un aviso.
+                    # Para response_schema, es mejor que el Pydantic model sea simple.
+                    if value:
+                        first_type = _transform_node(value[0])
+                        for k_first, v_first in first_type.items():
+                            transformed_node[k_first] = v_first
+                        log.warning("Complex 'anyOf' in Pydantic schema for Gemini response_schema, took first option.",
+                                    original_anyof=value, chosen_type=first_type)
+                    else:
+                        log.warning("Empty 'anyOf' in Pydantic schema for Gemini response_schema.", original_anyof=value)
+                continue 
+
+            elif isinstance(value, dict):
+                transformed_node[key] = _transform_node(value)
+            elif isinstance(value, list) and key not in ["enum", "required"]: 
+                transformed_node[key] = [_transform_node(item) if isinstance(item, dict) else item for item in value]
+            else:
+                transformed_node[key] = value
+        
+        # Convertir 'type' a MAYÚSCULAS según la especificación OpenAPI que usa Gemini
+        if "type" in transformed_node:
+            json_type = transformed_node["type"]
+            if isinstance(json_type, list): # type: ["string", "null"]
+                if "null" in json_type:
+                    transformed_node["nullable"] = True 
+                actual_type = next((t for t in json_type if t != "null"), "OBJECT") # Default to OBJECT if only null
+                if isinstance(actual_type, str):
+                    transformed_node["type"] = actual_type.upper()
+                else: # Podría ser un sub-esquema (raro para listas de tipos)
+                    transformed_node["type"] = _transform_node(actual_type).get("type", "OBJECT")
+
+            elif isinstance(json_type, str):
+                transformed_node["type"] = json_type.upper()
+            
+            # Gemini espera que el tipo para 'array' sea 'ARRAY', no 'LIST' (si Pydantic lo genera así)
+            if transformed_node["type"] == "LIST": # Pydantic puede usar 'list'
+                transformed_node["type"] = "ARRAY"
+
+
+        # Asegurar que `items` exista para tipo ARRAY
+        if transformed_node.get("type") == "ARRAY" and "items" not in transformed_node:
+            log.warning("Schema for ARRAY type missing 'items' definition for Gemini. Adding generic object item.", node_details=transformed_node)
+            transformed_node["items"] = {"type": "OBJECT"} # Fallback genérico
+
+        return transformed_node
+
+    # Aplicar la transformación al schema raíz
+    final_schema = _transform_node(schema_copy)
+    
+    log.debug("Cleaned Pydantic JSON Schema for Gemini response_schema", original_schema=pydantic_schema, cleaned_schema=final_schema)
+    return final_schema
+
 
 class GeminiAdapter(LLMPort):
     _api_key: str
@@ -2580,7 +2694,8 @@ class GeminiAdapter(LLMPort):
         wait=wait_exponential(multiplier=settings.HTTP_CLIENT_BACKOFF_FACTOR, min=2, max=10),
         retry=retry_if_exception_type((
             TimeoutError,
-            # google.api_core.exceptions.GoogleAPIError u otras específicas de la librería si se identifican
+            # Se pueden agregar aquí errores específicos de google.api_core.exceptions si se identifican
+            # como errores de red o servicio transitorios que justifiquen un reintento.
         )),
         reraise=True,
         before_sleep=lambda retry_state: log.warning(
@@ -2608,19 +2723,24 @@ class GeminiAdapter(LLMPort):
         generation_config_parts: Dict[str, Any] = {
             "temperature": 0.6, 
             "top_p": 0.9,
-            # "max_output_tokens": settings.MAX_PROMPT_TOKENS // Si se necesita limitar la salida del LLM directamente
         }
         
         if response_pydantic_schema:
             generation_config_parts["response_mime_type"] = "application/json"
-            generation_config_parts["response_schema"] = response_pydantic_schema
-            generate_log.debug("Configured Gemini for JSON output using response_schema.", schema_name=response_pydantic_schema.__name__)
+            
+            # Obtener el esquema JSON del modelo Pydantic
+            pydantic_schema_json = response_pydantic_schema.model_json_schema()
+            # Limpiar el esquema para Gemini
+            cleaned_schema_for_gemini = _clean_pydantic_schema_for_gemini_response(pydantic_schema_json)
+            
+            generation_config_parts["response_schema"] = cleaned_schema_for_gemini
+            generate_log.debug("Configured Gemini for JSON output using cleaned response_schema.", 
+                               schema_name=response_pydantic_schema.__name__,
+                               cleaned_schema=cleaned_schema_for_gemini)
         
         final_generation_config = genai_types.GenerationConfig(**generation_config_parts)
         
         try:
-            # No se pasa 'tools' ni 'tool_config' aquí si solo se usa response_schema para forzar JSON.
-            # Si se necesitaran otras function calls, se agregarían a 'tools'.
             call_kwargs: Dict[str, Any] = {"generation_config": final_generation_config}
             
             generate_log.debug("Sending request to Gemini API...")
@@ -2657,22 +2777,21 @@ class GeminiAdapter(LLMPort):
                      })
                 return f"[Respuesta vacía de Gemini (candidato sin contenido). Razón: {finish_reason_cand_str}]"
             
-            if response_pydantic_schema:
-                # Cuando se usa response_mime_type="application/json" y response_schema,
-                # el SDK de Gemini (versiones recientes) debería devolver el texto ya como un string JSON.
-                if candidate.content.parts[0].text:
-                    generated_text = candidate.content.parts[0].text
-                    generate_log.debug("Received potential JSON text from Gemini API.", response_length=len(generated_text))
-                    # La validación Pydantic (model_validate_json) se hará en el UseCase
-                else:
-                    generate_log.error("Expected JSON response, but no text found in the first part of candidate content.")
+            if candidate.content.parts[0].text:
+                generated_text = candidate.content.parts[0].text
+            else:
+                generate_log.error("Gemini response part exists but has no text content.")
+                if response_pydantic_schema:
                     return json.dumps({
-                         "error_message": "Respuesta JSON esperada pero no se encontró texto en la respuesta del LLM.",
-                         "respuesta_detallada": "Error: El asistente no devolvió una respuesta en el formato JSON esperado.",
-                         "fuentes_citadas": []
+                        "error_message": "Respuesta del LLM incompleta o en formato inesperado.",
+                        "respuesta_detallada": "Error: El asistente devolvió una respuesta sin contenido textual.",
+                        "fuentes_citadas": []
                     })
+                return "[Respuesta del LLM incompleta o sin contenido textual]"
+
+            if response_pydantic_schema:
+                generate_log.debug("Received potential JSON text from Gemini API.", response_length=len(generated_text))
             else: 
-                generated_text = "".join(part.text for part in candidate.content.parts if hasattr(part, 'text') and part.text)
                 generate_log.debug("Received plain text response from Gemini API", response_length=len(generated_text))
                 
             return generated_text.strip()
@@ -2699,9 +2818,6 @@ class GeminiAdapter(LLMPort):
                     "fuentes_citadas": []
                 })
             raise ConnectionError(f"Gemini API call failed unexpectedly: {e}") from e
-
-# La función _clean_pydantic_schema_for_gemini_tool se elimina ya que no se usa con response_schema.
-# Si se necesitaran 'tools' para otras cosas, se reintroduciría.
 ```
 
 ## File: `app\infrastructure\persistence\__init__.py`

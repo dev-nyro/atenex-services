@@ -1490,6 +1490,7 @@ import uuid
 from pathlib import Path
 import sys
 import pickle # Para serializar
+from typing import List # <--- CORRECCIÓN: Importación añadida
 
 try:
     # LLM: CORRECTION - Importar de rank_bm25
@@ -1514,6 +1515,7 @@ from app.infrastructure.persistence.postgres_repositories import PostgresChunkCo
 from app.infrastructure.persistence import postgres_connector
 from app.infrastructure.storage.gcs_index_storage_adapter import GCSIndexStorageAdapter, GCSIndexStorageError
 from app.infrastructure.sparse_retrieval.bm25_adapter import BM25Adapter # Sigue siendo útil para dump/load
+from typing import Optional # Añadido para la firma de main_builder_logic
 
 # LLM: CORRECTION - Usar la implementación definida en bm25_adapter o una aquí
 BM25_IMPLEMENTATION_FOR_BUILDER = BM25Okapi 
