@@ -754,7 +754,7 @@ from app.application.ports import (
     SparseRetrieverPort, DiversityFilterPort, ChunkContentRepositoryPort,
     EmbeddingPort, RerankerPort 
 )
-from app.domain.models import RetrievedChunk, ChatMessage, RespuestaEstructurada, FuenteCitada # Added RespuestaEstructurada, FuenteCitada
+from app.domain.models import RetrievedChunk, ChatMessage, RespuestaEstructurada, FuenteCitada 
 from haystack.components.builders.prompt_builder import PromptBuilder
 from haystack import Document
 
@@ -766,7 +766,7 @@ from fastapi import HTTPException, status
 log = structlog.get_logger(__name__)
 
 GREETING_REGEX = re.compile(r"^\s*(hola|hello|hi|buenos días|buenas tardes|buenas noches|hey|qué tal|hi there)\s*[\.,!?]*\s*$", re.IGNORECASE)
-RRF_K = 60
+RRF_K = 60 # Constante para Reciprocal Rank Fusion
 
 MAP_REDUCE_NO_RELEVANT_INFO = "No hay información relevante en este fragmento."
 
@@ -794,22 +794,21 @@ class AskQueryUseCase:
                  vector_store: VectorStorePort,
                  llm: LLMPort,
                  embedding_adapter: EmbeddingPort,
-                 http_client: httpx.AsyncClient, # Para Reranker
-                 sparse_retriever: Optional[SparseRetrieverPort] = None, # Puede ser RemoteSparseRetrieverAdapter
-                 chunk_content_repo: Optional[ChunkContentRepositoryPort] = None, # Se mantiene para fusión
+                 http_client: httpx.AsyncClient, 
+                 sparse_retriever: Optional[SparseRetrieverPort] = None, 
+                 chunk_content_repo: Optional[ChunkContentRepositoryPort] = None, 
                  diversity_filter: Optional[DiversityFilterPort] = None):
         self.chat_repo = chat_repo
         self.log_repo = log_repo
         self.vector_store = vector_store
         self.llm = llm
         self.embedding_adapter = embedding_adapter
-        self.http_client = http_client # Global client for reranker etc.
+        self.http_client = http_client 
         self.settings = settings
         
-        # Sparse retriever (ahora puede ser el RemoteSparseRetrieverAdapter)
         self.sparse_retriever = sparse_retriever if settings.BM25_ENABLED and sparse_retriever else None
         
-        self.chunk_content_repo = chunk_content_repo # Necesario para fusionar si sparse devuelve solo IDs
+        self.chunk_content_repo = chunk_content_repo 
         self.diversity_filter = diversity_filter if settings.DIVERSITY_FILTER_ENABLED else None
 
         self._prompt_builder_rag = self._initialize_prompt_builder_from_path(settings.RAG_PROMPT_TEMPLATE_PATH)
@@ -819,8 +818,8 @@ class AskQueryUseCase:
 
         log_params = {
             "embedding_adapter_type": type(self.embedding_adapter).__name__,
-            "bm25_enabled_setting": settings.BM25_ENABLED, # El flag general
-            "sparse_retriever_active": bool(self.sparse_retriever), # Si la instancia está activa
+            "bm25_enabled_setting": settings.BM25_ENABLED, 
+            "sparse_retriever_active": bool(self.sparse_retriever), 
             "sparse_retriever_type": type(self.sparse_retriever).__name__ if self.sparse_retriever else "None",
             "reranker_enabled": settings.RERANKER_ENABLED,
             "reranker_service_url": str(settings.RERANKER_SERVICE_URL) if settings.RERANKER_ENABLED else "N/A",
@@ -840,7 +839,6 @@ class AskQueryUseCase:
         log.info("AskQueryUseCase Initialized", **log_params)
         if settings.BM25_ENABLED and not self.sparse_retriever:
              log.error("BM25_ENABLED in settings, but sparse_retriever instance is NOT available (init failed or service unavailable). Sparse search will be skipped.")
-        # ChunkContentRepository es necesario si sparse_retriever solo devuelve IDs
         if self.sparse_retriever and not self.chunk_content_repo:
             log.error("SparseRetriever is active but ChunkContentRepository is missing. Content fetching for sparse results will fail.")
 
@@ -936,24 +934,22 @@ class AskQueryUseCase:
 
     def _reciprocal_rank_fusion(self,
                                 dense_results: List[RetrievedChunk],
-                                sparse_results: List[Tuple[str, float]], # chunk_id, score
+                                sparse_results: List[Tuple[str, float]], 
                                 k: int = RRF_K) -> Dict[str, float]:
         fused_scores: Dict[str, float] = {}
-        # Dense results: RetrievedChunk (con id, score, etc.)
         for rank, chunk in enumerate(dense_results):
-            if chunk.id: # Asegurar que el chunk tiene un ID
+            if chunk.id: 
                 fused_scores[chunk.id] = fused_scores.get(chunk.id, 0.0) + 1.0 / (k + rank + 1)
         
-        # Sparse results: Tupla (chunk_id, score)
         for rank, (chunk_id, _) in enumerate(sparse_results):
-            if chunk_id: # Asegurar que el chunk_id es válido
+            if chunk_id: 
                 fused_scores[chunk_id] = fused_scores.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
         return fused_scores
 
     async def _fetch_content_for_fused_results(
         self,
-        fused_scores: Dict[str, float], # chunk_id: fused_score
-        dense_map: Dict[str, RetrievedChunk], # chunk_id: RetrievedChunk (de resultados densos)
+        fused_scores: Dict[str, float], 
+        dense_map: Dict[str, RetrievedChunk], 
         top_n: int
         ) -> List[RetrievedChunk]:
         fetch_log = log.bind(action="fetch_content_for_fused", top_n=top_n, fused_count=len(fused_scores))
@@ -1091,12 +1087,12 @@ class AskQueryUseCase:
             llm_handler_log.error("LLM JSON response failed Pydantic validation", raw_response=truncate_text(json_answer_str, 500), errors=pydantic_err.errors())
             answer_for_user = "La respuesta del asistente no tuvo el formato esperado. Por favor, intenta de nuevo."
             assistant_sources_for_db = [{"error": "Pydantic validation failed", "details": pydantic_err.errors()}]
-            retrieved_chunks_for_response = original_chunks_for_citation[:self.settings.NUM_SOURCES_TO_SHOW] # Fallback
+            retrieved_chunks_for_response = original_chunks_for_citation[:self.settings.NUM_SOURCES_TO_SHOW] 
         except json.JSONDecodeError as json_err:
             llm_handler_log.error("Failed to parse JSON response from LLM", raw_response=truncate_text(json_answer_str, 500), error=str(json_err))
             answer_for_user = f"Hubo un error al procesar la respuesta del asistente (JSON malformado): {truncate_text(json_answer_str,100)}. Por favor, intenta de nuevo."
             assistant_sources_for_db = [{"error": "JSON decode error", "details": str(json_err)}]
-            retrieved_chunks_for_response = original_chunks_for_citation[:self.settings.NUM_SOURCES_TO_SHOW] # Fallback
+            retrieved_chunks_for_response = original_chunks_for_citation[:self.settings.NUM_SOURCES_TO_SHOW] 
 
         await self.chat_repo.save_message(
             chat_id=final_chat_id, role='assistant',
@@ -1152,7 +1148,6 @@ class AskQueryUseCase:
         history_messages: List[ChatMessage] = []
 
         try:
-            # --- Chat Management ---
             if chat_id:
                 if not await self.chat_repo.check_chat_ownership(chat_id, user_id, company_id):
                     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Chat not found or access denied.")
@@ -1171,7 +1166,6 @@ class AskQueryUseCase:
             await self.chat_repo.save_message(chat_id=final_chat_id, role='user', content=query)
             exec_log.info("Chat state managed and user message saved", is_new_chat=(not chat_id))
 
-            # --- Greeting Check ---
             if GREETING_REGEX.match(query):
                 answer = "¡Hola! ¿En qué puedo ayudarte hoy con la información de tus documentos?"
                 await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=None)
@@ -1223,7 +1217,7 @@ class AskQueryUseCase:
             if not combined_chunks_with_content:
                 exec_log.warning("No chunks with content after fusion/fetch. Using general prompt.")
                 general_prompt = await self._build_prompt(query, [], chat_history=chat_history_str, builder=self._prompt_builder_general)
-                answer_str = await self.llm.generate(general_prompt) # No schema for general
+                answer_str = await self.llm.generate(general_prompt) 
                 
                 await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer_str, sources=None)
                 no_docs_log_id = await self.log_repo.log_query_interaction(
@@ -1276,12 +1270,25 @@ class AskQueryUseCase:
                                 
                                 if chunk_id in original_chunks_map:
                                     original_chunk_obj = original_chunks_map[chunk_id]
-                                    original_chunk_obj.score = new_score 
-                                    if original_chunk_obj.metadata:
-                                        original_chunk_obj.metadata["reranked_score"] = new_score
-                                    else:
-                                        original_chunk_obj.metadata = {"reranked_score": new_score}
-                                    updated_reranked_chunks.append(original_chunk_obj) 
+                                    # --- CORRECTION: Preserve original embedding ---
+                                    preserved_embedding = original_chunk_obj.embedding
+                                    
+                                    # Rebuild the chunk object or update in place
+                                    updated_chunk = RetrievedChunk(
+                                        id=original_chunk_obj.id,
+                                        content=original_chunk_obj.content, # Content should already be there
+                                        score=new_score, # New score from reranker
+                                        metadata={ # Merge metadata, prioritizing reranker's if any, add reranked_score
+                                            **(original_chunk_obj.metadata or {}),
+                                            **(reranked_item_data.get("metadata", {})),
+                                            "reranked_score": new_score
+                                        },
+                                        embedding=preserved_embedding, # Crucial: use original embedding
+                                        document_id=original_chunk_obj.document_id,
+                                        file_name=original_chunk_obj.file_name,
+                                        company_id=original_chunk_obj.company_id
+                                    )
+                                    updated_reranked_chunks.append(updated_chunk)
                             
                             if updated_reranked_chunks: 
                                 chunks_for_llm_or_mapreduce = updated_reranked_chunks
@@ -3928,11 +3935,19 @@ CONTENIDO DEL FRAGMENTO:
 ────────────────────────────────────────────────────────────────────────────────
 
 TAREA PARA ESTE FRAGMENTO (ID: {{ doc_item.id }}):
-1.  Extrae y resume *únicamente* la información de este fragmento que sea **directa y explícitamente relevante** para responder a la PREGUNTA ORIGINAL DEL USUARIO.
-2.  Sé MUY CONCISO. Una o dos frases suelen ser suficientes.
-3.  Si el fragmento contiene información relevante, inicia tu respuesta para este fragmento con: "Información relevante del fragmento [ID: {{ doc_item.id }}]:".
-4.  Si el fragmento **NO contiene información explícitamente relevante**, responde EXACTAMENTE: "No hay información relevante en el fragmento [ID: {{ doc_item.id }}]."
-5.  NO inventes información. NO uses conocimiento externo. NO hagas referencias a otros documentos fuera de los procesados en este lote.
+1.  Lee atentamente la PREGUNTA ORIGINAL DEL USUARIO y el CONTENIDO DEL FRAGMENTO.
+2.  Si la PREGUNTA ORIGINAL DEL USUARIO es sobre **reuniones, juntas o actas**, extrae y resume **detalladamente** del FRAGMENTO ACTUAL:
+    *   Fecha de la reunión.
+    *   Tipo de reunión (ej. junta de accionistas, reunión de directorio).
+    *   Principales temas tratados o puntos de la agenda.
+    *   Decisiones importantes tomadas.
+    *   Nombres de participantes clave mencionados (si los hay).
+    *   Cualquier otra información directamente relevante a la reunión descrita.
+    Si la pregunta no es sobre reuniones, extrae y resume *únicamente* la información del FRAGMENTO ACTUAL que sea **directa y explícitamente relevante** para responder a la PREGUNTA ORIGINAL DEL USUARIO.
+3.  Sé CONCISO pero COMPLETO para la información relevante.
+4.  Si el fragmento contiene información relevante, inicia tu respuesta para este fragmento con: "Información relevante del fragmento [ID: {{ doc_item.id }}] (Archivo: {{ doc_item.meta.file_name | default('Desconocido') }}, Pág: {{ doc_item.meta.page | default('N/A') }}):".
+5.  Si el fragmento **NO contiene información explícitamente relevante** para la pregunta, responde EXACTAMENTE: "No hay información relevante en el fragmento [ID: {{ doc_item.id }}]."
+6.  NO inventes información. NO uses conocimiento externo.
 
 EXTRACCIÓN CONCISA DEL FRAGMENTO [ID: {{ doc_item.id }}]:
 {# Aquí la IA debe generar la extracción para este doc_item. #}
@@ -3946,61 +3961,63 @@ Después de procesar todos los fragmentos anteriores, concatena todas las extrac
 ## File: `app\prompts\rag_template_gemini_v2.txt`
 ```txt
 ════════════════════════════════════════════════════════════════════
-A T E N E X · INSTRUCCIONES DE GENERACIÓN (Gemini 2.5 Flash - RAG Directo)
+A T E N E X · SÍNTESIS DE RESPUESTA (Gemini 2.5 Flash)
 ════════════════════════════════════════════════════════════════════
 
 1 · IDENTIDAD Y TONO
-Eres **Atenex**, un asistente de IA experto en consulta de documentación empresarial (PDFs, manuales, etc.). Eres profesional, directo, verificable y empático. Escribe en **español latino** claro y conciso. Prioriza la precisión y la seguridad.
+Eres **Atenex**, un asistente de IA experto en consulta de documentación empresarial. Eres profesional, directo, verificable y empático. Escribe en **español latino** claro y conciso. Prioriza la precisión y la seguridad.
 
-2 · PRINCIPIOS CLAVE
-   - **BASATE SOLO EN EL CONTEXTO:** Usa *únicamente* la información del HISTORIAL RECIENTE y los DOCUMENTOS RECUPERADOS a continuación. **No inventes**, especules ni uses conocimiento externo. Si la respuesta no está explícitamente en el contexto, indícalo claramente en `respuesta_detallada`.
-   - **CITACIÓN:** Cuando uses información de un documento recuperado, añade una cita al final de la frase o párrafo relevante indicando el documento. Formato preferido: `[Doc N]`. Este `N` debe corresponder al índice del documento en la lista de DOCUMENTOS RECUPERADOS.
-   - **NO ESPECULACIÓN:** Si la información solicitada no se encuentra, `respuesta_detallada` debe ser "No encontré información específica sobre eso en los documentos proporcionados ni en el historial reciente."
-   - **NO CÓDIGO:** No generes bloques de código ejecutable. Puedes explicar conceptos o pseudocódigo si es útil.
-   - **PREGUNTAS AMPLIAS:** Si la pregunta es muy general (ej. "dame todo sobre X"), en lugar de intentar resumir todo, tu `respuesta_detallada` debe identificar 1-3 temas clave cubiertos en los documentos y una `siguiente_pregunta_sugerida` podría ser una pregunta aclaratoria al usuario para enfocar la consulta. Ejemplo: `respuesta_detallada`: "Los documentos mencionan X en relación a Y y Z.", `siguiente_pregunta_sugerida`: "¿Te interesa algún aspecto en particular de X, como su relación con Y o Z?".
-   - **PETICIONES DE ARCHIVOS:** Si el usuario pide explícitamente "el PDF" o "el documento" y varios chunks recuperados pertenecen al mismo archivo (identificable por `doc.meta.file_name`), tu `respuesta_detallada` debe indicar que tienes información *proveniente* de ese archivo específico, resumir lo más relevante según la consulta, y citarlo. **No puedes entregar el archivo binario**, solo responder basado en su contenido textual.
+2 · TAREA PRINCIPAL
+Tu tarea es sintetizar la INFORMACIÓN RECOPILADA (extractos de múltiples documentos) para responder de forma **extensa y detallada** a la PREGUNTA ORIGINAL DEL USUARIO, considerando también el HISTORIAL RECIENTE de la conversación. Si la pregunta pide un resumen de reuniones a lo largo del tiempo, intenta construir una narrativa cronológica o temática basada en los extractos. Debes generar una respuesta en formato JSON estructurado.
 
-3 · CONTEXTO PROPORCIONADO
+3 · CONTEXTO
+PREGUNTA ORIGINAL DEL USUARIO:
+{{ original_query }}
+
 {% if chat_history %}
 ───────────────────── HISTORIAL RECIENTE (Más antiguo a más nuevo) ─────────────────────
 {{ chat_history }}
 ────────────────────────────────────────────────────────────────────────────────────────
 {% endif %}
-──────────────────── DOCUMENTOS RECUPERADOS (Ordenados por relevancia) ──────────────────
-{% for doc in documents %}
-[Doc {{ loop.index }}] «{{ doc.meta.file_name | default("Archivo Desconocido") }}»
- ID Chunk: {{ doc.id }}
- Título Doc: {{ doc.meta.title | default("Sin Título") }}
- Página: {{ doc.meta.page | default("?") }}
- Score: {{ "%.3f"|format(doc.score) if doc.score is not none else "N/A" }}
- Extracto: {{ doc.content | trim }}
---------------------------------------------------------------------------------------------{% endfor %}
+
+──────────────────── INFORMACIÓN RECOPILADA DE DOCUMENTOS (Fase Map) ───────────────────
+A continuación se presentan varios extractos y resúmenes de diferentes documentos que podrían ser relevantes. Cada bloque de información fue extraído individualmente.
+{{ mapped_responses }} {# Aquí se concatenarán las respuestas de la fase Map #}
 ────────────────────────────────────────────────────────────────────────────────────────
 
-4 · PREGUNTA ACTUAL DEL USUARIO
-{{ query }}
+──────────────────── LISTA DE CHUNKS ORIGINALES CONSIDERADOS (Para referencia de citación) ───────────────────
+Estos son los chunks originales de los cuales se extrajo la INFORMACIÓN RECOPILADA. Úsalos para construir la sección `fuentes_citadas` y para las citas `[Doc N]` en `respuesta_detallada`.
+{% for doc_chunk in original_documents_for_citation %}
+[Doc {{ loop.index }}] ID: {{ doc_chunk.id }}, Archivo: «{{ doc_chunk.meta.file_name | default("Archivo Desconocido") }}», Título: {{ doc_chunk.meta.title | default("Sin Título") }}, Pág: {{ doc_chunk.meta.page | default("?") }}, Score Original: {{ "%.3f"|format(doc_chunk.score) if doc_chunk.score is not none else "N/A" }}
+{% endfor %}
+─────────────────────────────────────────────────────────────────────────────────────────
+
+4 · PRINCIPIOS CLAVE PARA LA SÍNTESIS
+   - **BASATE SOLO EN EL CONTEXTO PROPORCIONADO:** Usa *únicamente* la INFORMACIÓN RECOPILADA y el HISTORIAL RECIENTE. **No inventes**, especules ni uses conocimiento externo.
+   - **CITACIÓN PRECISA:** Cuando uses información que provenga de un chunk específico (identificable en la INFORMACIÓN RECOPILADA), debes citarlo usando la etiqueta `[Doc N]` correspondiente al chunk de la LISTA DE CHUNKS ORIGINALES CONSIDERADOS.
+   - **NO ESPECULACIÓN:** Si la información combinada no es suficiente para responder completamente, indícalo claramente en `respuesta_detallada`.
+   - **RESPUESTA INTEGRAL Y DETALLADA:** Intenta conectar la información de diferentes extractos para dar una respuesta completa y rica en detalles si es posible, especialmente si el usuario pide un resumen "extenso". Identifica temas comunes o cronologías.
+   - **MANEJO DE "NO SÉ":** Si la INFORMACIÓN RECOPILADA es predominantemente "No hay información relevante...", tu `respuesta_detallada` debe ser "No encontré información específica sobre eso en los documentos procesados." Si hay algo de información pero es escasa, indica que la información es limitada.
 
 5 · PROCESO DE PENSAMIENTO SUGERIDO (INTERNO - Chain-of-Thought)
-Antes de generar la respuesta final en el formato JSON requerido, mentalmente sigue estos pasos:
-a. Revisa la PREGUNTA ACTUAL DEL USUARIO y el HISTORIAL RECIENTE para entender completamente la intención.
-b. Analiza los DOCUMENTOS RECUPERADOS. Identifica los fragmentos más relevantes que responden directamente a cada parte de la pregunta.
-c. Si hay información contradictoria o complementaria entre los documentos, resuélvela o preséntala de forma clara.
-d. Formula una respuesta concisa y directa a la pregunta principal en el campo `respuesta_detallada`.
-e. Asegúrate de que CADA DATO fáctico en `respuesta_detallada` que provenga de los documentos esté apropiadamente citado [Doc N].
-f. Genera un `resumen_ejecutivo` si la respuesta detallada es larga (más de ~160 palabras).
-g. Construye la lista `fuentes_citadas` basándote ESTRICTAMENTE en los [Doc N] que usaste y citaste. Verifica que los números de documento (`cita_tag`) coincidan con los índices de los DOCUMENTOS RECUPERADOS. Incluye el `id_documento` (ID del chunk), `nombre_archivo`, `pagina` y `score` de los documentos originales.
-h. Considera una `siguiente_pregunta_sugerida` que sea útil para el usuario.
-i. Finalmente, ensambla toda la respuesta en el formato JSON especificado.
+Antes de generar el JSON final:
+a. Revisa la PREGUNTA ORIGINAL y el HISTORIAL para la intención completa. ¿Pide detalle, extensión?
+b. Analiza la INFORMACIÓN RECOPILADA. Identifica los puntos clave de cada extracto. Agrupa información sobre el mismo tema o evento (ej. misma reunión).
+c. Sintetiza estos puntos en una narrativa coherente y detallada para `respuesta_detallada`. Si se piden resúmenes de reuniones, intenta listar cada reunión y sus detalles.
+d. Cruza la información sintetizada con la LISTA DE CHUNKS ORIGINALES para asegurar que las citas `[Doc N]` sean correctas y se refieran al chunk correcto.
+e. Genera un `resumen_ejecutivo` si `respuesta_detallada` es extensa.
+f. Construye `fuentes_citadas` solo con los documentos que realmente usaste y citaste. El `cita_tag` debe coincidir con el usado en `respuesta_detallada`.
+g. Considera una `siguiente_pregunta_sugerida` si es natural.
+h. Ensambla el JSON.
 
 6 · FORMATO DE RESPUESTA REQUERIDO (OBJETO JSON VÁLIDO)
-Tu respuesta DEBE ser un objeto JSON válido con la siguiente estructura. Presta atención a los tipos de datos y campos requeridos/opcionales.
 ```json
 {
   "resumen_ejecutivo": "string | null (Un breve resumen de 1-2 frases si la respuesta es larga, sino null)",
   "respuesta_detallada": "string (La respuesta completa y elaborada, incluyendo citas [Doc N] donde corresponda. Si no se encontró información, indícalo aquí)",
   "fuentes_citadas": [
     {
-      "id_documento": "string | null (ID del chunk original, corresponde al 'ID Chunk' de la lista de documentos recuperados)",
+      "id_documento": "string | null (ID del chunk original, si está disponible en su metadata)",
       "nombre_archivo": "string (Nombre del archivo fuente)",
       "pagina": "string | null (Número de página, si está disponible)",
       "score": "number | null (Score de relevancia original del chunk, si está disponible)",
@@ -4012,8 +4029,8 @@ Tu respuesta DEBE ser un objeto JSON válido con la siguiente estructura. Presta
 ```
 Asegúrate de que:
 - El JSON sea sintácticamente correcto.
-- Las citas `[Doc N]` en `respuesta_detallada` coincidan con las listadas en `fuentes_citadas` (mismo `N` y misma fuente referenciada por el `loop.index` de los DOCUMENTOS RECUPERADOS).
-- `fuentes_citadas` solo contenga documentos efectivamente usados y referenciados. Para cada fuente, usa la información del chunk original listado arriba.
+- Las citas [Doc N] en respuesta_detallada coincidan con las listadas en fuentes_citadas (mismo N y misma fuente).
+- fuentes_citadas solo contenga documentos efectivamente usados y referenciados.
 - No incluyas comentarios dentro del JSON.
 
 ════════════════════════════════════════════════════════════════════

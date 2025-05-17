@@ -24,25 +24,25 @@ BM25_IMPLEMENTATION = BM25Okapi
 
 class BM25Adapter(SparseSearchPort):
     def __init__(self):
-        self._bm25_available = False
+        self._bm2s_available = False 
         if BM25_IMPLEMENTATION is None:
             log.error(
-                # LLM: CORRECTION - Mensaje de log
+                
                 "rank_bm25 library not installed or its classes (BM25Okapi/BM25Plus) not found. BM25 search functionality will be UNAVAILABLE. "
                 "Install with: poetry add rank_bm25"
             )
         else:
-            self._bm25_available = True
+            self._bm2s_available = True 
             log.info(f"BM25Adapter initialized. rank_bm25 library ({BM25_IMPLEMENTATION.__name__}) is available.")
 
     async def initialize_engine(self) -> None:
-        if not self._bm25_available:
+        if not self._bm2s_available: 
             log.warning(f"BM25 engine (rank_bm25 library - {BM25_IMPLEMENTATION.__name__ if BM25_IMPLEMENTATION else 'N/A'}) not available. Search will fail if attempted.")
         else:
             log.info(f"BM25 engine (rank_bm25 library - {BM25_IMPLEMENTATION.__name__}) available and ready.")
 
     def is_available(self) -> bool:
-        return self._bm25_available
+        return self._bm2s_available 
 
     @staticmethod
     def load_bm2s_from_file(file_path: str) -> Any: 
