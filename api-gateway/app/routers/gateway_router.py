@@ -253,11 +253,9 @@ async def proxy_get_document_stats(
     status_filter: Optional[str] = Query(None, alias="status", description="Filter by specific status (processed, processing, uploaded, error)."),
     group_by: Optional[str] = Query(None, description="Group activity by (day, week, month, user).")
 ):
-    
-    # CORRECCIÓN: Cambiar la ruta de backend para que apunte a /api/v1/ingest/stats
-    # Asumiendo que settings.API_V1_STR es "/api/v1"
-    # El backend_path final será "/api/v1/ingest/stats"
-    backend_path = f"{settings.API_V1_STR}/ingest/stats"
+    # El prefijo del ingest-service es /api/v1/ingest, y el endpoint es /stats
+    # Por lo tanto, el path completo en el ingest-service es /api/v1/ingest/stats
+    backend_path = f"{settings.API_V1_STR}/ingest/stats" 
     
     log.info("Proxying request for document stats",
              original_path=request.url.path,
@@ -284,6 +282,9 @@ async def proxy_ingest_service_generic(
     user_payload: LoggedStrictAuth,
     endpoint_path: str = Path(...),
 ):
+    # Asume que los endpoints en ingest-service están directamente bajo /api/v1/ingest/...
+    # y que el settings.API_V1_STR del ingest-service es "/api/v1/ingest"
+    # Entonces, si endpoint_path es "upload", el backend_path será "/api/v1/ingest/upload"
     backend_path = f"{settings.API_V1_STR}/ingest/{endpoint_path}"
     return await _proxy_request(
         request=request,
@@ -294,6 +295,7 @@ async def proxy_ingest_service_generic(
     )
 
 if settings.AUTH_SERVICE_URL:
+    # Lógica para el proxy de auth_service si está configurado
     pass
 else:
     log.info("Auth service proxy is disabled (GATEWAY_AUTH_SERVICE_URL not set).")
