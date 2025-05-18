@@ -1,8 +1,6 @@
 # ingest-service/app/api/v1/endpoints/ingest.py
-# ESTE ES EL ARCHIVO QUE DEBES CORREGIR EN TU REPOSITORIO DE INGEST-SERVICE
-
-from datetime import date # Asegurar que date está importado
-from app.api.v1.schemas import DocumentStatsResponse, DocumentStatsByStatus, DocumentStatsByType # Importar nuevos schemas
+from datetime import date
+from app.api.v1.schemas import DocumentStatsResponse, DocumentStatsByStatus, DocumentStatsByType
 
 import uuid
 import mimetypes
@@ -69,9 +67,9 @@ async def get_db_conn():
     try:
         conn = await pool.acquire()
         yield conn
-    except HTTPException: # Allow HTTPExceptions from endpoint logic to propagate
+    except HTTPException: 
         raise
-    except Exception as e: # Catch other errors related to DB connection acquisition/usage
+    except Exception as e: 
         log.error("Database connection error occurred during request processing", error=str(e), exc_info=True)
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database connection error.")
     finally:
@@ -83,12 +81,6 @@ async def get_db_conn():
 
 
 def _get_milvus_collection_sync() -> Optional[Collection]:
-    """
-    Synchronously connects to Milvus and returns the Collection object if it exists.
-    For Zilliz Cloud, loading is managed by the service.
-    Returns None if the collection does not exist.
-    Raises RuntimeError for connection failures.
-    """
     alias = "api_sync_helper"
     sync_milvus_log = log.bind(component="MilvusHelperSync", alias=alias, collection_name=MILVUS_COLLECTION_NAME)
     
@@ -206,7 +198,7 @@ def normalize_filename(filename: str) -> str:
 
 # --- API Endpoints ---
 
-@router.get( # ÚNICA DEFINICIÓN CORRECTA PARA ESTADÍSTICAS
+@router.get(
     "/stats",
     response_model=DocumentStatsResponse,
     summary="Get aggregated document statistics for a company",
@@ -219,7 +211,6 @@ def normalize_filename(filename: str) -> str:
         503: {"model": ErrorDetail, "description": "Service Unavailable (DB error)"},
     }
 )
-# Se elimina la ruta duplicada @router.get("/ingest/stats", ...)
 async def get_document_statistics(
     request: Request,
     from_date: Optional[date] = Query(None, description="Filter statistics from this date (YYYY-MM-DD). Inclusive."),
@@ -269,27 +260,43 @@ async def get_document_statistics(
             total_documents = await db_conn.fetchval(total_docs_query, *params)
             total_documents = total_documents or 0
 
-            processed_where_sql = where_sql
-            processed_params = list(params)
-            if status_filter and status_filter != DocumentStatus.PROCESSED:
-                total_chunks_processed = 0
-            else:
-                temp_chunk_params = list(params)
-                temp_chunk_where_sql = where_sql
-                if not status_filter: 
-                    temp_chunk_where_sql += f" AND status = ${len(temp_chunk_params) + 1}"
-                    temp_chunk_params.append(DocumentStatus.PROCESSED.value)
-                
-                total_chunks_query_sql = f"SELECT SUM(chunk_count) FROM documents WHERE {temp_chunk_where_sql};"
-                val = await db_conn.fetchval(total_chunks_query_sql, *temp_chunk_params)
+            total_chunks_processed = 0 # Inicializar
+            # Construir la query para total_chunks_processed
+            # Esta query debe considerar los filtros existentes Y el status='processed'
+            
+            # Start with the existing filters
+            chunk_where_clauses = list(where_clauses) 
+            chunk_params = list(params)
+            
+            # Add the 'processed' status filter if not already present
+            if status_filter:
+                if status_filter != DocumentStatus.PROCESSED:
+                    # If filtering by a status other than 'processed', then chunks from processed docs is 0
+                    total_chunks_processed = 0
+                # If status_filter IS 'processed', the condition is already in where_clauses
+            else: # No status_filter, so add condition for status = 'processed'
+                chunk_where_clauses.append(f"status = ${param_idx}") # Use the next available param index
+                chunk_params.append(DocumentStatus.PROCESSED.value)
+                # param_idx += 1 # Increment for safety, though not strictly needed if this is the last addition
+
+            # Only run the sum query if we expect there might be processed chunks
+            if not (status_filter and status_filter != DocumentStatus.PROCESSED):
+                final_chunk_where_sql = " AND ".join(chunk_where_clauses)
+                total_chunks_query_sql = f"SELECT SUM(chunk_count) FROM documents WHERE {final_chunk_where_sql};"
+                val = await db_conn.fetchval(total_chunks_query_sql, *chunk_params)
                 total_chunks_processed = val or 0
+
 
             by_status_query = f"SELECT status, COUNT(*) as count FROM documents WHERE {where_sql} GROUP BY status;"
             status_rows = await db_conn.fetch(by_status_query, *params)
             stats_by_status = DocumentStatsByStatus()
             for row in status_rows:
-                if row['status'] in DocumentStatus.__members__.values(): 
-                    setattr(stats_by_status, DocumentStatus(row['status']).value, row['count'])
+                # Check if the status from DB is a valid member of DocumentStatus enum
+                try:
+                    status_enum_member = DocumentStatus(row['status'])
+                    setattr(stats_by_status, status_enum_member.value, row['count'])
+                except ValueError:
+                    stats_log.warning("Unknown status value from DB", db_status=row['status'], count=row['count'])
             
             by_type_query = f"SELECT file_type, COUNT(*) as count FROM documents WHERE {where_sql} GROUP BY file_type;"
             type_rows = await db_conn.fetch(by_type_query, *params)
@@ -298,20 +305,19 @@ async def get_document_statistics(
             type_mapping = {
                 "application/pdf": "pdf",
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
-                "application/msword": "docx", # Unificar doc y docx bajo 'docx'
+                "application/msword": "docx", 
                 "text/plain": "txt",
-                "text/markdown": "other", # Agrupar markdown y html en 'other' por ahora
-                "text/html": "other",
+                "text/markdown": "md", # Corrected mapping
+                "text/html": "html",   # Corrected mapping
             }
             for row in type_rows:
                 mapped_type_key = row['file_type']
-                # Buscar el tipo mapeado o usar 'other'
                 stat_field = type_mapping.get(mapped_type_key)
 
                 if stat_field and hasattr(stats_by_type, stat_field):
-                    current_val = getattr(stats_by_type, stat_field)
+                    current_val = getattr(stats_by_type, stat_field, 0) # Default to 0 if not set
                     setattr(stats_by_type, stat_field, current_val + row['count'])
-                else: # Si no está en el mapping directo o no es un campo del modelo, va a other
+                else: 
                     stats_by_type.other += row['count']
 
             dates_query = f"SELECT MIN(uploaded_at) as oldest, MAX(uploaded_at) as newest FROM documents WHERE {where_sql};"
@@ -323,11 +329,11 @@ async def get_document_statistics(
 
             return DocumentStatsResponse(
                 total_documents=total_documents,
-                total_chunks=total_chunks_processed, # Nombre del campo en el modelo es total_chunks
+                total_chunks_processed=total_chunks_processed, # CORREGIDO EL NOMBRE DEL CAMPO
                 by_status=stats_by_status,
                 by_type=stats_by_type,
-                by_user=[], # Placeholder, requiere join con tabla users o info de user_id en documents
-                recent_activity=[], # Placeholder, requiere query de agregación por tiempo
+                by_user=[], 
+                recent_activity=[], 
                 oldest_document_date=oldest_document_date,
                 newest_document_date=newest_document_date,
             )
@@ -1172,7 +1178,7 @@ async def delete_document_endpoint(
     gcs_client: GCSClient = Depends(get_gcs_client),
 ):
     company_id = request.headers.get("X-Company-ID")
-    req_id = getattr(request.state, 'request_id', 'N/A')
+    req_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
     if not company_id:
         log.bind(request_id=req_id).warning("Missing X-Company-ID header in delete_document_endpoint")
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing required header: X-Company-ID")

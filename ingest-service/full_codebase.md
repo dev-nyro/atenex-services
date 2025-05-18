@@ -60,209 +60,12 @@ app/
 
 ## File: `app\api\v1\endpoints\ingest.py`
 ```py
+# ingest-service/app/api/v1/endpoints/ingest.py
+# ESTE ES EL ARCHIVO QUE DEBES CORREGIR EN TU REPOSITORIO DE INGEST-SERVICE
+
 from datetime import date # Asegurar que date está importado
 from app.api.v1.schemas import DocumentStatsResponse, DocumentStatsByStatus, DocumentStatsByType # Importar nuevos schemas
 
-import uuid
-import mimetypes
-import json
-from typing import List, Optional, Dict, Any
-import asyncio
-from contextlib import asynccontextmanager
-import logging
-
-from fastapi import (
-    APIRouter, Depends, HTTPException, status,
-    UploadFile, File, Form, Header, Query, Path, BackgroundTasks, Request, Body
-)
-import structlog
-import asyncpg
-from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type, before_sleep_log
-
-from pymilvus import Collection, connections, utility, MilvusException
-
-from app.core.config import settings
-from app.db import postgres_client as db_client
-from app.models.domain import DocumentStatus
-from app.api.v1.schemas import IngestResponse, StatusResponse, PaginatedStatusResponse, ErrorDetail
-from app.services.gcs_client import GCSClient, GCSClientError
-from app.tasks.celery_app import celery_app
-from app.tasks.process_document import process_document_standalone as process_document_task
-from app.services.ingest_pipeline import (
-    MILVUS_COLLECTION_NAME,
-    MILVUS_COMPANY_ID_FIELD,
-    MILVUS_DOCUMENT_ID_FIELD,
-    MILVUS_PK_FIELD,
-)
-
-log = structlog.get_logger(__name__)
-
-router = APIRouter()
-
-# --- DOCUMENT STATS ENDPOINT ---
-
-@router.get(
-    "/stats",
-    response_model=DocumentStatsResponse,
-    summary="Get aggregated document statistics for a company",
-    description="Provides aggregated statistics about documents for the specified company, with optional filters.",
-    responses={
-        200: {"description": "Successfully retrieved document statistics."},
-        401: {"model": ErrorDetail, "description": "Unauthorized (Not used if gateway handles auth)"},
-        422: {"model": ErrorDetail, "description": "Validation Error (e.g., missing X-Company-ID or invalid date format)"},
-        500: {"model": ErrorDetail, "description": "Internal Server Error"},
-        503: {"model": ErrorDetail, "description": "Service Unavailable (DB error)"},
-    }
-)
-@router.get(
-    "/ingest/stats",
-    response_model=DocumentStatsResponse,
-    include_in_schema=False
-)
-async def get_document_statistics(
-    request: Request,
-    from_date: Optional[date] = Query(None, description="Filter statistics from this date (YYYY-MM-DD). Inclusive."),
-    to_date: Optional[date] = Query(None, description="Filter statistics up to this date (YYYY-MM-DD). Inclusive."),
-    status_filter: Optional[DocumentStatus] = Query(None, alias="status", description="Filter statistics by a specific document status."),
-    # db_conn: asyncpg.Connection = Depends(get_db_conn) # Usar el context manager get_db_conn
-):
-    company_id_str = request.headers.get("X-Company-ID")
-    req_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
-    stats_log = log.bind(request_id=req_id)
-
-    if not company_id_str:
-        stats_log.warning("Missing X-Company-ID header for document statistics")
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing required header: X-Company-ID")
-    try:
-        company_uuid = uuid.UUID(company_id_str)
-    except ValueError:
-        stats_log.warning("Invalid Company ID format for document statistics", company_id_received=company_id_str)
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Company ID format.")
-
-    stats_log = stats_log.bind(company_id=company_id_str, from_date=from_date, to_date=to_date, status_filter=status_filter)
-    stats_log.info("Request for document statistics received")
-
-    # Construir la base de la cláusula WHERE y los parámetros
-    where_clauses = ["company_id = $1"]
-    params: List[Any] = [company_uuid]
-    param_idx = 2
-
-    if from_date:
-        where_clauses.append(f"uploaded_at >= ${param_idx}")
-        params.append(from_date)
-        param_idx += 1
-    
-    if to_date:
-        # Para que to_date sea inclusivo, podríamos añadir un día y usar '<', o castear a date en SQL si uploaded_at es timestamp
-        # Por simplicidad, si to_date es YYYY-MM-DD, buscaremos <= YYYY-MM-DD 23:59:59.999999
-        # O más simple: castear uploaded_at a date en SQL: DATE(uploaded_at) <= $param_idx
-        where_clauses.append(f"DATE(uploaded_at) <= ${param_idx}")
-        params.append(to_date)
-        param_idx += 1
-
-    if status_filter:
-        where_clauses.append(f"status = ${param_idx}")
-        params.append(status_filter.value)
-        param_idx += 1
-    
-    where_sql = " AND ".join(where_clauses)
-
-    try:
-        async with get_db_conn() as db_conn:
-            # 1. Total Documents
-            total_docs_query = f"SELECT COUNT(*) FROM documents WHERE {where_sql};"
-            total_documents = await db_conn.fetchval(total_docs_query, *params)
-            total_documents = total_documents or 0
-
-            # 2. Total Chunks Processed
-            # Add status = 'processed' to the where_sql for this specific query
-            processed_where_sql = where_sql
-            processed_params = list(params)
-            if status_filter and status_filter != DocumentStatus.PROCESSED:
-                total_chunks_processed = 0 # If filtering by another status, processed chunks will be 0
-            elif not status_filter: # If no status filter, add one for 'processed'
-                processed_where_sql += f" AND status = ${len(processed_params) + 1}"
-                processed_params.append(DocumentStatus.PROCESSED.value)
-            
-            # if status_filter is None or status_filter == DocumentStatus.PROCESSED:
-            total_chunks_query = f"SELECT SUM(chunk_count) FROM documents WHERE {processed_where_sql} AND status = '{DocumentStatus.PROCESSED.value}';"
-            # Corrected params logic for total_chunks_query
-            # We need to adjust params if status_filter wasn't 'processed' or None
-            final_total_chunks_params = list(params)
-            final_total_chunks_where_sql = where_sql
-            
-            # If status_filter is applied and it's NOT 'processed', then total_chunks_processed is 0 for that filter.
-            # If status_filter IS 'processed', then the original params and where_sql are fine.
-            # If status_filter is NOT applied, we need to add 'status = processed' to the query.
-            if status_filter and status_filter != DocumentStatus.PROCESSED:
-                 total_chunks_processed = 0
-            else:
-                temp_chunk_params = list(params)
-                temp_chunk_where_sql = where_sql
-                if not status_filter: # If no status filter was applied initially, add one for 'processed'
-                    temp_chunk_where_sql += f" AND status = ${len(temp_chunk_params) + 1}"
-                    temp_chunk_params.append(DocumentStatus.PROCESSED.value)
-                
-                total_chunks_query_sql = f"SELECT SUM(chunk_count) FROM documents WHERE {temp_chunk_where_sql};"
-                val = await db_conn.fetchval(total_chunks_query_sql, *temp_chunk_params)
-                total_chunks_processed = val or 0
-
-
-            # 3. By Status
-            by_status_query = f"SELECT status, COUNT(*) as count FROM documents WHERE {where_sql} GROUP BY status;"
-            status_rows = await db_conn.fetch(by_status_query, *params)
-            stats_by_status = DocumentStatsByStatus()
-            for row in status_rows:
-                if row['status'] in DocumentStatus.__members__.values(): # Check if valid enum member
-                    setattr(stats_by_status, DocumentStatus(row['status']).value, row['count'])
-            
-            # 4. By Type
-            by_type_query = f"SELECT file_type, COUNT(*) as count FROM documents WHERE {where_sql} GROUP BY file_type;"
-            type_rows = await db_conn.fetch(by_type_query, *params)
-            stats_by_type = DocumentStatsByType()
-            
-            type_mapping = {
-                "application/pdf": "pdf",
-                "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
-                "application/msword": "doc",
-                "text/plain": "txt",
-                "text/markdown": "md",
-                "text/html": "html",
-            }
-            for row in type_rows:
-                mapped_type = type_mapping.get(row['file_type'])
-                if mapped_type and hasattr(stats_by_type, mapped_type):
-                    current_val = getattr(stats_by_type, mapped_type)
-                    setattr(stats_by_type, mapped_type, current_val + row['count'])
-                else:
-                    stats_by_type.other += row['count']
-
-            # 5. Oldest and Newest Document Dates
-            dates_query = f"SELECT MIN(uploaded_at) as oldest, MAX(uploaded_at) as newest FROM documents WHERE {where_sql};"
-            date_row = await db_conn.fetchrow(dates_query, *params)
-            oldest_document_date = date_row['oldest'] if date_row else None
-            newest_document_date = date_row['newest'] if date_row else None
-
-            stats_log.info("Successfully retrieved document statistics from DB")
-
-            return DocumentStatsResponse(
-                total_documents=total_documents,
-                total_chunks_processed=total_chunks_processed,
-                by_status=stats_by_status,
-                by_type=stats_by_type,
-                # by_user=[], # Placeholder
-                # recent_activity=[], # Placeholder
-                oldest_document_date=oldest_document_date,
-                newest_document_date=newest_document_date,
-            )
-
-    except asyncpg.exceptions.PostgresConnectionError as db_conn_err:
-        stats_log.error("Database connection error while fetching statistics", error=str(db_conn_err), exc_info=True)
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database connection error.")
-    except Exception as e:
-        stats_log.exception("Unexpected error fetching document statistics", error=str(e))
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error.")
-# ingest-service/app/api/v1/endpoints/ingest.py
 import uuid
 import mimetypes
 import json
@@ -351,20 +154,14 @@ def _get_milvus_collection_sync() -> Optional[Collection]:
     alias = "api_sync_helper"
     sync_milvus_log = log.bind(component="MilvusHelperSync", alias=alias, collection_name=MILVUS_COLLECTION_NAME)
     
-    # Check if connection exists and is healthy, otherwise attempt to (re)connect
-    # This basic check might not be fully sufficient for complex scenarios with thread executors
-    # but aims to reduce redundant connection attempts for sequential calls from the same thread.
     try:
         if alias in connections.list_connections():
-            # A more robust check would be to see if the connection is active,
-            # but Pymilvus doesn't offer a direct 'is_connected' or 'ping'.
-            # Trying a lightweight operation like get_connection_addr can indicate health.
             connections.get_connection_addr(alias)
             sync_milvus_log.debug("Reusing existing Milvus connection for sync helper.")
         else:
-            raise MilvusException(message="Alias not found, attempting new connection.") # Trigger connect block
+            raise MilvusException(message="Alias not found, attempting new connection.") 
             
-    except Exception: # Catches if alias not in list or get_connection_addr fails
+    except Exception: 
         sync_milvus_log.info("Connecting to Milvus (Zilliz) for sync helper...")
         try:
             connections.connect(
@@ -392,17 +189,13 @@ def _get_milvus_collection_sync() -> Optional[Collection]:
 
     except MilvusException as e:
         sync_milvus_log.error("Milvus error during collection check/instantiation for sync helper", error=str(e))
-        return None # Or re-raise as RuntimeError if access is critical
+        return None 
     except Exception as e:
         sync_milvus_log.exception("Unexpected error during Milvus collection access for sync helper", error=str(e))
         return None
 
 
 def _get_milvus_chunk_count_sync(document_id: str, company_id: str) -> int:
-    """
-    Synchronously counts chunks in Milvus for a specific document using pymilvus query.
-    Returns -1 if the collection doesn't exist or an error occurs.
-    """
     count_log = log.bind(document_id=document_id, company_id=company_id, component="MilvusHelperSync")
     try:
         collection = _get_milvus_collection_sync()
@@ -429,10 +222,6 @@ def _get_milvus_chunk_count_sync(document_id: str, company_id: str) -> int:
         return -1
 
 def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
-    """
-    Synchronously deletes chunks from Milvus using pymilvus: Query PKs first, then delete by PK list.
-    Returns False if the collection doesn't exist or an error occurs.
-    """
     delete_log = log.bind(document_id=document_id, company_id=company_id, component="MilvusHelperSync")
     expr = f'{MILVUS_COMPANY_ID_FIELD} == "{company_id}" and {MILVUS_DOCUMENT_ID_FIELD} == "{document_id}"'
     pks_to_delete: List[str] = []
@@ -456,7 +245,7 @@ def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
         delete_expr = f'{MILVUS_PK_FIELD} in {json.dumps(pks_to_delete)}'
         delete_log.info("Attempting to delete chunks from Milvus using PK list expression (sync).", filter_expr=delete_expr)
         delete_result = collection.delete(expr=delete_expr)
-        collection.flush() # Ensure deletions are committed
+        collection.flush() 
         delete_log.info("Milvus delete operation by PK list executed and flushed (sync).", deleted_count=delete_result.delete_count)
 
         if delete_result.delete_count != len(pks_to_delete):
@@ -475,10 +264,143 @@ def _delete_milvus_sync(document_id: str, company_id: str) -> bool:
 
 
 def normalize_filename(filename: str) -> str:
-    """Normaliza el nombre de archivo eliminando espacios al inicio/final y espacios duplicados."""
     return " ".join(filename.strip().split())
 
 # --- API Endpoints ---
+
+@router.get( # ÚNICA DEFINICIÓN CORRECTA PARA ESTADÍSTICAS
+    "/stats",
+    response_model=DocumentStatsResponse,
+    summary="Get aggregated document statistics for a company",
+    description="Provides aggregated statistics about documents for the specified company, with optional filters.",
+    responses={
+        200: {"description": "Successfully retrieved document statistics."},
+        401: {"model": ErrorDetail, "description": "Unauthorized (Not used if gateway handles auth)"},
+        422: {"model": ErrorDetail, "description": "Validation Error (e.g., missing X-Company-ID or invalid date format)"},
+        500: {"model": ErrorDetail, "description": "Internal Server Error"},
+        503: {"model": ErrorDetail, "description": "Service Unavailable (DB error)"},
+    }
+)
+# Se elimina la ruta duplicada @router.get("/ingest/stats", ...)
+async def get_document_statistics(
+    request: Request,
+    from_date: Optional[date] = Query(None, description="Filter statistics from this date (YYYY-MM-DD). Inclusive."),
+    to_date: Optional[date] = Query(None, description="Filter statistics up to this date (YYYY-MM-DD). Inclusive."),
+    status_filter: Optional[DocumentStatus] = Query(None, alias="status", description="Filter statistics by a specific document status."),
+):
+    company_id_str = request.headers.get("X-Company-ID")
+    req_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
+    stats_log = log.bind(request_id=req_id)
+
+    if not company_id_str:
+        stats_log.warning("Missing X-Company-ID header for document statistics")
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing required header: X-Company-ID")
+    try:
+        company_uuid = uuid.UUID(company_id_str)
+    except ValueError:
+        stats_log.warning("Invalid Company ID format for document statistics", company_id_received=company_id_str)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Company ID format.")
+
+    stats_log = stats_log.bind(company_id=company_id_str, from_date=from_date, to_date=to_date, status_filter=status_filter)
+    stats_log.info("Request for document statistics received")
+
+    where_clauses = ["company_id = $1"]
+    params: List[Any] = [company_uuid]
+    param_idx = 2
+
+    if from_date:
+        where_clauses.append(f"uploaded_at >= ${param_idx}")
+        params.append(from_date)
+        param_idx += 1
+    
+    if to_date:
+        where_clauses.append(f"DATE(uploaded_at) <= ${param_idx}")
+        params.append(to_date)
+        param_idx += 1
+
+    if status_filter:
+        where_clauses.append(f"status = ${param_idx}")
+        params.append(status_filter.value)
+        param_idx += 1
+    
+    where_sql = " AND ".join(where_clauses)
+
+    try:
+        async with get_db_conn() as db_conn:
+            total_docs_query = f"SELECT COUNT(*) FROM documents WHERE {where_sql};"
+            total_documents = await db_conn.fetchval(total_docs_query, *params)
+            total_documents = total_documents or 0
+
+            processed_where_sql = where_sql
+            processed_params = list(params)
+            if status_filter and status_filter != DocumentStatus.PROCESSED:
+                total_chunks_processed = 0
+            else:
+                temp_chunk_params = list(params)
+                temp_chunk_where_sql = where_sql
+                if not status_filter: 
+                    temp_chunk_where_sql += f" AND status = ${len(temp_chunk_params) + 1}"
+                    temp_chunk_params.append(DocumentStatus.PROCESSED.value)
+                
+                total_chunks_query_sql = f"SELECT SUM(chunk_count) FROM documents WHERE {temp_chunk_where_sql};"
+                val = await db_conn.fetchval(total_chunks_query_sql, *temp_chunk_params)
+                total_chunks_processed = val or 0
+
+            by_status_query = f"SELECT status, COUNT(*) as count FROM documents WHERE {where_sql} GROUP BY status;"
+            status_rows = await db_conn.fetch(by_status_query, *params)
+            stats_by_status = DocumentStatsByStatus()
+            for row in status_rows:
+                if row['status'] in DocumentStatus.__members__.values(): 
+                    setattr(stats_by_status, DocumentStatus(row['status']).value, row['count'])
+            
+            by_type_query = f"SELECT file_type, COUNT(*) as count FROM documents WHERE {where_sql} GROUP BY file_type;"
+            type_rows = await db_conn.fetch(by_type_query, *params)
+            stats_by_type = DocumentStatsByType()
+            
+            type_mapping = {
+                "application/pdf": "pdf",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+                "application/msword": "docx", # Unificar doc y docx bajo 'docx'
+                "text/plain": "txt",
+                "text/markdown": "other", # Agrupar markdown y html en 'other' por ahora
+                "text/html": "other",
+            }
+            for row in type_rows:
+                mapped_type_key = row['file_type']
+                # Buscar el tipo mapeado o usar 'other'
+                stat_field = type_mapping.get(mapped_type_key)
+
+                if stat_field and hasattr(stats_by_type, stat_field):
+                    current_val = getattr(stats_by_type, stat_field)
+                    setattr(stats_by_type, stat_field, current_val + row['count'])
+                else: # Si no está en el mapping directo o no es un campo del modelo, va a other
+                    stats_by_type.other += row['count']
+
+            dates_query = f"SELECT MIN(uploaded_at) as oldest, MAX(uploaded_at) as newest FROM documents WHERE {where_sql};"
+            date_row = await db_conn.fetchrow(dates_query, *params)
+            oldest_document_date = date_row['oldest'] if date_row else None
+            newest_document_date = date_row['newest'] if date_row else None
+
+            stats_log.info("Successfully retrieved document statistics from DB")
+
+            return DocumentStatsResponse(
+                total_documents=total_documents,
+                total_chunks=total_chunks_processed, # Nombre del campo en el modelo es total_chunks
+                by_status=stats_by_status,
+                by_type=stats_by_type,
+                by_user=[], # Placeholder, requiere join con tabla users o info de user_id en documents
+                recent_activity=[], # Placeholder, requiere query de agregación por tiempo
+                oldest_document_date=oldest_document_date,
+                newest_document_date=newest_document_date,
+            )
+
+    except asyncpg.exceptions.PostgresConnectionError as db_conn_err:
+        stats_log.error("Database connection error while fetching statistics", error=str(db_conn_err), exc_info=True)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database connection error.")
+    except Exception as e:
+        stats_log.exception("Unexpected error fetching document statistics", error=str(e))
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error.")
+
 
 @router.delete(
     "/bulk",
@@ -497,12 +419,8 @@ async def bulk_delete_documents(
     body: Dict[str, List[str]] = Body(..., example={"document_ids": ["id1", "id2"]}),
     gcs_client: GCSClient = Depends(get_gcs_client),
 ):
-    """
-    Bulk deletes documents: removes from Milvus (Zilliz), GCS, and PostgreSQL.
-    Continues on error, returns lists of deleted and failed IDs with reasons.
-    """
     company_id = request.headers.get("X-Company-ID")
-    req_id = getattr(request.state, 'request_id', 'N/A')
+    req_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
     if not company_id:
         log.bind(request_id=req_id).warning("Missing X-Company-ID header in bulk_delete_documents")
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing required header: X-Company-ID")
@@ -541,7 +459,6 @@ async def bulk_delete_documents(
             errors_for_this_doc: List[str] = []
             loop = asyncio.get_running_loop()
             
-            # Milvus Delete
             single_delete_log.debug("Bulk: Attempting Milvus delete for document.")
             try:
                 milvus_deleted_ok = await loop.run_in_executor(None, _delete_milvus_sync, str(doc_uuid), company_id)
@@ -554,7 +471,6 @@ async def bulk_delete_documents(
                 single_delete_log.exception("Bulk: Unexpected error during Milvus delete execution for document.", error=str(e_milvus))
                 errors_for_this_doc.append(f"Milvus: {type(e_milvus).__name__}")
 
-            # GCS Delete
             gcs_path = doc_data.get('file_path')
             if gcs_path:
                 single_delete_log.debug("Bulk: Attempting GCS delete for document.", gcs_path=gcs_path)
@@ -567,7 +483,6 @@ async def bulk_delete_documents(
             else:
                 single_delete_log.warning("Bulk: GCS path unknown for document, skipping GCS delete.")
 
-            # PostgreSQL Delete
             single_delete_log.debug("Bulk: Attempting PostgreSQL delete for document.")
             try:
                 async with get_db_conn() as conn:
@@ -661,9 +576,6 @@ async def upload_document(
              endpoint_log.warning(f"Invalid metadata content: {e}")
              raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid metadata content: {e}")
 
-    # Check for duplicate document
-    # This block now correctly propagates HTTPExceptions (like 409)
-    # or raises 503 for genuine DB connection issues via the updated get_db_conn.
     try:
         async with get_db_conn() as conn:
             existing_doc = await api_db_retry_strategy(db_client.find_document_by_name_and_company)(
@@ -677,9 +589,9 @@ async def upload_document(
                 )
             elif existing_doc:
                 endpoint_log.info("Found existing document in error state, proceeding with upload.", document_id=existing_doc['id'])
-    except HTTPException as http_exc: # Re-raise if it's already an HTTPException (e.g., 409 from above, or 503 from get_db_conn)
+    except HTTPException as http_exc: 
         raise http_exc
-    except Exception as e: # Catch any other unexpected error during this specific check
+    except Exception as e: 
         endpoint_log.exception("Unexpected error checking for duplicate document", error=str(e))
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error during duplicate check.")
 
@@ -696,9 +608,8 @@ async def upload_document(
                 metadata=metadata
             )
         endpoint_log.info("Document record created in PostgreSQL", document_id=str(document_id))
-    except Exception as e: # This will catch DB errors from create_document_record or from get_db_conn itself
+    except Exception as e: 
         endpoint_log.exception("Failed to create document record in PostgreSQL", error=str(e))
-        # If get_db_conn raised 503, it will be re-raised. Otherwise, wrap this specific error.
         if not isinstance(e, HTTPException):
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database error creating record.")
         raise
@@ -717,13 +628,13 @@ async def upload_document(
 
         if not file_exists:
             endpoint_log.error("File not found in GCS after upload attempt", object_name=file_path_in_storage, filename=normalized_filename)
-            async with get_db_conn() as conn: # Separate context for status update
+            async with get_db_conn() as conn: 
                 await api_db_retry_strategy(db_client.update_document_status)(
                     document_id=document_id, status=DocumentStatus.ERROR, error_message="File not found in GCS after upload", conn=conn
                 )
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="File verification in GCS failed after upload.")
 
-        async with get_db_conn() as conn: # Separate context for status update
+        async with get_db_conn() as conn: 
             await api_db_retry_strategy(db_client.update_document_status)(
                 document_id=document_id, status=DocumentStatus.UPLOADED, conn=conn
             )
@@ -801,7 +712,7 @@ async def get_document_status(
     gcs_client: GCSClient = Depends(get_gcs_client),
 ):
     company_id = request.headers.get("X-Company-ID")
-    req_id = getattr(request.state, 'request_id', 'N/A')
+    req_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
     if not company_id:
         log.bind(request_id=req_id).warning("Missing X-Company-ID header in get_document_status")
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing required header: X-Company-ID")
@@ -874,14 +785,13 @@ async def get_document_status(
                         status_log.warning("Grace period: no status change for missing GCS file (recent processed)")
         except Exception as gcs_e:
             status_log.error("GCS check failed", error=str(gcs_e))
-            gcs_exists = False # Assume false on error
-            # Only flag as error if not already in error and outside grace period for processed docs
+            gcs_exists = False 
             if updated_status_enum != DocumentStatus.ERROR:
                 if not (updated_status_enum == DocumentStatus.PROCESSED and updated_at_dt and (now_utc - updated_at_dt).total_seconds() < GRACE_PERIOD_SECONDS):
                     needs_update = True
                     updated_status_enum = DocumentStatus.ERROR
                     updated_error_message = (updated_error_message or "") + f" GCS check error ({type(gcs_e).__name__})."
-                    updated_chunk_count = 0 # Assume chunks are gone if GCS is inaccessible
+                    updated_chunk_count = 0 
                 else:
                      status_log.warning("Grace period: no status change for GCS exception (recent processed)")
 
@@ -894,10 +804,9 @@ async def get_document_status(
         )
         status_log.info("Milvus chunk count check complete (pymilvus)", count=milvus_chunk_count)
 
-        if milvus_chunk_count == -1: # Indicates Milvus error or collection not found
+        if milvus_chunk_count == -1: 
             status_log.error("Milvus count check failed or collection not accessible (returned -1).")
             if updated_status_enum != DocumentStatus.ERROR:
-                # If was 'processed' but Milvus is now failing, it's an error state (outside grace period)
                 if updated_status_enum == DocumentStatus.PROCESSED:
                      if not (updated_at_dt and (now_utc - updated_at_dt).total_seconds() < GRACE_PERIOD_SECONDS):
                         needs_update = True
@@ -905,25 +814,24 @@ async def get_document_status(
                         updated_error_message = (updated_error_message or "") + " Milvus check failed or processed data missing."
                      else:
                          status_log.warning("Grace period: no status change for failed Milvus count check (recent processed)")
-                # For other states like UPLOADING, PROCESSING, a Milvus check error doesn't change status yet
                 else:
                      status_log.info("Milvus check failed, but status is not 'processed'. No status change needed yet.", current_status=updated_status_enum.value)
         
-        elif milvus_chunk_count > 0: # Chunks found in Milvus
+        elif milvus_chunk_count > 0: 
             if gcs_exists and updated_status_enum in [DocumentStatus.ERROR, DocumentStatus.UPLOADED, DocumentStatus.PROCESSING]:
                 status_log.warning("Inconsistency: Chunks found in Milvus and GCS file exists, but DB status is not 'processed'. Correcting.")
                 needs_update = True
                 updated_status_enum = DocumentStatus.PROCESSED
                 updated_chunk_count = milvus_chunk_count
-                updated_error_message = None # Clear error if now processed
+                updated_error_message = None 
             elif updated_status_enum == DocumentStatus.PROCESSED:
                 if updated_chunk_count != milvus_chunk_count:
                     status_log.warning("Inconsistency: DB chunk count differs from live Milvus count.", db_count=updated_chunk_count, live_count=milvus_chunk_count)
                     needs_update = True
-                    updated_chunk_count = milvus_chunk_count # Correct DB count
+                    updated_chunk_count = milvus_chunk_count 
         
-        elif milvus_chunk_count == 0: # No chunks found in Milvus
-            if updated_status_enum == DocumentStatus.PROCESSED: # Was 'processed' but chunks are gone
+        elif milvus_chunk_count == 0: 
+            if updated_status_enum == DocumentStatus.PROCESSED: 
                 status_log.warning("Inconsistency: DB status 'processed' but no chunks found in Milvus. Correcting.")
                 if not (updated_at_dt and (now_utc - updated_at_dt).total_seconds() < GRACE_PERIOD_SECONDS):
                     needs_update = True
@@ -932,13 +840,13 @@ async def get_document_status(
                     updated_error_message = (updated_error_message or "") + " Processed data missing from Milvus."
                 else:
                      status_log.warning("Grace period: no status change for zero Milvus chunks (recent processed)")
-            elif updated_status_enum == DocumentStatus.ERROR and updated_chunk_count != 0: # Was error but DB still thought there were chunks
+            elif updated_status_enum == DocumentStatus.ERROR and updated_chunk_count != 0: 
                 needs_update = True
-                updated_chunk_count = 0 # Correct chunk count in DB
+                updated_chunk_count = 0 
 
-    except Exception as e: # Catch any exception from run_in_executor or Milvus logic itself
+    except Exception as e: 
         status_log.exception("Unexpected error during Milvus count check execution", error=str(e))
-        milvus_chunk_count = -1 # Ensure it's -1 on any failure
+        milvus_chunk_count = -1 
         if updated_status_enum != DocumentStatus.ERROR:
             if not (updated_status_enum == DocumentStatus.PROCESSED and updated_at_dt and (now_utc - updated_at_dt).total_seconds() < GRACE_PERIOD_SECONDS):
                 needs_update = True
@@ -959,17 +867,15 @@ async def get_document_status(
                      conn=conn_update
                  )
              status_log.info("Document status updated successfully in DB after inconsistency check.")
-             # Reflect these updates in the data to be returned
              doc_data['status'] = updated_status_enum.value
              doc_data['chunk_count'] = updated_chunk_count
              doc_data['error_message'] = updated_error_message
         except Exception as e_db_update:
             status_log.exception("Failed to update document status in DB after inconsistency check", error=str(e_db_update))
-            # The original doc_data will be returned, possibly stale if DB update failed.
 
     final_status_val = doc_data['status']
-    final_chunk_count_val = doc_data.get('chunk_count', 0 if doc_data['status'] != DocumentStatus.PROCESSED.value else None) # Ensure 0 if not processed
-    if doc_data['status'] == DocumentStatus.PROCESSED.value and final_chunk_count_val is None : final_chunk_count_val = 0 # Default to 0 if processed but count is None
+    final_chunk_count_val = doc_data.get('chunk_count', 0 if doc_data['status'] != DocumentStatus.PROCESSED.value else None) 
+    if doc_data['status'] == DocumentStatus.PROCESSED.value and final_chunk_count_val is None : final_chunk_count_val = 0 
     final_error_message_val = doc_data.get('error_message')
 
     return StatusResponse(
@@ -1006,7 +912,7 @@ async def list_document_statuses(
     gcs_client: GCSClient = Depends(get_gcs_client),
 ):
     company_id = request.headers.get("X-Company-ID")
-    req_id = getattr(request.state, 'request_id', 'N/A')
+    req_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
     if not company_id:
         log.bind(request_id=req_id).warning("Missing X-Company-ID header in list_document_statuses")
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing required header: X-Company-ID")
@@ -1031,21 +937,17 @@ async def list_document_statuses(
     if not documents_db: return [] 
 
     async def check_single_document(doc_db_data: Dict[str, Any]) -> Dict[str, Any]:
-        # Simplified version of get_document_status logic for list items
-        # This does not use the grace period to simplify, might lead to more frequent updates if called rapidly
         check_log = log.bind(request_id=req_id, document_id=str(doc_db_data['id']), company_id=company_id)
         doc_id_str = str(doc_db_data['id'])
         doc_needs_update = False
         
-        # Start with DB data
         doc_current_status_enum = DocumentStatus(doc_db_data['status'])
         doc_current_chunk_count = doc_db_data.get('chunk_count')
         doc_current_error_msg = doc_db_data.get('error_message')
 
-        # These will hold the "live" or "corrected" values
         doc_updated_status_enum = doc_current_status_enum
         doc_updated_chunk_count = doc_current_chunk_count
-        doc_updated_error_msg = doc_current_error_msg # Preserve original error unless overwritten
+        doc_updated_error_msg = doc_current_error_msg 
 
         gcs_path_db = doc_db_data.get('file_path')
         live_gcs_exists = False
@@ -1065,7 +967,7 @@ async def list_document_statuses(
                     doc_updated_status_enum = DocumentStatus.ERROR
                     doc_updated_error_msg = (doc_updated_error_msg or "").strip() + " GCS check error."
                     doc_updated_chunk_count = 0
-        else: # No GCS path in DB
+        else: 
             live_gcs_exists = False 
             if doc_updated_status_enum not in [DocumentStatus.ERROR, DocumentStatus.PENDING]:
                  doc_needs_update = True
@@ -1079,41 +981,40 @@ async def list_document_statuses(
         try:
             live_milvus_chunk_count = await loop.run_in_executor(None, _get_milvus_chunk_count_sync, doc_id_str, company_id)
             
-            if live_milvus_chunk_count == -1: # Milvus check failed
-                if doc_updated_status_enum == DocumentStatus.PROCESSED: # Was processed, now Milvus fails
+            if live_milvus_chunk_count == -1: 
+                if doc_updated_status_enum == DocumentStatus.PROCESSED: 
                     doc_needs_update = True
                     doc_updated_status_enum = DocumentStatus.ERROR
                     doc_updated_error_msg = (doc_updated_error_msg or "").strip() + " Milvus check failed/processed data missing."
-            elif live_milvus_chunk_count > 0: # Chunks in Milvus
+            elif live_milvus_chunk_count > 0: 
                 if live_gcs_exists and doc_updated_status_enum in [DocumentStatus.ERROR, DocumentStatus.UPLOADED, DocumentStatus.PROCESSING]:
                     doc_needs_update = True
                     doc_updated_status_enum = DocumentStatus.PROCESSED
                     doc_updated_chunk_count = live_milvus_chunk_count
-                    doc_updated_error_msg = None # Clear error
+                    doc_updated_error_msg = None 
                 elif doc_updated_status_enum == DocumentStatus.PROCESSED and doc_updated_chunk_count != live_milvus_chunk_count:
                     doc_needs_update = True
-                    doc_updated_chunk_count = live_milvus_chunk_count # Correct count
-            elif live_milvus_chunk_count == 0: # No chunks in Milvus
+                    doc_updated_chunk_count = live_milvus_chunk_count 
+            elif live_milvus_chunk_count == 0: 
                 if doc_updated_status_enum == DocumentStatus.PROCESSED:
                     doc_needs_update = True
                     doc_updated_status_enum = DocumentStatus.ERROR
                     doc_updated_chunk_count = 0
                     doc_updated_error_msg = (doc_updated_error_msg or "").strip() + " Processed data missing from Milvus."
-                elif doc_updated_status_enum == DocumentStatus.ERROR and doc_updated_chunk_count != 0: # DB thought error but had chunks
+                elif doc_updated_status_enum == DocumentStatus.ERROR and doc_updated_chunk_count != 0: 
                     doc_needs_update = True
                     doc_updated_chunk_count = 0
         except Exception as e_milvus_list:
             check_log.exception("Unexpected error during Milvus count check for list item", error=str(e_milvus_list))
             live_milvus_chunk_count = -1
-            if doc_updated_status_enum != DocumentStatus.ERROR: # Only update if not already error
+            if doc_updated_status_enum != DocumentStatus.ERROR: 
                 doc_needs_update = True
                 doc_updated_status_enum = DocumentStatus.ERROR
                 doc_updated_error_msg = (doc_updated_error_msg or "").strip() + " Error checking Milvus."
 
-        # If status became non-ERROR due to corrections, clear error message
         if doc_updated_status_enum != DocumentStatus.ERROR and doc_current_status_enum == DocumentStatus.ERROR:
             doc_updated_error_msg = None
-        elif doc_updated_status_enum == DocumentStatus.ERROR and not doc_updated_error_msg: # Ensure error status has a message
+        elif doc_updated_status_enum == DocumentStatus.ERROR and not doc_updated_error_msg: 
             doc_updated_error_msg = "Error detected during status check."
 
 
@@ -1128,14 +1029,11 @@ async def list_document_statuses(
         }
 
     list_log.info(f"Performing live checks for {len(documents_db)} documents concurrently...")
-    # Consider limiting concurrency if GCS/Milvus connections become an issue
-    # For GCS, google-cloud-python uses urllib3 which has a default pool size.
-    # For Milvus, _get_milvus_collection_sync attempts to manage its own connection.
     check_tasks = [check_single_document(doc) for doc in documents_db]
-    check_results = await asyncio.gather(*check_tasks, return_exceptions=True) # Handle individual task errors
+    check_results = await asyncio.gather(*check_tasks, return_exceptions=True) 
     list_log.info("Live checks completed for list items.")
 
-    updated_doc_data_map = {} # Store potentially updated data from DB if update occurs
+    updated_doc_data_map = {} 
     docs_to_update_in_db = []
     
     processed_results = []
@@ -1143,13 +1041,12 @@ async def list_document_statuses(
         original_doc_data = documents_db[i]
         if isinstance(result_or_exc, Exception):
             list_log.error("Error processing single document check in gather", doc_id=str(original_doc_data['id']), error=str(result_or_exc), exc_info=result_or_exc)
-            # Fallback to original DB data for this item, potentially with error indication
             processed_results.append({
-                "db_data": original_doc_data, "needs_update": False, # Cannot determine if update needed
+                "db_data": original_doc_data, "needs_update": False, 
                 "updated_status_enum": DocumentStatus(original_doc_data['status']),
                 "updated_chunk_count": original_doc_data.get('chunk_count'),
                 "final_error_message": original_doc_data.get('error_message', "Error during status refresh"),
-                "live_gcs_exists": False, "live_milvus_chunk_count": -1 # Unknown live status
+                "live_gcs_exists": False, "live_milvus_chunk_count": -1 
             })
             continue
         processed_results.append(result_or_exc)
@@ -1157,7 +1054,6 @@ async def list_document_statuses(
 
     for result in processed_results:
         doc_id_str = str(result["db_data"]["id"])
-        # This map will store the state *after* potential DB update, or the live state if no update needed
         updated_doc_data_map[doc_id_str] = {
             **result["db_data"], 
             "status": result["updated_status_enum"].value,
@@ -1166,7 +1062,7 @@ async def list_document_statuses(
         }
         if result["needs_update"]:
             docs_to_update_in_db.append({
-                "id": result["db_data"]["id"], # This is UUID object
+                "id": result["db_data"]["id"], 
                 "status_enum": result["updated_status_enum"],
                 "chunk_count": result["updated_chunk_count"], 
                 "error_message": result["final_error_message"]
@@ -1176,12 +1072,12 @@ async def list_document_statuses(
         list_log.warning("Updating statuses sequentially in DB for inconsistent documents", count=len(docs_to_update_in_db))
         updated_count_db = 0; failed_update_count_db = 0
         try:
-             async with get_db_conn() as conn_batch_update: # Single connection for all updates
+             async with get_db_conn() as conn_batch_update: 
                  for update_info in docs_to_update_in_db:
                      try:
                          await api_db_retry_strategy(db_client.update_document_status)(
                              conn=conn_batch_update, 
-                             document_id=update_info["id"], # Pass UUID object
+                             document_id=update_info["id"], 
                              status=update_info["status_enum"],
                              chunk_count=update_info["chunk_count"], 
                              error_message=update_info["error_message"]
@@ -1191,21 +1087,18 @@ async def list_document_statuses(
                          failed_update_count_db += 1
                          list_log.error("Failed DB update for single doc during list check", document_id=str(update_info["id"]), error=str(single_update_err))
              list_log.info("Finished sequential DB updates for list items.", updated=updated_count_db, failed=failed_update_count_db)
-        except Exception as bulk_db_conn_err: # Error getting connection for the batch
+        except Exception as bulk_db_conn_err: 
             list_log.exception("Error acquiring DB connection for sequential updates in list", error=str(bulk_db_conn_err))
-            # In this case, updated_doc_data_map will reflect live state but not persisted DB changes
 
     final_response_items = []
-    for result in processed_results: # Iterate over processed_results again to build final response
+    for result in processed_results: 
          doc_id_str = str(result["db_data"]["id"])
-         # Use data from updated_doc_data_map if an update was attempted/successful, otherwise from original result
          current_data_for_response = updated_doc_data_map.get(doc_id_str, result["db_data"])
          
-         # Ensure chunk_count is sensible for the status for the response
          final_chunk_count_resp = current_data_for_response.get('chunk_count')
          if current_data_for_response['status'] != DocumentStatus.PROCESSED.value:
              final_chunk_count_resp = 0
-         elif final_chunk_count_resp is None: # PROCESSED but count is None
+         elif final_chunk_count_resp is None: 
              final_chunk_count_resp = 0
 
 
@@ -1217,8 +1110,8 @@ async def list_document_statuses(
             file_type=current_data_for_response.get('file_type'), 
             file_path=current_data_for_response.get('file_path'),
             chunk_count=final_chunk_count_resp,
-            gcs_exists=result["live_gcs_exists"], # Use live check result
-            milvus_chunk_count=result["live_milvus_chunk_count"], # Use live check result
+            gcs_exists=result["live_gcs_exists"], 
+            milvus_chunk_count=result["live_milvus_chunk_count"], 
             last_updated=current_data_for_response.get('updated_at'),
             uploaded_at=current_data_for_response.get('uploaded_at'), 
             error_message=current_data_for_response.get('error_message'),
@@ -1254,7 +1147,7 @@ async def retry_ingestion(
 ):
     company_id = request.headers.get("X-Company-ID")
     user_id = request.headers.get("X-User-ID") 
-    req_id = getattr(request.state, 'request_id', 'N/A')
+    req_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
     if not company_id: raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing required header: X-Company-ID")
     try: company_uuid = uuid.UUID(company_id)
     except ValueError: raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Company ID format.")
