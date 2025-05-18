@@ -2,7 +2,7 @@
 # api-gateway/app/main.py
 import os
 from fastapi import FastAPI, Request, Depends, HTTPException, status
-from typing import Optional, List, Set
+from typing import Optional, List, Set # Importado Set
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -80,40 +80,50 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.PROJECT_NAME,
     description="Atenex API Gateway: Single entry point, JWT auth, routing via explicit HTTP calls, Admin API.",
-    version="1.1.4", # Nueva versión para reflejar corrección CORS definitiva
+    version="1.1.5", # Nueva versión para reflejar corrección CORS específica del error
     lifespan=lifespan,
 )
 
 # --- Middlewares ---
 
-# --- CORRECCIÓN CORS DEFINITIVA: Usar allow_origins con lista explícita ---
-allowed_origins = [
-    "http://localhost:3000",
-    "http://localhost:3001",
-    "http://127.0.0.1:3000",
-    "http://127.0.0.1:3001",
-]
+# --- CORRECCIÓN CORS ---
+# Usar un set para la construcción inicial para evitar duplicados, luego convertir a lista.
+allowed_origins_set: Set[str] = {
+    "http://localhost:3000",    # Desarrollo local frontend
+    "http://localhost:3001",    # Otro puerto de desarrollo local frontend
+    "http://127.0.0.1:3000",    # Desarrollo local frontend
+    "http://127.0.0.1:3001",    # Otro puerto de desarrollo local frontend
+}
 
-# Añadir la URL base de Vercel si está configurada
+# Añadir el dominio de producción del frontend desde el que se origina el error
+PROD_FRONTEND_URL = "https://www.atenex.pe"
+allowed_origins_set.add(PROD_FRONTEND_URL)
+
+# Añadir la URL base de Vercel si está configurada en las settings
 if settings.VERCEL_FRONTEND_URL:
-    allowed_origins.append(settings.VERCEL_FRONTEND_URL)
-    # Añadir explícitamente la URL de preview de Vercel que causa el problema
-    allowed_origins.append("https://atenex-frontend-git-main-devnyro-gmailcoms-projects.vercel.app")
+    allowed_origins_set.add(settings.VERCEL_FRONTEND_URL)
 
-# Añadir la URL de Ngrok específica de los logs
-# Considera hacer esto configurable a través de variables de entorno si cambia frecuentemente
-NGROK_URL_FROM_LOG = "https://2646-2001-1388-53a1-bd93-5941-79e3-d98a-2e11.ngrok-free.app"
-if NGROK_URL_FROM_LOG not in allowed_origins: # Evitar duplicados
-    allowed_origins.append(NGROK_URL_FROM_LOG)
+# Añadir la URL de preview de Vercel que estaba en el código original (si sigue siendo relevante)
+# Es mejor si esta URL es configurable si cambia o hay múltiples previews.
+VERCEL_PREVIEW_URL = "https://atenex-frontend-git-main-devnyro-gmailcoms-projects.vercel.app"
+allowed_origins_set.add(VERCEL_PREVIEW_URL)
 
-# También añadir la URL de NGROK directamente si está en settings (aunque no se usó en el log)
-# if settings.NGROK_URL and settings.NGROK_URL not in allowed_origins:
-#     allowed_origins.append(settings.NGROK_URL)
+# Añadir la URL de Ngrok específica que aparece en el log de error del frontend
+# Esta es la URL a la que el frontend está intentando conectarse.
+NGROK_URL_FROM_ERROR_LOG = "https://1bdb-2001-1388-53a0-ca20-ec59-6cb3-85d5-9c1a.ngrok-free.app"
+allowed_origins_set.add(NGROK_URL_FROM_ERROR_LOG)
 
+# La variable NGROK_URL_FROM_LOG (con https://2646-...) del código original
+# se puede eliminar o comentar si ya no es relevante, o si se prefiere que la URL de Ngrok
+# venga de una variable de entorno (ej. settings.NGROK_URL).
+# Por ahora, la omitiremos para enfocarnos en la URL del error.
 
-log.info("Configuring CORS middleware", allowed_origins=allowed_origins)
+final_allowed_origins = list(allowed_origins_set)
+
+log.info("Configuring CORS middleware", allowed_origins=final_allowed_origins)
+
 app.add_middleware(CORSMiddleware,
-                   allow_origins=allowed_origins, # Usar la lista explícita de orígenes
+                   allow_origins=final_allowed_origins, # Usar la lista final de orígenes únicos
                    allow_credentials=True,
                    allow_methods=["*"], # Permite GET, POST, OPTIONS, etc.
                    allow_headers=["*"], # Permite todos los headers comunes (incluyendo Content-Type, Authorization, etc.)
@@ -171,7 +181,8 @@ async def add_request_context_timing_logging(request: Request, call_next):
         # ¡IMPORTANTE! Re-aplicar cabeceras CORS a respuestas de error
         # El middleware CORSMiddleware podría no ejecutarse completamente si la excepción ocurre muy temprano.
         req_origin = request.headers.get("Origin")
-        if req_origin in allowed_origins: # Comprobar si el origen de la petición está permitido
+        # Usar final_allowed_origins para la comprobación
+        if req_origin in final_allowed_origins:
              response.headers["Access-Control-Allow-Origin"] = req_origin
              response.headers["Access-Control-Allow-Credentials"] = "true"
              # Opcional: añadir otros headers CORS si son necesarios para errores

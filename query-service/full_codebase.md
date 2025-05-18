@@ -1593,7 +1593,7 @@ POSTGRES_K8S_USER_DEFAULT = "postgres"
 
 # Milvus
 ZILLIZ_ENDPOINT_DEFAULT = "https://in03-0afab716eb46d7f.serverless.gcp-us-west1.cloud.zilliz.com"
-MILVUS_DEFAULT_COLLECTION = "document_chunks_minilm"
+MILVUS_DEFAULT_COLLECTION = "atenex-collection-01"
 MILVUS_DEFAULT_EMBEDDING_FIELD = "embedding"
 MILVUS_DEFAULT_CONTENT_FIELD = "content"
 MILVUS_DEFAULT_COMPANY_ID_FIELD = "company_id"
