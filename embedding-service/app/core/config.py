@@ -3,7 +3,7 @@ import logging
 import os
 from typing import Optional, List, Any, Dict
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field, field_validator, ValidationError, ValidationInfo
+from pydantic import Field, field_validator, ValidationError, ValidationInfo, SecretStr
 import sys
 import json
 
@@ -11,11 +11,13 @@ import json
 DEFAULT_PROJECT_NAME = "Atenex Embedding Service"
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_API_V1_STR = "/api/v1"
-DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-DEFAULT_EMBEDDING_DIMENSION = 384
-DEFAULT_FASTEMBED_CACHE_DIR: Optional[str] = None # Set to a path like "/app/models" in Docker for persistence
-DEFAULT_FASTEMBED_THREADS: Optional[int] = None # None uses FastEmbed default (usually num CPU cores)
-DEFAULT_FASTEMBED_MAX_LENGTH: int = 512 # Max sequence length for the model
+
+# OpenAI specific defaults
+DEFAULT_OPENAI_EMBEDDING_MODEL_NAME = "text-embedding-3-small"
+DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_SMALL = 1536 # for text-embedding-3-small
+DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_LARGE = 3072 # for text-embedding-3-large
+DEFAULT_OPENAI_TIMEOUT_SECONDS = 30
+DEFAULT_OPENAI_MAX_RETRIES = 3
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -30,18 +32,16 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = Field(default=DEFAULT_PROJECT_NAME)
     API_V1_STR: str = Field(default=DEFAULT_API_V1_STR)
     LOG_LEVEL: str = Field(default=DEFAULT_LOG_LEVEL)
-    PORT: int = Field(default=8003, description="Port the service will listen on.") # Example port
+    PORT: int = Field(default=8003, description="Port the service will listen on.")
 
-    # --- Embedding Model (FastEmbed) ---
-    FASTEMBED_MODEL_NAME: str = Field(default=DEFAULT_EMBEDDING_MODEL)
-    EMBEDDING_DIMENSION: int = Field(default=DEFAULT_EMBEDDING_DIMENSION)
-    # Optional: For query/document specific prefixes if your chosen model supports/recommends them
-    # FASTEMBED_QUERY_PREFIX: Optional[str] = Field(default=None)
-    # FASTEMBED_DOCUMENT_PREFIX: Optional[str] = Field(default=None)
-    FASTEMBED_CACHE_DIR: Optional[str] = Field(default=DEFAULT_FASTEMBED_CACHE_DIR, description="Directory to cache downloaded FastEmbed models.")
-    FASTEMBED_THREADS: Optional[int] = Field(default=DEFAULT_FASTEMBED_THREADS, gt=0, description="Number of threads for FastEmbed tokenization.")
-    FASTEMBED_MAX_LENGTH: int = Field(default=DEFAULT_FASTEMBED_MAX_LENGTH, gt=0, description="Max sequence length for the embedding model.")
-
+    # --- OpenAI Embedding Model ---
+    OPENAI_API_KEY: SecretStr = Field(..., description="OpenAI API Key.")
+    OPENAI_EMBEDDING_MODEL_NAME: str = Field(default=DEFAULT_OPENAI_EMBEDDING_MODEL_NAME, description="Name of the OpenAI embedding model to use.")
+    OPENAI_EMBEDDING_DIMENSIONS_OVERRIDE: Optional[int] = Field(default=None, gt=0, description="Optional: Override embedding dimensions. Supported by text-embedding-3 models.")
+    EMBEDDING_DIMENSION: int = Field(description="Actual dimension of the embeddings that will be produced.") # This will be validated
+    OPENAI_API_BASE: Optional[str] = Field(default=None, description="Optional: Base URL for OpenAI API, e.g., for Azure OpenAI.")
+    OPENAI_TIMEOUT_SECONDS: int = Field(default=DEFAULT_OPENAI_TIMEOUT_SECONDS, gt=0)
+    OPENAI_MAX_RETRIES: int = Field(default=DEFAULT_OPENAI_MAX_RETRIES, ge=0)
 
     # --- Validators ---
     @field_validator('LOG_LEVEL')
@@ -55,29 +55,41 @@ class Settings(BaseSettings):
 
     @field_validator('EMBEDDING_DIMENSION')
     @classmethod
-    def check_embedding_dimension(cls, v: int, info: ValidationInfo) -> int:
+    def validate_embedding_dimension(cls, v: int, info: ValidationInfo) -> int:
         if v <= 0:
             raise ValueError("EMBEDDING_DIMENSION must be a positive integer.")
-        model_name = info.data.get('FASTEMBED_MODEL_NAME', DEFAULT_EMBEDDING_MODEL)
 
-        # Basic check for known models
-        expected_dim = -1
-        if 'all-MiniLM-L6-v2' in model_name: expected_dim = 384
-        elif 'bge-small-en-v1.5' in model_name: expected_dim = 384
-        elif 'bge-base-en-v1.5' in model_name: expected_dim = 768
-        elif 'bge-large-en-v1.5' in model_name: expected_dim = 1024
+        model_name = info.data.get('OPENAI_EMBEDDING_MODEL_NAME', DEFAULT_OPENAI_EMBEDDING_MODEL_NAME)
+        dimensions_override = info.data.get('OPENAI_EMBEDDING_DIMENSIONS_OVERRIDE')
 
-        if expected_dim != -1 and v != expected_dim:
+        expected_dimension = None
+        if model_name == "text-embedding-3-small":
+            expected_dimension = DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_SMALL
+        elif model_name == "text-embedding-3-large":
+            expected_dimension = DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_LARGE
+        elif model_name == "text-embedding-ada-002": # Older model, different dimension
+             expected_dimension = 1536 # OpenAI 'text-embedding-ada-002' dimension
+        # Add other OpenAI models and their default dimensions if needed
+
+        if dimensions_override is not None:
+            if v != dimensions_override:
+                raise ValueError(
+                    f"EMBEDDING_DIMENSION ({v}) must match OPENAI_EMBEDDING_DIMENSIONS_OVERRIDE ({dimensions_override}) when override is set."
+                )
+            # Further validation could check if override is valid for the model, but OpenAI API handles this.
+            logging.info(f"Using overridden embedding dimension: {v} for model {model_name}")
+        elif expected_dimension is not None:
+            if v != expected_dimension:
+                raise ValueError(
+                    f"EMBEDDING_DIMENSION ({v}) does not match the default dimension ({expected_dimension}) for model '{model_name}'. "
+                    f"If you intend to use a different dimension, set OPENAI_EMBEDDING_DIMENSIONS_OVERRIDE."
+                )
+            logging.info(f"Using default embedding dimension: {v} for model {model_name}")
+        else:
             logging.warning(
-                f"Configured EMBEDDING_DIMENSION ({v}) differs from standard dimension ({expected_dim}) "
-                f"for model '{model_name}'. Ensure this is intentional and matches the actual model output."
+                f"Could not determine default dimension for model '{model_name}'. "
+                f"Using configured EMBEDDING_DIMENSION: {v}. Ensure this is correct."
             )
-        elif expected_dim == -1:
-             logging.warning(
-                f"Unknown standard embedding dimension for model '{model_name}'. "
-                f"Using configured dimension {v}. Verify this matches the actual model output."
-            )
-        logging.debug(f"Using EMBEDDING_DIMENSION: {v} for model: {model_name}")
         return v
 
 # --- Global Settings Instance ---
@@ -94,15 +106,16 @@ try:
     settings = Settings()
     temp_log_config.info("--- Embedding Service Settings Loaded ---")
     for key, value in settings.model_dump().items():
-        temp_log_config.info(f"  {key.upper()}: {value}")
+        display_value = "********" if isinstance(value, SecretStr) and key == "OPENAI_API_KEY" else value
+        temp_log_config.info(f"  {key.upper()}: {display_value}")
     temp_log_config.info("------------------------------------")
 
 except (ValidationError, ValueError) as e_config:
     error_details_config = ""
     if isinstance(e_config, ValidationError):
         try: error_details_config = f"\nValidation Errors:\n{json.dumps(e_config.errors(), indent=2)}"
-        except Exception: error_details_config = f"\nRaw Errors: {e_config}" # Ensure e_config is used
-    else: error_details_config = f"\nError: {e_config}" # Ensure e_config is used
+        except Exception: error_details_config = f"\nRaw Errors: {e_config}"
+    else: error_details_config = f"\nError: {e_config}"
     temp_log_config.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     temp_log_config.critical(f"! FATAL: Embedding Service configuration validation failed!{error_details_config}")
     temp_log_config.critical(f"! Check environment variables (prefixed with EMBEDDING_) or .env file.")

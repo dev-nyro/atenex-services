@@ -19,8 +19,9 @@ from app.core.config import settings
 from app.api.v1.endpoints import embedding_endpoint
 from app.application.ports.embedding_model_port import EmbeddingModelPort
 from app.application.use_cases.embed_texts_use_case import EmbedTextsUseCase
-from app.infrastructure.embedding_models.fastembed_adapter import FastEmbedAdapter
-from app.dependencies import set_embedding_service_dependencies # Import the setter
+# --- MODIFICATION: Import OpenAIAdapter ---
+from app.infrastructure.embedding_models.openai_adapter import OpenAIAdapter
+from app.dependencies import set_embedding_service_dependencies
 
 log = structlog.get_logger("embedding_service.main")
 
@@ -35,15 +36,16 @@ async def lifespan(app: FastAPI):
     global embedding_model_adapter, embed_texts_use_case, SERVICE_MODEL_READY
     log.info(f"Starting up {settings.PROJECT_NAME}...")
 
-    model_adapter_instance = FastEmbedAdapter()
+    # --- MODIFICATION: Use OpenAIAdapter ---
+    model_adapter_instance = OpenAIAdapter()
     try:
         await model_adapter_instance.initialize_model()
         embedding_model_adapter = model_adapter_instance # Assign if successful
         SERVICE_MODEL_READY = True
-        log.info("Embedding model initialized successfully via FastEmbedAdapter.")
+        log.info("Embedding model client initialized successfully via OpenAIAdapter.")
     except Exception as e:
         SERVICE_MODEL_READY = False
-        log.critical("CRITICAL: Failed to initialize embedding model during startup.", error=str(e), exc_info=True)
+        log.critical("CRITICAL: Failed to initialize embedding model client during startup.", error=str(e), exc_info=True)
         # embedding_model_adapter will remain None or be the failed instance.
         # The health check will reflect this.
 
@@ -55,19 +57,21 @@ async def lifespan(app: FastAPI):
     else:
         # Ensure dependencies are set to reflect not-ready state
         set_embedding_service_dependencies(use_case_instance=None, ready_flag=False)
-        log.error("Service not fully ready due to embedding model initialization issues.")
+        log.error("Service not fully ready due to embedding model client initialization issues.")
 
-    log.info(f"{settings.PROJECT_NAME} startup sequence finished. Model Ready: {SERVICE_MODEL_READY}")
+    log.info(f"{settings.PROJECT_NAME} startup sequence finished. Model Client Ready: {SERVICE_MODEL_READY}")
     yield
     log.info(f"Shutting down {settings.PROJECT_NAME}...")
-    # Cleanup if necessary (e.g., close connections, though FastEmbed might not need explicit cleanup)
+    if embedding_model_adapter and hasattr(embedding_model_adapter, '_client') and embedding_model_adapter._client: # type: ignore
+        await embedding_model_adapter._client.close() # type: ignore
+        log.info("OpenAI async client closed.")
     log.info("Shutdown complete.")
 
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    version="0.1.0",
-    description="Atenex Embedding Service for generating text embeddings using FastEmbed.",
+    version="0.1.1", # Incremented version
+    description="Atenex Embedding Service for generating text embeddings using OpenAI.",
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
     lifespan=lifespan
 )
@@ -160,45 +164,51 @@ async def health_check():
     global SERVICE_MODEL_READY, embedding_model_adapter
     health_log = log.bind(check="health_status")
 
-    model_status_str = "not_loaded"
+    model_status_str = "client_not_initialized" # Changed from not_loaded
     model_name_str = None
     model_dim_int = None
+    service_overall_status = "error"
 
     if embedding_model_adapter: # Check if adapter instance exists
         is_healthy, status_msg = await embedding_model_adapter.health_check()
         if is_healthy:
-            model_status_str = "loaded"
+            model_status_str = "client_ready" # Changed from loaded
             model_info = embedding_model_adapter.get_model_info()
             model_name_str = model_info.get("model_name")
             model_dim_int = model_info.get("dimension")
+            if SERVICE_MODEL_READY: # Double check this global flag
+                 service_overall_status = "ok"
+            else: # Should not happen if is_healthy is true, but as a safeguard
+                model_status_str = "client_initialization_pending_or_failed"
+                health_log.error("Health check: Adapter healthy but service global flag indicates not ready.")
         else:
-            model_status_str = "error"
-            health_log.error("Health check: Embedding model error.", model_status_message=status_msg)
+            model_status_str = "client_error" # Changed from error
+            health_log.error("Health check: Embedding model client error.", model_status_message=status_msg)
+            model_info = embedding_model_adapter.get_model_info() # Try to get info even if unhealthy
+            model_name_str = model_info.get("model_name")
+            model_dim_int = model_info.get("dimension")
     else: # Adapter not even initialized
         health_log.warning("Health check: Embedding model adapter not initialized.")
         SERVICE_MODEL_READY = False # Ensure flag is accurate
 
-    if not SERVICE_MODEL_READY: # This global flag is set by lifespan based on successful init
-        health_log.error("Service not ready (model initialization failed or pending).")
-        raise HTTPException(
+    response_payload = schemas.HealthCheckResponse(
+        status=service_overall_status,
+        service=settings.PROJECT_NAME,
+        model_status=model_status_str,
+        model_name=model_name_str or settings.OPENAI_EMBEDDING_MODEL_NAME, # Fallback to config if not available from adapter
+        model_dimension=model_dim_int or settings.EMBEDDING_DIMENSION # Fallback to config
+    ).model_dump(exclude_none=True)
+
+    if not SERVICE_MODEL_READY or service_overall_status == "error":
+        health_log.error("Service not ready (model client initialization failed or pending).")
+        # Return 503 but with the detailed payload
+        return JSONResponse(
             status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=schemas.HealthCheckResponse(
-                status="error",
-                service=settings.PROJECT_NAME,
-                model_status=model_status_str,
-                model_name=model_name_str,
-                model_dimension=model_dim_int
-            ).model_dump(exclude_none=True)
+            content=response_payload
         )
 
     health_log.info("Health check successful.", model_status=model_status_str)
-    return schemas.HealthCheckResponse(
-        status="ok",
-        service=settings.PROJECT_NAME,
-        model_status=model_status_str,
-        model_name=model_name_str,
-        model_dimension=model_dim_int
-    )
+    return response_payload
 
 # --- Root Endpoint (Simple Ack)  ---
 @app.get("/", tags=["Root"], response_class=PlainTextResponse, include_in_schema=False)
@@ -212,5 +222,4 @@ if __name__ == "__main__":
     print(f"----- Starting {settings.PROJECT_NAME} locally on port {port_to_run} -----")
     uvicorn.run("app.main:app", host="0.0.0.0", port=port_to_run, reload=True, log_level=log_level_main)
 
-# 0.1.0 version
-# jfu
+# 1.1.1 version

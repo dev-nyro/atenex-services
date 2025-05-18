@@ -22,12 +22,12 @@ class EmbedResponse(BaseModel):
         json_schema_extra = {
             "example": {
                 "embeddings": [
-                    [0.1, 0.2, 0.3, -0.1, -0.2, -0.3],
-                    [0.4, 0.5, 0.6, -0.4, -0.5, -0.6]
+                    [0.001, -0.02, ..., 0.03],
+                    [0.04, 0.005, ..., -0.006]
                 ],
                 "model_info": {
-                    "model_name": "sentence-transformers/all-MiniLM-L6-v2",
-                    "dimension": 384
+                    "model_name": "text-embedding-3-small",
+                    "dimension": 1536
                 }
             }
         }
@@ -35,6 +35,6 @@ class EmbedResponse(BaseModel):
 class HealthCheckResponse(BaseModel):
     status: str = Field(default="ok", description="Overall status of the service.")
     service: str = Field(..., description="Name of the service.")
-    model_status: str = Field(..., description="Status of the embedding model ('loaded', 'error', 'not_loaded').")
-    model_name: str | None = Field(None, description="Name of the loaded embedding model, if any.")
-    model_dimension: int | None = Field(None, description="Dimension of the loaded embedding model, if any.")
+    model_status: str = Field(..., description="Status of the embedding model client ('client_ready', 'client_error', 'client_not_initialized', 'client_initialization_pending_or_failed').")
+    model_name: str | None = Field(None, description="Name of the configured/used embedding model, if available.")
+    model_dimension: int | None = Field(None, description="Dimension of the configured/used embedding model, if available.")

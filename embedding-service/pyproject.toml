@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "embedding-service"
-version = "1.1.0"
-description = "Atenex Embedding Service using FastAPI and FastEmbed"
+version = "1.1.1"
+description = "Atenex Embedding Service using FastAPI and OpenAI"
 authors = ["Atenex Team <dev@atenex.com>"]
 readme = "README.md"
 
@@ -13,15 +13,11 @@ gunicorn = "^21.2.0" # For production deployments
 pydantic = {extras = ["email"], version = "^2.6.4"}
 pydantic-settings = "^2.2.1"
 structlog = "^24.1.0"
-tenacity = "^8.2.3" # For potential retries in clients if this service calls others (not typical for embedding service)
+tenacity = "^8.2.3"
 
 # --- Embedding Engine ---
-fastembed = ">=0.3.0,<0.4.0" # Qdrant's FastEmbed
-# sentence-transformers is a dependency of FastEmbed for many models,
-# but FastEmbed manages its specific version.
-# onnxruntime is also often a dependency for some FastEmbed models,
-# ensure it's compatible or install explicitly if needed.
-onnxruntime = "^1.18.0" # Recommended to align with ingest/query service if they also use it.
+openai = "^1.14.0" # OpenAI Python client library
+
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"
