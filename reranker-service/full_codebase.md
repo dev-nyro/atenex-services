@@ -362,11 +362,15 @@ import logging
 import sys
 from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field, field_validator, ValidationInfo, ValidationError, AnyHttpUrl
+from pydantic import Field, field_validator, ValidationInfo, ValidationError
 import json
 import torch 
 
+# Definir IS_CUDA_AVAILABLE a nivel de módulo para que esté disponible globalmente
+# y para los defaults de la clase Settings.
 IS_CUDA_AVAILABLE = torch.cuda.is_available()
+_config_validator_logger = logging.getLogger("reranker_service.config.validator")
+
 
 # --- Default Values ---
 DEFAULT_MODEL_NAME = "BAAI/bge-reranker-base"
@@ -376,11 +380,9 @@ DEFAULT_PORT = 8004
 DEFAULT_HF_CACHE_DIR = "/app/.cache/huggingface"
 DEFAULT_MAX_SEQ_LENGTH = 512
 
-# Ajustes basados en disponibilidad de CUDA
 DEFAULT_BATCH_SIZE = 64 if IS_CUDA_AVAILABLE else 128
 DEFAULT_GUNICORN_WORKERS = 1 if IS_CUDA_AVAILABLE else 2 
-# Forzar 0 para tokenizer workers con CUDA para evitar problemas de multiprocessing.
-DEFAULT_TOKENIZER_WORKERS = 0 if IS_CUDA_AVAILABLE else 2 
+DEFAULT_TOKENIZER_WORKERS = 0 if IS_CUDA_AVAILABLE else 2 # Forzado a 0 con CUDA para estabilidad
 
 
 class Settings(BaseSettings):
@@ -421,29 +423,26 @@ class Settings(BaseSettings):
     @classmethod
     def check_model_device(cls, v: str, info: ValidationInfo) -> str:
         normalized_v = v.lower()
+        # IS_CUDA_AVAILABLE ya está definida globalmente
         if normalized_v == "cuda" and not IS_CUDA_AVAILABLE:
-            # Usar el logger global aquí podría ser problemático si aún no está configurado.
-            # Usar logging estándar para este caso.
-            logging.getLogger("reranker_service.config.validator").warning(
+            _config_validator_logger.warning(
                 "MODEL_DEVICE set to 'cuda' but CUDA is not available. Falling back to 'cpu'."
             )
             return "cpu"
         
         allowed_devices_prefixes = ["cpu", "cuda", "mps"]
         if not any(normalized_v.startswith(prefix) for prefix in allowed_devices_prefixes):
-            logging.getLogger("reranker_service.config.validator").warning(
+            _config_validator_logger.warning(
                 f"MODEL_DEVICE '{v}' is unusual. Ensure it's a valid device string for PyTorch/sentence-transformers."
             )
         return normalized_v
 
-    # Validadores para asegurar configuración segura con CUDA
     @field_validator('WORKERS')
     @classmethod
     def limit_gunicorn_workers_on_cuda(cls, v: int, info: ValidationInfo) -> int:
-        # info.data ya tiene los valores parseados hasta este punto
-        model_device_val = info.data.get('MODEL_DEVICE', DEFAULT_MODEL_DEVICE) # Usar default si no está aún
+        model_device_val = info.data.get('MODEL_DEVICE', DEFAULT_MODEL_DEVICE)
         if model_device_val.startswith('cuda') and v > 1:
-            logging.getLogger("reranker_service.config.validator").warning(
+            _config_validator_logger.warning(
                 f"RERANKER_WORKERS (Gunicorn workers) was {v}, but MODEL_DEVICE is '{model_device_val}'. "
                 "Forcing WORKERS=1 with GPU to prevent resource contention and potential CUDA errors."
             )
@@ -455,13 +454,12 @@ class Settings(BaseSettings):
     def force_tokenizer_workers_zero_on_cuda(cls, v: int, info: ValidationInfo) -> int:
         model_device_val = info.data.get('MODEL_DEVICE', DEFAULT_MODEL_DEVICE)
         if model_device_val.startswith('cuda') and v > 0:
-            logging.getLogger("reranker_service.config.validator").warning(
+            _config_validator_logger.warning(
                 f"RERANKER_TOKENIZER_WORKERS was {v}, but MODEL_DEVICE is '{model_device_val}'. "
                 "Forcing TOKENIZER_WORKERS=0 with GPU to ensure stability (avoids multiprocessing for tokenization)."
             )
             return 0
         return v
-
 
 # --- Global Settings Instance ---
 _temp_log = logging.getLogger("reranker_service.config.loader") 
@@ -470,16 +468,16 @@ if not _temp_log.handlers:
     _formatter = logging.Formatter('%(levelname)s: [%(name)s] %(message)s')
     _handler.setFormatter(_formatter)
     _temp_log.addHandler(_handler)
-    _temp_log.setLevel(logging.INFO)
+    _temp_log.setLevel(logging.INFO) # Usar INFO para la carga de config
 
 try:
     _temp_log.info("Loading Reranker Service settings...")
-    _temp_log.info(f"torch.cuda.is_available() Check: {IS_CUDA_AVAILABLE}")
-    settings = Settings() # Los validadores se ejecutan aquí
+    _temp_log.info(f"Initial Check: torch.cuda.is_available() = {IS_CUDA_AVAILABLE}")
+    settings = Settings() 
     _temp_log.info("Reranker Service Settings Loaded and Validated Successfully:")
     log_data = settings.model_dump() 
-    for key, value in log_data.items():
-        _temp_log.info(f"  {key.upper()}: {value}")
+    for key_name, value_setting in log_data.items(): # Corregir nombre de variable
+        _temp_log.info(f"  {key_name.upper()}: {value_setting}")
 
 except (ValidationError, ValueError) as e:
     error_details_str = ""
@@ -682,7 +680,7 @@ import os
 
 from app.application.ports.reranker_model_port import RerankerModelPort
 from app.domain.models import DocumentToRerank, RerankedDocument
-from app.core.config import settings
+from app.core.config import settings # settings ya tiene los valores validados
 
 logger = structlog.get_logger(__name__)
 
@@ -705,7 +703,7 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
         init_log = logger.bind(
             adapter_action="load_model",
             model_name=settings.MODEL_NAME,
-            device=settings.MODEL_DEVICE,
+            device=settings.MODEL_DEVICE, # Este es el valor después de la validación
             configured_hf_cache_dir=settings.HF_CACHE_DIR
         )
         init_log.info("Attempting to load CrossEncoder model...")
@@ -720,7 +718,7 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
             cls._model = CrossEncoder(
                 model_name=settings.MODEL_NAME,
                 max_length=settings.MAX_SEQ_LENGTH,
-                device=settings.MODEL_DEVICE,
+                device=settings.MODEL_DEVICE, # Usar el valor validado
             )
             
             if settings.MODEL_DEVICE.startswith("cuda") and cls._model is not None:
@@ -744,29 +742,16 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
             logger.error("Reranker model not loaded or not ready for prediction.")
             raise RuntimeError("Reranker model is not available for prediction.")
 
+        # settings.TOKENIZER_WORKERS ya ha sido validado y forzado a 0 para CUDA si es necesario.
+        num_dataloader_workers = settings.TOKENIZER_WORKERS
+
         predict_log = logger.bind(
             adapter_action="_predict_scores_async", 
             num_pairs=len(query_doc_pairs),
-            tokenizer_workers_config=settings.TOKENIZER_WORKERS 
-        )
-        
-        # Forzar num_dataloader_workers a 0 si se usa CUDA para evitar errores de "invalid resource handle"
-        # Esta lógica ahora también está en el validador de config.py, pero es bueno ser explícito aquí.
-        if settings.MODEL_DEVICE.startswith("cuda"):
-            num_dataloader_workers = 0
-            if settings.TOKENIZER_WORKERS > 0:
-                 predict_log.info( # Cambiado a info para que sea visible si se intenta usar workers con CUDA
-                    "TOKENIZER_WORKERS > 0 ignored and set to 0 because MODEL_DEVICE is cuda.",
-                    original_tokenizer_workers=settings.TOKENIZER_WORKERS
-                )
-        else:
-            num_dataloader_workers = settings.TOKENIZER_WORKERS
-        
-        predict_log.debug(
-            "Starting asynchronous prediction.",
             effective_num_dataloader_workers=num_dataloader_workers,
-            batch_size=settings.BATCH_SIZE
+            batch_size_used=settings.BATCH_SIZE
         )
+        predict_log.debug("Starting asynchronous prediction.")
         
         loop = asyncio.get_event_loop()
         try:
@@ -869,17 +854,15 @@ import uvicorn
 import asyncio
 import uuid 
 import sys 
-# import multiprocessing as mp # Ya no es necesario para mp.set_start_method
-# import torch # Ya no es necesario aquí, config.py lo usa
 
-from app.core.config import settings # settings ya tiene IS_CUDA_AVAILABLE
+# IS_CUDA_AVAILABLE se importa desde config
+from app.core.config import settings, IS_CUDA_AVAILABLE 
 from app.core.logging_config import setup_logging
 
 setup_logging() 
 logger = structlog.get_logger(settings.PROJECT_NAME.lower().replace(" ", "-") + ".main")
 
-# La configuración de multiprocessing ya no se manipula aquí.
-# Se confía en que num_workers=0 para CUDA en el adaptador evitará problemas.
+# Ya no se manipula el método de inicio de multiprocessing.
 
 from app.api.v1.endpoints import rerank_endpoint
 from app.infrastructure.rerankers.sentence_transformer_adapter import SentenceTransformerRerankerAdapter
@@ -897,13 +880,13 @@ async def lifespan(app: FastAPI):
         version="0.1.0", 
         port=settings.PORT,
         log_level=settings.LOG_LEVEL,
-        model_name=settings.MODEL_NAME,
-        model_device_configured=settings.MODEL_DEVICE,
-        cuda_available_check=settings.IS_CUDA_AVAILABLE, # Usar el check de config
-        effective_model_device=settings.MODEL_DEVICE, # Después del validador, este es el dispositivo real
-        gunicorn_workers_configured=settings.WORKERS, # Valor después del validador
-        tokenizer_workers_configured=settings.TOKENIZER_WORKERS, # Valor después del validador
-        batch_size_configured=settings.BATCH_SIZE
+        configured_model_name=settings.MODEL_NAME,
+        configured_model_device=settings.MODEL_DEVICE, # Este es el valor original de la env var o default
+        cuda_available_on_host=IS_CUDA_AVAILABLE, # Check real de torch.cuda.is_available()
+        effective_model_device=settings.MODEL_DEVICE, # Este es el valor después de la validación en config.py
+        effective_gunicorn_workers=settings.WORKERS, 
+        effective_tokenizer_workers=settings.TOKENIZER_WORKERS,
+        effective_batch_size=settings.BATCH_SIZE
     )
     
     model_adapter_instance = SentenceTransformerRerankerAdapter()
@@ -914,7 +897,7 @@ async def lifespan(app: FastAPI):
         if model_adapter_instance.is_ready(): 
             logger.info(
                 "Reranker model adapter initialized and model loaded successfully.",
-                loaded_model_name=model_adapter_instance.get_model_name() # Usar el getter
+                loaded_model_name=model_adapter_instance.get_model_name()
             )
             rerank_use_case_instance = RerankDocumentsUseCase(reranker_model=model_adapter_instance)
             set_dependencies(model_adapter=model_adapter_instance, use_case=rerank_use_case_instance)
@@ -923,7 +906,7 @@ async def lifespan(app: FastAPI):
         else:
             logger.error(
                 "Reranker model failed to load during startup. Service will be unhealthy.",
-                configured_model_name=settings.MODEL_NAME 
+                configured_model_name=settings.MODEL_NAME # Lo que se intentó cargar
             )
             SERVICE_IS_READY = False
             use_case_on_failure = RerankDocumentsUseCase(reranker_model=model_adapter_instance)
@@ -1033,8 +1016,6 @@ logger.info("API routers included.", prefix=settings.API_V1_STR)
 )
 async def health_check():
     model_status = SentenceTransformerRerankerAdapter.get_model_status()
-    # Usar settings.MODEL_NAME ya que es lo que se intentó cargar
-    # y el get_model_name() del adapter devolverá esto si la carga falló.
     current_model_name = settings.MODEL_NAME 
 
     health_log = logger.bind(service_ready_flag=SERVICE_IS_READY, model_actual_status=model_status)

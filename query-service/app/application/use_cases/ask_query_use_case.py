@@ -498,9 +498,6 @@ class AskQueryUseCase:
                 rerank_log = exec_log.bind(action="rerank_remote", num_chunks_to_rerank=len(chunks_for_llm_or_mapreduce))
                 
                 documents_for_reranker = []
-                # Map to keep track of original RetrievedChunk objects by their ID
-                # This is crucial for preserving embeddings and other original metadata.
-                # Ensure this map contains objects that *have* embeddings if they came from dense search.
                 map_id_to_original_chunk_before_rerank = {c.id: c for c in chunks_for_llm_or_mapreduce}
 
 
@@ -508,7 +505,7 @@ class AskQueryUseCase:
                     if original_chunk_obj.content and original_chunk_obj.id: 
                         documents_for_reranker.append({
                             "id": original_chunk_obj.id,
-                            "text": original_chunk_obj.content, # Use content from RetrievedChunk
+                            "text": original_chunk_obj.content, 
                             "metadata": original_chunk_obj.metadata or {} 
                         })
                 
@@ -520,13 +517,11 @@ class AskQueryUseCase:
                     }
                     try:
                         rerank_log.debug("Sending request to reranker service...")
-                        # Asegurarse que RERANKER_SERVICE_URL no tenga un "/" al final si el endpoint ya lo tiene
                         base_reranker_url = str(settings.RERANKER_SERVICE_URL).rstrip('/')
                         reranker_url = f"{base_reranker_url}/api/v1/rerank"
-                         # Si la URL base ya es .../api/v1, entonces sería base_reranker_url + "/rerank"
                         if base_reranker_url.endswith("/api/v1"):
                             reranker_url = f"{base_reranker_url.rsplit('/api/v1',1)[0]}/api/v1/rerank"
-                        elif base_reranker_url.endswith("/api"): # Menos probable pero por si acaso
+                        elif base_reranker_url.endswith("/api"): 
                             reranker_url = f"{base_reranker_url.rsplit('/api',1)[0]}/api/v1/rerank"
 
 
@@ -548,22 +543,19 @@ class AskQueryUseCase:
                                 chunk_id = reranked_item_data.get("id")
                                 new_score = reranked_item_data.get("score")
                                 
-                                # Recuperar el objeto RetrievedChunk original completo usando el ID
                                 if chunk_id in map_id_to_original_chunk_before_rerank:
                                     original_retrieved_chunk = map_id_to_original_chunk_before_rerank[chunk_id]
                                     
-                                    # Crear un nuevo RetrievedChunk o actualizar el existente,
-                                    # asegurándose de mantener el embedding y otra metadata vital.
                                     updated_chunk = RetrievedChunk(
                                         id=original_retrieved_chunk.id,
                                         content=original_retrieved_chunk.content, 
-                                        score=new_score, # Score actualizado del reranker
+                                        score=new_score, 
                                         metadata={
                                             **(original_retrieved_chunk.metadata or {}),
-                                            **(reranked_item_data.get("metadata", {})), # Merge metadata del reranker si la hay
-                                            "reranked_score": new_score # Guardar el score del reranker
+                                            **(reranked_item_data.get("metadata", {})), 
+                                            "reranked_score": new_score 
                                         },
-                                        embedding=original_retrieved_chunk.embedding, # Mantener embedding original
+                                        embedding=original_retrieved_chunk.embedding, 
                                         document_id=original_retrieved_chunk.document_id,
                                         file_name=original_retrieved_chunk.file_name,
                                         company_id=original_retrieved_chunk.company_id
@@ -581,9 +573,8 @@ class AskQueryUseCase:
                             rerank_log.warning("Reranker service response format invalid.", response_data=reranked_data)
                     except httpx.HTTPStatusError as http_err:
                         rerank_log.error("HTTP error from Reranker service", status_code=http_err.response.status_code, response_text=http_err.response.text, exc_info=False)
-                    except httpx.RequestError as req_err: # Incluye ConnectError, Timeout, etc.
-                        rerank_log.error("Request error contacting Reranker service", error_details=str(req_err), exc_info=False) # No traceback para errores de red comunes
-                        # El pipeline continuará con los chunks fusionados pero no reranqueados
+                    except httpx.RequestError as req_err: 
+                        rerank_log.error("Request error contacting Reranker service", error_details=str(req_err), exc_info=False) 
                     except Exception as e_rerank:
                         rerank_log.exception("Unexpected error during reranking call.")
                 else:
@@ -593,6 +584,81 @@ class AskQueryUseCase:
                 pipeline_stages_used.append(f"reranking ({'disabled' if not self.settings.RERANKER_ENABLED else 'skipped_no_chunks_or_content'})")
             
             num_chunks_after_rerank = len(chunks_for_llm_or_mapreduce)
+
+            # --- BEGIN CORRECTION FOR MMRDiversityFilter EMBEDDING ---
+            # Populate embeddings for chunks before sending to MMRDiversityFilter
+            if chunks_for_llm_or_mapreduce and self.diversity_filter : # Only if there are chunks and filter is active
+                pipeline_stages_used.append("embedding_population_for_mmr")
+                mmr_prep_log = exec_log.bind(action="mmr_embedding_population")
+                
+                chunk_ids_for_mmr_filter = [doc.id for doc in chunks_for_llm_or_mapreduce if doc.id]
+                mmr_prep_log.debug("Preparing embeddings for MMR", num_chunks_input=len(chunks_for_llm_or_mapreduce), num_ids_to_fetch=len(chunk_ids_for_mmr_filter))
+
+                vectors_from_milvus_by_id: Dict[str, List[float]] = {}
+                if chunk_ids_for_mmr_filter:
+                    try:
+                        vectors_from_milvus_by_id = await self.vector_store.fetch_vectors_by_ids(chunk_ids_for_mmr_filter)
+                        mmr_prep_log.info(f"Fetched {len(vectors_from_milvus_by_id)} vectors from Milvus for MMR.")
+                    except Exception as e_milvus_fetch:
+                         mmr_prep_log.error("Failed to fetch vectors from Milvus for MMR, fallback may occur.", error=str(e_milvus_fetch))
+
+                texts_needing_embedding_generation: List[str] = []
+                # Keep a mapping from original index of text to chunk object to update it later
+                map_text_index_to_chunk_obj: Dict[int, RetrievedChunk] = {} 
+                
+                # Create a new list for chunks that will go to MMR, preserving original order as much as possible
+                # but ensuring they are reconstructed with the embedding field.
+                chunks_ready_for_mmr: List[RetrievedChunk] = []
+
+                for original_chunk in chunks_for_llm_or_mapreduce:
+                    retrieved_embedding = vectors_from_milvus_by_id.get(original_chunk.id)
+                    
+                    if retrieved_embedding is None and original_chunk.content: # If Milvus didn't have it, AND content exists
+                        if original_chunk.embedding is None: # Only add to fallback if no embedding was ever present
+                            map_text_index_to_chunk_obj[len(texts_needing_embedding_generation)] = original_chunk
+                            texts_needing_embedding_generation.append(original_chunk.content)
+                            
+                    # Reconstruct the chunk. If embedding was already there (e.g. from dense_map earlier),
+                    # or fetched from Milvus now, it will be included. Otherwise, it's None for now.
+                    chunks_ready_for_mmr.append(
+                        RetrievedChunk(
+                            id=original_chunk.id,
+                            content=original_chunk.content,
+                            score=original_chunk.score,
+                            metadata=original_chunk.metadata,
+                            embedding=retrieved_embedding if retrieved_embedding else original_chunk.embedding, # Prioritize fresh Milvus fetch, then existing
+                            document_id=original_chunk.document_id,
+                            file_name=original_chunk.file_name,
+                            company_id=original_chunk.company_id
+                        )
+                    )
+                
+                if texts_needing_embedding_generation:
+                    mmr_prep_log.info(f"Requesting {len(texts_needing_embedding_generation)} missing embeddings from embedding_adapter for MMR.")
+                    try:
+                        # Call the embedding adapter to get embeddings for texts
+                        generated_embeddings_list = await self.embedding_adapter.embed_texts(texts_needing_embedding_generation)
+                        
+                        if len(generated_embeddings_list) == len(texts_needing_embedding_generation):
+                            for idx, generated_emb_vector in enumerate(generated_embeddings_list):
+                                chunk_to_update = map_text_index_to_chunk_obj[idx] 
+                                # Find the corresponding chunk in chunks_ready_for_mmr and update its embedding
+                                for ch_ready in chunks_ready_for_mmr:
+                                    if ch_ready.id == chunk_to_update.id:
+                                        ch_ready.embedding = generated_emb_vector
+                                        break
+                            mmr_prep_log.info("Successfully updated chunks with newly generated embeddings for MMR.")
+                        else:
+                            mmr_prep_log.error("Mismatch in count of generated embeddings and requested texts for MMR fallback.",
+                                               requested_count=len(texts_needing_embedding_generation),
+                                               generated_count=len(generated_embeddings_list))
+                    except Exception as e_embed_fallback:
+                        mmr_prep_log.error("Failed to generate embeddings via adapter for MMR fallback.", error=str(e_embed_fallback))
+                
+                # The list chunks_for_llm_or_mapreduce now contains chunks with embeddings populated
+                chunks_for_llm_or_mapreduce = chunks_ready_for_mmr
+            # --- END CORRECTION FOR MMRDiversityFilter EMBEDDING ---
+
 
             # Log para depurar embeddings antes del filtro MMR
             num_with_embeddings_before_mmr = sum(1 for c_chk in chunks_for_llm_or_mapreduce if c_chk.embedding is not None)

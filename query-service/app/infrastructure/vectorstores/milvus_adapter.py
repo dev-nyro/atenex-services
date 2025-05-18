@@ -2,6 +2,7 @@
 import structlog
 import asyncio
 from typing import List, Optional, Dict, Any
+import json # Importar json para la expresión 'in'
 
 from pymilvus import Collection, connections, utility, MilvusException, DataType
 from haystack import Document # Keep Haystack Document for conversion ease initially
@@ -62,9 +63,13 @@ class MilvusAdapter(VectorStorePort):
     _collection: Optional[Collection] = None
     _connected = False
     _alias = "query_service_milvus_adapter"
+    _pk_field_name: str
+    _vector_field_name: str
 
     def __init__(self):
-        pass
+        self._pk_field_name = INGEST_SCHEMA_FIELDS["pk"]
+        self._vector_field_name = INGEST_SCHEMA_FIELDS["vector"]
+
 
     async def _ensure_connection(self):
         """Ensures connection to Milvus is established."""
@@ -130,13 +135,13 @@ class MilvusAdapter(VectorStorePort):
         try:
             collection = await self._get_collection()
 
-            search_params = settings.MILVUS_SEARCH_PARAMS.copy() # Use a copy to avoid modifying global settings
+            search_params = settings.MILVUS_SEARCH_PARAMS.copy() 
             filter_expr = f'{INGEST_SCHEMA_FIELDS["company"]} == "{company_id}"'
             search_log.debug("Using filter expression", expr=filter_expr)
 
             required_output_fields_set = {
-                INGEST_SCHEMA_FIELDS["pk"],
-                INGEST_SCHEMA_FIELDS["vector"],
+                self._pk_field_name,
+                self._vector_field_name,
                 INGEST_SCHEMA_FIELDS["content"],
                 INGEST_SCHEMA_FIELDS["company"],
                 INGEST_SCHEMA_FIELDS["document"],
@@ -146,7 +151,7 @@ class MilvusAdapter(VectorStorePort):
             output_fields_list = list(required_output_fields_set)
 
             search_log.debug("Performing Milvus vector search...",
-                             vector_field=INGEST_SCHEMA_FIELDS["vector"],
+                             vector_field=self._vector_field_name,
                              output_fields=output_fields_list)
 
             loop = asyncio.get_running_loop()
@@ -154,12 +159,12 @@ class MilvusAdapter(VectorStorePort):
                 None,
                 lambda: collection.search(
                     data=[embedding],
-                    anns_field=INGEST_SCHEMA_FIELDS["vector"],
+                    anns_field=self._vector_field_name,
                     param=search_params,
                     limit=top_k,
                     expr=filter_expr,
                     output_fields=output_fields_list,
-                    consistency_level="Strong" # Recommended for RAG consistency
+                    consistency_level="Strong" 
                 )
             )
 
@@ -169,12 +174,13 @@ class MilvusAdapter(VectorStorePort):
             if search_results and search_results[0]:
                 for hit in search_results[0]:
                     entity_data = hit.entity.to_dict() if hasattr(hit, 'entity') and hasattr(hit.entity, 'to_dict') else {}
-
-                    pk_id = str(hit.id)
+                    
+                    # hit.id es el PK
+                    pk_id = str(hit.id) 
                     content = entity_data.get(INGEST_SCHEMA_FIELDS["content"], "")
-                    embedding_vector = entity_data.get(INGEST_SCHEMA_FIELDS["vector"])
+                    embedding_vector = entity_data.get(self._vector_field_name)
 
-                    metadata_dict = {k: v for k, v in entity_data.items() if k != INGEST_SCHEMA_FIELDS["vector"]}
+                    metadata_dict = {k: v for k, v in entity_data.items() if k != self._vector_field_name}
                     
                     doc_id_val = metadata_dict.get(INGEST_SCHEMA_FIELDS["document"])
                     comp_id_val = metadata_dict.get(INGEST_SCHEMA_FIELDS["company"])
@@ -201,6 +207,54 @@ class MilvusAdapter(VectorStorePort):
         except Exception as e:
             search_log.exception("Unexpected error during Milvus search")
             raise ConnectionError(f"Vector DB search service error: {e}") from e
+
+    async def fetch_vectors_by_ids(
+        self,
+        ids: List[str],
+        *,
+        collection_name: str | None = None,
+    ) -> Dict[str, List[float]]:
+        """
+        Devuelve un dict {id: embedding}. Si Milvus no encuentra alguno, no lo incluye.
+        """
+        fetch_log = log.bind(adapter="MilvusAdapter", action="fetch_vectors_by_ids", num_ids=len(ids))
+        if not ids:
+            fetch_log.debug("No IDs provided, returning empty dict.")
+            return {}
+
+        try:
+            _collection_obj = await self._get_collection()
+            
+            # Milvus 'in' operator expects a list of strings or numbers. JSON dump for safety with strings.
+            ids_json_array_str = json.dumps(ids)
+            expr = f'{self._pk_field_name} in {ids_json_array_str}'
+            
+            fetch_log.debug("Querying Milvus for vectors by PKs", expr=expr, pk_field=self._pk_field_name, vector_field=self._vector_field_name)
+
+            output_fields_to_fetch = [self._pk_field_name, self._vector_field_name]
+
+            loop = asyncio.get_running_loop()
+            res = await loop.run_in_executor(
+                None,
+                lambda: _collection_obj.query(
+                    expr=expr,
+                    output_fields=output_fields_to_fetch,
+                    consistency_level="Strong"
+                )
+            )
+            
+            # Milvus query devuelve List[Dict]; lo convertimos a {id: vec}
+            # El PK devuelto por query estará en el campo self._pk_field_name
+            fetched_vectors = {row[self._pk_field_name]: row[self._vector_field_name] for row in res if self._pk_field_name in row and self._vector_field_name in row}
+            fetch_log.info(f"Fetched {len(fetched_vectors)} vectors from Milvus out of {len(ids)} requested.")
+            return fetched_vectors
+        except MilvusException as me:
+            fetch_log.error("Milvus query for vectors by IDs failed", error_code=me.code, error_message=me.message)
+            raise ConnectionError(f"Vector DB query error (Code: {me.code}): {me.message}") from me
+        except Exception as e:
+            fetch_log.exception("Unexpected error during Milvus vector fetch by IDs")
+            raise ConnectionError(f"Vector DB query service error: {e}") from e
+
 
     async def connect(self):
         """Explicitly ensures connection (can be called during startup if needed)."""
