@@ -3,7 +3,7 @@ from datetime import date # Asegurar que date está importado
 from app.api.v1.schemas import DocumentStatsResponse, DocumentStatsByStatus, DocumentStatsByType # Importar nuevos schemas
 
 @router.get(
-    "/documents/stats",
+    "/stats",
     response_model=DocumentStatsResponse,
     summary="Get aggregated document statistics for a company",
     description="Provides aggregated statistics about documents for the specified company, with optional filters.",
