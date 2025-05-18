@@ -364,6 +364,7 @@ from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, field_validator, ValidationInfo, ValidationError, AnyHttpUrl
 import json
+import torch # Para verificar IS_CUDA
 
 # --- Default Values ---
 DEFAULT_MODEL_NAME = "BAAI/bge-reranker-base"
@@ -371,12 +372,18 @@ DEFAULT_MODEL_DEVICE = "cpu"
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_PORT = 8004
 DEFAULT_HF_CACHE_DIR = "/app/.cache/huggingface"
-DEFAULT_BATCH_SIZE = 128 
 DEFAULT_MAX_SEQ_LENGTH = 512
-# Para GPU, empezar con 1 o 2 workers es a menudo óptimo.
-# Puedes aumentar y monitorear el rendimiento y uso de VRAM.
-DEFAULT_GUNICORN_WORKERS = 2 
-DEFAULT_TOKENIZER_WORKERS = 1 # Workers para la tokenización en CPU
+
+# Ajustes dinámicos basados en disponibilidad de CUDA
+IS_CUDA_AVAILABLE = torch.cuda.is_available()
+
+DEFAULT_BATCH_SIZE = 64 if IS_CUDA_AVAILABLE else 128
+# Con mp.set_start_method('spawn'), podemos usar workers para tokenización incluso con CUDA.
+# 0 significa tokenización secuencial. >0 para paralelizar en CPU.
+DEFAULT_TOKENIZER_WORKERS = 2 if IS_CUDA_AVAILABLE else 2 # Ajustar según CPUs disponibles
+# Para GPU, 1 worker Gunicorn suele ser un buen punto de partida para evitar contención de GPU.
+# Para CPU, podemos usar más, basado en cores.
+DEFAULT_GUNICORN_WORKERS = 1 if IS_CUDA_AVAILABLE else 2
 
 
 class Settings(BaseSettings):
@@ -402,7 +409,8 @@ class Settings(BaseSettings):
     MAX_SEQ_LENGTH: int = Field(default=DEFAULT_MAX_SEQ_LENGTH, gt=0)
 
     WORKERS: int = Field(default=DEFAULT_GUNICORN_WORKERS, gt=0)
-    TOKENIZER_WORKERS: int = Field(default=DEFAULT_TOKENIZER_WORKERS, ge=0) # 0 para secuencial, >=1 para paralelo
+    # TOKENIZER_WORKERS: ge=0 (0 para secuencial, >=1 para paralelo)
+    TOKENIZER_WORKERS: int = Field(default=DEFAULT_TOKENIZER_WORKERS, ge=0)
 
     @field_validator('LOG_LEVEL')
     @classmethod
@@ -416,8 +424,12 @@ class Settings(BaseSettings):
     @field_validator('MODEL_DEVICE')
     @classmethod
     def check_model_device(cls, v: str) -> str:
-        allowed_devices_prefixes = ["cpu", "cuda", "mps"]
         normalized_v = v.lower()
+        if normalized_v == "cuda" and not IS_CUDA_AVAILABLE:
+            logging.warning("MODEL_DEVICE set to 'cuda' but CUDA is not available. Falling back to 'cpu'.")
+            return "cpu"
+        
+        allowed_devices_prefixes = ["cpu", "cuda", "mps"]
         if not any(normalized_v.startswith(prefix) for prefix in allowed_devices_prefixes):
             logging.warning(f"MODEL_DEVICE '{v}' is unusual. Ensure it's a valid device string for PyTorch/sentence-transformers.")
         return normalized_v
@@ -434,6 +446,7 @@ if not _temp_log.handlers:
 
 try:
     _temp_log.info("Loading Reranker Service settings...")
+    _temp_log.info(f"CUDA Available Check: {IS_CUDA_AVAILABLE}")
     settings = Settings()
     _temp_log.info("Reranker Service Settings Loaded Successfully:")
     log_data = settings.model_dump() 
@@ -663,6 +676,7 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
     def load_model(cls):
         """
         Loads the CrossEncoder model based on settings.
+        Applies FP16 optimization if on CUDA.
         """
         if cls._model_status == "loaded" and cls._model_name_loaded == settings.MODEL_NAME:
             logger.info("Reranker model already loaded and configured.", model_name=settings.MODEL_NAME)
@@ -689,7 +703,17 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
                 model_name=settings.MODEL_NAME,
                 max_length=settings.MAX_SEQ_LENGTH,
                 device=settings.MODEL_DEVICE,
+                # trust_remote_code=True # Solo si es necesario para modelos específicos
             )
+            
+            # Optimización en GPU: FP16
+            if settings.MODEL_DEVICE.startswith("cuda") and cls._model is not None:
+                try:
+                    cls._model.model.half() # type: ignore
+                    init_log.info("CrossEncoder model converted to FP16 for GPU optimization.")
+                except Exception as e_fp16:
+                    init_log.warning("Failed to convert CrossEncoder model to FP16.", error_message=str(e_fp16))
+
             load_time = time.time() - start_time
             cls._model_name_loaded = settings.MODEL_NAME
             cls._model_status = "loaded"
@@ -702,6 +726,7 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
     async def _predict_scores_async(self, query_doc_pairs: List[Tuple[str, str]]) -> List[float]:
         """
         Performs model prediction asynchronously in a thread pool.
+        Uses TOKENIZER_WORKERS from settings.
         """
         if not self.is_ready() or SentenceTransformerRerankerAdapter._model is None:
             logger.error("Reranker model not loaded or not ready for prediction.")
@@ -710,23 +735,23 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
         predict_log = logger.bind(
             adapter_action="_predict_scores_async", 
             num_pairs=len(query_doc_pairs),
-            tokenizer_workers=settings.TOKENIZER_WORKERS
+            tokenizer_workers_setting=settings.TOKENIZER_WORKERS # Log el valor de la config
             )
-        predict_log.debug("Starting asynchronous prediction.")
+        
+        # El número de workers para DataLoader vendrá directamente de la configuración.
+        # Si es 0, la tokenización es secuencial en el hilo principal.
+        # Si es >0 y mp.set_start_method('spawn') está activo para CUDA, funcionará.
+        num_dataloader_workers = settings.TOKENIZER_WORKERS
+        predict_log.debug(f"Starting asynchronous prediction with num_dataloader_workers={num_dataloader_workers}.")
         
         loop = asyncio.get_event_loop()
         try:
-            # Use settings.TOKENIZER_WORKERS for num_workers in model.predict
-            # 0 means tokenization runs in the main process used by run_in_executor.
-            # >=1 means it uses a torch.utils.data.DataLoader for parallel tokenization.
-            internal_num_workers = settings.TOKENIZER_WORKERS
-            
             predict_task_with_args = functools.partial(
                 SentenceTransformerRerankerAdapter._model.predict,
                 query_doc_pairs,  
                 batch_size=settings.BATCH_SIZE,
                 show_progress_bar=False,
-                num_workers=internal_num_workers,
+                num_workers=num_dataloader_workers, # Usar el valor de settings
                 activation_fct=None, 
                 apply_softmax=False, 
                 convert_to_numpy=True, 
@@ -748,9 +773,6 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
     async def rerank(
         self, query: str, documents: List[DocumentToRerank]
     ) -> List[RerankedDocument]:
-        """
-        Reranks documents based on the query using the loaded CrossEncoder model.
-        """
         rerank_log = logger.bind(
             adapter_action="rerank", 
             query_preview=query[:50]+"..." if len(query) > 50 else query,
@@ -800,7 +822,9 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
         return reranked_docs_with_scores
 
     def get_model_name(self) -> str:
-        return settings.MODEL_NAME 
+        # Devuelve el nombre del modelo que se intentó cargar según la configuración,
+        # o el nombre del modelo cargado si tuvo éxito.
+        return SentenceTransformerRerankerAdapter._model_name_loaded or settings.MODEL_NAME
 
     def is_ready(self) -> bool:
         return SentenceTransformerRerankerAdapter._model is not None and \
@@ -822,37 +846,51 @@ import structlog
 import uvicorn 
 import asyncio
 import uuid 
-import sys # Necesario para sys.argv
-import multiprocessing as mp # Necesario para set_start_method
+import sys 
+import multiprocessing as mp 
+import torch # Para verificar disponibilidad de CUDA al inicio
 
 from app.core.config import settings
 from app.core.logging_config import setup_logging
 
-setup_logging() # Configurar logging primero
+setup_logging() 
 logger = structlog.get_logger(settings.PROJECT_NAME.lower().replace(" ", "-") + ".main")
 
+# --- Configuración de Multiprocessing para CUDA ---
+# Debe ejecutarse ANTES de que PyTorch/CUDA se inicialice en los workers de Gunicorn/Uvicorn.
+# Esta variable global ayuda a asegurar que solo se intente una vez por proceso.
+_MP_START_METHOD_SET = False
 
-# --- Configuración de Multiprocessing para CUDA con Gunicorn/Uvicorn ---
-# Esto debe hacerse ANTES de que PyTorch/CUDA se inicialice en los workers.
-# La condición verifica si se está ejecutando bajo Gunicorn o Uvicorn directamente.
-# El módulo 'main' se carga una vez por worker de Gunicorn.
-if "gunicorn" in sys.argv[0] or "uvicorn" in sys.argv[0] or __name__ == "app.main":
+def _configure_mp_for_cuda():
+    global _MP_START_METHOD_SET
+    if _MP_START_METHOD_SET:
+        return
+
     if settings.MODEL_DEVICE.startswith("cuda"):
+        # Solo intentar cambiar si el método actual no es 'spawn'.
+        # En Windows, el default ya es 'spawn'. En Linux es 'fork'.
         current_start_method = mp.get_start_method(allow_none=True)
-        if current_start_method != 'spawn':
+        if sys.platform != "win32" and current_start_method != 'spawn':
             try:
                 mp.set_start_method('spawn', force=True)
                 logger.info(
                     "Successfully set multiprocessing start method to 'spawn' for CUDA compatibility.",
-                    current_method_was=current_start_method
+                    previous_method=current_start_method
                 )
             except RuntimeError as e:
+                # Esto puede ocurrir si ya se ha configurado o si el contexto es incorrecto.
                 logger.warning(
                     f"Could not set multiprocessing start method to 'spawn': {e}. Current method: {current_start_method}",
-                    exc_info=True
+                    exc_info=False # No es necesario el traceback completo para una advertencia.
                 )
-        else:
+        elif current_start_method == 'spawn':
             logger.info("Multiprocessing start method already set to 'spawn'.")
+        else: # Plataforma Windows donde spawn ya es el default
+             logger.info(f"Running on {sys.platform}, default start method is '{current_start_method}'. No change needed for 'spawn'.")
+    _MP_START_METHOD_SET = True
+
+# Llamar a la configuración aquí, se ejecutará cuando se importe main.py en cada worker.
+_configure_mp_for_cuda()
 
 
 from app.api.v1.endpoints import rerank_endpoint
@@ -872,25 +910,27 @@ async def lifespan(app: FastAPI):
         port=settings.PORT,
         log_level=settings.LOG_LEVEL,
         model_device=settings.MODEL_DEVICE,
-        tokenizer_workers=settings.TOKENIZER_WORKERS
+        gunicorn_workers=settings.WORKERS,
+        tokenizer_workers=settings.TOKENIZER_WORKERS,
+        batch_size=settings.BATCH_SIZE
     )
     
-    model_adapter = SentenceTransformerRerankerAdapter()
+    # Asegurar que la config de MP se haya intentado (debería haberse ejecutado al importar)
+    _configure_mp_for_cuda()
+
+    model_adapter_instance = SentenceTransformerRerankerAdapter()
     
     try:
-        # La carga del modelo es bloqueante, ejecutar en thread pool
         await asyncio.to_thread(SentenceTransformerRerankerAdapter.load_model) 
         
-        if model_adapter.is_ready(): 
+        if model_adapter_instance.is_ready(): 
             logger.info(
                 "Reranker model adapter initialized and model loaded successfully.",
-                model_name=model_adapter.get_model_name()
+                model_name=model_adapter_instance.get_model_name()
             )
-            # El use case no necesita ser `None` si el adapter no está listo,
-            # la lógica de `get_rerank_use_case` lo manejará.
-            rerank_use_case = RerankDocumentsUseCase(reranker_model=model_adapter)
-            set_dependencies(model_adapter=model_adapter, use_case=rerank_use_case)
-            SERVICE_IS_READY = True # Solo si el modelo se carga bien.
+            rerank_use_case_instance = RerankDocumentsUseCase(reranker_model=model_adapter_instance)
+            set_dependencies(model_adapter=model_adapter_instance, use_case=rerank_use_case_instance)
+            SERVICE_IS_READY = True 
             logger.info(f"{settings.PROJECT_NAME} is ready to serve requests.")
         else:
             logger.error(
@@ -898,13 +938,11 @@ async def lifespan(app: FastAPI):
                 model_name=settings.MODEL_NAME 
             )
             SERVICE_IS_READY = False
-            # Aun así, configurar las dependencias para que el health check pueda obtener el estado del modelo.
-            # Si rerank_use_case no se puede instanciar sin un modelo_adapter válido,
-            # entonces el use_case podría ser None aquí y get_rerank_use_case fallaría.
-            # Asumimos que el use_case puede tomar un adapter no listo.
-            rerank_use_case_on_fail = RerankDocumentsUseCase(reranker_model=model_adapter)
-            set_dependencies(model_adapter=model_adapter, use_case=rerank_use_case_on_fail)
-
+            # Configurar dependencias incluso si el modelo no está listo para que el health check pueda obtener el estado
+            # Si RerankDocumentsUseCase requiere un adapter funcional, esto podría necesitar ajuste.
+            # Por ahora, se asume que puede instanciarse con un adapter no listo.
+            use_case_on_failure = RerankDocumentsUseCase(reranker_model=model_adapter_instance)
+            set_dependencies(model_adapter=model_adapter_instance, use_case=use_case_on_failure)
 
     except Exception as e:
         logger.fatal(
@@ -913,16 +951,14 @@ async def lifespan(app: FastAPI):
             exc_info=True
         )
         SERVICE_IS_READY = False
-        # Intentar configurar dependencias incluso en fallo para diagnósticos
-        failed_adapter = model_adapter if 'model_adapter' in locals() else SentenceTransformerRerankerAdapter() # Crea una instancia si no existe
-        failed_use_case = RerankDocumentsUseCase(reranker_model=failed_adapter)
-        set_dependencies(model_adapter=failed_adapter, use_case=failed_use_case)
-
+        # En caso de error fatal, intentar establecer dependencias con el estado actual para diagnósticos
+        # Esto podría fallar si model_adapter_instance no se inicializó, de ahí el try-except implícito.
+        _sa = model_adapter_instance if 'model_adapter_instance' in locals() else SentenceTransformerRerankerAdapter()
+        _ruc = RerankDocumentsUseCase(reranker_model=_sa)
+        set_dependencies(model_adapter=_sa, use_case=_ruc)
 
     yield 
     logger.info(f"{settings.PROJECT_NAME} service shutting down...")
-    # Aquí podrías añadir lógica de limpieza si fuera necesario, como liberar recursos de GPU explícitamente.
-    # Sin embargo, Python y PyTorch suelen manejar esto bien al salir.
     logger.info(f"{settings.PROJECT_NAME} has been shut down.")
 
 app = FastAPI(
@@ -1050,38 +1086,20 @@ async def root_redirect():
         f"{settings.PROJECT_NAME} is running. See {settings.API_V1_STR}/docs for API documentation."
     )
 
-# La ejecución con `if __name__ == "__main__":` es para desarrollo local con `python app/main.py`
-# Gunicorn ejecutará el archivo directamente, por lo que el bloque de `set_start_method` anterior se ejecutará.
 if __name__ == "__main__":
-    # Para desarrollo local, también es bueno establecer el método de inicio si se usa CUDA
-    if settings.MODEL_DEVICE.startswith("cuda"):
-        current_start_method = mp.get_start_method(allow_none=True)
-        if current_start_method != 'spawn':
-            try:
-                mp.set_start_method('spawn', force=True)
-                logger.info(
-                    "LOCAL DEV: Successfully set multiprocessing start method to 'spawn' for CUDA.",
-                     current_method_was=current_start_method
-                )
-            except RuntimeError as e:
-                 logger.warning(
-                    f"LOCAL DEV: Could not set multiprocessing start method to 'spawn': {e}. Current: {current_start_method}",
-                    exc_info=True
-                )
-        else:
-            logger.info("LOCAL DEV: Multiprocessing start method already 'spawn'.")
-
-    logger.info(f"Starting {settings.PROJECT_NAME} locally with Uvicorn...")
+    # Para desarrollo local directo con `python app/main.py`,
+    # _configure_mp_for_cuda() ya se habrá llamado al importar.
+    # No es necesario llamarlo de nuevo aquí explícitamente si está al inicio del script.
+    logger.info(f"Starting {settings.PROJECT_NAME} locally with Uvicorn (direct run)...")
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0", 
         port=settings.PORT,
         log_level=settings.LOG_LEVEL.lower(), 
-        reload=True 
-        # reload_dirs=["app"] # Opcional si el reload simple no es suficiente
+        reload=True
     )
 
-# JFU 
+# JFU
 ```
 
 ## File: `app\utils\__init__.py`

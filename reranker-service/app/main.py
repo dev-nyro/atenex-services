@@ -8,51 +8,17 @@ import uvicorn
 import asyncio
 import uuid 
 import sys 
-import multiprocessing as mp 
-import torch # Para verificar disponibilidad de CUDA al inicio
+# import multiprocessing as mp # Ya no es necesario para mp.set_start_method
+# import torch # Ya no es necesario aquí, config.py lo usa
 
-from app.core.config import settings
+from app.core.config import settings # settings ya tiene IS_CUDA_AVAILABLE
 from app.core.logging_config import setup_logging
 
 setup_logging() 
 logger = structlog.get_logger(settings.PROJECT_NAME.lower().replace(" ", "-") + ".main")
 
-# --- Configuración de Multiprocessing para CUDA ---
-# Debe ejecutarse ANTES de que PyTorch/CUDA se inicialice en los workers de Gunicorn/Uvicorn.
-# Esta variable global ayuda a asegurar que solo se intente una vez por proceso.
-_MP_START_METHOD_SET = False
-
-def _configure_mp_for_cuda():
-    global _MP_START_METHOD_SET
-    if _MP_START_METHOD_SET:
-        return
-
-    if settings.MODEL_DEVICE.startswith("cuda"):
-        # Solo intentar cambiar si el método actual no es 'spawn'.
-        # En Windows, el default ya es 'spawn'. En Linux es 'fork'.
-        current_start_method = mp.get_start_method(allow_none=True)
-        if sys.platform != "win32" and current_start_method != 'spawn':
-            try:
-                mp.set_start_method('spawn', force=True)
-                logger.info(
-                    "Successfully set multiprocessing start method to 'spawn' for CUDA compatibility.",
-                    previous_method=current_start_method
-                )
-            except RuntimeError as e:
-                # Esto puede ocurrir si ya se ha configurado o si el contexto es incorrecto.
-                logger.warning(
-                    f"Could not set multiprocessing start method to 'spawn': {e}. Current method: {current_start_method}",
-                    exc_info=False # No es necesario el traceback completo para una advertencia.
-                )
-        elif current_start_method == 'spawn':
-            logger.info("Multiprocessing start method already set to 'spawn'.")
-        else: # Plataforma Windows donde spawn ya es el default
-             logger.info(f"Running on {sys.platform}, default start method is '{current_start_method}'. No change needed for 'spawn'.")
-    _MP_START_METHOD_SET = True
-
-# Llamar a la configuración aquí, se ejecutará cuando se importe main.py en cada worker.
-_configure_mp_for_cuda()
-
+# La configuración de multiprocessing ya no se manipula aquí.
+# Se confía en que num_workers=0 para CUDA en el adaptador evitará problemas.
 
 from app.api.v1.endpoints import rerank_endpoint
 from app.infrastructure.rerankers.sentence_transformer_adapter import SentenceTransformerRerankerAdapter
@@ -70,15 +36,15 @@ async def lifespan(app: FastAPI):
         version="0.1.0", 
         port=settings.PORT,
         log_level=settings.LOG_LEVEL,
-        model_device=settings.MODEL_DEVICE,
-        gunicorn_workers=settings.WORKERS,
-        tokenizer_workers=settings.TOKENIZER_WORKERS,
-        batch_size=settings.BATCH_SIZE
+        model_name=settings.MODEL_NAME,
+        model_device_configured=settings.MODEL_DEVICE,
+        cuda_available_check=settings.IS_CUDA_AVAILABLE, # Usar el check de config
+        effective_model_device=settings.MODEL_DEVICE, # Después del validador, este es el dispositivo real
+        gunicorn_workers_configured=settings.WORKERS, # Valor después del validador
+        tokenizer_workers_configured=settings.TOKENIZER_WORKERS, # Valor después del validador
+        batch_size_configured=settings.BATCH_SIZE
     )
     
-    # Asegurar que la config de MP se haya intentado (debería haberse ejecutado al importar)
-    _configure_mp_for_cuda()
-
     model_adapter_instance = SentenceTransformerRerankerAdapter()
     
     try:
@@ -87,7 +53,7 @@ async def lifespan(app: FastAPI):
         if model_adapter_instance.is_ready(): 
             logger.info(
                 "Reranker model adapter initialized and model loaded successfully.",
-                model_name=model_adapter_instance.get_model_name()
+                loaded_model_name=model_adapter_instance.get_model_name() # Usar el getter
             )
             rerank_use_case_instance = RerankDocumentsUseCase(reranker_model=model_adapter_instance)
             set_dependencies(model_adapter=model_adapter_instance, use_case=rerank_use_case_instance)
@@ -96,12 +62,9 @@ async def lifespan(app: FastAPI):
         else:
             logger.error(
                 "Reranker model failed to load during startup. Service will be unhealthy.",
-                model_name=settings.MODEL_NAME 
+                configured_model_name=settings.MODEL_NAME 
             )
             SERVICE_IS_READY = False
-            # Configurar dependencias incluso si el modelo no está listo para que el health check pueda obtener el estado
-            # Si RerankDocumentsUseCase requiere un adapter funcional, esto podría necesitar ajuste.
-            # Por ahora, se asume que puede instanciarse con un adapter no listo.
             use_case_on_failure = RerankDocumentsUseCase(reranker_model=model_adapter_instance)
             set_dependencies(model_adapter=model_adapter_instance, use_case=use_case_on_failure)
 
@@ -112,8 +75,6 @@ async def lifespan(app: FastAPI):
             exc_info=True
         )
         SERVICE_IS_READY = False
-        # En caso de error fatal, intentar establecer dependencias con el estado actual para diagnósticos
-        # Esto podría fallar si model_adapter_instance no se inicializó, de ahí el try-except implícito.
         _sa = model_adapter_instance if 'model_adapter_instance' in locals() else SentenceTransformerRerankerAdapter()
         _ruc = RerankDocumentsUseCase(reranker_model=_sa)
         set_dependencies(model_adapter=_sa, use_case=_ruc)
@@ -211,6 +172,8 @@ logger.info("API routers included.", prefix=settings.API_V1_STR)
 )
 async def health_check():
     model_status = SentenceTransformerRerankerAdapter.get_model_status()
+    # Usar settings.MODEL_NAME ya que es lo que se intentó cargar
+    # y el get_model_name() del adapter devolverá esto si la carga falló.
     current_model_name = settings.MODEL_NAME 
 
     health_log = logger.bind(service_ready_flag=SERVICE_IS_READY, model_actual_status=model_status)
@@ -248,9 +211,6 @@ async def root_redirect():
     )
 
 if __name__ == "__main__":
-    # Para desarrollo local directo con `python app/main.py`,
-    # _configure_mp_for_cuda() ya se habrá llamado al importar.
-    # No es necesario llamarlo de nuevo aquí explícitamente si está al inicio del script.
     logger.info(f"Starting {settings.PROJECT_NAME} locally with Uvicorn (direct run)...")
     uvicorn.run(
         "app.main:app",

@@ -30,6 +30,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     APP_HOME="/app" \
     RERANKER_PORT_DEFAULT=8004 \
     RERANKER_WORKERS_DEFAULT=2 \
+    # AÑADIR ESTOS DEFAULTS SEGUROS PARA CUDA:
+    RERANKER_MODEL_DEVICE_DEFAULT=gpu \
+    RERANKER_GUNICORN_WORKERS_CUDA_DEFAULT=1 \
+    RERANKER_TOKENIZER_WORKERS_CUDA_DEFAULT=0 \
     HF_HOME="/app/.cache/huggingface" \
     TRANSFORMERS_CACHE="/app/.cache/huggingface"
 
@@ -45,4 +49,6 @@ RUN mkdir -p ${HF_HOME} && \
 
 EXPOSE ${RERANKER_PORT:-${RERANKER_PORT_DEFAULT}}
 
+# El CMD usará las variables de entorno RERANKER_WORKERS y RERANKER_TOKENIZER_WORKERS
+# que serán validadas y posiblemente forzadas por config.py si se usa CUDA.
 CMD sh -c "exec gunicorn -k uvicorn.workers.UvicornWorker app.main:app --bind 0.0.0.0:${RERANKER_PORT:-${RERANKER_PORT_DEFAULT}} --workers ${RERANKER_WORKERS:-${RERANKER_WORKERS_DEFAULT}} --timeout 120"

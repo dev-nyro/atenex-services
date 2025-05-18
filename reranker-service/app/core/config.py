@@ -5,7 +5,9 @@ from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, field_validator, ValidationInfo, ValidationError, AnyHttpUrl
 import json
-import torch # Para verificar IS_CUDA
+import torch 
+
+IS_CUDA_AVAILABLE = torch.cuda.is_available()
 
 # --- Default Values ---
 DEFAULT_MODEL_NAME = "BAAI/bge-reranker-base"
@@ -15,16 +17,11 @@ DEFAULT_PORT = 8004
 DEFAULT_HF_CACHE_DIR = "/app/.cache/huggingface"
 DEFAULT_MAX_SEQ_LENGTH = 512
 
-# Ajustes dinámicos basados en disponibilidad de CUDA
-IS_CUDA_AVAILABLE = torch.cuda.is_available()
-
+# Ajustes basados en disponibilidad de CUDA
 DEFAULT_BATCH_SIZE = 64 if IS_CUDA_AVAILABLE else 128
-# Con mp.set_start_method('spawn'), podemos usar workers para tokenización incluso con CUDA.
-# 0 significa tokenización secuencial. >0 para paralelizar en CPU.
-DEFAULT_TOKENIZER_WORKERS = 2 if IS_CUDA_AVAILABLE else 2 # Ajustar según CPUs disponibles
-# Para GPU, 1 worker Gunicorn suele ser un buen punto de partida para evitar contención de GPU.
-# Para CPU, podemos usar más, basado en cores.
-DEFAULT_GUNICORN_WORKERS = 1 if IS_CUDA_AVAILABLE else 2
+DEFAULT_GUNICORN_WORKERS = 1 if IS_CUDA_AVAILABLE else 2 
+# Forzar 0 para tokenizer workers con CUDA para evitar problemas de multiprocessing.
+DEFAULT_TOKENIZER_WORKERS = 0 if IS_CUDA_AVAILABLE else 2 
 
 
 class Settings(BaseSettings):
@@ -50,7 +47,6 @@ class Settings(BaseSettings):
     MAX_SEQ_LENGTH: int = Field(default=DEFAULT_MAX_SEQ_LENGTH, gt=0)
 
     WORKERS: int = Field(default=DEFAULT_GUNICORN_WORKERS, gt=0)
-    # TOKENIZER_WORKERS: ge=0 (0 para secuencial, >=1 para paralelo)
     TOKENIZER_WORKERS: int = Field(default=DEFAULT_TOKENIZER_WORKERS, ge=0)
 
     @field_validator('LOG_LEVEL')
@@ -64,16 +60,48 @@ class Settings(BaseSettings):
 
     @field_validator('MODEL_DEVICE')
     @classmethod
-    def check_model_device(cls, v: str) -> str:
+    def check_model_device(cls, v: str, info: ValidationInfo) -> str:
         normalized_v = v.lower()
         if normalized_v == "cuda" and not IS_CUDA_AVAILABLE:
-            logging.warning("MODEL_DEVICE set to 'cuda' but CUDA is not available. Falling back to 'cpu'.")
+            # Usar el logger global aquí podría ser problemático si aún no está configurado.
+            # Usar logging estándar para este caso.
+            logging.getLogger("reranker_service.config.validator").warning(
+                "MODEL_DEVICE set to 'cuda' but CUDA is not available. Falling back to 'cpu'."
+            )
             return "cpu"
         
         allowed_devices_prefixes = ["cpu", "cuda", "mps"]
         if not any(normalized_v.startswith(prefix) for prefix in allowed_devices_prefixes):
-            logging.warning(f"MODEL_DEVICE '{v}' is unusual. Ensure it's a valid device string for PyTorch/sentence-transformers.")
+            logging.getLogger("reranker_service.config.validator").warning(
+                f"MODEL_DEVICE '{v}' is unusual. Ensure it's a valid device string for PyTorch/sentence-transformers."
+            )
         return normalized_v
+
+    # Validadores para asegurar configuración segura con CUDA
+    @field_validator('WORKERS')
+    @classmethod
+    def limit_gunicorn_workers_on_cuda(cls, v: int, info: ValidationInfo) -> int:
+        # info.data ya tiene los valores parseados hasta este punto
+        model_device_val = info.data.get('MODEL_DEVICE', DEFAULT_MODEL_DEVICE) # Usar default si no está aún
+        if model_device_val.startswith('cuda') and v > 1:
+            logging.getLogger("reranker_service.config.validator").warning(
+                f"RERANKER_WORKERS (Gunicorn workers) was {v}, but MODEL_DEVICE is '{model_device_val}'. "
+                "Forcing WORKERS=1 with GPU to prevent resource contention and potential CUDA errors."
+            )
+            return 1
+        return v
+
+    @field_validator('TOKENIZER_WORKERS')
+    @classmethod
+    def force_tokenizer_workers_zero_on_cuda(cls, v: int, info: ValidationInfo) -> int:
+        model_device_val = info.data.get('MODEL_DEVICE', DEFAULT_MODEL_DEVICE)
+        if model_device_val.startswith('cuda') and v > 0:
+            logging.getLogger("reranker_service.config.validator").warning(
+                f"RERANKER_TOKENIZER_WORKERS was {v}, but MODEL_DEVICE is '{model_device_val}'. "
+                "Forcing TOKENIZER_WORKERS=0 with GPU to ensure stability (avoids multiprocessing for tokenization)."
+            )
+            return 0
+        return v
 
 
 # --- Global Settings Instance ---
@@ -87,9 +115,9 @@ if not _temp_log.handlers:
 
 try:
     _temp_log.info("Loading Reranker Service settings...")
-    _temp_log.info(f"CUDA Available Check: {IS_CUDA_AVAILABLE}")
-    settings = Settings()
-    _temp_log.info("Reranker Service Settings Loaded Successfully:")
+    _temp_log.info(f"torch.cuda.is_available() Check: {IS_CUDA_AVAILABLE}")
+    settings = Settings() # Los validadores se ejecutan aquí
+    _temp_log.info("Reranker Service Settings Loaded and Validated Successfully:")
     log_data = settings.model_dump() 
     for key, value in log_data.items():
         _temp_log.info(f"  {key.upper()}: {value}")
