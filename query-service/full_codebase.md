@@ -1620,7 +1620,7 @@ DEFAULT_REDUCE_PROMPT_TEMPLATE_PATH = str(PROMPT_DIR / "reduce_prompt_template_v
 
 
 # Models
-DEFAULT_EMBEDDING_DIMENSION = 384
+DEFAULT_EMBEDDING_DIMENSION = 1536
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-preview-04-17" 
 
 # RAG Pipeline Parameters
