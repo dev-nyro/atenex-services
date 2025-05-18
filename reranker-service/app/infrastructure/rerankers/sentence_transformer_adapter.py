@@ -9,7 +9,7 @@ import os
 
 from app.application.ports.reranker_model_port import RerankerModelPort
 from app.domain.models import DocumentToRerank, RerankedDocument
-from app.core.config import settings
+from app.core.config import settings # settings ya tiene los valores validados
 
 logger = structlog.get_logger(__name__)
 
@@ -32,7 +32,7 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
         init_log = logger.bind(
             adapter_action="load_model",
             model_name=settings.MODEL_NAME,
-            device=settings.MODEL_DEVICE,
+            device=settings.MODEL_DEVICE, # Este es el valor después de la validación
             configured_hf_cache_dir=settings.HF_CACHE_DIR
         )
         init_log.info("Attempting to load CrossEncoder model...")
@@ -47,7 +47,7 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
             cls._model = CrossEncoder(
                 model_name=settings.MODEL_NAME,
                 max_length=settings.MAX_SEQ_LENGTH,
-                device=settings.MODEL_DEVICE,
+                device=settings.MODEL_DEVICE, # Usar el valor validado
             )
             
             if settings.MODEL_DEVICE.startswith("cuda") and cls._model is not None:
@@ -71,29 +71,16 @@ class SentenceTransformerRerankerAdapter(RerankerModelPort):
             logger.error("Reranker model not loaded or not ready for prediction.")
             raise RuntimeError("Reranker model is not available for prediction.")
 
+        # settings.TOKENIZER_WORKERS ya ha sido validado y forzado a 0 para CUDA si es necesario.
+        num_dataloader_workers = settings.TOKENIZER_WORKERS
+
         predict_log = logger.bind(
             adapter_action="_predict_scores_async", 
             num_pairs=len(query_doc_pairs),
-            tokenizer_workers_config=settings.TOKENIZER_WORKERS 
-        )
-        
-        # Forzar num_dataloader_workers a 0 si se usa CUDA para evitar errores de "invalid resource handle"
-        # Esta lógica ahora también está en el validador de config.py, pero es bueno ser explícito aquí.
-        if settings.MODEL_DEVICE.startswith("cuda"):
-            num_dataloader_workers = 0
-            if settings.TOKENIZER_WORKERS > 0:
-                 predict_log.info( # Cambiado a info para que sea visible si se intenta usar workers con CUDA
-                    "TOKENIZER_WORKERS > 0 ignored and set to 0 because MODEL_DEVICE is cuda.",
-                    original_tokenizer_workers=settings.TOKENIZER_WORKERS
-                )
-        else:
-            num_dataloader_workers = settings.TOKENIZER_WORKERS
-        
-        predict_log.debug(
-            "Starting asynchronous prediction.",
             effective_num_dataloader_workers=num_dataloader_workers,
-            batch_size=settings.BATCH_SIZE
+            batch_size_used=settings.BATCH_SIZE
         )
+        predict_log.debug("Starting asynchronous prediction.")
         
         loop = asyncio.get_event_loop()
         try:

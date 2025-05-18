@@ -8,17 +8,15 @@ import uvicorn
 import asyncio
 import uuid 
 import sys 
-# import multiprocessing as mp # Ya no es necesario para mp.set_start_method
-# import torch # Ya no es necesario aquí, config.py lo usa
 
-from app.core.config import settings # settings ya tiene IS_CUDA_AVAILABLE
+# IS_CUDA_AVAILABLE se importa desde config
+from app.core.config import settings, IS_CUDA_AVAILABLE 
 from app.core.logging_config import setup_logging
 
 setup_logging() 
 logger = structlog.get_logger(settings.PROJECT_NAME.lower().replace(" ", "-") + ".main")
 
-# La configuración de multiprocessing ya no se manipula aquí.
-# Se confía en que num_workers=0 para CUDA en el adaptador evitará problemas.
+# Ya no se manipula el método de inicio de multiprocessing.
 
 from app.api.v1.endpoints import rerank_endpoint
 from app.infrastructure.rerankers.sentence_transformer_adapter import SentenceTransformerRerankerAdapter
@@ -36,13 +34,13 @@ async def lifespan(app: FastAPI):
         version="0.1.0", 
         port=settings.PORT,
         log_level=settings.LOG_LEVEL,
-        model_name=settings.MODEL_NAME,
-        model_device_configured=settings.MODEL_DEVICE,
-        cuda_available_check=settings.IS_CUDA_AVAILABLE, # Usar el check de config
-        effective_model_device=settings.MODEL_DEVICE, # Después del validador, este es el dispositivo real
-        gunicorn_workers_configured=settings.WORKERS, # Valor después del validador
-        tokenizer_workers_configured=settings.TOKENIZER_WORKERS, # Valor después del validador
-        batch_size_configured=settings.BATCH_SIZE
+        configured_model_name=settings.MODEL_NAME,
+        configured_model_device=settings.MODEL_DEVICE, # Este es el valor original de la env var o default
+        cuda_available_on_host=IS_CUDA_AVAILABLE, # Check real de torch.cuda.is_available()
+        effective_model_device=settings.MODEL_DEVICE, # Este es el valor después de la validación en config.py
+        effective_gunicorn_workers=settings.WORKERS, 
+        effective_tokenizer_workers=settings.TOKENIZER_WORKERS,
+        effective_batch_size=settings.BATCH_SIZE
     )
     
     model_adapter_instance = SentenceTransformerRerankerAdapter()
@@ -53,7 +51,7 @@ async def lifespan(app: FastAPI):
         if model_adapter_instance.is_ready(): 
             logger.info(
                 "Reranker model adapter initialized and model loaded successfully.",
-                loaded_model_name=model_adapter_instance.get_model_name() # Usar el getter
+                loaded_model_name=model_adapter_instance.get_model_name()
             )
             rerank_use_case_instance = RerankDocumentsUseCase(reranker_model=model_adapter_instance)
             set_dependencies(model_adapter=model_adapter_instance, use_case=rerank_use_case_instance)
@@ -62,7 +60,7 @@ async def lifespan(app: FastAPI):
         else:
             logger.error(
                 "Reranker model failed to load during startup. Service will be unhealthy.",
-                configured_model_name=settings.MODEL_NAME 
+                configured_model_name=settings.MODEL_NAME # Lo que se intentó cargar
             )
             SERVICE_IS_READY = False
             use_case_on_failure = RerankDocumentsUseCase(reranker_model=model_adapter_instance)
@@ -172,8 +170,6 @@ logger.info("API routers included.", prefix=settings.API_V1_STR)
 )
 async def health_check():
     model_status = SentenceTransformerRerankerAdapter.get_model_status()
-    # Usar settings.MODEL_NAME ya que es lo que se intentó cargar
-    # y el get_model_name() del adapter devolverá esto si la carga falló.
     current_model_name = settings.MODEL_NAME 
 
     health_log = logger.bind(service_ready_flag=SERVICE_IS_READY, model_actual_status=model_status)
