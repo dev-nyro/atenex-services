@@ -4,7 +4,7 @@ from pymilvus import connections, utility, Collection, MilvusException
 # --- Configuración ---
 MILVUS_HOST = "milvus-standalone.nyro-develop.svc.cluster.local"  # Conectamos al servicio Milvus dentro del cluster
 MILVUS_PORT = "19530"
-COLLECTION_NAME = "document_chunks_haystack" # Nombre de la colección a eliminar
+COLLECTION_NAME = "atenex-collection-01" # Nombre de la colección a eliminar
 CONNECTION_ALIAS = "local_cleanup"
 # --- Fin Configuración ---
 
