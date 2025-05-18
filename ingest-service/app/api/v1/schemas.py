@@ -3,7 +3,7 @@ import uuid
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional, Dict, Any, List
 from app.models.domain import DocumentStatus
-from datetime import datetime
+from datetime import datetime, date # Asegurar que date está importado
 import json
 import logging
 
@@ -42,10 +42,7 @@ class StatusResponse(BaseModel):
     uploaded_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
-    # --- RENAMED FIELD: gcs_exists ---
     gcs_exists: Optional[bool] = Field(None, description="Indicates if the original file currently exists in GCS.")
-    # --- REMOVED minio_exists ---
-    # minio_exists: Optional[bool] = None
     milvus_chunk_count: Optional[int] = Field(None, description="Live count of chunks found in Milvus for this document (-1 if check failed).")
     message: Optional[str] = None
 
@@ -63,7 +60,6 @@ class StatusResponse(BaseModel):
     class Config:
         validate_assignment = True
         populate_by_name = True
-        # --- UPDATED EXAMPLE: Use file_path and gcs_exists ---
         json_schema_extra = {
              "example": {
                 "id": "52ad2ba8-cab9-4108-a504-b9822fe99bdc",
@@ -77,12 +73,11 @@ class StatusResponse(BaseModel):
                 "error_message": "Processing timed out after 600 seconds.",
                 "uploaded_at": "2025-04-19T19:42:38.671016Z",
                 "updated_at": "2025-04-19T19:42:42.337854Z",
-                "gcs_exists": True, # Updated field name
+                "gcs_exists": True,
                 "milvus_chunk_count": 0,
                 "message": "El procesamiento falló: Timeout."
             }
         }
-        # ------------------------------------
 
 class PaginatedStatusResponse(BaseModel):
     """Schema for paginated list of document statuses."""
@@ -107,7 +102,7 @@ class PaginatedStatusResponse(BaseModel):
                         "error_message": "Processing timed out after 600 seconds.",
                         "uploaded_at": "2025-04-19T19:42:38.671016Z",
                         "updated_at": "2025-04-19T19:42:42.337854Z",
-                        "gcs_exists": True, # Updated field name
+                        "gcs_exists": True,
                         "milvus_chunk_count": 0,
                         "message": "El procesamiento falló: Timeout."
                     }
@@ -117,3 +112,55 @@ class PaginatedStatusResponse(BaseModel):
                 "offset": 0
             }
         }
+
+# --- NUEVOS SCHEMAS PARA ESTADÍSTICAS DE DOCUMENTOS ---
+class DocumentStatsByStatus(BaseModel):
+    processed: int = 0
+    processing: int = 0
+    uploaded: int = 0
+    error: int = 0
+    pending: int = 0 # Añadir pending ya que es un DocumentStatus
+
+class DocumentStatsByType(BaseModel):
+    pdf: int = Field(0, alias="application/pdf")
+    docx: int = Field(0, alias="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    doc: int = Field(0, alias="application/msword")
+    txt: int = Field(0, alias="text/plain")
+    md: int = Field(0, alias="text/markdown")
+    html: int = Field(0, alias="text/html")
+    other: int = 0
+
+    class Config:
+        populate_by_name = True
+
+
+class DocumentStatsByUser(BaseModel):
+    # Esta parte es más compleja de implementar en ingest-service si no tiene acceso a la tabla de users
+    # Por ahora, la definición del schema está aquí, pero su implementación podría ser básica o diferida.
+    user_id: str # Podría ser UUID del user que subió el doc, pero no está en la tabla 'documents'
+    name: Optional[str] = None
+    count: int
+
+class DocumentRecentActivity(BaseModel):
+    # Similar, agrupar por fecha y estado es una query más compleja.
+    # Definición aquí, implementación podría ser básica.
+    date: date
+    uploaded: int = 0
+    processing: int = 0
+    processed: int = 0
+    error: int = 0
+    pending: int = 0
+
+class DocumentStatsResponse(BaseModel):
+    total_documents: int
+    total_chunks_processed: int # Suma de chunk_count para documentos en estado 'processed'
+    by_status: DocumentStatsByStatus
+    by_type: DocumentStatsByType
+    # by_user: List[DocumentStatsByUser] # Omitir por ahora para simplificar
+    # recent_activity: List[DocumentRecentActivity] # Omitir por ahora para simplificar
+    oldest_document_date: Optional[datetime] = None
+    newest_document_date: Optional[datetime] = None
+
+    model_config = { # Anteriormente Config
+        "from_attributes": True # Anteriormente orm_mode
+    }

@@ -60,6 +60,166 @@ app/
 
 ## File: `app\api\v1\endpoints\ingest.py`
 ```py
+# --- DOCUMENT STATS ENDPOINT ---
+from datetime import date # Asegurar que date está importado
+from app.api.v1.schemas import DocumentStatsResponse, DocumentStatsByStatus, DocumentStatsByType # Importar nuevos schemas
+
+@router.get(
+    "/documents/stats",
+    response_model=DocumentStatsResponse,
+    summary="Get aggregated document statistics for a company",
+    description="Provides aggregated statistics about documents for the specified company, with optional filters.",
+    responses={
+        200: {"description": "Successfully retrieved document statistics."},
+        401: {"model": ErrorDetail, "description": "Unauthorized (Not used if gateway handles auth)"},
+        422: {"model": ErrorDetail, "description": "Validation Error (e.g., missing X-Company-ID or invalid date format)"},
+        500: {"model": ErrorDetail, "description": "Internal Server Error"},
+        503: {"model": ErrorDetail, "description": "Service Unavailable (DB error)"},
+    }
+)
+async def get_document_statistics(
+    request: Request,
+    from_date: Optional[date] = Query(None, description="Filter statistics from this date (YYYY-MM-DD). Inclusive."),
+    to_date: Optional[date] = Query(None, description="Filter statistics up to this date (YYYY-MM-DD). Inclusive."),
+    status_filter: Optional[DocumentStatus] = Query(None, alias="status", description="Filter statistics by a specific document status."),
+    # db_conn: asyncpg.Connection = Depends(get_db_conn) # Usar el context manager get_db_conn
+):
+    company_id_str = request.headers.get("X-Company-ID")
+    req_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
+    stats_log = log.bind(request_id=req_id)
+
+    if not company_id_str:
+        stats_log.warning("Missing X-Company-ID header for document statistics")
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing required header: X-Company-ID")
+    try:
+        company_uuid = uuid.UUID(company_id_str)
+    except ValueError:
+        stats_log.warning("Invalid Company ID format for document statistics", company_id_received=company_id_str)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Company ID format.")
+
+    stats_log = stats_log.bind(company_id=company_id_str, from_date=from_date, to_date=to_date, status_filter=status_filter)
+    stats_log.info("Request for document statistics received")
+
+    # Construir la base de la cláusula WHERE y los parámetros
+    where_clauses = ["company_id = $1"]
+    params: List[Any] = [company_uuid]
+    param_idx = 2
+
+    if from_date:
+        where_clauses.append(f"uploaded_at >= ${param_idx}")
+        params.append(from_date)
+        param_idx += 1
+    
+    if to_date:
+        # Para que to_date sea inclusivo, podríamos añadir un día y usar '<', o castear a date en SQL si uploaded_at es timestamp
+        # Por simplicidad, si to_date es YYYY-MM-DD, buscaremos <= YYYY-MM-DD 23:59:59.999999
+        # O más simple: castear uploaded_at a date en SQL: DATE(uploaded_at) <= $param_idx
+        where_clauses.append(f"DATE(uploaded_at) <= ${param_idx}")
+        params.append(to_date)
+        param_idx += 1
+
+    if status_filter:
+        where_clauses.append(f"status = ${param_idx}")
+        params.append(status_filter.value)
+        param_idx += 1
+    
+    where_sql = " AND ".join(where_clauses)
+
+    try:
+        async with get_db_conn() as db_conn:
+            # 1. Total Documents
+            total_docs_query = f"SELECT COUNT(*) FROM documents WHERE {where_sql};"
+            total_documents = await db_conn.fetchval(total_docs_query, *params)
+            total_documents = total_documents or 0
+
+            # 2. Total Chunks Processed
+            # Add status = 'processed' to the where_sql for this specific query
+            processed_where_sql = where_sql
+            processed_params = list(params)
+            if status_filter and status_filter != DocumentStatus.PROCESSED:
+                total_chunks_processed = 0 # If filtering by another status, processed chunks will be 0
+            elif not status_filter: # If no status filter, add one for 'processed'
+                processed_where_sql += f" AND status = ${len(processed_params) + 1}"
+                processed_params.append(DocumentStatus.PROCESSED.value)
+            
+            # if status_filter is None or status_filter == DocumentStatus.PROCESSED:
+            total_chunks_query = f"SELECT SUM(chunk_count) FROM documents WHERE {processed_where_sql} AND status = '{DocumentStatus.PROCESSED.value}';"
+            # Corrected params logic for total_chunks_query
+            # We need to adjust params if status_filter wasn't 'processed' or None
+            final_total_chunks_params = list(params)
+            final_total_chunks_where_sql = where_sql
+            
+            # If status_filter is applied and it's NOT 'processed', then total_chunks_processed is 0 for that filter.
+            # If status_filter IS 'processed', then the original params and where_sql are fine.
+            # If status_filter is NOT applied, we need to add 'status = processed' to the query.
+            if status_filter and status_filter != DocumentStatus.PROCESSED:
+                 total_chunks_processed = 0
+            else:
+                temp_chunk_params = list(params)
+                temp_chunk_where_sql = where_sql
+                if not status_filter: # If no status filter was applied initially, add one for 'processed'
+                    temp_chunk_where_sql += f" AND status = ${len(temp_chunk_params) + 1}"
+                    temp_chunk_params.append(DocumentStatus.PROCESSED.value)
+                
+                total_chunks_query_sql = f"SELECT SUM(chunk_count) FROM documents WHERE {temp_chunk_where_sql};"
+                val = await db_conn.fetchval(total_chunks_query_sql, *temp_chunk_params)
+                total_chunks_processed = val or 0
+
+
+            # 3. By Status
+            by_status_query = f"SELECT status, COUNT(*) as count FROM documents WHERE {where_sql} GROUP BY status;"
+            status_rows = await db_conn.fetch(by_status_query, *params)
+            stats_by_status = DocumentStatsByStatus()
+            for row in status_rows:
+                if row['status'] in DocumentStatus.__members__.values(): # Check if valid enum member
+                    setattr(stats_by_status, DocumentStatus(row['status']).value, row['count'])
+            
+            # 4. By Type
+            by_type_query = f"SELECT file_type, COUNT(*) as count FROM documents WHERE {where_sql} GROUP BY file_type;"
+            type_rows = await db_conn.fetch(by_type_query, *params)
+            stats_by_type = DocumentStatsByType()
+            
+            type_mapping = {
+                "application/pdf": "pdf",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+                "application/msword": "doc",
+                "text/plain": "txt",
+                "text/markdown": "md",
+                "text/html": "html",
+            }
+            for row in type_rows:
+                mapped_type = type_mapping.get(row['file_type'])
+                if mapped_type and hasattr(stats_by_type, mapped_type):
+                    current_val = getattr(stats_by_type, mapped_type)
+                    setattr(stats_by_type, mapped_type, current_val + row['count'])
+                else:
+                    stats_by_type.other += row['count']
+
+            # 5. Oldest and Newest Document Dates
+            dates_query = f"SELECT MIN(uploaded_at) as oldest, MAX(uploaded_at) as newest FROM documents WHERE {where_sql};"
+            date_row = await db_conn.fetchrow(dates_query, *params)
+            oldest_document_date = date_row['oldest'] if date_row else None
+            newest_document_date = date_row['newest'] if date_row else None
+
+            stats_log.info("Successfully retrieved document statistics from DB")
+
+            return DocumentStatsResponse(
+                total_documents=total_documents,
+                total_chunks_processed=total_chunks_processed,
+                by_status=stats_by_status,
+                by_type=stats_by_type,
+                # by_user=[], # Placeholder
+                # recent_activity=[], # Placeholder
+                oldest_document_date=oldest_document_date,
+                newest_document_date=newest_document_date,
+            )
+
+    except asyncpg.exceptions.PostgresConnectionError as db_conn_err:
+        stats_log.error("Database connection error while fetching statistics", error=str(db_conn_err), exc_info=True)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database connection error.")
+    except Exception as e:
+        stats_log.exception("Unexpected error fetching document statistics", error=str(e))
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error.")
 # ingest-service/app/api/v1/endpoints/ingest.py
 import uuid
 import mimetypes
@@ -1220,7 +1380,7 @@ import uuid
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional, Dict, Any, List
 from app.models.domain import DocumentStatus
-from datetime import datetime
+from datetime import datetime, date # Asegurar que date está importado
 import json
 import logging
 
@@ -1259,10 +1419,7 @@ class StatusResponse(BaseModel):
     uploaded_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
-    # --- RENAMED FIELD: gcs_exists ---
     gcs_exists: Optional[bool] = Field(None, description="Indicates if the original file currently exists in GCS.")
-    # --- REMOVED minio_exists ---
-    # minio_exists: Optional[bool] = None
     milvus_chunk_count: Optional[int] = Field(None, description="Live count of chunks found in Milvus for this document (-1 if check failed).")
     message: Optional[str] = None
 
@@ -1280,7 +1437,6 @@ class StatusResponse(BaseModel):
     class Config:
         validate_assignment = True
         populate_by_name = True
-        # --- UPDATED EXAMPLE: Use file_path and gcs_exists ---
         json_schema_extra = {
              "example": {
                 "id": "52ad2ba8-cab9-4108-a504-b9822fe99bdc",
@@ -1294,12 +1450,11 @@ class StatusResponse(BaseModel):
                 "error_message": "Processing timed out after 600 seconds.",
                 "uploaded_at": "2025-04-19T19:42:38.671016Z",
                 "updated_at": "2025-04-19T19:42:42.337854Z",
-                "gcs_exists": True, # Updated field name
+                "gcs_exists": True,
                 "milvus_chunk_count": 0,
                 "message": "El procesamiento falló: Timeout."
             }
         }
-        # ------------------------------------
 
 class PaginatedStatusResponse(BaseModel):
     """Schema for paginated list of document statuses."""
@@ -1324,7 +1479,7 @@ class PaginatedStatusResponse(BaseModel):
                         "error_message": "Processing timed out after 600 seconds.",
                         "uploaded_at": "2025-04-19T19:42:38.671016Z",
                         "updated_at": "2025-04-19T19:42:42.337854Z",
-                        "gcs_exists": True, # Updated field name
+                        "gcs_exists": True,
                         "milvus_chunk_count": 0,
                         "message": "El procesamiento falló: Timeout."
                     }
@@ -1334,6 +1489,58 @@ class PaginatedStatusResponse(BaseModel):
                 "offset": 0
             }
         }
+
+# --- NUEVOS SCHEMAS PARA ESTADÍSTICAS DE DOCUMENTOS ---
+class DocumentStatsByStatus(BaseModel):
+    processed: int = 0
+    processing: int = 0
+    uploaded: int = 0
+    error: int = 0
+    pending: int = 0 # Añadir pending ya que es un DocumentStatus
+
+class DocumentStatsByType(BaseModel):
+    pdf: int = Field(0, alias="application/pdf")
+    docx: int = Field(0, alias="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    doc: int = Field(0, alias="application/msword")
+    txt: int = Field(0, alias="text/plain")
+    md: int = Field(0, alias="text/markdown")
+    html: int = Field(0, alias="text/html")
+    other: int = 0
+
+    class Config:
+        populate_by_name = True
+
+
+class DocumentStatsByUser(BaseModel):
+    # Esta parte es más compleja de implementar en ingest-service si no tiene acceso a la tabla de users
+    # Por ahora, la definición del schema está aquí, pero su implementación podría ser básica o diferida.
+    user_id: str # Podría ser UUID del user que subió el doc, pero no está en la tabla 'documents'
+    name: Optional[str] = None
+    count: int
+
+class DocumentRecentActivity(BaseModel):
+    # Similar, agrupar por fecha y estado es una query más compleja.
+    # Definición aquí, implementación podría ser básica.
+    date: date
+    uploaded: int = 0
+    processing: int = 0
+    processed: int = 0
+    error: int = 0
+    pending: int = 0
+
+class DocumentStatsResponse(BaseModel):
+    total_documents: int
+    total_chunks_processed: int # Suma de chunk_count para documentos en estado 'processed'
+    by_status: DocumentStatsByStatus
+    by_type: DocumentStatsByType
+    # by_user: List[DocumentStatsByUser] # Omitir por ahora para simplificar
+    # recent_activity: List[DocumentRecentActivity] # Omitir por ahora para simplificar
+    oldest_document_date: Optional[datetime] = None
+    newest_document_date: Optional[datetime] = None
+
+    model_config = { # Anteriormente Config
+        "from_attributes": True # Anteriormente orm_mode
+    }
 ```
 
 ## File: `app\core\__init__.py`
@@ -2858,6 +3065,7 @@ class GCSClient:
 from __future__ import annotations
 
 import os
+import json
 import uuid
 import hashlib
 import structlog
