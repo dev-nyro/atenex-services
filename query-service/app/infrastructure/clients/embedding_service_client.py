@@ -3,6 +3,7 @@ import httpx
 import structlog
 from typing import List, Dict, Any, Optional
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import json # FLAG_CORRECTION: Import json
 
 from app.core.config import settings
 
@@ -61,30 +62,27 @@ class EmbeddingServiceClient:
         except httpx.RequestError as e:
             client_log.error("Request error while contacting embedding service", error=str(e))
             raise ConnectionError(f"Could not connect to embedding service: {e}") from e
+        except json.JSONDecodeError as e_json: # FLAG_CORRECTION: Catch json.JSONDecodeError
+            client_log.error("Error parsing JSON response from embedding service", error=str(e_json), raw_response=response.text if 'response' in locals() else "N/A")
+            raise ValueError(f"Invalid JSON response from embedding service: {e_json}") from e_json
         except (ValueError, TypeError) as e: 
-            client_log.error("Error processing response from embedding service", error=str(e))
-            raise ValueError(f"Invalid response from embedding service: {e}") from e
+            client_log.error("Error processing response from embedding service (ValueError/TypeError)", error=str(e))
+            raise ValueError(f"Invalid response data from embedding service: {e}") from e
 
 
     async def get_model_info(self) -> Optional[Dict[str, Any]]:
-        """
-        Intenta obtener información del modelo desde la respuesta del endpoint /embed.
-        Nota: El embedding-service actual no tiene un endpoint /info,
-        pero el /embed response incluye model_info. Esta función es una forma
-        de inferirlo si se necesita, aunque es mejor tener un health check más completo.
-        Este método también DEBERÍA tener reintentos si se considera crítico para el inicio.
-        Por ahora, lo dejaremos como está y el fallo en `initialize` de RemoteEmbeddingAdapter
-        no es fatal si `check_health` (ahora con reintentos) pasa.
-        """
         client_log = log.bind(action="get_model_info_via_embed", target_service="embedding-service")
         try:
-            response = await self._client.post(self.embed_endpoint, json={"texts": ["test"]}) # No reintenta esta llamada POST particular
+            response = await self._client.post(self.embed_endpoint, json={"texts": ["test"]}) 
             response.raise_for_status()
             data = response.json()
             if "model_info" in data and isinstance(data["model_info"], dict):
                 client_log.info("Model info retrieved from embedding service", model_info=data["model_info"])
                 return data["model_info"]
             client_log.warning("Model info not found in embedding service response.", response_data=data)
+            return None
+        except json.JSONDecodeError as e_json: # FLAG_CORRECTION: Catch json.JSONDecodeError
+            client_log.error("Failed to parse JSON for get_model_info from embedding service", error=str(e_json), raw_response=response.text if 'response' in locals() else "N/A")
             return None
         except Exception as e:
             client_log.error("Failed to get model_info from embedding service via /embed", error=str(e))
@@ -93,7 +91,7 @@ class EmbeddingServiceClient:
     @retry(
         stop=stop_after_attempt(settings.HTTP_CLIENT_MAX_RETRIES + 1),
         wait=wait_exponential(multiplier=settings.HTTP_CLIENT_BACKOFF_FACTOR, min=1, max=5), 
-        retry=retry_if_exception_type((httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError, ConnectionError)), # Added ConnectionError for tenacity
+        retry=retry_if_exception_type((httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError, ConnectionError)),
         reraise=True,
         before_sleep=lambda retry_state: log.warning(
             "Retrying EmbeddingServiceClient.check_health",
@@ -104,10 +102,6 @@ class EmbeddingServiceClient:
         )
     )
     async def check_health(self) -> bool:
-        """
-        Verifica la salud del embedding service llamando a su endpoint /health.
-        Añadido retry para robustez.
-        """
         client_log = log.bind(action="check_health_with_retry", target_service="embedding-service")
         try:
             client_log.debug("Attempting health check...")
@@ -115,12 +109,13 @@ class EmbeddingServiceClient:
             response.raise_for_status() 
 
             data = response.json()
-            if data.get("status") == "ok" and data.get("model_status") == "loaded":
+            # FLAG_CORRECTION: Accept 'client_ready' or 'loaded' as valid model_status
+            model_is_ready = data.get("model_status") in ["loaded", "client_ready"]
+            if data.get("status") == "ok" and model_is_ready:
                 client_log.info("Embedding service health check successful.", health_data=data)
                 return True
             else:
-                client_log.warning("Embedding service health check returned ok status but model not ready or unexpected payload.", health_data=data)
-                # Consider this a failure for readiness if model_status is not 'loaded'
+                client_log.warning("Embedding service health check returned ok status but model not fully ready or unexpected payload.", health_data=data)
                 raise ConnectionError(f"Embedding service not fully ready: status={data.get('status')}, model_status={data.get('model_status')}")
         except httpx.HTTPStatusError as e:
             client_log.warning("HTTP error during embedding service health check (will be retried or reraised).", status_code=e.response.status_code, response_text=e.response.text)
@@ -128,14 +123,13 @@ class EmbeddingServiceClient:
         except httpx.RequestError as e:
             client_log.error("Request error during embedding service health check (will be retried or reraised).", error=str(e))
             raise ConnectionError(f"Request error connecting to embedding service: {e}") from e
-        except json.JSONDecodeError as e_json: # Especificar el error de JSON
-            client_log.error("Failed to parse JSON response from embedding service health check.", error=str(e_json))
+        except json.JSONDecodeError as e_json: # FLAG_CORRECTION: Catch json.JSONDecodeError
+            client_log.error("Failed to parse JSON response from embedding service health check.", error=str(e_json), raw_response=response.text if 'response' in locals() else "N/A")
             raise ConnectionError(f"Invalid JSON response from embedding service health: {e_json}") from e_json
         except Exception as e: 
             client_log.error("Unexpected error during embedding service health check (will be retried or reraised).", error=str(e))
             raise ConnectionError(f"Unexpected error during health check: {e}") from e
 
     async def close(self):
-        """Cierra el cliente HTTP."""
         await self._client.aclose()
         log.info("EmbeddingServiceClient closed.")
