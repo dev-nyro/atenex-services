@@ -4297,7 +4297,7 @@ def truncate_text(text: str, max_length: int) -> str:
 ```toml
 [tool.poetry]
 name = "query-service"
-version = "0.3.5" # Incrementar versión por corrección
+version = "1.3.5" # Incrementar versión por corrección
 description = "Query service for SaaS B2B using Clean Architecture, PyMilvus, Haystack & Advanced RAG with remote embeddings, reranking, and sparse search."
 authors = ["Nyro <dev@atenex.com>"]
 readme = "README.md"

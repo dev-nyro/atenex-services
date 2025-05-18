@@ -1393,7 +1393,7 @@ if __name__ == "__main__":
 ```toml
 [tool.poetry]
 name = "docproc-service"
-version = "0.1.0"
+version = "1.1.0"
 description = "Atenex Document Processing Service: Extracts text and chunks documents."
 authors = ["Atenex Team <dev@atenex.com>"]
 readme = "README.md"

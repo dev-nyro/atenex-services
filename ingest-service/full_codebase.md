@@ -3753,7 +3753,7 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
 ```toml
 [tool.poetry]
 name = "ingest-service"
-version = "0.3.2"
+version = "1.3.2"
 description = "Ingest service for Atenex B2B SaaS (Postgres/GCS/Milvus/Remote Embedding & DocProc Services - CPU - Prefork)"
 authors = ["Atenex Team <dev@atenex.com>"]
 readme = "README.md"

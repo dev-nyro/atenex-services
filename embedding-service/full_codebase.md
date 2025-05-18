@@ -31,7 +31,8 @@ app/
 │   ├── __init__.py
 │   └── embedding_models
 │       ├── __init__.py
-│       └── fastembed_adapter.py
+│       ├── fastembed_adapter.py
+│       └── openai_adapter.py
 ├── main.py
 └── utils
     └── __init__.py
@@ -144,12 +145,12 @@ class EmbedResponse(BaseModel):
         json_schema_extra = {
             "example": {
                 "embeddings": [
-                    [0.1, 0.2, 0.3, -0.1, -0.2, -0.3],
-                    [0.4, 0.5, 0.6, -0.4, -0.5, -0.6]
+                    [0.001, -0.02, ..., 0.03],
+                    [0.04, 0.005, ..., -0.006]
                 ],
                 "model_info": {
-                    "model_name": "sentence-transformers/all-MiniLM-L6-v2",
-                    "dimension": 384
+                    "model_name": "text-embedding-3-small",
+                    "dimension": 1536
                 }
             }
         }
@@ -157,9 +158,9 @@ class EmbedResponse(BaseModel):
 class HealthCheckResponse(BaseModel):
     status: str = Field(default="ok", description="Overall status of the service.")
     service: str = Field(..., description="Name of the service.")
-    model_status: str = Field(..., description="Status of the embedding model ('loaded', 'error', 'not_loaded').")
-    model_name: str | None = Field(None, description="Name of the loaded embedding model, if any.")
-    model_dimension: int | None = Field(None, description="Dimension of the loaded embedding model, if any.")
+    model_status: str = Field(..., description="Status of the embedding model client ('client_ready', 'client_error', 'client_not_initialized', 'client_initialization_pending_or_failed').")
+    model_name: str | None = Field(None, description="Name of the configured/used embedding model, if available.")
+    model_dimension: int | None = Field(None, description="Dimension of the configured/used embedding model, if available.")
 ```
 
 ## File: `app\application\__init__.py`
@@ -298,7 +299,7 @@ import logging
 import os
 from typing import Optional, List, Any, Dict
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field, field_validator, ValidationError, ValidationInfo
+from pydantic import Field, field_validator, ValidationError, ValidationInfo, SecretStr
 import sys
 import json
 
@@ -306,11 +307,13 @@ import json
 DEFAULT_PROJECT_NAME = "Atenex Embedding Service"
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_API_V1_STR = "/api/v1"
-DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-DEFAULT_EMBEDDING_DIMENSION = 384
-DEFAULT_FASTEMBED_CACHE_DIR: Optional[str] = None # Set to a path like "/app/models" in Docker for persistence
-DEFAULT_FASTEMBED_THREADS: Optional[int] = None # None uses FastEmbed default (usually num CPU cores)
-DEFAULT_FASTEMBED_MAX_LENGTH: int = 512 # Max sequence length for the model
+
+# OpenAI specific defaults
+DEFAULT_OPENAI_EMBEDDING_MODEL_NAME = "text-embedding-3-small"
+DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_SMALL = 1536 # for text-embedding-3-small
+DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_LARGE = 3072 # for text-embedding-3-large
+DEFAULT_OPENAI_TIMEOUT_SECONDS = 30
+DEFAULT_OPENAI_MAX_RETRIES = 3
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -325,18 +328,16 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = Field(default=DEFAULT_PROJECT_NAME)
     API_V1_STR: str = Field(default=DEFAULT_API_V1_STR)
     LOG_LEVEL: str = Field(default=DEFAULT_LOG_LEVEL)
-    PORT: int = Field(default=8003, description="Port the service will listen on.") # Example port
+    PORT: int = Field(default=8003, description="Port the service will listen on.")
 
-    # --- Embedding Model (FastEmbed) ---
-    FASTEMBED_MODEL_NAME: str = Field(default=DEFAULT_EMBEDDING_MODEL)
-    EMBEDDING_DIMENSION: int = Field(default=DEFAULT_EMBEDDING_DIMENSION)
-    # Optional: For query/document specific prefixes if your chosen model supports/recommends them
-    # FASTEMBED_QUERY_PREFIX: Optional[str] = Field(default=None)
-    # FASTEMBED_DOCUMENT_PREFIX: Optional[str] = Field(default=None)
-    FASTEMBED_CACHE_DIR: Optional[str] = Field(default=DEFAULT_FASTEMBED_CACHE_DIR, description="Directory to cache downloaded FastEmbed models.")
-    FASTEMBED_THREADS: Optional[int] = Field(default=DEFAULT_FASTEMBED_THREADS, gt=0, description="Number of threads for FastEmbed tokenization.")
-    FASTEMBED_MAX_LENGTH: int = Field(default=DEFAULT_FASTEMBED_MAX_LENGTH, gt=0, description="Max sequence length for the embedding model.")
-
+    # --- OpenAI Embedding Model ---
+    OPENAI_API_KEY: SecretStr = Field(..., description="OpenAI API Key.")
+    OPENAI_EMBEDDING_MODEL_NAME: str = Field(default=DEFAULT_OPENAI_EMBEDDING_MODEL_NAME, description="Name of the OpenAI embedding model to use.")
+    OPENAI_EMBEDDING_DIMENSIONS_OVERRIDE: Optional[int] = Field(default=None, gt=0, description="Optional: Override embedding dimensions. Supported by text-embedding-3 models.")
+    EMBEDDING_DIMENSION: int = Field(description="Actual dimension of the embeddings that will be produced.") # This will be validated
+    OPENAI_API_BASE: Optional[str] = Field(default=None, description="Optional: Base URL for OpenAI API, e.g., for Azure OpenAI.")
+    OPENAI_TIMEOUT_SECONDS: int = Field(default=DEFAULT_OPENAI_TIMEOUT_SECONDS, gt=0)
+    OPENAI_MAX_RETRIES: int = Field(default=DEFAULT_OPENAI_MAX_RETRIES, ge=0)
 
     # --- Validators ---
     @field_validator('LOG_LEVEL')
@@ -350,29 +351,41 @@ class Settings(BaseSettings):
 
     @field_validator('EMBEDDING_DIMENSION')
     @classmethod
-    def check_embedding_dimension(cls, v: int, info: ValidationInfo) -> int:
+    def validate_embedding_dimension(cls, v: int, info: ValidationInfo) -> int:
         if v <= 0:
             raise ValueError("EMBEDDING_DIMENSION must be a positive integer.")
-        model_name = info.data.get('FASTEMBED_MODEL_NAME', DEFAULT_EMBEDDING_MODEL)
 
-        # Basic check for known models
-        expected_dim = -1
-        if 'all-MiniLM-L6-v2' in model_name: expected_dim = 384
-        elif 'bge-small-en-v1.5' in model_name: expected_dim = 384
-        elif 'bge-base-en-v1.5' in model_name: expected_dim = 768
-        elif 'bge-large-en-v1.5' in model_name: expected_dim = 1024
+        model_name = info.data.get('OPENAI_EMBEDDING_MODEL_NAME', DEFAULT_OPENAI_EMBEDDING_MODEL_NAME)
+        dimensions_override = info.data.get('OPENAI_EMBEDDING_DIMENSIONS_OVERRIDE')
 
-        if expected_dim != -1 and v != expected_dim:
+        expected_dimension = None
+        if model_name == "text-embedding-3-small":
+            expected_dimension = DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_SMALL
+        elif model_name == "text-embedding-3-large":
+            expected_dimension = DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_LARGE
+        elif model_name == "text-embedding-ada-002": # Older model, different dimension
+             expected_dimension = 1536 # OpenAI 'text-embedding-ada-002' dimension
+        # Add other OpenAI models and their default dimensions if needed
+
+        if dimensions_override is not None:
+            if v != dimensions_override:
+                raise ValueError(
+                    f"EMBEDDING_DIMENSION ({v}) must match OPENAI_EMBEDDING_DIMENSIONS_OVERRIDE ({dimensions_override}) when override is set."
+                )
+            # Further validation could check if override is valid for the model, but OpenAI API handles this.
+            logging.info(f"Using overridden embedding dimension: {v} for model {model_name}")
+        elif expected_dimension is not None:
+            if v != expected_dimension:
+                raise ValueError(
+                    f"EMBEDDING_DIMENSION ({v}) does not match the default dimension ({expected_dimension}) for model '{model_name}'. "
+                    f"If you intend to use a different dimension, set OPENAI_EMBEDDING_DIMENSIONS_OVERRIDE."
+                )
+            logging.info(f"Using default embedding dimension: {v} for model {model_name}")
+        else:
             logging.warning(
-                f"Configured EMBEDDING_DIMENSION ({v}) differs from standard dimension ({expected_dim}) "
-                f"for model '{model_name}'. Ensure this is intentional and matches the actual model output."
+                f"Could not determine default dimension for model '{model_name}'. "
+                f"Using configured EMBEDDING_DIMENSION: {v}. Ensure this is correct."
             )
-        elif expected_dim == -1:
-             logging.warning(
-                f"Unknown standard embedding dimension for model '{model_name}'. "
-                f"Using configured dimension {v}. Verify this matches the actual model output."
-            )
-        logging.debug(f"Using EMBEDDING_DIMENSION: {v} for model: {model_name}")
         return v
 
 # --- Global Settings Instance ---
@@ -389,15 +402,16 @@ try:
     settings = Settings()
     temp_log_config.info("--- Embedding Service Settings Loaded ---")
     for key, value in settings.model_dump().items():
-        temp_log_config.info(f"  {key.upper()}: {value}")
+        display_value = "********" if isinstance(value, SecretStr) and key == "OPENAI_API_KEY" else value
+        temp_log_config.info(f"  {key.upper()}: {display_value}")
     temp_log_config.info("------------------------------------")
 
 except (ValidationError, ValueError) as e_config:
     error_details_config = ""
     if isinstance(e_config, ValidationError):
         try: error_details_config = f"\nValidation Errors:\n{json.dumps(e_config.errors(), indent=2)}"
-        except Exception: error_details_config = f"\nRaw Errors: {e_config}" # Ensure e_config is used
-    else: error_details_config = f"\nError: {e_config}" # Ensure e_config is used
+        except Exception: error_details_config = f"\nRaw Errors: {e_config}"
+    else: error_details_config = f"\nError: {e_config}"
     temp_log_config.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     temp_log_config.critical(f"! FATAL: Embedding Service configuration validation failed!{error_details_config}")
     temp_log_config.critical(f"! Check environment variables (prefixed with EMBEDDING_) or .env file.")
@@ -666,6 +680,184 @@ class FastEmbedAdapter(EmbeddingModelPort):
             return False, "Model not loaded."
 ```
 
+## File: `app\infrastructure\embedding_models\openai_adapter.py`
+```py
+# embedding-service/app/infrastructure/embedding_models/openai_adapter.py
+import structlog
+from typing import List, Tuple, Dict, Any, Optional
+import asyncio
+import time
+from openai import AsyncOpenAI, APIConnectionError, RateLimitError, AuthenticationError, OpenAIError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+from app.application.ports.embedding_model_port import EmbeddingModelPort
+from app.core.config import settings
+
+log = structlog.get_logger(__name__)
+
+class OpenAIAdapter(EmbeddingModelPort):
+    """
+    Adapter for OpenAI's Embedding API.
+    """
+    _client: Optional[AsyncOpenAI] = None
+    _model_name: str
+    _embedding_dimension: int
+    _dimensions_override: Optional[int]
+    _model_initialized: bool = False
+    _initialization_error: Optional[str] = None
+
+    def __init__(self):
+        self._model_name = settings.OPENAI_EMBEDDING_MODEL_NAME
+        self._embedding_dimension = settings.EMBEDDING_DIMENSION
+        self._dimensions_override = settings.OPENAI_EMBEDDING_DIMENSIONS_OVERRIDE
+        # Client initialization is deferred to an async method.
+        log.info("OpenAIAdapter initialized", model_name=self._model_name, target_dimension=self._embedding_dimension)
+
+    async def initialize_model(self):
+        """
+        Initializes the OpenAI client.
+        This should be called during service startup (e.g., lifespan).
+        """
+        if self._model_initialized:
+            log.debug("OpenAI client already initialized.", model_name=self._model_name)
+            return
+
+        init_log = log.bind(adapter="OpenAIAdapter", action="initialize_model", model_name=self._model_name)
+        init_log.info("Initializing OpenAI client...")
+        start_time = time.perf_counter()
+
+        if not settings.OPENAI_API_KEY.get_secret_value():
+            self._initialization_error = "OpenAI API Key is not configured."
+            init_log.critical(self._initialization_error)
+            self._model_initialized = False
+            raise ConnectionError(self._initialization_error)
+
+        try:
+            self._client = AsyncOpenAI(
+                api_key=settings.OPENAI_API_KEY.get_secret_value(),
+                base_url=settings.OPENAI_API_BASE,
+                timeout=settings.OPENAI_TIMEOUT_SECONDS,
+                max_retries=0 # We use tenacity for retries in embed_texts
+            )
+
+            # Optional: Perform a lightweight test call to verify API key and connectivity
+            # For example, listing models (can be slow, consider if truly needed for health)
+            # await self._client.models.list(limit=1)
+
+            self._model_initialized = True
+            self._initialization_error = None
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            init_log.info("OpenAI client initialized successfully.", duration_ms=duration_ms)
+
+        except AuthenticationError as e:
+            self._initialization_error = f"OpenAI API Authentication Failed: {e}. Check your API key."
+            init_log.critical(self._initialization_error, exc_info=False) # exc_info=False for auth errors usually
+            self._client = None
+            self._model_initialized = False
+            raise ConnectionError(self._initialization_error) from e
+        except APIConnectionError as e:
+            self._initialization_error = f"OpenAI API Connection Error: {e}. Check network or OpenAI status."
+            init_log.critical(self._initialization_error, exc_info=True)
+            self._client = None
+            self._model_initialized = False
+            raise ConnectionError(self._initialization_error) from e
+        except Exception as e:
+            self._initialization_error = f"Failed to initialize OpenAI client for model '{self._model_name}': {str(e)}"
+            init_log.critical(self._initialization_error, exc_info=True)
+            self._client = None
+            self._model_initialized = False
+            raise ConnectionError(self._initialization_error) from e
+
+    @retry(
+        stop=stop_after_attempt(settings.OPENAI_MAX_RETRIES + 1), # settings.OPENAI_MAX_RETRIES are retries, so +1 for initial attempt
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((APIConnectionError, RateLimitError, OpenAIError)), # Add other retryable OpenAI errors if needed
+        before_sleep=lambda retry_state: log.warning(
+            "Retrying OpenAI embedding call",
+            model_name=settings.OPENAI_EMBEDDING_MODEL_NAME,
+            attempt_number=retry_state.attempt_number,
+            wait_time=retry_state.next_action.sleep,
+            error=str(retry_state.outcome.exception()) if retry_state.outcome else "Unknown error"
+        )
+    )
+    async def embed_texts(self, texts: List[str]) -> List[List[float]]:
+        if not self._model_initialized or not self._client:
+            log.error("OpenAI client not initialized. Cannot generate embeddings.", init_error=self._initialization_error)
+            raise ConnectionError("OpenAI embedding model is not available.")
+
+        if not texts:
+            return []
+
+        embed_log = log.bind(adapter="OpenAIAdapter", action="embed_texts", num_texts=len(texts), model=self._model_name)
+        embed_log.debug("Generating embeddings via OpenAI API...")
+
+        try:
+            api_params = {
+                "model": self._model_name,
+                "input": texts,
+                "encoding_format": "float"
+            }
+            if self._dimensions_override is not None:
+                api_params["dimensions"] = self._dimensions_override
+
+            response = await self._client.embeddings.create(**api_params) # type: ignore
+
+            if not response.data or not all(item.embedding for item in response.data):
+                embed_log.error("OpenAI API returned no embedding data or empty embeddings.", api_response=response.model_dump_json(indent=2))
+                raise ValueError("OpenAI API returned no valid embedding data.")
+
+            # Verify dimensions of the first embedding as a sanity check
+            if response.data and response.data[0].embedding:
+                actual_dim = len(response.data[0].embedding)
+                if actual_dim != self._embedding_dimension:
+                    embed_log.warning(
+                        "Dimension mismatch in OpenAI response.",
+                        expected_dim=self._embedding_dimension,
+                        actual_dim=actual_dim,
+                        model_used=response.model
+                    )
+                    # This indicates a potential configuration issue or unexpected API change.
+                    # Depending on strictness, could raise an error or just log.
+                    # For now, we'll trust the configured EMBEDDING_DIMENSION.
+
+            embeddings_list = [item.embedding for item in response.data]
+            embed_log.debug("Embeddings generated successfully via OpenAI.", num_embeddings=len(embeddings_list), usage_tokens=response.usage.total_tokens if response.usage else "N/A")
+            return embeddings_list
+        except AuthenticationError as e:
+            embed_log.error("OpenAI API Authentication Error during embedding", error=str(e))
+            raise ConnectionError(f"OpenAI authentication failed: {e}") from e # Propagate as ConnectionError to be caught by endpoint
+        except RateLimitError as e:
+            embed_log.error("OpenAI API Rate Limit Exceeded during embedding", error=str(e))
+            raise OpenAIError(f"OpenAI rate limit exceeded: {e}") from e # Let tenacity handle retry
+        except APIConnectionError as e:
+            embed_log.error("OpenAI API Connection Error during embedding", error=str(e))
+            raise OpenAIError(f"OpenAI connection error: {e}") from e # Let tenacity handle retry
+        except OpenAIError as e: # Catch other OpenAI specific errors
+            embed_log.error(f"OpenAI API Error during embedding: {type(e).__name__}", error=str(e))
+            raise RuntimeError(f"OpenAI API error: {e}") from e
+        except Exception as e:
+            embed_log.exception("Unexpected error during OpenAI embedding process")
+            raise RuntimeError(f"Embedding generation failed with unexpected error: {e}") from e
+
+    def get_model_info(self) -> Dict[str, Any]:
+        return {
+            "model_name": self._model_name,
+            "dimension": self._embedding_dimension, # This is the validated, final dimension
+        }
+
+    async def health_check(self) -> Tuple[bool, str]:
+        if self._model_initialized and self._client:
+            # A more robust health check could involve a lightweight API call,
+            # but be mindful of cost and rate limits for frequent health checks.
+            # For now, if client is initialized, we assume basic health.
+            # A true test is done during initialize_model or first embedding call.
+            return True, f"OpenAI client initialized for model {self._model_name}."
+        elif self._initialization_error:
+            return False, f"OpenAI client initialization failed: {self._initialization_error}"
+        else:
+            return False, "OpenAI client not initialized."
+```
+
 ## File: `app\main.py`
 ```py
 # embedding-service/app/main.py
@@ -689,8 +881,9 @@ from app.core.config import settings
 from app.api.v1.endpoints import embedding_endpoint
 from app.application.ports.embedding_model_port import EmbeddingModelPort
 from app.application.use_cases.embed_texts_use_case import EmbedTextsUseCase
-from app.infrastructure.embedding_models.fastembed_adapter import FastEmbedAdapter
-from app.dependencies import set_embedding_service_dependencies # Import the setter
+# --- MODIFICATION: Import OpenAIAdapter ---
+from app.infrastructure.embedding_models.openai_adapter import OpenAIAdapter
+from app.dependencies import set_embedding_service_dependencies
 
 log = structlog.get_logger("embedding_service.main")
 
@@ -705,15 +898,16 @@ async def lifespan(app: FastAPI):
     global embedding_model_adapter, embed_texts_use_case, SERVICE_MODEL_READY
     log.info(f"Starting up {settings.PROJECT_NAME}...")
 
-    model_adapter_instance = FastEmbedAdapter()
+    # --- MODIFICATION: Use OpenAIAdapter ---
+    model_adapter_instance = OpenAIAdapter()
     try:
         await model_adapter_instance.initialize_model()
         embedding_model_adapter = model_adapter_instance # Assign if successful
         SERVICE_MODEL_READY = True
-        log.info("Embedding model initialized successfully via FastEmbedAdapter.")
+        log.info("Embedding model client initialized successfully via OpenAIAdapter.")
     except Exception as e:
         SERVICE_MODEL_READY = False
-        log.critical("CRITICAL: Failed to initialize embedding model during startup.", error=str(e), exc_info=True)
+        log.critical("CRITICAL: Failed to initialize embedding model client during startup.", error=str(e), exc_info=True)
         # embedding_model_adapter will remain None or be the failed instance.
         # The health check will reflect this.
 
@@ -725,19 +919,21 @@ async def lifespan(app: FastAPI):
     else:
         # Ensure dependencies are set to reflect not-ready state
         set_embedding_service_dependencies(use_case_instance=None, ready_flag=False)
-        log.error("Service not fully ready due to embedding model initialization issues.")
+        log.error("Service not fully ready due to embedding model client initialization issues.")
 
-    log.info(f"{settings.PROJECT_NAME} startup sequence finished. Model Ready: {SERVICE_MODEL_READY}")
+    log.info(f"{settings.PROJECT_NAME} startup sequence finished. Model Client Ready: {SERVICE_MODEL_READY}")
     yield
     log.info(f"Shutting down {settings.PROJECT_NAME}...")
-    # Cleanup if necessary (e.g., close connections, though FastEmbed might not need explicit cleanup)
+    if embedding_model_adapter and hasattr(embedding_model_adapter, '_client') and embedding_model_adapter._client: # type: ignore
+        await embedding_model_adapter._client.close() # type: ignore
+        log.info("OpenAI async client closed.")
     log.info("Shutdown complete.")
 
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    version="0.1.0",
-    description="Atenex Embedding Service for generating text embeddings using FastEmbed.",
+    version="0.1.1", # Incremented version
+    description="Atenex Embedding Service for generating text embeddings using OpenAI.",
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
     lifespan=lifespan
 )
@@ -830,45 +1026,51 @@ async def health_check():
     global SERVICE_MODEL_READY, embedding_model_adapter
     health_log = log.bind(check="health_status")
 
-    model_status_str = "not_loaded"
+    model_status_str = "client_not_initialized" # Changed from not_loaded
     model_name_str = None
     model_dim_int = None
+    service_overall_status = "error"
 
     if embedding_model_adapter: # Check if adapter instance exists
         is_healthy, status_msg = await embedding_model_adapter.health_check()
         if is_healthy:
-            model_status_str = "loaded"
+            model_status_str = "client_ready" # Changed from loaded
             model_info = embedding_model_adapter.get_model_info()
             model_name_str = model_info.get("model_name")
             model_dim_int = model_info.get("dimension")
+            if SERVICE_MODEL_READY: # Double check this global flag
+                 service_overall_status = "ok"
+            else: # Should not happen if is_healthy is true, but as a safeguard
+                model_status_str = "client_initialization_pending_or_failed"
+                health_log.error("Health check: Adapter healthy but service global flag indicates not ready.")
         else:
-            model_status_str = "error"
-            health_log.error("Health check: Embedding model error.", model_status_message=status_msg)
+            model_status_str = "client_error" # Changed from error
+            health_log.error("Health check: Embedding model client error.", model_status_message=status_msg)
+            model_info = embedding_model_adapter.get_model_info() # Try to get info even if unhealthy
+            model_name_str = model_info.get("model_name")
+            model_dim_int = model_info.get("dimension")
     else: # Adapter not even initialized
         health_log.warning("Health check: Embedding model adapter not initialized.")
         SERVICE_MODEL_READY = False # Ensure flag is accurate
 
-    if not SERVICE_MODEL_READY: # This global flag is set by lifespan based on successful init
-        health_log.error("Service not ready (model initialization failed or pending).")
-        raise HTTPException(
+    response_payload = schemas.HealthCheckResponse(
+        status=service_overall_status,
+        service=settings.PROJECT_NAME,
+        model_status=model_status_str,
+        model_name=model_name_str or settings.OPENAI_EMBEDDING_MODEL_NAME, # Fallback to config if not available from adapter
+        model_dimension=model_dim_int or settings.EMBEDDING_DIMENSION # Fallback to config
+    ).model_dump(exclude_none=True)
+
+    if not SERVICE_MODEL_READY or service_overall_status == "error":
+        health_log.error("Service not ready (model client initialization failed or pending).")
+        # Return 503 but with the detailed payload
+        return JSONResponse(
             status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=schemas.HealthCheckResponse(
-                status="error",
-                service=settings.PROJECT_NAME,
-                model_status=model_status_str,
-                model_name=model_name_str,
-                model_dimension=model_dim_int
-            ).model_dump(exclude_none=True)
+            content=response_payload
         )
 
     health_log.info("Health check successful.", model_status=model_status_str)
-    return schemas.HealthCheckResponse(
-        status="ok",
-        service=settings.PROJECT_NAME,
-        model_status=model_status_str,
-        model_name=model_name_str,
-        model_dimension=model_dim_int
-    )
+    return response_payload
 
 # --- Root Endpoint (Simple Ack)  ---
 @app.get("/", tags=["Root"], response_class=PlainTextResponse, include_in_schema=False)
@@ -882,8 +1084,7 @@ if __name__ == "__main__":
     print(f"----- Starting {settings.PROJECT_NAME} locally on port {port_to_run} -----")
     uvicorn.run("app.main:app", host="0.0.0.0", port=port_to_run, reload=True, log_level=log_level_main)
 
-# 0.1.0 version
-# jfu
+# 1.1.1 version
 ```
 
 ## File: `app\utils\__init__.py`
@@ -896,8 +1097,8 @@ if __name__ == "__main__":
 ```toml
 [tool.poetry]
 name = "embedding-service"
-version = "0.1.0"
-description = "Atenex Embedding Service using FastAPI and FastEmbed"
+version = "1.1.1"
+description = "Atenex Embedding Service using FastAPI and OpenAI"
 authors = ["Atenex Team <dev@atenex.com>"]
 readme = "README.md"
 
@@ -909,15 +1110,11 @@ gunicorn = "^21.2.0" # For production deployments
 pydantic = {extras = ["email"], version = "^2.6.4"}
 pydantic-settings = "^2.2.1"
 structlog = "^24.1.0"
-tenacity = "^8.2.3" # For potential retries in clients if this service calls others (not typical for embedding service)
+tenacity = "^8.2.3"
 
 # --- Embedding Engine ---
-fastembed = ">=0.3.0,<0.4.0" # Qdrant's FastEmbed
-# sentence-transformers is a dependency of FastEmbed for many models,
-# but FastEmbed manages its specific version.
-# onnxruntime is also often a dependency for some FastEmbed models,
-# ensure it's compatible or install explicitly if needed.
-onnxruntime = "^1.18.0" # Recommended to align with ingest/query service if they also use it.
+openai = "^1.14.0" # OpenAI Python client library
+
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"
