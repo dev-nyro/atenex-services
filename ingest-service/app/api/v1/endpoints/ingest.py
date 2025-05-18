@@ -52,6 +52,11 @@ router = APIRouter()
         503: {"model": ErrorDetail, "description": "Service Unavailable (DB error)"},
     }
 )
+@router.get(
+    "/ingest/stats",
+    response_model=DocumentStatsResponse,
+    include_in_schema=False
+)
 async def get_document_statistics(
     request: Request,
     from_date: Optional[date] = Query(None, description="Filter statistics from this date (YYYY-MM-DD). Inclusive."),

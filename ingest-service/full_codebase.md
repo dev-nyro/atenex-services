@@ -60,12 +60,49 @@ app/
 
 ## File: `app\api\v1\endpoints\ingest.py`
 ```py
-# --- DOCUMENT STATS ENDPOINT ---
 from datetime import date # Asegurar que date está importado
 from app.api.v1.schemas import DocumentStatsResponse, DocumentStatsByStatus, DocumentStatsByType # Importar nuevos schemas
 
+import uuid
+import mimetypes
+import json
+from typing import List, Optional, Dict, Any
+import asyncio
+from contextlib import asynccontextmanager
+import logging
+
+from fastapi import (
+    APIRouter, Depends, HTTPException, status,
+    UploadFile, File, Form, Header, Query, Path, BackgroundTasks, Request, Body
+)
+import structlog
+import asyncpg
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type, before_sleep_log
+
+from pymilvus import Collection, connections, utility, MilvusException
+
+from app.core.config import settings
+from app.db import postgres_client as db_client
+from app.models.domain import DocumentStatus
+from app.api.v1.schemas import IngestResponse, StatusResponse, PaginatedStatusResponse, ErrorDetail
+from app.services.gcs_client import GCSClient, GCSClientError
+from app.tasks.celery_app import celery_app
+from app.tasks.process_document import process_document_standalone as process_document_task
+from app.services.ingest_pipeline import (
+    MILVUS_COLLECTION_NAME,
+    MILVUS_COMPANY_ID_FIELD,
+    MILVUS_DOCUMENT_ID_FIELD,
+    MILVUS_PK_FIELD,
+)
+
+log = structlog.get_logger(__name__)
+
+router = APIRouter()
+
+# --- DOCUMENT STATS ENDPOINT ---
+
 @router.get(
-    "/documents/stats",
+    "/stats",
     response_model=DocumentStatsResponse,
     summary="Get aggregated document statistics for a company",
     description="Provides aggregated statistics about documents for the specified company, with optional filters.",
