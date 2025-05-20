@@ -10,7 +10,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     POETRY_NO_INTERACTION=1 \
     POETRY_VIRTUALENVS_CREATE=false
 
-# onnxruntime puede necesitar libgomp1
+# onnxruntime puede necesitar libgomp1, PyTorch might need it too.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl build-essential libgomp1 && \
     rm -rf /var/lib/apt/lists/*
@@ -30,13 +30,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     APP_HOME="/app" \
     EMBEDDING_PORT=8003 \
-    HF_HOME="/app/.cache/huggingface" \
-    TRANSFORMERS_CACHE="/app/.cache/huggingface" \
-    FASTEMBED_CACHE_DIR="/app/.cache/fastembed"
+    # HuggingFace cache directories, ST_HF_CACHE_DIR will point to one of these.
+    HF_HOME="${APP_HOME}/.cache/huggingface/hub" \
+    TRANSFORMERS_CACHE="${APP_HOME}/.cache/huggingface/transformers" \
+    SENTENCE_TRANSFORMERS_HOME="${APP_HOME}/.cache/sentence_transformers"
 
 WORKDIR ${APP_HOME}
 
-# Reinstalar libgomp1 si es estrictamente necesario en runtime para onnx
+# Reinstalar libgomp1 si es estrictamente necesario en runtime.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends libgomp1 && \
     rm -rf /var/lib/apt/lists/*
@@ -46,12 +47,14 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 
 COPY ./app ${APP_HOME}/app
 
-RUN mkdir -p ${HF_HOME} ${FASTEMBED_CACHE_DIR} && \
+# Create cache directories and set permissions
+RUN mkdir -p ${HF_HOME} ${TRANSFORMERS_CACHE} ${SENTENCE_TRANSFORMERS_HOME} && \
     chown -R nobody:nogroup ${APP_HOME}/.cache && \
-    chmod -R 777 ${APP_HOME}/.cache # Considerar permisos más restrictivos si es posible
+    chmod -R 777 ${APP_HOME}/.cache 
 
 EXPOSE ${EMBEDDING_PORT}
 
-# CORREGIDO: Usar sh -c para permitir la expansión de la variable de entorno
-# y 'exec' para que Gunicorn sea el proceso PID 1.
-CMD exec sh -c "gunicorn -w 2 -k uvicorn.workers.UvicornWorker app.main:app --bind 0.0.0.0:${EMBEDDING_PORT} --timeout 120"
+# Use gunicorn_conf.py for configuration
+# Ensure gunicorn_conf.py is copied into the APP_HOME/app directory or APP_HOME
+# Assuming gunicorn_conf.py is in app/
+CMD ["gunicorn", "-c", "app/gunicorn_conf.py", "app.main:app"]
