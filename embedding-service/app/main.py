@@ -252,3 +252,5 @@ if __name__ == "__main__":
         log_level=log_level_main,
         workers=1 # For local dev, uvicorn manages its own loop. Gunicorn workers setting is for prod.
     )
+
+# JFU
