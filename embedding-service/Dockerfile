@@ -30,10 +30,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     APP_HOME="/app" \
     EMBEDDING_PORT=8003 \
-    # HuggingFace cache directories, ST_HF_CACHE_DIR will point to one of these.
-    HF_HOME="${APP_HOME}/.cache/huggingface/hub" \
-    TRANSFORMERS_CACHE="${APP_HOME}/.cache/huggingface/transformers" \
-    SENTENCE_TRANSFORMERS_HOME="${APP_HOME}/.cache/sentence_transformers"
+    # HuggingFace cache directories variables, defined for clarity and use by the app
+    # The actual creation path will use ${APP_HOME} directly in RUN for robustness
+    HF_HOME_SUBPATH=".cache/huggingface/hub" \
+    TRANSFORMERS_CACHE_SUBPATH=".cache/huggingface/transformers" \
+    SENTENCE_TRANSFORMERS_HOME_SUBPATH=".cache/sentence_transformers"
 
 WORKDIR ${APP_HOME}
 
@@ -48,13 +49,16 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 COPY ./app ${APP_HOME}/app
 
 # Create cache directories and set permissions
-RUN mkdir -p ${HF_HOME} ${TRANSFORMERS_CACHE} ${SENTENCE_TRANSFORMERS_HOME} && \
+# Use APP_HOME directly to ensure correct path creation.
+RUN mkdir -p ${APP_HOME}/${HF_HOME_SUBPATH} \
+             ${APP_HOME}/${TRANSFORMERS_CACHE_SUBPATH} \
+             ${APP_HOME}/${SENTENCE_TRANSFORMERS_HOME_SUBPATH} && \
     chown -R nobody:nogroup ${APP_HOME}/.cache && \
     chmod -R 777 ${APP_HOME}/.cache 
 
 EXPOSE ${EMBEDDING_PORT}
 
 # Use gunicorn_conf.py for configuration
-# Ensure gunicorn_conf.py is copied into the APP_HOME/app directory or APP_HOME
-# Assuming gunicorn_conf.py is in app/
+# Ensure gunicorn_conf.py is copied into the APP_HOME directory
+# The COPY ./app ${APP_HOME}/app command should handle gunicorn_conf.py if it's inside ./app
 CMD ["gunicorn", "-c", "app/gunicorn_conf.py", "app.main:app"]

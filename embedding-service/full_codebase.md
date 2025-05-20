@@ -27,12 +27,14 @@ app/
 ├── domain
 │   ├── __init__.py
 │   └── models.py
+├── gunicorn_conf.py
 ├── infrastructure
 │   ├── __init__.py
 │   └── embedding_models
 │       ├── __init__.py
 │       ├── fastembed_adapter.py
-│       └── openai_adapter.py
+│       ├── openai_adapter.py
+│       └── sentence_transformer_adapter.py
 ├── main.py
 └── utils
     └── __init__.py
@@ -329,11 +331,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, field_validator, ValidationError, ValidationInfo, SecretStr
 import sys
 import json
+import torch # For CUDA check
 
 # --- Defaults ---
 DEFAULT_PROJECT_NAME = "Atenex Embedding Service"
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_API_V1_STR = "/api/v1"
+DEFAULT_ACTIVE_EMBEDDING_PROVIDER = "openai" # "openai" or "sentence_transformer"
 
 # OpenAI specific defaults
 DEFAULT_OPENAI_EMBEDDING_MODEL_NAME = "text-embedding-3-small"
@@ -341,6 +345,16 @@ DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_SMALL = 1536 # for text-embedding-3-small
 DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_LARGE = 3072 # for text-embedding-3-large
 DEFAULT_OPENAI_TIMEOUT_SECONDS = 30
 DEFAULT_OPENAI_MAX_RETRIES = 3
+
+# SentenceTransformer (ST) specific defaults
+DEFAULT_ST_MODEL_NAME = "intfloat/e5-base-v2" # Popular E5 model
+DEFAULT_ST_EMBEDDING_DIMENSION_E5_BASE = 768
+DEFAULT_ST_EMBEDDING_DIMENSION_E5_LARGE = 1024
+DEFAULT_ST_MODEL_DEVICE = "cpu" # "cpu" or "cuda"
+DEFAULT_ST_BATCH_SIZE_CPU = 64
+DEFAULT_ST_BATCH_SIZE_CUDA = 128 # Can be higher on GPU
+DEFAULT_ST_NORMALIZE_EMBEDDINGS = True
+DEFAULT_ST_USE_FP16 = True # Enable by default if CUDA supports it
 
 # FastEmbed specific defaults (kept for potential future use, but not primary)
 DEFAULT_FASTEMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
@@ -362,20 +376,34 @@ class Settings(BaseSettings):
     API_V1_STR: str = Field(default=DEFAULT_API_V1_STR)
     LOG_LEVEL: str = Field(default=DEFAULT_LOG_LEVEL)
     PORT: int = Field(default=8003, description="Port the service will listen on.")
+    WORKERS: int = Field(default=2, description="Number of Gunicorn workers.")
+
 
     # --- Active Embedding Provider ---
-    # This will determine which adapter is primarily used.
-    # For now, we'll hardcode it to OpenAI in main.py logic,
-    # but this could be a config option in a more advanced setup.
+    ACTIVE_EMBEDDING_PROVIDER: str = Field(default=DEFAULT_ACTIVE_EMBEDDING_PROVIDER, description="Active embedding provider: 'openai' or 'sentence_transformer'.")
 
     # --- OpenAI Embedding Model ---
     OPENAI_API_KEY: Optional[SecretStr] = Field(default=None, description="OpenAI API Key. Required if using OpenAI.")
     OPENAI_EMBEDDING_MODEL_NAME: str = Field(default=DEFAULT_OPENAI_EMBEDDING_MODEL_NAME, description="Name of the OpenAI embedding model to use.")
     OPENAI_EMBEDDING_DIMENSIONS_OVERRIDE: Optional[int] = Field(default=None, gt=0, description="Optional: Override embedding dimensions for OpenAI. Supported by text-embedding-3 models.")
-    EMBEDDING_DIMENSION: int = Field(default=DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_SMALL, description="Actual dimension of the embeddings that will be produced by the active provider.")
     OPENAI_API_BASE: Optional[str] = Field(default=None, description="Optional: Base URL for OpenAI API, e.g., for Azure OpenAI.")
     OPENAI_TIMEOUT_SECONDS: int = Field(default=DEFAULT_OPENAI_TIMEOUT_SECONDS, gt=0)
     OPENAI_MAX_RETRIES: int = Field(default=DEFAULT_OPENAI_MAX_RETRIES, ge=0)
+
+    # --- SentenceTransformer (ST) Model ---
+    ST_MODEL_NAME: str = Field(default=DEFAULT_ST_MODEL_NAME)
+    ST_MODEL_DEVICE: str = Field(default=DEFAULT_ST_MODEL_DEVICE, description="Device for ST model: 'cpu', 'cuda', 'cuda:0', etc.")
+    ST_HF_CACHE_DIR: Optional[str] = Field(default=None, description="Cache directory for HuggingFace models for ST.")
+    ST_BATCH_SIZE: int = Field(default=DEFAULT_ST_BATCH_SIZE_CPU, gt=0)
+    ST_NORMALIZE_EMBEDDINGS: bool = Field(default=DEFAULT_ST_NORMALIZE_EMBEDDINGS)
+    ST_USE_FP16: bool = Field(default=DEFAULT_ST_USE_FP16, description="Enable FP16 for ST models on CUDA if supported.")
+
+
+    # --- Embedding Dimension (Crucial, validated based on active provider) ---
+    EMBEDDING_DIMENSION: int = Field(
+        default=DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_SMALL, # Default will be OpenAI initially
+        description="Actual dimension of the embeddings produced by the active provider."
+    )
 
     # --- FastEmbed Model (Optional, for fallback or specific use cases if retained) ---
     FASTEMBED_MODEL_NAME: str = Field(default=DEFAULT_FASTEMBED_MODEL_NAME)
@@ -393,63 +421,126 @@ class Settings(BaseSettings):
         if normalized_v not in valid_levels:
             raise ValueError(f"Invalid LOG_LEVEL '{v}'. Must be one of {valid_levels}")
         return normalized_v
-
-    @field_validator('EMBEDDING_DIMENSION')
+    
+    @field_validator('ACTIVE_EMBEDDING_PROVIDER')
     @classmethod
-    def validate_embedding_dimension(cls, v: int, info: ValidationInfo) -> int:
-        # This validation assumes OpenAI is the primary provider for EMBEDDING_DIMENSION.
-        # If FastEmbed were primary, this logic would need to adapt or be conditional.
+    def check_active_provider(cls, v: str) -> str:
+        valid_providers = ["openai", "sentence_transformer"]
+        if v.lower() not in valid_providers:
+            raise ValueError(f"Invalid ACTIVE_EMBEDDING_PROVIDER '{v}'. Must be one of {valid_providers}")
+        return v.lower()
+
+    @field_validator('ST_MODEL_DEVICE')
+    @classmethod
+    def check_st_model_device(cls, v: str, info: ValidationInfo) -> str:
+        device_str = v.lower()
+        if device_str.startswith("cuda"):
+            if not torch.cuda.is_available():
+                logging.warning(f"ST_MODEL_DEVICE set to '{v}' but CUDA is not available. Forcing to 'cpu'.")
+                return "cpu"
+            # Validate specific CUDA device index if provided, e.g., "cuda:0"
+            if ":" in device_str:
+                try:
+                    idx = int(device_str.split(":")[1])
+                    if idx >= torch.cuda.device_count():
+                        logging.warning(f"CUDA device index {idx} is invalid. Max available: {torch.cuda.device_count()-1}. Using default CUDA device.")
+                        return "cuda" 
+                except ValueError:
+                    logging.warning(f"Invalid CUDA device format '{device_str}'. Using default CUDA device 'cuda'.")
+                    return "cuda"
+        elif device_str != "cpu" and device_str != "mps": # MPS for MacOS, not fully tested here
+             logging.warning(f"Unsupported ST_MODEL_DEVICE '{v}'. Using 'cpu'. Supported: 'cpu', 'cuda', 'cuda:N', 'mps'.")
+             return "cpu"
+        return device_str
+
+    @field_validator('WORKERS')
+    @classmethod
+    def check_workers_gpu(cls, v: int, info: ValidationInfo) -> int:
+        # If using SentenceTransformer on GPU, force workers to 1 for stability
+        active_provider = info.data.get('ACTIVE_EMBEDDING_PROVIDER', DEFAULT_ACTIVE_EMBEDDING_PROVIDER)
+        st_device = info.data.get('ST_MODEL_DEVICE', DEFAULT_ST_MODEL_DEVICE)
+        
+        if active_provider == "sentence_transformer" and st_device.startswith("cuda"):
+            if v > 1:
+                logging.warning(
+                    f"EMBEDDING_WORKERS set to {v} but using SentenceTransformer on CUDA. "
+                    "Forcing workers to 1 to prevent VRAM contention and ensure stability."
+                )
+                return 1
+        return v
+
+    @field_validator('ST_BATCH_SIZE')
+    @classmethod
+    def set_st_batch_size_based_on_device(cls, v: int, info: ValidationInfo) -> int:
+        # If ST_BATCH_SIZE is the default CPU one, but device is CUDA, use CUDA default.
+        # This allows users to override with their own specific value if they want.
+        st_device = info.data.get('ST_MODEL_DEVICE', DEFAULT_ST_MODEL_DEVICE)
+        if st_device.startswith("cuda") and v == DEFAULT_ST_BATCH_SIZE_CPU:
+            logging.info(f"ST_MODEL_DEVICE is CUDA, adjusting ST_BATCH_SIZE to default CUDA value: {DEFAULT_ST_BATCH_SIZE_CUDA}")
+            return DEFAULT_ST_BATCH_SIZE_CUDA
+        return v
+
+    @field_validator('EMBEDDING_DIMENSION', mode='after') # mode='after' to ensure other relevant fields are processed
+    @classmethod
+    def validate_embedding_dimension_vs_provider(cls, v: int, info: ValidationInfo) -> int:
         if v <= 0:
             raise ValueError("EMBEDDING_DIMENSION must be a positive integer.")
 
-        # Values from context (already parsed or default)
-        openai_model_name = info.data.get('OPENAI_EMBEDDING_MODEL_NAME', DEFAULT_OPENAI_EMBEDDING_MODEL_NAME)
-        openai_dimensions_override = info.data.get('OPENAI_EMBEDDING_DIMENSIONS_OVERRIDE')
+        active_provider = info.data.get('ACTIVE_EMBEDDING_PROVIDER')
+        # Ensure this runs after ACTIVE_EMBEDDING_PROVIDER is validated.
 
-        expected_dimension_openai = None
-        if openai_model_name == "text-embedding-3-small":
-            expected_dimension_openai = DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_SMALL
-        elif openai_model_name == "text-embedding-3-large":
-            expected_dimension_openai = DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_LARGE
-        elif openai_model_name == "text-embedding-ada-002":
-             expected_dimension_openai = 1536
+        if active_provider == "openai":
+            openai_model_name = info.data.get('OPENAI_EMBEDDING_MODEL_NAME', DEFAULT_OPENAI_EMBEDDING_MODEL_NAME)
+            openai_dimensions_override = info.data.get('OPENAI_EMBEDDING_DIMENSIONS_OVERRIDE')
+            expected_dimension_openai = None
+            if openai_model_name == "text-embedding-3-small": expected_dimension_openai = DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_SMALL
+            elif openai_model_name == "text-embedding-3-large": expected_dimension_openai = DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_LARGE
+            elif openai_model_name == "text-embedding-ada-002": expected_dimension_openai = 1536
+
+            if openai_dimensions_override is not None:
+                if v != openai_dimensions_override:
+                    raise ValueError(
+                        f"EMBEDDING_DIMENSION ({v}) must match OPENAI_EMBEDDING_DIMENSIONS_OVERRIDE ({openai_dimensions_override}) "
+                        f"when ACTIVE_EMBEDDING_PROVIDER is 'openai' and override is set."
+                    )
+            elif expected_dimension_openai is not None:
+                if v != expected_dimension_openai:
+                    raise ValueError(
+                        f"EMBEDDING_DIMENSION ({v}) for 'openai' provider does not match the default dimension ({expected_dimension_openai}) "
+                        f"for OpenAI model '{openai_model_name}'. Set OPENAI_EMBEDDING_DIMENSIONS_OVERRIDE or correct EMBEDDING_DIMENSION."
+                    )
+            else: # Unknown OpenAI model, EMBEDDING_DIMENSION must be set correctly by user
+                logging.warning(f"OpenAI model '{openai_model_name}' has no default dimension in config. EMBEDDING_DIMENSION is {v}. Ensure this is correct.")
+
+        elif active_provider == "sentence_transformer":
+            st_model_name = info.data.get('ST_MODEL_NAME', DEFAULT_ST_MODEL_NAME)
+            # Define expected dimensions for known ST models
+            expected_dimension_st = None
+            if st_model_name == "intfloat/e5-base-v2": expected_dimension_st = DEFAULT_ST_EMBEDDING_DIMENSION_E5_BASE
+            elif st_model_name == "intfloat/e5-large-v2": expected_dimension_st = DEFAULT_ST_EMBEDDING_DIMENSION_E5_LARGE
+            elif st_model_name == "sentence-transformers/all-MiniLM-L6-v2": expected_dimension_st = 384 # Example
+
+            if expected_dimension_st is not None:
+                if v != expected_dimension_st:
+                    raise ValueError(
+                        f"EMBEDDING_DIMENSION ({v}) for 'sentence_transformer' provider does not match the expected dimension ({expected_dimension_st}) "
+                        f"for ST model '{st_model_name}'. Correct EMBEDDING_DIMENSION or ST_MODEL_NAME."
+                    )
+            else: # Unknown ST model, EMBEDDING_DIMENSION must be set correctly by user
+                logging.warning(f"ST model '{st_model_name}' has no default dimension in config. EMBEDDING_DIMENSION is {v}. Ensure this is correct.")
         
-        # If an override is provided for OpenAI, EMBEDDING_DIMENSION must match it.
-        if openai_dimensions_override is not None:
-            if v != openai_dimensions_override:
-                raise ValueError(
-                    f"EMBEDDING_DIMENSION ({v}) must match OPENAI_EMBEDDING_DIMENSIONS_OVERRIDE ({openai_dimensions_override}) when override is set for OpenAI."
-                )
-            logging.info(f"Using overridden OpenAI embedding dimension: {v} for model {openai_model_name}")
-        # If no override, and we have an expected dimension for the selected OpenAI model, it must match.
-        elif expected_dimension_openai is not None:
-            if v != expected_dimension_openai:
-                raise ValueError(
-                    f"EMBEDDING_DIMENSION ({v}) does not match the default dimension ({expected_dimension_openai}) for OpenAI model '{openai_model_name}'. "
-                    f"If you intend to use a different dimension with this OpenAI model, set OPENAI_EMBEDDING_DIMENSIONS_OVERRIDE."
-                )
-            logging.info(f"Using default OpenAI embedding dimension: {v} for model {openai_model_name}")
-        # If it's a different OpenAI model or some other provider is implicitly active
-        else:
-            logging.warning(
-                f"Could not determine a default OpenAI dimension for model '{openai_model_name}'. "
-                f"Using configured EMBEDDING_DIMENSION: {v}. Ensure this is correct for the active embedding provider."
-            )
+        # If provider is neither, this validator might need adjustment or the provider check is sufficient.
         return v
     
     @field_validator('OPENAI_API_KEY', mode='before')
     @classmethod
-    def check_openai_api_key(cls, v: Optional[str], info: ValidationInfo) -> Optional[SecretStr]:
-        # This validator primarily ensures that if OpenAI is intended, the key should be present.
-        # The actual decision to use OpenAI vs FastEmbed will be in main.py for now.
-        # If we were to make it configurable via an 'ACTIVE_PROVIDER' env var, this would change.
-        if v is None:
-            # Allow None if, for example, FastEmbed was the intended active provider.
-            # However, for the current goal of making OpenAI primary, we might want it to be stricter.
-            # For now, let's log a warning if it's not set, as OpenAIAdapter will fail later if it's needed.
-            logging.warning("OPENAI_API_KEY is not set. OpenAI embeddings will not be available.")
-            return None
-        return SecretStr(v)
+    def check_openai_api_key_if_provider(cls, v: Optional[str], info: ValidationInfo) -> Optional[SecretStr]:
+        active_provider = info.data.get('ACTIVE_EMBEDDING_PROVIDER', DEFAULT_ACTIVE_EMBEDDING_PROVIDER)
+        if active_provider == "openai" and v is None:
+            raise ValueError("OPENAI_API_KEY is required when ACTIVE_EMBEDDING_PROVIDER is 'openai'.")
+        if v is not None:
+            return SecretStr(v)
+        return None
 
 
 # --- Global Settings Instance ---
@@ -465,8 +556,9 @@ try:
     temp_log_config.info("Loading Embedding Service settings...")
     settings = Settings()
     temp_log_config.info("--- Embedding Service Settings Loaded ---")
+    # Use model_dump to get all fields, including those set by validators
     for key, value in settings.model_dump().items():
-        display_value = "********" if isinstance(value, SecretStr) and "API_KEY" in key.upper() else value
+        display_value = "********" if isinstance(value, SecretStr) else value
         temp_log_config.info(f"  {key.upper()}: {display_value}")
     temp_log_config.info("------------------------------------")
 
@@ -609,6 +701,47 @@ from typing import List, Dict, Any, Optional
 #     text_id: Optional[str] = None # If texts need to be identified
 #     vector: List[float]
 #     source_text_preview: str # For context
+```
+
+## File: `app\gunicorn_conf.py`
+```py
+# embedding-service/app/gunicorn_conf.py
+import os
+import multiprocessing
+from app.core.config import settings # Load settings to access configured WORKERS
+
+# Gunicorn config variables
+# `settings.WORKERS` is already validated in config.py based on device
+workers = settings.WORKERS
+worker_class = "uvicorn.workers.UvicornWorker"
+
+# Bind to 0.0.0.0 to be accessible from outside the container
+host = os.getenv("EMBEDDING_HOST", "0.0.0.0")
+port = os.getenv("EMBEDDING_PORT", str(settings.PORT)) # Use settings.PORT as default
+bind = f"{host}:{port}"
+
+# Logging
+# Gunicorn logging will be handled by structlog through FastAPI's setup
+# accesslog = "-" # Log to stdout
+# errorlog = "-"  # Log to stderr
+# loglevel = settings.LOG_LEVEL.lower() # Already handled by app
+
+# Worker timeout
+timeout = int(os.getenv("EMBEDDING_GUNICORN_TIMEOUT", "120"))
+
+# Other settings
+# preload_app = True # Consider if model loading time is very long and you want to load before forking workers.
+                     # However, for GPU models, it's often better to load in each worker if workers > 1,
+                     # but we force workers=1 for GPU SentenceTransformer for now.
+
+# Print effective Gunicorn configuration for clarity
+print("--- Gunicorn Configuration ---")
+print(f"Workers: {workers}")
+print(f"Worker Class: {worker_class}")
+print(f"Bind: {bind}")
+print(f"Timeout: {timeout}")
+# print(f"Preload App: {preload_app}")
+print("----------------------------")
 ```
 
 ## File: `app\infrastructure\__init__.py`
@@ -941,6 +1074,196 @@ class OpenAIAdapter(EmbeddingModelPort):
             return False, "OpenAI client not initialized."
 ```
 
+## File: `app\infrastructure\embedding_models\sentence_transformer_adapter.py`
+```py
+# embedding-service/app/infrastructure/embedding_models/sentence_transformer_adapter.py
+import structlog
+from typing import List, Tuple, Dict, Any, Optional
+import asyncio
+import time
+import os
+import numpy as np
+
+from sentence_transformers import SentenceTransformer
+from sentence_transformers.util import semantic_search
+import torch
+
+from app.application.ports.embedding_model_port import EmbeddingModelPort
+from app.core.config import settings # Import global settings
+
+log = structlog.get_logger(__name__)
+
+class SentenceTransformerAdapter(EmbeddingModelPort):
+    """
+    Adapter for SentenceTransformer models (e.g., E5).
+    """
+    _model: Optional[SentenceTransformer] = None
+    _model_name: str
+    _model_dimension: int
+    _device: str
+    _cache_dir: Optional[str]
+    _batch_size: int
+    _normalize_embeddings: bool
+    _use_fp16: bool
+
+    _model_loaded: bool = False
+    _model_load_error: Optional[str] = None
+
+    def __init__(self):
+        self._model_name = settings.ST_MODEL_NAME
+        self._model_dimension = settings.EMBEDDING_DIMENSION # This comes from global, validated config
+        self._device = settings.ST_MODEL_DEVICE
+        self._cache_dir = settings.ST_HF_CACHE_DIR
+        self._batch_size = settings.ST_BATCH_SIZE
+        self._normalize_embeddings = settings.ST_NORMALIZE_EMBEDDINGS
+        
+        # Determine if FP16 should be used
+        self._use_fp16 = False
+        if self._device.startswith("cuda"):
+            if torch.cuda.is_available():
+                # Basic check for FP16 support (Ampere and newer generally good)
+                major, _ = torch.cuda.get_device_capability(torch.device(self._device))
+                if major >= 7: # Volta, Turing, Ampere, Hopper etc.
+                    self._use_fp16 = settings.ST_USE_FP16
+                    log.info(f"CUDA device '{self._device}' supports FP16. ST_USE_FP16: {self._use_fp16}.")
+                else:
+                    log.warning(f"CUDA device '{self._device}' (capability {major}.x) may have limited FP16 support. ST_USE_FP16 set to False.")
+                    self._use_fp16 = False # Force False if older GPU
+            else: # CUDA specified but not available
+                log.warning(f"ST_MODEL_DEVICE set to '{self._device}' but CUDA is not available. Falling back to CPU.")
+                self._device = "cpu"
+                self._use_fp16 = False # FP16 is for CUDA
+        
+        log.info(
+            "SentenceTransformerAdapter initialized",
+            configured_model_name=self._model_name,
+            target_dimension=self._model_dimension,
+            device=self._device,
+            use_fp16=self._use_fp16,
+            batch_size=self._batch_size,
+            normalize=self._normalize_embeddings,
+        )
+
+    async def initialize_model(self):
+        if self._model_loaded:
+            log.debug("SentenceTransformer model already initialized.", model_name=self._model_name)
+            return
+
+        init_log = log.bind(adapter="SentenceTransformerAdapter", action="initialize_model", model_name=self._model_name, device=self._device)
+        init_log.info("Initializing SentenceTransformer model...")
+        start_time = time.perf_counter()
+        
+        try:
+            # Ensure cache directory exists if specified
+            if self._cache_dir:
+                os.makedirs(self._cache_dir, exist_ok=True)
+                init_log.info(f"Using HuggingFace cache directory: {self._cache_dir}")
+
+            # SentenceTransformer loading is synchronous
+            self._model = await asyncio.to_thread(
+                SentenceTransformer,
+                model_name_or_path=self._model_name,
+                device=self._device,
+                cache_folder=self._cache_dir
+            )
+
+            if self._use_fp16 and self._device.startswith("cuda"):
+                init_log.info("Converting model to FP16 for CUDA device.")
+                self._model = self._model.half() # type: ignore
+
+            # Perform a test embedding to confirm dimension
+            test_vector = self._model.encode(["test vector"], normalize_embeddings=self._normalize_embeddings)
+            actual_dim = test_vector.shape[1]
+
+            if actual_dim != self._model_dimension:
+                self._model_load_error = (
+                    f"SentenceTransformer Model dimension mismatch. Global EMBEDDING_DIMENSION is {self._model_dimension}, "
+                    f"but model '{self._model_name}' produced {actual_dim} dimensions."
+                )
+                init_log.error(self._model_load_error)
+                self._model = None
+                self._model_loaded = False
+                raise ValueError(self._model_load_error)
+
+            self._model_loaded = True
+            self._model_load_error = None
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            init_log.info("SentenceTransformer model initialized and validated successfully.", duration_ms=duration_ms, actual_dimension=actual_dim)
+
+        except Exception as e:
+            self._model_load_error = f"Failed to load SentenceTransformer model '{self._model_name}': {str(e)}"
+            init_log.critical(self._model_load_error, exc_info=True)
+            self._model = None
+            self._model_loaded = False
+            raise ConnectionError(self._model_load_error) from e
+
+    async def embed_texts(self, texts: List[str]) -> List[List[float]]:
+        if not self._model_loaded or not self._model:
+            log.error("SentenceTransformer model not loaded. Cannot generate embeddings.", model_error=self._model_load_error)
+            raise ConnectionError(f"SentenceTransformer model is not available. Load error: {self._model_load_error}")
+
+        if not texts:
+            return []
+
+        embed_log = log.bind(adapter="SentenceTransformerAdapter", action="embed_texts", num_texts=len(texts))
+        embed_log.debug("Generating embeddings with SentenceTransformer...")
+
+        # E5 models expect "query: " or "passage: " prefix.
+        # This service primarily embeds document chunks, so "passage: " is appropriate.
+        # A more robust solution might involve the client specifying text_type.
+        prefixed_texts = [f"passage: {text}" for text in texts]
+
+        try:
+            # model.encode is CPU/GPU-bound, run in thread pool if called from async context
+            # However, SentenceTransformer handles its own parallelism with PyTorch.
+            # For FastAPI, direct await on a threadpool call is good practice.
+            
+            # The encode method handles device placement and FP16 if model is configured.
+            embeddings_array: np.ndarray = await asyncio.to_thread(
+                self._model.encode, # type: ignore
+                sentences=prefixed_texts,
+                batch_size=self._batch_size,
+                convert_to_tensor=False, # Get NumPy array
+                convert_to_numpy=True,
+                show_progress_bar=False, # Disable for server logs
+                normalize_embeddings=self._normalize_embeddings,
+            )
+            
+            embeddings_list = embeddings_array.tolist()
+            embed_log.debug("SentenceTransformer embeddings generated successfully.")
+            return embeddings_list
+        except Exception as e:
+            embed_log.exception("Error during SentenceTransformer embedding process")
+            raise RuntimeError(f"SentenceTransformer embedding generation failed: {e}") from e
+
+    def get_model_info(self) -> Dict[str, Any]:
+        return {
+            "model_name": self._model_name,
+            "dimension": self._model_dimension, # This is the validated, final dimension
+            "device": self._device,
+            "provider": "sentence_transformer"
+        }
+
+    async def health_check(self) -> Tuple[bool, str]:
+        if self._model_loaded and self._model:
+            try:
+                # Test with a short text
+                _ = await asyncio.to_thread(
+                    self._model.encode, #type: ignore
+                    ["health check"], 
+                    batch_size=1, 
+                    normalize_embeddings=self._normalize_embeddings
+                )
+                return True, f"SentenceTransformer model '{self._model_name}' on '{self._device}' loaded and responsive."
+            except Exception as e:
+                log.error("SentenceTransformer model health check failed during test embedding", error=str(e), exc_info=True)
+                return False, f"SentenceTransformer model '{self._model_name}' loaded but unresponsive: {str(e)}"
+        elif self._model_load_error:
+            return False, f"SentenceTransformer model '{self._model_name}' failed to load: {self._model_load_error}"
+        else:
+            return False, f"SentenceTransformer model '{self._model_name}' not loaded."
+```
+
 ## File: `app\main.py`
 ```py
 # embedding-service/app/main.py
@@ -960,12 +1283,12 @@ from app.core.logging_config import setup_logging
 setup_logging() # Initialize logging early
 
 # Import other components after logging is set up
-from app.core.config import settings
+from app.core.config import settings # This now loads the validated settings
 from app.api.v1.endpoints import embedding_endpoint
 from app.application.ports.embedding_model_port import EmbeddingModelPort
 from app.application.use_cases.embed_texts_use_case import EmbedTextsUseCase
 from app.infrastructure.embedding_models.openai_adapter import OpenAIAdapter
-# from app.infrastructure.embedding_models.fastembed_adapter import FastEmbedAdapter # Kept for reference
+from app.infrastructure.embedding_models.sentence_transformer_adapter import SentenceTransformerAdapter
 from app.dependencies import set_embedding_service_dependencies
 
 log = structlog.get_logger("embedding_service.main")
@@ -980,51 +1303,66 @@ SERVICE_MODEL_READY = False
 async def lifespan(app: FastAPI):
     global embedding_model_adapter, embed_texts_use_case, SERVICE_MODEL_READY
     log.info(f"Starting up {settings.PROJECT_NAME}...")
+    log.info(f"Active embedding provider: {settings.ACTIVE_EMBEDDING_PROVIDER}")
 
-    # --- Use OpenAIAdapter as the primary embedding provider ---
-    if not settings.OPENAI_API_KEY or not settings.OPENAI_API_KEY.get_secret_value():
-        log.critical("OpenAI_API_KEY is not set. Cannot initialize OpenAIAdapter.")
-        SERVICE_MODEL_READY = False
-        embedding_model_adapter = None
+    model_adapter_instance: EmbeddingModelPort | None = None
+
+    if settings.ACTIVE_EMBEDDING_PROVIDER == "openai":
+        if not settings.OPENAI_API_KEY or not settings.OPENAI_API_KEY.get_secret_value():
+            log.critical("OpenAI_API_KEY is not set. Cannot initialize OpenAIAdapter.")
+            SERVICE_MODEL_READY = False
+        else:
+            model_adapter_instance = OpenAIAdapter()
+    elif settings.ACTIVE_EMBEDDING_PROVIDER == "sentence_transformer":
+        model_adapter_instance = SentenceTransformerAdapter()
     else:
-        model_adapter_instance = OpenAIAdapter()
+        log.critical(f"Unsupported ACTIVE_EMBEDDING_PROVIDER: {settings.ACTIVE_EMBEDDING_PROVIDER}")
+        SERVICE_MODEL_READY = False
+
+    if model_adapter_instance:
         try:
             await model_adapter_instance.initialize_model()
             embedding_model_adapter = model_adapter_instance # Assign if successful
             SERVICE_MODEL_READY = True
-            log.info("Embedding model client initialized successfully using OpenAIAdapter.")
+            log.info(f"Embedding model client initialized successfully using {type(model_adapter_instance).__name__}.")
         except Exception as e:
             SERVICE_MODEL_READY = False
-            log.critical("CRITICAL: Failed to initialize OpenAI embedding model client during startup.", error=str(e), exc_info=True)
-            # embedding_model_adapter will be the failed instance or None.
-            # The health check will reflect this.
+            log.critical(
+                f"CRITICAL: Failed to initialize {type(model_adapter_instance).__name__} "
+                "embedding model client during startup.",
+                error=str(e), exc_info=True
+            )
+    else: # Handle case where provider was unsupported or OpenAI key missing
+        SERVICE_MODEL_READY = False
+        log.error("No valid embedding model adapter could be instantiated based on configuration.")
+
 
     if embedding_model_adapter and SERVICE_MODEL_READY:
         use_case_instance = EmbedTextsUseCase(embedding_model=embedding_model_adapter)
         embed_texts_use_case = use_case_instance # Assign to global
         set_embedding_service_dependencies(use_case_instance=use_case_instance, ready_flag=True)
-        log.info("EmbedTextsUseCase instantiated and dependencies set with OpenAIAdapter.")
+        log.info(f"EmbedTextsUseCase instantiated and dependencies set with {type(embedding_model_adapter).__name__}.")
     else:
-        # Ensure dependencies are set to reflect not-ready state
         set_embedding_service_dependencies(use_case_instance=None, ready_flag=False)
         log.error("Service not fully ready due to embedding model client initialization issues.")
 
     log.info(f"{settings.PROJECT_NAME} startup sequence finished. Model Client Ready: {SERVICE_MODEL_READY}")
     yield
     log.info(f"Shutting down {settings.PROJECT_NAME}...")
-    if embedding_model_adapter and isinstance(embedding_model_adapter, OpenAIAdapter) and embedding_model_adapter._client:
+    if isinstance(embedding_model_adapter, OpenAIAdapter) and embedding_model_adapter._client:
         try:
             await embedding_model_adapter._client.close()
             log.info("OpenAI async client closed successfully.")
         except Exception as e:
             log.error("Error closing OpenAI async client.", error=str(e), exc_info=True)
+    # Add cleanup for SentenceTransformerAdapter if needed (e.g. releasing GPU memory, though Python GC usually handles it)
     log.info("Shutdown complete.")
 
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    version="1.1.1", 
-    description="Atenex Embedding Service for generating text embeddings using OpenAI.",
+    version="1.2.0", # Incremented version
+    description=f"Atenex Embedding Service. Active provider: {settings.ACTIVE_EMBEDDING_PROVIDER}",
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
     lifespan=lifespan
 )
@@ -1131,22 +1469,29 @@ async def health_check():
              model_status_str = "client_initialization_pending_or_failed" # Adapter might be ok, but global state isn't
              health_log.error("Health check: Adapter client healthy but service global flag indicates not ready.")
         else: # Adapter not healthy
-            model_status_str = "client_error"
+            model_status_str = "client_error" # Use this or status_msg for more detail
             health_log.error("Health check: Embedding model client error.", model_status_message=status_msg)
     else: 
-        health_log.warning("Health check: Embedding model adapter not initialized.")
+        health_log.warning("Health check: Embedding model adapter not initialized (no valid provider configured or initial error).")
         SERVICE_MODEL_READY = False # Ensure flag is accurate
+        # Try to get default model name/dim from config if adapter is None
+        if settings.ACTIVE_EMBEDDING_PROVIDER == "openai":
+            model_name_str = settings.OPENAI_EMBEDDING_MODEL_NAME
+        elif settings.ACTIVE_EMBEDDING_PROVIDER == "sentence_transformer":
+            model_name_str = settings.ST_MODEL_NAME
+        model_dim_int = settings.EMBEDDING_DIMENSION
+
 
     response_payload = schemas.HealthCheckResponse(
         status=service_overall_status,
         service=settings.PROJECT_NAME,
         model_status=model_status_str,
-        model_name=model_name_str or settings.OPENAI_EMBEDDING_MODEL_NAME, 
-        model_dimension=model_dim_int or settings.EMBEDDING_DIMENSION 
+        model_name=model_name_str, 
+        model_dimension=model_dim_int 
     ).model_dump(exclude_none=True)
 
     if not SERVICE_MODEL_READY or service_overall_status == "error":
-        health_log.error("Service not ready (model client initialization failed, pending, or error).", current_status=model_status_str)
+        health_log.error("Service not ready.", current_status=model_status_str, service_model_ready_flag=SERVICE_MODEL_READY)
         return JSONResponse(
             status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE,
             content=response_payload
@@ -1158,14 +1503,23 @@ async def health_check():
 # --- Root Endpoint (Simple Ack)  ---
 @app.get("/", tags=["Root"], response_class=PlainTextResponse, include_in_schema=False)
 async def root():
-    return f"{settings.PROJECT_NAME} is running."
+    return f"{settings.PROJECT_NAME} (Provider: {settings.ACTIVE_EMBEDDING_PROVIDER}) is running."
 
 
 if __name__ == "__main__":
+    # Uvicorn is typically run by Gunicorn in production. This is for local dev.
+    # Gunicorn config (workers, etc.) will be handled by gunicorn_conf.py when deployed.
     port_to_run = settings.PORT
     log_level_main = settings.LOG_LEVEL.lower()
-    print(f"----- Starting {settings.PROJECT_NAME} locally on port {port_to_run} -----")
-    uvicorn.run("app.main:app", host="0.0.0.0", port=port_to_run, reload=True, log_level=log_level_main)
+    print(f"----- Starting {settings.PROJECT_NAME} locally on port {port_to_run} (Provider: {settings.ACTIVE_EMBEDDING_PROVIDER}) -----")
+    uvicorn.run(
+        "app.main:app",
+        host="0.0.0.0",
+        port=port_to_run,
+        reload=True, # Reload for local dev
+        log_level=log_level_main,
+        workers=1 # For local dev, uvicorn manages its own loop. Gunicorn workers setting is for prod.
+    )
 ```
 
 ## File: `app\utils\__init__.py`
@@ -1178,8 +1532,8 @@ if __name__ == "__main__":
 ```toml
 [tool.poetry]
 name = "embedding-service"
-version = "1.1.1"
-description = "Atenex Embedding Service using FastAPI and OpenAI"
+version = "1.1.1" # Se mantiene la versión, podría incrementarse a 1.2.0 tras este cambio.
+description = "Atenex Embedding Service using FastAPI and choice of embedding models (OpenAI, Sentence Transformers)"
 authors = ["Atenex Team <dev@atenex.com>"]
 readme = "README.md"
 
@@ -1195,7 +1549,8 @@ tenacity = "^8.2.3"
 
 # --- Embedding Engine ---
 openai = "^1.14.0" # OpenAI Python client library
-
+sentence-transformers = "^2.7.0" # Para modelos como E5
+# torch se instalará como dependencia de sentence-transformers
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"
