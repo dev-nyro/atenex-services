@@ -1,6 +1,8 @@
 # embedding-service/app/api/v1/schemas.py
 from pydantic import BaseModel, Field, conlist
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Literal
+
+TextType = Literal["query", "passage"]
 
 class EmbedRequest(BaseModel):
     texts: conlist(str, min_length=1) = Field(
@@ -25,8 +27,8 @@ class EmbedResponse(BaseModel):
                     [0.04, 0.005, ..., -0.006]
                 ],
                 "model_info": {
-                    "model_name": "text-embedding-3-small", # Updated example
-                    "dimension": 1536 # Updated example
+                    "model_name": "text-embedding-3-small",
+                    "dimension": 1536
                 }
             }
         }

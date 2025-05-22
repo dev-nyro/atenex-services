@@ -125,7 +125,9 @@ async def embed_texts_endpoint(
 ```py
 # embedding-service/app/api/v1/schemas.py
 from pydantic import BaseModel, Field, conlist
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Literal
+
+TextType = Literal["query", "passage"]
 
 class EmbedRequest(BaseModel):
     texts: conlist(str, min_length=1) = Field(
@@ -150,8 +152,8 @@ class EmbedResponse(BaseModel):
                     [0.04, 0.005, ..., -0.006]
                 ],
                 "model_info": {
-                    "model_name": "text-embedding-3-small", # Updated example
-                    "dimension": 1536 # Updated example
+                    "model_name": "text-embedding-3-small",
+                    "dimension": 1536
                 }
             }
         }
@@ -1103,7 +1105,7 @@ class SentenceTransformerAdapter(EmbeddingModelPort):
     _cache_dir: Optional[str]
     _batch_size: int
     _normalize_embeddings: bool
-    _use_fp16: bool # Este se determinará en initialize_model
+    _use_fp16: bool 
 
     _model_loaded: bool = False
     _model_load_error: Optional[str] = None
@@ -1111,18 +1113,17 @@ class SentenceTransformerAdapter(EmbeddingModelPort):
     def __init__(self):
         self._model_name = settings.ST_MODEL_NAME
         self._model_dimension = settings.EMBEDDING_DIMENSION 
-        self._device = settings.ST_MODEL_DEVICE # Inicial, puede cambiar a 'cpu' si CUDA no está
+        self._device = settings.ST_MODEL_DEVICE 
         self._cache_dir = settings.ST_HF_CACHE_DIR
         self._batch_size = settings.ST_BATCH_SIZE
         self._normalize_embeddings = settings.ST_NORMALIZE_EMBEDDINGS
-        # _use_fp16 se determinará en initialize_model
         
-        # No realizar llamadas a CUDA aquí
+        
         log.info(
             "SentenceTransformerAdapter instance created (model not loaded yet)",
             configured_model_name=self._model_name,
             target_dimension=self._model_dimension,
-            initial_configured_device=self._device, # Log inicial
+            initial_configured_device=self._device, 
             batch_size=self._batch_size,
             normalize=self._normalize_embeddings,
         )
@@ -1134,19 +1135,18 @@ class SentenceTransformerAdapter(EmbeddingModelPort):
 
         init_log = log.bind(adapter="SentenceTransformerAdapter", action="initialize_model", model_name=self._model_name)
         
-        # Determinar el dispositivo y _use_fp16 aquí, dentro del worker y lifespan
+        
         final_device = self._device
         self._use_fp16 = False 
         if self._device.startswith("cuda"):
             if torch.cuda.is_available():
                 init_log.info(f"CUDA is available. Checking capability for device: {self._device}")
-                # Esto puede fallar si el índice es incorrecto, por lo que se usa el device_str validado de config.py
-                # que ya debería ser 'cuda' o 'cuda:0' si es válido.
+                
                 try:
                     current_cuda_device_for_check = torch.device(final_device)
                     major, _ = torch.cuda.get_device_capability(current_cuda_device_for_check)
                     init_log.info(f"CUDA device '{final_device}' capability: {major}.x")
-                    if major >= 7: # Volta, Turing, Ampere, Hopper etc.
+                    if major >= 7: 
                         self._use_fp16 = settings.ST_USE_FP16
                         init_log.info(f"FP16 support confirmed. ST_USE_FP16: {self._use_fp16}.")
                     else:
@@ -1161,9 +1161,9 @@ class SentenceTransformerAdapter(EmbeddingModelPort):
                 final_device = "cpu"
                 self._use_fp16 = False
         
-        # Actualizar self._device al final_device determinado
+        
         self._device = final_device
-        init_log = init_log.bind(effective_device=self._device, use_fp16=self._use_fp16) # Rebind con info actualizada
+        init_log = init_log.bind(effective_device=self._device, use_fp16=self._use_fp16) 
         init_log.info("Initializing SentenceTransformer model with effective device settings...")
         
         start_time = time.perf_counter()
@@ -1176,11 +1176,11 @@ class SentenceTransformerAdapter(EmbeddingModelPort):
             self._model = await asyncio.to_thread(
                 SentenceTransformer,
                 model_name_or_path=self._model_name,
-                device=self._device, # Usar el _device determinado
+                device=self._device, 
                 cache_folder=self._cache_dir
             )
 
-            if self._use_fp16 and self._device.startswith("cuda"): # Solo si _use_fp16 es True y device es CUDA
+            if self._use_fp16 and self._device.startswith("cuda"): 
                 init_log.info("Converting model to FP16 for CUDA device.")
                 self._model = self._model.half() 
 
@@ -1253,7 +1253,7 @@ class SentenceTransformerAdapter(EmbeddingModelPort):
         return {
             "model_name": self._model_name,
             "dimension": self._model_dimension, 
-            "device": self._device, # Reporta el dispositivo efectivo
+            "device": self._device, 
             "provider": "sentence_transformer"
         }
 
@@ -1533,7 +1533,7 @@ if __name__ == "__main__":
         workers=1 # For local dev, uvicorn manages its own loop. Gunicorn workers setting is for prod.
     )
 
-# JFU 2
+# JFU
 ```
 
 ## File: `app\utils\__init__.py`
