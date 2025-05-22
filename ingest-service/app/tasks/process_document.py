@@ -232,7 +232,7 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
 
         log.info("Calling Document Processing Service (synchronous)...")
         stdlib_task_logger.info("StdLib: Calling Document Processing Service (synchronous)...")
-        docproc_url = str(settings.INGEST_DOCPROC_SERVICE_URL)
+        docproc_url = str(settings.DOCPROC_SERVICE_URL)
         files_payload = {'file': (normalized_filename, file_bytes, content_type)}
         data_payload = {
             'original_filename': normalized_filename, 
@@ -298,7 +298,7 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
 
         log.info(f"Calling Embedding Service for {len(chunk_texts_for_embedding)} texts (synchronous)...")
         stdlib_task_logger.info(f"StdLib: Calling Embedding Service for {len(chunk_texts_for_embedding)} texts...")
-        embedding_service_url = str(settings.INGEST_EMBEDDING_SERVICE_URL)
+        embedding_service_url = str(settings.EMBEDDING_SERVICE_URL)
         
         embedding_request_payload = {
             "texts": chunk_texts_for_embedding,

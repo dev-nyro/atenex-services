@@ -71,8 +71,8 @@ class Settings(BaseSettings):
     GCS_BUCKET_NAME: str = Field(default="atenex", description="Name of the Google Cloud Storage bucket for storing original files.")
 
     EMBEDDING_DIMENSION: int = Field(default=DEFAULT_EMBEDDING_DIM, description="Dimension of embeddings expected from the embedding service, used for Milvus schema.")
-    INGEST_EMBEDDING_SERVICE_URL: AnyHttpUrl = Field(default_factory=lambda: AnyHttpUrl(DEFAULT_EMBEDDING_SERVICE_URL), description="URL of the external embedding service.")
-    INGEST_DOCPROC_SERVICE_URL: AnyHttpUrl = Field(default_factory=lambda: AnyHttpUrl(DEFAULT_DOCPROC_SERVICE_URL), description="URL of the external document processing service.")
+    EMBEDDING_SERVICE_URL: AnyHttpUrl = Field(default_factory=lambda: AnyHttpUrl(DEFAULT_EMBEDDING_SERVICE_URL), description="URL of the external embedding service.")
+    DOCPROC_SERVICE_URL: AnyHttpUrl = Field(default_factory=lambda: AnyHttpUrl(DEFAULT_DOCPROC_SERVICE_URL), description="URL of the external document processing service.")
 
     TIKTOKEN_ENCODING_NAME: str = Field(default=DEFAULT_TIKTOKEN_ENCODING, description="Name of the tiktoken encoding to use for token counting.")
 
@@ -101,7 +101,6 @@ class Settings(BaseSettings):
     @classmethod
     def check_embedding_dimension(cls, v: int, info: ValidationInfo) -> int:
         if v <= 0: raise ValueError("EMBEDDING_DIMENSION must be a positive integer.")
-        # Using standard logging as temp_log might not be configured yet or this is cleaner for validators
         logging.debug(f"Using EMBEDDING_DIMENSION for Milvus schema: {v}")
         return v
 
@@ -110,7 +109,6 @@ class Settings(BaseSettings):
     def check_required_secret_value_present(cls, v: Any, info: ValidationInfo) -> Any:
         if v is None or v == "":
              field_name = info.field_name if info.field_name else "Unknown Secret Field"
-             # Using generic field_name from info, as this validator is generic
              raise ValueError(f"Required secret field '{field_name}' (mapped from INGEST_{field_name.upper()}) cannot be empty.")
         return v
 
@@ -120,15 +118,13 @@ class Settings(BaseSettings):
         if not isinstance(v, str):
             raise ValueError("MILVUS_URI must be a string.")
         v_strip = v.strip()
-        if not v_strip.startswith("https://"): # Zilliz uses HTTPS
+        if not v_strip.startswith("https://"): 
             raise ValueError(f"Invalid Zilliz URI: Must start with https://. Received: '{v_strip}'")
         try:
             parsed = urlparse(v_strip)
             if not parsed.hostname:
                 raise ValueError(f"Invalid URI: Missing hostname in '{v_strip}'")
-            # Zilliz Cloud endpoints usually do not require a port in the URI (HTTPS implies 443)
-            # If a port is present, urlparse will handle it.
-            return v_strip # Mantener HTTPS URI tal cual
+            return v_strip 
         except Exception as e:
             raise ValueError(f"Invalid Milvus URI format '{v_strip}': {e}") from e
 
@@ -136,32 +132,28 @@ class Settings(BaseSettings):
     @classmethod
     def check_zilliz_key(cls, v: Any, info: ValidationInfo) -> Any:
          if v is None or v == "" or (isinstance(v, SecretStr) and not v.get_secret_value()):
-            # The plan's error message refers to 'INGEST_ZILLIZ_API_KEY' which is the env var.
-            # Pydantic's info.field_name will be 'ZILLIZ_API_KEY'.
-            # For clarity, we'll use the env var name as per the plan.
             raise ValueError(f"Required secret field for Zilliz (expected as INGEST_ZILLIZ_API_KEY) cannot be empty.")
          return v
 
-    @field_validator('INGEST_EMBEDDING_SERVICE_URL', 'INGEST_DOCPROC_SERVICE_URL', mode='before')
+    @field_validator('EMBEDDING_SERVICE_URL', 'DOCPROC_SERVICE_URL', mode='before')
     @classmethod
     def assemble_service_url(cls, v: Optional[str], info: ValidationInfo) -> str:
         default_map = {
-            "INGEST_EMBEDDING_SERVICE_URL": DEFAULT_EMBEDDING_SERVICE_URL,
-            "INGEST_DOCPROC_SERVICE_URL": DEFAULT_DOCPROC_SERVICE_URL
+            "EMBEDDING_SERVICE_URL": DEFAULT_EMBEDDING_SERVICE_URL,
+            "DOCPROC_SERVICE_URL": DEFAULT_DOCPROC_SERVICE_URL
         }
-        # Ensure info.field_name is valid before using it as a key
-        default_url_key = str(info.field_name) if info.field_name and info.field_name in default_map else ""
+        default_url_key = str(info.field_name) 
         default_url = default_map.get(default_url_key, "")
 
-        url_to_validate = v if v is not None else default_url # Prioritize env var over default
+        url_to_validate = v if v is not None else default_url 
         if not url_to_validate:
-            raise ValueError(f"URL for {default_url_key or info.field_name} cannot be empty and no default is set.")
+            raise ValueError(f"URL for {default_url_key} cannot be empty and no default is set.")
 
         try:
             validated_url = AnyHttpUrl(url_to_validate)
             return str(validated_url)
         except ValidationError as ve:
-             raise ValueError(f"Invalid URL format for {default_url_key or info.field_name}: {ve}") from ve
+             raise ValueError(f"Invalid URL format for {default_url_key}: {ve}") from ve
 
 
 temp_log = logging.getLogger("ingest_service.config.loader")
@@ -170,7 +162,7 @@ if not temp_log.handlers:
     formatter = logging.Formatter('%(levelname)-8s [%(asctime)s] [%(name)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
     handler.setFormatter(formatter)
     temp_log.addHandler(handler)
-    temp_log.setLevel(logging.INFO) # Ensure temp_log level is appropriate
+    temp_log.setLevel(logging.INFO) 
 
 try:
     temp_log.info("Loading Ingest Service settings...")
@@ -193,8 +185,8 @@ try:
     temp_log.info(f"  MILVUS_GRPC_TIMEOUT:          {settings.MILVUS_GRPC_TIMEOUT}")
     temp_log.info(f"  GCS_BUCKET_NAME:              {settings.GCS_BUCKET_NAME}")
     temp_log.info(f"  EMBEDDING_DIMENSION (Milvus): {settings.EMBEDDING_DIMENSION}")
-    temp_log.info(f"  INGEST_EMBEDDING_SERVICE_URL: {settings.INGEST_EMBEDDING_SERVICE_URL}")
-    temp_log.info(f"  INGEST_DOCPROC_SERVICE_URL:   {settings.INGEST_DOCPROC_SERVICE_URL}")
+    temp_log.info(f"  INGEST_EMBEDDING_SERVICE_URL (from env INGEST_EMBEDDING_SERVICE_URL): {settings.EMBEDDING_SERVICE_URL}")
+    temp_log.info(f"  INGEST_DOCPROC_SERVICE_URL (from env INGEST_DOCPROC_SERVICE_URL):   {settings.DOCPROC_SERVICE_URL}")
     temp_log.info(f"  TIKTOKEN_ENCODING_NAME:       {settings.TIKTOKEN_ENCODING_NAME}")
     temp_log.info(f"  SUPPORTED_CONTENT_TYPES:      {settings.SUPPORTED_CONTENT_TYPES}")
     temp_log.info(f"------------------------------------")
@@ -212,6 +204,6 @@ except (ValidationError, ValueError) as e:
     temp_log.critical(f"! Original Error Type: {type(e).__name__}")
     temp_log.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     sys.exit(1)
-except Exception as e: # Catch any other unexpected error during settings load
+except Exception as e: 
     temp_log.exception(f"FATAL: Unexpected error loading Ingest Service settings: {e}")
     sys.exit(1)

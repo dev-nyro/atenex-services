@@ -22,7 +22,7 @@ class DocProcServiceClient(BaseServiceClient):
     Client for interacting with the Atenex Document Processing Service.
     """
     def __init__(self, base_url: str = None):
-        effective_base_url = base_url or str(settings.INGEST_DOCPROC_SERVICE_URL).rstrip('/')
+        effective_base_url = base_url or str(settings.DOCPROC_SERVICE_URL).rstrip('/')
         
         parsed_url = httpx.URL(effective_base_url)
         self.service_endpoint_path = parsed_url.path
@@ -125,7 +125,7 @@ class DocProcServiceClient(BaseServiceClient):
         """
         health_log = self.log.bind(action="docproc_health_check")
         try:
-            parsed_service_url = httpx.URL(str(settings.INGEST_DOCPROC_SERVICE_URL))
+            parsed_service_url = httpx.URL(str(settings.DOCPROC_SERVICE_URL))
             health_endpoint_url_base = f"{parsed_service_url.scheme}://{parsed_service_url.host}"
             if parsed_service_url.port:
                 health_endpoint_url_base += f":{parsed_service_url.port}"

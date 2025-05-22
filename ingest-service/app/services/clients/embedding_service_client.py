@@ -22,7 +22,7 @@ class EmbeddingServiceClient(BaseServiceClient):
     Client for interacting with the Atenex Embedding Service.
     """
     def __init__(self, base_url: str = None):
-        effective_base_url = base_url or str(settings.INGEST_EMBEDDING_SERVICE_URL).rstrip('/')
+        effective_base_url = base_url or str(settings.EMBEDDING_SERVICE_URL).rstrip('/')
         
         parsed_url = httpx.URL(effective_base_url)
         self.service_endpoint_path = parsed_url.path 
@@ -59,7 +59,7 @@ class EmbeddingServiceClient(BaseServiceClient):
 
         request_payload = {
             "texts": texts,
-            "text_type": text_type # Pasar el text_type
+            "text_type": text_type 
         }
         self.log.debug(f"Requesting embeddings for {len(texts)} texts from {self.service_endpoint_path}", num_texts=len(texts), text_type=text_type)
 
@@ -111,7 +111,7 @@ class EmbeddingServiceClient(BaseServiceClient):
     async def health_check(self) -> bool:
         health_log = self.log.bind(action="health_check")
         try:
-            parsed_service_url = httpx.URL(str(settings.INGEST_EMBEDDING_SERVICE_URL)) 
+            parsed_service_url = httpx.URL(str(settings.EMBEDDING_SERVICE_URL)) 
             health_endpoint_url_base = f"{parsed_service_url.scheme}://{parsed_service_url.host}"
             if parsed_service_url.port:
                 health_endpoint_url_base += f":{parsed_service_url.port}"
@@ -121,7 +121,7 @@ class EmbeddingServiceClient(BaseServiceClient):
             response.raise_for_status()
             health_data = response.json()
             
-            model_is_ready = health_data.get("model_status") in ["client_ready", "loaded"] # 'loaded' for older versions
+            model_is_ready = health_data.get("model_status") in ["client_ready", "loaded"] 
             if health_data.get("status") == "ok" and model_is_ready:
                 health_log.info("Embedding Service is healthy and model is loaded/ready.", health_data=health_data)
                 return True

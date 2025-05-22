@@ -3715,7 +3715,6 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
         stdlib_task_logger.info(f"StdLib: Calling Embedding Service for {len(chunk_texts_for_embedding)} texts...")
         embedding_service_url = str(settings.INGEST_EMBEDDING_SERVICE_URL)
         
-        # Pass text_type="passage" as ingest-service always processes document passages
         embedding_request_payload = {
             "texts": chunk_texts_for_embedding,
             "text_type": "passage"
@@ -3751,9 +3750,6 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
                 stdlib_task_logger.error(f"StdLib: {emb_count_err}")
                 raise RuntimeError(emb_count_err)
             
-            # Compare received dimension with INGEST_EMBEDDING_DIMENSION
-            # This is crucial because Milvus collection schema depends on this.
-            # The embedding service's model_info.dimension should match settings.EMBEDDING_DIMENSION
             if embeddings and model_info.get("dimension") != settings.EMBEDDING_DIMENSION:
                  emb_dim_err = (f"Embedding dimension from service ({model_info.get('dimension')}) "
                                 f"does not match ingest-service's configured EMBEDDING_DIMENSION ({settings.EMBEDDING_DIMENSION}). "
