@@ -1533,7 +1533,7 @@ if __name__ == "__main__":
         workers=1 # For local dev, uvicorn manages its own loop. Gunicorn workers setting is for prod.
     )
 
-# JFU
+# JFU 2
 ```
 
 ## File: `app\utils\__init__.py`
