@@ -2120,7 +2120,7 @@ import httpx
 import structlog
 from typing import List, Dict, Any, Optional
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-import json # FLAG_CORRECTION: Import json
+import json
 
 from app.core.config import settings
 
@@ -2132,17 +2132,25 @@ class EmbeddingServiceClient:
     """
     def __init__(self, base_url: str, timeout: int = settings.HTTP_CLIENT_TIMEOUT):
         self.base_url = base_url.rstrip('/')
-        self.embed_endpoint = f"{self.base_url}/api/v1/embed" 
-        self.health_endpoint = f"{self.base_url}/health"
-
-        if "/api/v1" in self.base_url.split('/')[-2:]:
-             self.embed_endpoint = f"{self.base_url}/embed"
+        
+        # Determinar el endpoint correcto para /embed y /health
+        parsed_base_url = httpx.URL(self.base_url)
+        
+        if "/api/v1/embed" in parsed_base_url.path: 
+            self.embed_endpoint = str(parsed_base_url)
+            self.health_endpoint = f"{parsed_base_url.scheme}://{parsed_base_url.netloc.decode()}/health"
+        elif "/api/v1" in parsed_base_url.path: 
+            self.embed_endpoint = f"{self.base_url}/embed" # Asume que /api/v1 está en base_url
+            self.health_endpoint = f"{parsed_base_url.scheme}://{parsed_base_url.netloc.decode()}/health"
         else: 
-             self.embed_endpoint = f"{self.base_url}/api/v1/embed"
-
-
+            self.embed_endpoint = f"{self.base_url}/api/v1/embed"
+            self.health_endpoint = f"{self.base_url}/health"
+            
         self._client = httpx.AsyncClient(timeout=timeout)
-        log.info("EmbeddingServiceClient initialized", base_url=self.base_url, embed_endpoint=self.embed_endpoint)
+        log.info("EmbeddingServiceClient initialized", 
+                 base_url_configured=self.base_url, 
+                 resolved_embed_endpoint=self.embed_endpoint,
+                 resolved_health_endpoint=self.health_endpoint)
 
     @retry(
         stop=stop_after_attempt(settings.HTTP_CLIENT_MAX_RETRIES + 1),
@@ -2150,18 +2158,24 @@ class EmbeddingServiceClient:
         retry=retry_if_exception_type((httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError)),
         reraise=True 
     )
-    async def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
+    async def generate_embeddings(self, texts: List[str], text_type: str = "passage") -> List[List[float]]:
         """
         Solicita embeddings para una lista de textos al servicio de embedding.
+        Args:
+            texts: Lista de textos a embeber.
+            text_type: El tipo de texto ('query' o 'passage'). Por defecto 'passage'.
         """
-        client_log = log.bind(action="generate_embeddings", num_texts=len(texts), target_service="embedding-service")
+        client_log = log.bind(action="generate_embeddings", num_texts=len(texts), text_type=text_type, target_service="embedding-service")
         if not texts:
             client_log.warning("No texts provided to generate_embeddings.")
             return []
 
-        payload = {"texts": texts}
+        payload = {
+            "texts": texts,
+            "text_type": text_type 
+        }
         try:
-            client_log.debug("Sending request to embedding service")
+            client_log.debug("Sending request to embedding service", endpoint=self.embed_endpoint, payload_preview=str(payload)[:200])
             response = await self._client.post(self.embed_endpoint, json=payload)
             response.raise_for_status() 
 
@@ -2179,7 +2193,7 @@ class EmbeddingServiceClient:
         except httpx.RequestError as e:
             client_log.error("Request error while contacting embedding service", error=str(e))
             raise ConnectionError(f"Could not connect to embedding service: {e}") from e
-        except json.JSONDecodeError as e_json: # FLAG_CORRECTION: Catch json.JSONDecodeError
+        except json.JSONDecodeError as e_json: 
             client_log.error("Error parsing JSON response from embedding service", error=str(e_json), raw_response=response.text if 'response' in locals() else "N/A")
             raise ValueError(f"Invalid JSON response from embedding service: {e_json}") from e_json
         except (ValueError, TypeError) as e: 
@@ -2190,7 +2204,9 @@ class EmbeddingServiceClient:
     async def get_model_info(self) -> Optional[Dict[str, Any]]:
         client_log = log.bind(action="get_model_info_via_embed", target_service="embedding-service")
         try:
-            response = await self._client.post(self.embed_endpoint, json={"texts": ["test"]}) 
+            # Realizar una petición con un texto de prueba para obtener model_info
+            # Se usa "query" text_type ya que no afecta a OpenAI y es un caso de uso para E5.
+            response = await self._client.post(self.embed_endpoint, json={"texts": ["test"], "text_type": "query"}) 
             response.raise_for_status()
             data = response.json()
             if "model_info" in data and isinstance(data["model_info"], dict):
@@ -2198,11 +2214,11 @@ class EmbeddingServiceClient:
                 return data["model_info"]
             client_log.warning("Model info not found in embedding service response.", response_data=data)
             return None
-        except json.JSONDecodeError as e_json: # FLAG_CORRECTION: Catch json.JSONDecodeError
+        except json.JSONDecodeError as e_json: 
             client_log.error("Failed to parse JSON for get_model_info from embedding service", error=str(e_json), raw_response=response.text if 'response' in locals() else "N/A")
             return None
         except Exception as e:
-            client_log.error("Failed to get model_info from embedding service via /embed", error=str(e))
+            client_log.error("Failed to get model_info from embedding service via /embed", error=str(e), exc_info=True)
             return None
 
     @retry(
@@ -2213,21 +2229,20 @@ class EmbeddingServiceClient:
         before_sleep=lambda retry_state: log.warning(
             "Retrying EmbeddingServiceClient.check_health",
             attempt=retry_state.attempt_number,
-            wait_time=f"{retry_state.next_action.sleep:.2f}s", # type: ignore
-            error_type=type(retry_state.outcome.exception()).__name__ if retry_state.outcome else "N/A", # type: ignore
-            error_message=str(retry_state.outcome.exception()) if retry_state.outcome else "N/A" # type: ignore
+            wait_time=f"{retry_state.next_action.sleep:.2f}s", 
+            error_type=type(retry_state.outcome.exception()).__name__ if retry_state.outcome else "N/A", 
+            error_message=str(retry_state.outcome.exception()) if retry_state.outcome else "N/A" 
         )
     )
     async def check_health(self) -> bool:
         client_log = log.bind(action="check_health_with_retry", target_service="embedding-service")
         try:
-            client_log.debug("Attempting health check...")
+            client_log.debug("Attempting health check...", health_endpoint=self.health_endpoint)
             response = await self._client.get(self.health_endpoint)
             response.raise_for_status() 
 
             data = response.json()
-            # FLAG_CORRECTION: Accept 'client_ready' or 'loaded' as valid model_status
-            model_is_ready = data.get("model_status") in ["loaded", "client_ready"]
+            model_is_ready = data.get("model_status") in ["client_ready", "loaded"]
             if data.get("status") == "ok" and model_is_ready:
                 client_log.info("Embedding service health check successful.", health_data=data)
                 return True
@@ -2240,7 +2255,7 @@ class EmbeddingServiceClient:
         except httpx.RequestError as e:
             client_log.error("Request error during embedding service health check (will be retried or reraised).", error=str(e))
             raise ConnectionError(f"Request error connecting to embedding service: {e}") from e
-        except json.JSONDecodeError as e_json: # FLAG_CORRECTION: Catch json.JSONDecodeError
+        except json.JSONDecodeError as e_json: 
             client_log.error("Failed to parse JSON response from embedding service health check.", error=str(e_json), raw_response=response.text if 'response' in locals() else "N/A")
             raise ConnectionError(f"Invalid JSON response from embedding service health: {e_json}") from e_json
         except Exception as e: 
@@ -2392,7 +2407,7 @@ from typing import List, Optional
 
 from app.application.ports.embedding_port import EmbeddingPort
 from app.infrastructure.clients.embedding_service_client import EmbeddingServiceClient
-from app.core.config import settings # Para EMBEDDING_DIMENSION
+from app.core.config import settings 
 
 log = structlog.get_logger(__name__)
 
@@ -2403,14 +2418,11 @@ class RemoteEmbeddingAdapter(EmbeddingPort):
     """
     def __init__(self, client: EmbeddingServiceClient):
         self.client = client
-        self._embedding_dimension: Optional[int] = None # Se intentará obtener del servicio
-        self._expected_dimension = settings.EMBEDDING_DIMENSION # Dimensión configurada/esperada
+        self._embedding_dimension: Optional[int] = None 
+        self._expected_dimension = settings.EMBEDDING_DIMENSION 
         log.info("RemoteEmbeddingAdapter initialized", expected_dimension=self._expected_dimension)
 
     async def initialize(self):
-        """
-        Intenta obtener la dimensión del embedding desde el servicio al iniciar.
-        """
         init_log = log.bind(adapter="RemoteEmbeddingAdapter", action="initialize")
         try:
             model_info = await self.client.get_model_info()
@@ -2429,7 +2441,7 @@ class RemoteEmbeddingAdapter(EmbeddingPort):
                 init_log.warning("Could not retrieve embedding dimension from service. Will use configured dimension.",
                                  configured_dimension=self._expected_dimension)
         except Exception as e:
-            init_log.error("Failed to retrieve embedding dimension during initialization.", error=str(e))
+            init_log.error("Failed to retrieve embedding dimension during initialization.", error=str(e), exc_info=True)
 
     async def embed_query(self, query_text: str) -> List[float]:
         adapter_log = log.bind(adapter="RemoteEmbeddingAdapter", action="embed_query")
@@ -2437,27 +2449,29 @@ class RemoteEmbeddingAdapter(EmbeddingPort):
             adapter_log.warning("Empty query text provided.")
             raise ValueError("Query text cannot be empty.")
         try:
-            embeddings = await self.client.generate_embeddings([query_text])
+            # Especificar text_type="query" para las consultas de usuario
+            embeddings = await self.client.generate_embeddings(texts=[query_text], text_type="query")
             if not embeddings or len(embeddings) != 1:
                 adapter_log.error("Embedding service did not return a valid embedding for the query.", received_embeddings=embeddings)
                 raise ValueError("Failed to get a valid embedding for the query.")
 
             embedding_vector = embeddings[0]
-            # Validar dimensión
-            if len(embedding_vector) != self.get_embedding_dimension(): # Usa el getter que prioriza servicio
+            
+            service_dim = self.get_embedding_dimension() 
+            if len(embedding_vector) != service_dim:
                 adapter_log.error("Embedding dimension mismatch for query embedding.",
-                                  expected_dim=self.get_embedding_dimension(),
+                                  expected_dim=service_dim,
                                   received_dim=len(embedding_vector))
-                raise ValueError(f"Embedding dimension mismatch: expected {self.get_embedding_dimension()}, got {len(embedding_vector)}")
+                raise ValueError(f"Embedding dimension mismatch: expected {service_dim}, got {len(embedding_vector)}")
 
             adapter_log.debug("Query embedded successfully via remote service.")
             return embedding_vector
         except ConnectionError as e:
             adapter_log.error("Connection error while embedding query.", error=str(e))
-            raise # Re-raise para que el use case lo maneje
+            raise 
         except ValueError as e:
             adapter_log.error("Value error while embedding query.", error=str(e))
-            raise # Re-raise
+            raise 
 
     async def embed_texts(self, texts: List[str]) -> List[List[float]]:
         adapter_log = log.bind(adapter="RemoteEmbeddingAdapter", action="embed_texts")
@@ -2465,18 +2479,19 @@ class RemoteEmbeddingAdapter(EmbeddingPort):
             adapter_log.warning("No texts provided to embed_texts.")
             return []
         try:
-            embeddings = await self.client.generate_embeddings(texts)
+            # Para lotes de texto genéricos (ej. passages), usar "passage" por defecto
+            embeddings = await self.client.generate_embeddings(texts=texts, text_type="passage")
             if len(embeddings) != len(texts):
                 adapter_log.error("Number of embeddings received does not match number of texts sent.",
                                   num_texts=len(texts), num_embeddings=len(embeddings))
                 raise ValueError("Mismatch in number of embeddings received from service.")
 
-            # Validar dimensión del primer embedding como muestra
-            if embeddings and len(embeddings[0]) != self.get_embedding_dimension():
+            service_dim = self.get_embedding_dimension()
+            if embeddings and len(embeddings[0]) != service_dim:
                  adapter_log.error("Embedding dimension mismatch for batch texts.",
-                                   expected_dim=self.get_embedding_dimension(),
+                                   expected_dim=service_dim,
                                    received_dim=len(embeddings[0]))
-                 raise ValueError(f"Embedding dimension mismatch: expected {self.get_embedding_dimension()}, got {len(embeddings[0])}")
+                 raise ValueError(f"Embedding dimension mismatch: expected {service_dim}, got {len(embeddings[0])}")
 
             adapter_log.debug(f"Successfully embedded {len(texts)} texts via remote service.")
             return embeddings
@@ -2488,18 +2503,11 @@ class RemoteEmbeddingAdapter(EmbeddingPort):
             raise
 
     def get_embedding_dimension(self) -> int:
-        """
-        Devuelve la dimensión del embedding, priorizando la obtenida del servicio,
-        o la configurada como fallback.
-        """
         if self._embedding_dimension is not None:
             return self._embedding_dimension
         return self._expected_dimension
 
     async def health_check(self) -> bool:
-        """
-        Delega la verificación de salud al cliente del servicio de embedding.
-        """
         return await self.client.check_health()
 ```
 
