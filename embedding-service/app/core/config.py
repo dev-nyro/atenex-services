@@ -22,13 +22,14 @@ DEFAULT_OPENAI_TIMEOUT_SECONDS = 30
 DEFAULT_OPENAI_MAX_RETRIES = 3
 
 # SentenceTransformer (ST) specific defaults
-DEFAULT_ST_MODEL_NAME = "intfloat/e5-base-v2" # Popular E5 model
-DEFAULT_ST_EMBEDDING_DIMENSION_E5_BASE = 768
-DEFAULT_ST_EMBEDDING_DIMENSION_E5_LARGE = 1024
+DEFAULT_ST_MODEL_NAME = "intfloat/multilingual-e5-base" # Updated default ST model
+DEFAULT_ST_EMBEDDING_DIMENSION_E5_BASE_V2 = 768 # For intfloat/e5-base-v2 (English)
+DEFAULT_ST_EMBEDDING_DIMENSION_MULTILINGUAL_E5_BASE = 768 # For intfloat/multilingual-e5-base
+DEFAULT_ST_EMBEDDING_DIMENSION_E5_LARGE_V2 = 1024 # For intfloat/e5-large-v2 (English)
 DEFAULT_ST_MODEL_DEVICE = "cpu" # "cpu" or "cuda"
 DEFAULT_ST_BATCH_SIZE_CPU = 64
 DEFAULT_ST_BATCH_SIZE_CUDA = 128 # Can be higher on GPU
-DEFAULT_ST_NORMALIZE_EMBEDDINGS = True
+DEFAULT_ST_NORMALIZE_EMBEDDINGS = True # E5 models recommend normalization
 DEFAULT_ST_USE_FP16 = True # Enable by default if CUDA supports it
 
 # FastEmbed specific defaults (kept for potential future use, but not primary)
@@ -191,8 +192,9 @@ class Settings(BaseSettings):
             st_model_name = info.data.get('ST_MODEL_NAME', DEFAULT_ST_MODEL_NAME)
             # Define expected dimensions for known ST models
             expected_dimension_st = None
-            if st_model_name == "intfloat/e5-base-v2": expected_dimension_st = DEFAULT_ST_EMBEDDING_DIMENSION_E5_BASE
-            elif st_model_name == "intfloat/e5-large-v2": expected_dimension_st = DEFAULT_ST_EMBEDDING_DIMENSION_E5_LARGE
+            if st_model_name == "intfloat/e5-base-v2": expected_dimension_st = DEFAULT_ST_EMBEDDING_DIMENSION_E5_BASE_V2
+            elif st_model_name == "intfloat/e5-large-v2": expected_dimension_st = DEFAULT_ST_EMBEDDING_DIMENSION_E5_LARGE_V2
+            elif st_model_name == "intfloat/multilingual-e5-base": expected_dimension_st = DEFAULT_ST_EMBEDDING_DIMENSION_MULTILINGUAL_E5_BASE
             elif st_model_name == "sentence-transformers/all-MiniLM-L6-v2": expected_dimension_st = 384 # Example
 
             if expected_dimension_st is not None:

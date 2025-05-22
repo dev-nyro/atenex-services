@@ -15,22 +15,18 @@ from celery.exceptions import Ignore, Reject, MaxRetriesExceededError, Retry
 from celery.signals import worker_process_init
 from sqlalchemy import Engine
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
-import logging # Import standard logging
+import logging 
 
-# LLM_COMMENT: Configure standard logging for basic output from worker tasks if structlog has issues.
-# This basicConfig might be called multiple times if worker processes re-initialize,
-# but it's generally safe and helps ensure handlers are attached.
 logging.basicConfig(
     stream=sys.stdout, 
-    level=logging.DEBUG, # Use DEBUG for more verbose standard logs during this debug phase
+    level=logging.DEBUG, 
     format='%(asctime)s - %(name)s - %(levelname)s - [StdLib] - %(message)s',
-    force=True # force=True can help if logging is already configured by Celery/another lib
+    force=True 
 )
 stdlib_task_logger = logging.getLogger("app.tasks.process_document.stdlib")
 
 
 def normalize_filename(filename: str) -> str:
-    """Normaliza el nombre de archivo eliminando espacios al inicio/final y espacios duplicados."""
     return " ".join(filename.strip().split())
 
 
@@ -63,7 +59,6 @@ sync_http_retry_strategy = retry(
 def init_worker_resources(**kwargs):
     global sync_engine, gcs_client_global
     
-    # LLM_COMMENT: Use a distinct logger for worker init to avoid context collision
     init_log_struct = structlog.get_logger("app.tasks.worker_init.struct")
     init_log_std = logging.getLogger("app.tasks.worker_init.std")
     
@@ -116,12 +111,10 @@ def init_worker_resources(**kwargs):
     acks_late=True
 )
 def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
-    # --- Debug: Force flush stdout/stderr ---
     sys.stdout.flush()
     sys.stderr.flush()
-    # --- End Debug ---
 
-    early_task_id = str(self.request.id or uuid.uuid4()) # Get task_id early for stdlib logging
+    early_task_id = str(self.request.id or uuid.uuid4()) 
     stdlib_task_logger.info(f"--- TASK ENTRY ID: {early_task_id} --- RAW KWARGS: {kwargs}")
     print(f"--- PRINT TASK ENTRY ID: {early_task_id} ---", flush=True)
 
@@ -138,7 +131,6 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
         "task_id": early_task_id, "attempt": f"{attempt}/{max_attempts}", "doc_id": document_id_str,
         "company_id": company_id_str, "filename": filename, "content_type": content_type
     }
-    # LLM_COMMENT: Ensure structlog is bound with current task context
     log = structlog.get_logger("app.tasks.process_document.task_exec").bind(**log_context)
     
     log.info("Structlog: Payload parsed, task instance bound.")
@@ -200,7 +192,7 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
     stdlib_task_logger.info(f"Task {early_task_id}: Pre-processing checks passed. Normalized filename: {normalized_filename}, GCS object: {object_name}")
 
     try:
-        log.info("Attempting to set status to PROCESSING in DB.") # Changed from debug to info
+        log.info("Attempting to set status to PROCESSING in DB.") 
         stdlib_task_logger.info(f"StdLib: Attempting to set status to PROCESSING for {doc_uuid}")
         status_updated = set_status_sync(
             engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.PROCESSING, error_message=None
@@ -221,7 +213,6 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
             log.info(f"Attempting GCS download: {object_name} -> {str(temp_file_path_obj)}")
             stdlib_task_logger.info(f"StdLib: Attempting GCS download: {object_name} -> {str(temp_file_path_obj)}")
             
-            # This is a critical blocking call
             gcs_client_global.download_file_sync(object_name, str(temp_file_path_obj))
             
             log.info("File downloaded successfully from GCS.")
@@ -232,19 +223,16 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
             log.info(f"File content read into memory ({len(file_bytes)} bytes).")
             stdlib_task_logger.info(f"StdLib: File content read into memory ({len(file_bytes)} bytes). Object: {object_name}")
 
-        # Ensure file_bytes is not None (though read_bytes should raise if file empty/unreadable)
         if file_bytes is None:
             fb_none_err = "File_bytes is None after GCS download and read, indicating an issue."
             log.error(fb_none_err, object_name=object_name)
             stdlib_task_logger.error(f"StdLib: {fb_none_err}. Object: {object_name}")
-            raise RuntimeError(fb_none_err) # Should lead to task failure
+            raise RuntimeError(fb_none_err) 
 
 
         log.info("Calling Document Processing Service (synchronous)...")
         stdlib_task_logger.info("StdLib: Calling Document Processing Service (synchronous)...")
         docproc_url = str(settings.INGEST_DOCPROC_SERVICE_URL)
-        # Note: original_filename in files_payload should ideally be just the filename part.
-        # normalized_filename should be correct here.
         files_payload = {'file': (normalized_filename, file_bytes, content_type)}
         data_payload = {
             'original_filename': normalized_filename, 
@@ -311,14 +299,19 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
         log.info(f"Calling Embedding Service for {len(chunk_texts_for_embedding)} texts (synchronous)...")
         stdlib_task_logger.info(f"StdLib: Calling Embedding Service for {len(chunk_texts_for_embedding)} texts...")
         embedding_service_url = str(settings.INGEST_EMBEDDING_SERVICE_URL)
-        embedding_request_payload = {"texts": chunk_texts_for_embedding}
+        
+        # Pass text_type="passage" as ingest-service always processes document passages
+        embedding_request_payload = {
+            "texts": chunk_texts_for_embedding,
+            "text_type": "passage"
+        }
         embeddings: List[List[float]] = []
         try:
             with httpx.Client(timeout=settings.HTTP_CLIENT_TIMEOUT) as client:
                 @sync_http_retry_strategy
                 def call_embedding_svc():
                     log.debug(f"Attempting POST to EmbeddingSvc: {embedding_service_url}")
-                    stdlib_task_logger.debug(f"StdLib: Attempting POST to EmbeddingSvc: {embedding_service_url}")
+                    stdlib_task_logger.debug(f"StdLib: Attempting POST to EmbeddingSvc: {embedding_service_url} with payload: {json.dumps(embedding_request_payload)[:200]}...")
                     return client.post(embedding_service_url, json=embedding_request_payload)
 
                 response_embed = call_embedding_svc()
@@ -342,11 +335,21 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
                 log.error("Embedding count mismatch from Embedding Service.", expected=len(chunk_texts_for_embedding), received=len(embeddings))
                 stdlib_task_logger.error(f"StdLib: {emb_count_err}")
                 raise RuntimeError(emb_count_err)
-            if embeddings and settings.EMBEDDING_DIMENSION > 0 and len(embeddings[0]) != settings.EMBEDDING_DIMENSION:
-                 emb_dim_err = f"Embedding dimension mismatch. Expected {settings.EMBEDDING_DIMENSION}, got {len(embeddings[0])}"
-                 log.error(f"Received embedding dimension ({len(embeddings[0])}) from service does not match configured Milvus dimension ({settings.EMBEDDING_DIMENSION}).")
+            
+            # Compare received dimension with INGEST_EMBEDDING_DIMENSION
+            # This is crucial because Milvus collection schema depends on this.
+            # The embedding service's model_info.dimension should match settings.EMBEDDING_DIMENSION
+            if embeddings and model_info.get("dimension") != settings.EMBEDDING_DIMENSION:
+                 emb_dim_err = (f"Embedding dimension from service ({model_info.get('dimension')}) "
+                                f"does not match ingest-service's configured EMBEDDING_DIMENSION ({settings.EMBEDDING_DIMENSION}). "
+                                "Ensure configurations are aligned across services (embedding-service and ingest-service).")
+                 log.error(emb_dim_err, 
+                           service_reported_dim=model_info.get('dimension'), 
+                           ingest_configured_dim=settings.EMBEDDING_DIMENSION)
                  stdlib_task_logger.error(f"StdLib: {emb_dim_err}")
-                 raise RuntimeError(emb_dim_err)
+                 if sync_engine: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=emb_dim_err[:500])
+                 raise Reject(emb_dim_err, requeue=False)
+
         except httpx.HTTPStatusError as hse_embed:
             error_msg_esc = f"Embedding Service Error ({hse_embed.response.status_code}): {str(hse_embed.response.text)[:300]}"
             log.error("Embedding Service HTTP Error", status_code=hse_embed.response.status_code, response_text=hse_embed.response.text, exc_info=True)
@@ -384,7 +387,7 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
             if sync_engine: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.PROCESSED, chunk_count=0, error_message=None)
             return {"status": DocumentStatus.PROCESSED.value, "chunks_inserted": 0, "document_id": document_id_str}
 
-        log.info(f"Attempting bulk insert of {len(chunks_for_pg_insert)} chunks into PostgreSQL.") # Changed from debug
+        log.info(f"Attempting bulk insert of {len(chunks_for_pg_insert)} chunks into PostgreSQL.") 
         stdlib_task_logger.info(f"StdLib: Attempting bulk insert of {len(chunks_for_pg_insert)} chunks into PostgreSQL.")
         inserted_pg_count = 0
         try:
@@ -408,7 +411,7 @@ def process_document_standalone(self: Task, *args, **kwargs) -> Dict[str, Any]:
              if sync_engine: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.ERROR, error_message=pg_crit_err_msg[:500])
              raise Reject(f"PostgreSQL bulk insert failed: {pg_insert_err}", requeue=False) from pg_insert_err
 
-        log.info("Setting final status to PROCESSED in DB.") # Changed from debug
+        log.info("Setting final status to PROCESSED in DB.") 
         stdlib_task_logger.info("StdLib: Setting final status to PROCESSED in DB.")
         if sync_engine: set_status_sync(engine=sync_engine, document_id=doc_uuid, status=DocumentStatus.PROCESSED, chunk_count=inserted_pg_count, error_message=None)
         
