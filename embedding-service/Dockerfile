@@ -50,8 +50,8 @@ COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 COPY ./app ${APP_HOME}/app
-# Asumiendo que gunicorn_conf.py está en la raíz del contexto de build (junto al Dockerfile)
-COPY ./gunicorn_conf.py ${APP_HOME}/gunicorn_conf.py
+# CORRECCIÓN: Copiar gunicorn_conf.py desde app/gunicorn_conf.py a la raíz de APP_HOME
+COPY ./app/gunicorn_conf.py ${APP_HOME}/gunicorn_conf.py
 
 
 # Crear directorios de caché. Aunque Sentence Transformers no se instale por defecto,
