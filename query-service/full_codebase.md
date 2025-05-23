@@ -1582,13 +1582,10 @@ class AskQueryUseCase:
                           map_reduce_chunk_threshold=settings.MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS)
             
             should_activate_mapreduce_by_tokens = total_tokens_for_llm > self.settings.MAX_PROMPT_TOKENS
-            should_activate_mapreduce_by_chunks = num_final_chunks_for_llm_or_mapreduce > self.settings.MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS
 
-            if self.settings.MAPREDUCE_ENABLED and \
-               (should_activate_mapreduce_by_tokens or should_activate_mapreduce_by_chunks) and \
-               num_final_chunks_for_llm_or_mapreduce > 1: 
-                
-                trigger_reason = "token_count" if should_activate_mapreduce_by_tokens else "chunk_count"
+            # MapReduce solo se activa si se supera el umbral de tokens, no por chunks
+            if self.settings.MAPREDUCE_ENABLED and should_activate_mapreduce_by_tokens and num_final_chunks_for_llm_or_mapreduce > 1:
+                trigger_reason = "token_count"
                 exec_log.info(f"Activating MapReduce due to {trigger_reason}. "
                               f"Chunks: {num_final_chunks_for_llm_or_mapreduce} (Chunk Threshold: {self.settings.MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS}), "
                               f"Tokens: {total_tokens_for_llm} (Token Threshold: {self.settings.MAX_PROMPT_TOKENS})", 
