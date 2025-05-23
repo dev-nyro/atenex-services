@@ -3,6 +3,7 @@ import structlog
 import asyncio
 import uuid
 import re
+import time
 from typing import Dict, Any, List, Tuple, Optional, Type, Set
 from datetime import datetime, timezone, timedelta
 import httpx
@@ -52,6 +53,19 @@ def format_time_delta(dt: datetime) -> str:
 
 class AskQueryUseCase:
     _tiktoken_encoding: Optional[tiktoken.Encoding] = None # Cache for tiktoken encoding
+    from collections import OrderedDict
+
+    class BoundedCache(OrderedDict):
+        def __init__(self, max_size: int, *args, **kwargs):
+            self.max_size = max_size
+            super().__init__(*args, **kwargs)
+
+        def __setitem__(self, key, value):
+            if len(self) >= self.max_size:
+                self.popitem(last=False)
+            super().__setitem__(key, value)
+
+    _token_count_cache: BoundedCache = BoundedCache(max_size=500) # Cache for token counts by content hash
 
     def __init__(self,
                  chat_repo: ChatRepositoryPort,
@@ -122,19 +136,91 @@ class AskQueryUseCase:
     def _count_tokens_for_chunks(self, chunks: List[RetrievedChunk]) -> int:
         if not chunks:
             return 0
-        total_tokens = 0
+        
+        # Filtrar chunks con contenido válido
+        valid_contents = [chunk.content for chunk in chunks if chunk.content and chunk.content.strip()]
+        if not valid_contents:
+            return 0
+        
         try:
             encoding = self._get_tiktoken_encoding()
-            for chunk in chunks:
-                if chunk.content:
-                    total_tokens += len(encoding.encode(chunk.content))
+            
+            # Optimización con cache: verificar si ya tenemos algunos contenidos calculados
+            total_tokens = 0
+            uncached_contents = []
+            
+            for content in valid_contents:
+                # Crear un hash simple del contenido para el cache
+                import hashlib
+                content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
+                
+                if content_hash in self._token_count_cache:
+                    total_tokens += self._token_count_cache[content_hash]
+                else:
+                    uncached_contents.append((content, content_hash))
+            
+            # Procesar solo los contenidos no cacheados
+            if uncached_contents:
+                if len(uncached_contents) == 1:
+                    # Caso simple: un solo contenido no cacheado
+                    content, content_hash = uncached_contents[0]
+                    token_count = len(encoding.encode(content))
+                    self._token_count_cache[content_hash] = token_count
+                    total_tokens += token_count
+                else:
+                    # Procesamiento por lotes para múltiples contenidos
+                    batch_contents = [content for content, _ in uncached_contents]
+                    separator = "\n\n---CHUNK_SEP---\n\n"
+                    concatenated = separator.join(batch_contents)
+                    
+                    # Contar tokens del lote concatenado
+                    batch_total = len(encoding.encode(concatenated))
+                    
+                    # Restar tokens del separador
+                    if len(batch_contents) > 1:
+                        separator_tokens = len(encoding.encode(separator))
+                        batch_total -= separator_tokens * (len(batch_contents) - 1)
+                    
+                    # Estimar tokens por contenido individual (distribución proporcional)
+                    total_chars = sum(len(content) for content in batch_contents)
+                    
+                    for content, content_hash in uncached_contents:
+                        if total_chars > 0:
+                            # Distribución proporcional basada en longitud de caracteres
+                            content_ratio = len(content) / total_chars
+                            estimated_tokens = int(batch_total * content_ratio)
+                        else:
+                            estimated_tokens = 0
+                        
+                        self._token_count_cache[content_hash] = estimated_tokens
+                        total_tokens += estimated_tokens
+            
+            # Limitar el tamaño del cache para evitar consumo excesivo de memoria
+            if len(self._token_count_cache) > 1000:
+                # Mantener solo los 500 más recientes (aproximadamente)
+                cache_items = list(self._token_count_cache.items())
+                pass  # No manual trimming needed as BoundedCache handles it automatically
+            
+            return total_tokens
+            
         except Exception as e:
-            log.error("Error counting tokens for chunks", error=str(e), exc_info=True)
-            # Estimación muy cruda si tiktoken falla: N chunks * X palabras/chunk * Y tokens/palabra
-            # O simplemente devolver un valor alto para forzar MapReduce si es crítico no exceder.
-            # Por ahora, si falla el conteo, asumimos que no se supera el umbral para evitar MapReduce innecesario.
-            return 0 # O manejar el error de forma más robusta
-        return total_tokens
+            log.error("Error counting tokens for chunks with tiktoken, falling back to estimation", 
+                     error=str(e), num_chunks=len(chunks), exc_info=False)
+            
+            # Estimación ultra-rápida basada en caracteres
+            # Ratios aproximados para diferentes idiomas:
+            # - Inglés: ~4 caracteres por token
+            # - Español: ~4.5 caracteres por token  
+            # - Código: ~3.5 caracteres por token
+            # Usamos 4 como promedio conservador
+            total_chars = sum(len(content) for content in valid_contents)
+            estimated_tokens = max(1, int(total_chars / 4))
+            
+            log.debug("Using fast character-based token estimation", 
+                     total_chars=total_chars, estimated_tokens=estimated_tokens,
+                     chars_per_token_ratio=4)
+            
+            return estimated_tokens
 
     def _initialize_prompt_builder_from_path(self, template_path: str) -> PromptBuilder:
         init_log = log.bind(action="_initialize_prompt_builder_from_path", path=template_path)
@@ -415,16 +501,20 @@ class AskQueryUseCase:
                 "bm25_enabled_in_settings": self.settings.BM25_ENABLED,
             }
             log_id = await self.log_repo.log_query_interaction(
-                company_id=company_id, user_id=user_id, query=query, answer=answer_for_user,
-                retrieved_documents_data=docs_for_log_summary, 
-                chat_id=final_chat_id, metadata=log_metadata_details
+                user_id=user_id,
+                company_id=company_id,
+                query=query,
+                answer=answer_for_user,
+                retrieved_documents_data=docs_for_log_summary,
+                metadata=log_metadata_details,
+                chat_id=final_chat_id
             )
-            llm_handler_log.info("Interaction logged successfully", db_log_id=str(log_id))
-        except Exception as log_err_final:
-            llm_handler_log.error("Failed to log RAG interaction", error=str(log_err_final), exc_info=False)
+            llm_handler_log.info("Query interaction logged successfully.", log_id=str(log_id) if log_id else "None")
+        except Exception as e_log:
+            llm_handler_log.error("Failed to log query interaction", error=str(e_log), exc_info=True)
+            # log_id remains as initialized (None)
 
         return answer_for_user, retrieved_chunks_for_response, log_id
-
 
     async def execute(
         self, query: str, company_id: uuid.UUID, user_id: uuid.UUID,
@@ -441,24 +531,15 @@ class AskQueryUseCase:
         history_messages: List[ChatMessage] = []
 
         try:
-            if chat_id:
-                if not await self.chat_repo.check_chat_ownership(chat_id, user_id, company_id):
-                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Chat not found or access denied.")
-                final_chat_id = chat_id
-                if self.settings.MAX_CHAT_HISTORY_MESSAGES > 0:
-                    history_messages = await self.chat_repo.get_chat_messages(
-                        chat_id=final_chat_id, user_id=user_id, company_id=company_id,
-                        limit=self.settings.MAX_CHAT_HISTORY_MESSAGES, offset=0
-                    )
-                    chat_history_str = self._format_chat_history(history_messages)
-                    exec_log.info("Chat history retrieved", num_messages=len(history_messages))
-            else:
-                initial_title = f"Chat: {truncate_text(query, 40)}"
-                final_chat_id = await self.chat_repo.create_chat(user_id=user_id, company_id=company_id, title=initial_title)
-            exec_log = exec_log.bind(chat_id=str(final_chat_id))
-            await self.chat_repo.save_message(chat_id=final_chat_id, role='user', content=query)
-            exec_log.info("Chat state managed and user message saved", is_new_chat=(not chat_id))
+            final_chat_id, chat_history_str, history_messages = await self._manage_chat_state(
+                query, company_id, user_id, chat_id, exec_log
+            )
 
+            if GREETING_REGEX.match(query):
+                return await self._handle_greeting(query, company_id, user_id, final_chat_id, exec_log)
+
+            pipeline_stages_used.append("query_embedding (remote)")
+            query_embedding = await self._embed_query(query)
             if GREETING_REGEX.match(query):
                 answer = "¡Hola! ¿En qué puedo ayudarte hoy con la información de tus documentos?"
                 await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=None)
@@ -733,12 +814,17 @@ class AskQueryUseCase:
 
             map_reduce_active = False
             json_answer_str: str
-            chunks_to_send_to_llm: List[RetrievedChunk] # Chunks que realmente irán al LLM
-
+            chunks_to_send_to_llm: List[RetrievedChunk] # Chunks que realmente irán al LLM            # Medir performance del conteo de tokens optimizado
+            token_count_start = time.perf_counter()
             total_tokens_for_llm = self._count_tokens_for_chunks(final_chunks_for_processing)
+            token_count_duration = time.perf_counter() - token_count_start
+            
+            cache_stats = self._get_cache_stats()
             exec_log.info("Token count for final list of processed chunks",
                           num_chunks=num_final_chunks_for_llm_or_mapreduce,
                           total_tokens=total_tokens_for_llm,
+                          token_count_duration_ms=round(token_count_duration * 1000, 2),
+                          cache_size=cache_stats["cache_size"],
                           map_reduce_token_threshold=settings.MAX_PROMPT_TOKENS,
                           map_reduce_chunk_threshold=settings.MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS)
             
@@ -888,3 +974,15 @@ class AskQueryUseCase:
         except Exception as e: 
             exec_log.exception("Unexpected error during use case execution") 
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An internal server error occurred: {type(e).__name__}. Please contact support if this persists.") from e
+
+    def _clear_token_cache(self) -> None:
+        """Limpia el cache de conteo de tokens para liberar memoria."""
+        self._token_count_cache.clear()
+        log.debug("Token count cache cleared")
+
+    def _get_cache_stats(self) -> Dict[str, Any]:
+        """Retorna estadísticas del cache para monitoreo."""
+        return {
+            "cache_size": len(self._token_count_cache),
+            "memory_usage_estimate_kb": len(self._token_count_cache) * 50 / 1024  # Estimación aprox
+        }

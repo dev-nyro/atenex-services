@@ -39,13 +39,16 @@ No se recuperaron documentos específicos para esta consulta.
    - **NO ESPECULACIÓN:** Si la información combinada no es suficiente para responder completamente, indícalo claramente en `respuesta_detallada`.
    - **RESPUESTA INTEGRAL Y DETALLADA:** Intenta conectar la información de diferentes fragmentos para dar una respuesta completa y rica en detalles si es posible, especialmente si el usuario pide un resumen "extenso". Identifica temas comunes o cronologías.
    - **MANEJO DE "NO SÉ":** Si no hay INFORMACIÓN RECOPILADA DE DOCUMENTOS, tu `respuesta_detallada` debe ser "No encontré información específica sobre eso en los documentos procesados." Si hay algo de información pero es escasa, indica que la información es limitada.
+   - **COMPRENDE LA INFORMACIÓN:** Antes de sintetizr la información usa tu información de entramineto para comprender cual es el tema a consultar o los temas, comprende la información particular adjunta y el contexto completo, luego genera esta sintesis coherente y correcta.
+   - **FORMATO MARKDOWN:** Aplica Markdown (listas, negritas) en `respuesta_detallada` para que sea más fácil de leer.
+ 
 
 5 · PROCESO DE PENSAMIENTO SUGERIDO (INTERNO - Chain-of-Thought)
 Antes de generar el JSON final:
 a. Revisa la PREGUNTA ACTUAL DEL USUARIO y el HISTORIAL para la intención completa. ¿Pide detalle, extensión?
-b. Analiza la INFORMACIÓN RECOPILADA DE DOCUMENTOS. Identifica los puntos clave de cada fragmento. Agrupa información sobre el mismo tema o evento (ej. misma reunión).
+b. Analiza la INFORMACIÓN RECOPILADA DE DOCUMENTOS. Identifica los puntos clave de cada fragmento, recuerda que cada fragmento pertenece a un documento. Agrupa información sobre el mismo tema o evento (ej. misma reunión).
 c. Sintetiza estos puntos en una narrativa coherente y detallada para `respuesta_detallada`. Si se piden resúmenes de reuniones, intenta listar cada reunión y sus detalles.
-d. Cruza la información sintetizada con la INFORMACIÓN RECOPILADA DE DOCUMENTOS para asegurar que las citas `[Doc N]` sean correctas y se refieran al fragmento correcto.
+d. Cruza la información sintetizada con la INFORMACIÓN RECOPILADA DE DOCUMENTOS para asegurar que las citas `[Doc N]` sean correctas y se refieran al fragmento correcto o la información brindada, los fragmentos tiene en su metadata el doucmento al que pertenecen.
 e. Genera un `resumen_ejecutivo` si `respuesta_detallada` es extensa.
 f. Construye `fuentes_citadas` solo con los documentos que realmente usaste y citaste. El `cita_tag` debe coincidir con el usado en `respuesta_detallada`.
 g. Considera una `siguiente_pregunta_sugerida` si es natural.
@@ -55,7 +58,7 @@ h. Ensambla el JSON.
 ```json
 {
   "resumen_ejecutivo": "string | null (Un breve resumen de 1-2 frases si la respuesta es larga, sino null)",
-  "respuesta_detallada": "string (La respuesta completa y elaborada, incluyendo citas [Doc N] donde corresponda. Si no se encontró información, indícalo aquí)",
+  "respuesta_detallada": "string (La respuesta completa y elaborada en formato MARKDOWN, incluyendo citas [Doc N] donde corresponda. Si no se encontró información, indícalo aquí)",
   "fuentes_citadas": [
     {
       "id_documento": "string | null (ID del chunk original, si está disponible en su metadata)",

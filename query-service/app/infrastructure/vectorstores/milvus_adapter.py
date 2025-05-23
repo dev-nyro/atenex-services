@@ -2,29 +2,19 @@
 import structlog
 import asyncio
 from typing import List, Optional, Dict, Any
-import json # Importar json para la expresión 'in'
+import json 
 
 from pymilvus import Collection, connections, utility, MilvusException, DataType
-from haystack import Document # Keep Haystack Document for conversion ease initially
+from haystack import Document 
 
-# LLM_REFACTOR_STEP_2: Update import paths and add Port/Domain import
 from app.core.config import settings
 from app.application.ports.vector_store_port import VectorStorePort
-from app.domain.models import RetrievedChunk # Import domain model
+from app.domain.models import RetrievedChunk 
 
-# --- Import field name constants from ingest_pipeline for clarity (Read-Only) ---
-# These constants represent the actual field names used in the Milvus collection schema
-# defined by the ingest-service.
-# This improves maintainability if field names change in the ingest service.
-# LLM_FLAG: MANUALLY_VERIFIED_INGEST_SCHEMA_FIELDS_CONSISTENCY
 try:
-    # Attempt to import from a shared location if ingest-service fields are exposed
-    # For now, we assume these constants are defined based on ingest-service's current schema
-    # In a mono-repo or shared library, this would be more direct.
-    # Hardcoding them here as a fallback based on the ingest-service README and common practice.
     MILVUS_PK_FIELD = "pk_id"
-    MILVUS_VECTOR_FIELD = "embedding" # Corresponds to settings.MILVUS_EMBEDDING_FIELD from ingest
-    MILVUS_CONTENT_FIELD = "content" # Corresponds to settings.MILVUS_CONTENT_FIELD from ingest
+    MILVUS_VECTOR_FIELD = "embedding" 
+    MILVUS_CONTENT_FIELD = "content" 
     MILVUS_COMPANY_ID_FIELD = "company_id"
     MILVUS_DOCUMENT_ID_FIELD = "document_id"
     MILVUS_FILENAME_FIELD = "file_name"
@@ -58,8 +48,6 @@ except ImportError:
 log = structlog.get_logger(__name__)
 
 class MilvusAdapter(VectorStorePort):
-    """Adaptador concreto para interactuar con Milvus usando pymilvus."""
-
     _collection: Optional[Collection] = None
     _connected = False
     _alias = "query_service_milvus_adapter"
@@ -72,7 +60,6 @@ class MilvusAdapter(VectorStorePort):
 
 
     async def _ensure_connection(self):
-        """Ensures connection to Milvus is established."""
         if not self._connected or self._alias not in connections.list_connections():
             uri = str(settings.MILVUS_URI)
             connect_log = log.bind(adapter="MilvusAdapter", action="connect", uri=uri, alias=self._alias)
@@ -81,7 +68,7 @@ class MilvusAdapter(VectorStorePort):
                 connections.connect(
                     alias=self._alias,
                     uri=uri,
-                    token=settings.ZILLIZ_API_KEY.get_secret_value(), # MODIFIED: Added token
+                    token=settings.ZILLIZ_API_KEY.get_secret_value(), 
                     timeout=settings.MILVUS_GRPC_TIMEOUT
                 )
                 self._connected = True
@@ -96,7 +83,6 @@ class MilvusAdapter(VectorStorePort):
                 raise ConnectionError(f"Unexpected Milvus (Zilliz) connection error: {e}") from e
 
     async def _get_collection(self) -> Collection:
-        """Gets the Milvus collection object, ensuring connection and loading."""
         await self._ensure_connection()
 
         if self._collection is None:
@@ -116,21 +102,20 @@ class MilvusAdapter(VectorStorePort):
 
             except MilvusException as e:
                 collection_log.error("Failed to get or load Milvus collection", error_code=e.code, error_message=e.message)
-                if "multiple indexes" in e.message.lower(): # LLM_FLAG: SENSITIVE_ERROR_HANDLING
+                if "multiple indexes" in e.message.lower(): 
                     collection_log.critical("Potential 'Ambiguous Index' error encountered. Please check Milvus indices for this collection.")
                 raise RuntimeError(f"Milvus collection access error (Code: {e.code}): {e.message}") from e
             except Exception as e:
                  collection_log.exception("Unexpected error accessing Milvus collection")
                  raise RuntimeError(f"Unexpected error accessing Milvus collection: {e}") from e
 
-        if not isinstance(self._collection, Collection): # LLM_FLAG: ROBUSTNESS_CHECK
+        if not isinstance(self._collection, Collection): 
             log.critical("Milvus collection object is unexpectedly None or invalid type after initialization attempt.")
             raise RuntimeError("Failed to obtain a valid Milvus collection object.")
 
         return self._collection
 
     async def search(self, embedding: List[float], company_id: str, top_k: int) -> List[RetrievedChunk]:
-        """Busca chunks relevantes usando pymilvus y los convierte al modelo de dominio."""
         search_log = log.bind(adapter="MilvusAdapter", action="search", company_id=company_id, top_k=top_k)
         try:
             collection = await self._get_collection()
@@ -147,8 +132,15 @@ class MilvusAdapter(VectorStorePort):
                 INGEST_SCHEMA_FIELDS["document"],
                 INGEST_SCHEMA_FIELDS["filename"],
             }
-            required_output_fields_set.update(settings.MILVUS_METADATA_FIELDS)
+            required_output_fields_set.update(settings.MILVUS_METADATA_FIELDS) # Incluye page, title, etc.
             output_fields_list = list(required_output_fields_set)
+            
+            # Asegurar que los campos de documento y nombre de archivo se pidan explícitamente si no están ya.
+            if INGEST_SCHEMA_FIELDS["document"] not in output_fields_list:
+                output_fields_list.append(INGEST_SCHEMA_FIELDS["document"])
+            if INGEST_SCHEMA_FIELDS["filename"] not in output_fields_list:
+                output_fields_list.append(INGEST_SCHEMA_FIELDS["filename"])
+            output_fields_list = list(set(output_fields_list)) # Evitar duplicados
 
             search_log.debug("Performing Milvus vector search...",
                              vector_field=self._vector_field_name,
@@ -173,18 +165,24 @@ class MilvusAdapter(VectorStorePort):
             domain_chunks: List[RetrievedChunk] = []
             if search_results and search_results[0]:
                 for hit in search_results[0]:
+                    # El método to_dict() en la entidad del hit es preferible si está disponible
                     entity_data = hit.entity.to_dict() if hasattr(hit, 'entity') and hasattr(hit.entity, 'to_dict') else {}
                     
-                    # hit.id es el PK
-                    pk_id = str(hit.id) 
-                    content = entity_data.get(INGEST_SCHEMA_FIELDS["content"], "")
-                    embedding_vector = entity_data.get(self._vector_field_name)
+                    # Si entity_data está vacío, intentar obtener los campos directamente del hit
+                    if not entity_data:
+                        entity_data = {field: hit.get(field) for field in output_fields_list if hit.get(field) is not None}
 
+                    pk_id = str(hit.id) # hit.id es el PK (pk_id)
+                    content = entity_data.get(INGEST_SCHEMA_FIELDS["content"], "")
+                    embedding_vector = entity_data.get(self._vector_field_name) # El embedding en sí
+                    
+                    # Mapear todos los campos recuperados a metadata, excluyendo el vector.
                     metadata_dict = {k: v for k, v in entity_data.items() if k != self._vector_field_name}
                     
-                    doc_id_val = metadata_dict.get(INGEST_SCHEMA_FIELDS["document"])
-                    comp_id_val = metadata_dict.get(INGEST_SCHEMA_FIELDS["company"])
-                    fname_val = metadata_dict.get(INGEST_SCHEMA_FIELDS["filename"])
+                    # Asignar explícitamente los campos principales del chunk
+                    doc_id_val = entity_data.get(INGEST_SCHEMA_FIELDS["document"])
+                    comp_id_val = entity_data.get(INGEST_SCHEMA_FIELDS["company"])
+                    fname_val = entity_data.get(INGEST_SCHEMA_FIELDS["filename"])
 
                     chunk = RetrievedChunk(
                         id=pk_id,
@@ -214,9 +212,6 @@ class MilvusAdapter(VectorStorePort):
         *,
         collection_name: str | None = None,
     ) -> Dict[str, List[float]]:
-        """
-        Devuelve un dict {id: embedding}. Si Milvus no encuentra alguno, no lo incluye.
-        """
         fetch_log = log.bind(adapter="MilvusAdapter", action="fetch_vectors_by_ids", num_ids=len(ids))
         if not ids:
             fetch_log.debug("No IDs provided, returning empty dict.")
@@ -224,8 +219,6 @@ class MilvusAdapter(VectorStorePort):
 
         try:
             _collection_obj = await self._get_collection()
-            
-            # Milvus 'in' operator expects a list of strings or numbers. JSON dump for safety with strings.
             ids_json_array_str = json.dumps(ids)
             expr = f'{self._pk_field_name} in {ids_json_array_str}'
             
@@ -243,9 +236,7 @@ class MilvusAdapter(VectorStorePort):
                 )
             )
             
-            # Milvus query devuelve List[Dict]; lo convertimos a {id: vec}
-            # El PK devuelto por query estará en el campo self._pk_field_name
-            fetched_vectors = {row[self._pk_field_name]: row[self._vector_field_name] for row in res if self._pk_field_name in row and self._vector_field_name in row}
+            fetched_vectors = {str(row[self._pk_field_name]): row[self._vector_field_name] for row in res if self._pk_field_name in row and self._vector_field_name in row}
             fetch_log.info(f"Fetched {len(fetched_vectors)} vectors from Milvus out of {len(ids)} requested.")
             return fetched_vectors
         except MilvusException as me:
@@ -257,11 +248,9 @@ class MilvusAdapter(VectorStorePort):
 
 
     async def connect(self):
-        """Explicitly ensures connection (can be called during startup if needed)."""
         await self._ensure_connection()
 
     async def disconnect(self):
-        """Disconnects from Milvus."""
         if self._connected and self._alias in connections.list_connections():
             log.info("Disconnecting from Milvus...", adapter="MilvusAdapter", alias=self._alias)
             try:
