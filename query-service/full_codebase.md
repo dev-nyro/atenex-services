@@ -741,12 +741,14 @@ import structlog
 import asyncio
 import uuid
 import re
+import time
 from typing import Dict, Any, List, Tuple, Optional, Type, Set
 from datetime import datetime, timezone, timedelta
 import httpx
 import os 
 import json 
 from pydantic import ValidationError 
+import tiktoken # Import tiktoken
 
 # Import Ports and Domain Models
 from app.application.ports import (
@@ -788,6 +790,21 @@ def format_time_delta(dt: datetime) -> str:
 
 
 class AskQueryUseCase:
+    _tiktoken_encoding: Optional[tiktoken.Encoding] = None # Cache for tiktoken encoding
+    from collections import OrderedDict
+
+    class BoundedCache(OrderedDict):
+        def __init__(self, max_size: int, *args, **kwargs):
+            self.max_size = max_size
+            super().__init__(*args, **kwargs)
+
+        def __setitem__(self, key, value):
+            if len(self) >= self.max_size:
+                self.popitem(last=False)
+            super().__setitem__(key, value)
+
+    _token_count_cache: BoundedCache = BoundedCache(max_size=500) # Cache for token counts by content hash
+
     def __init__(self,
                  chat_repo: ChatRepositoryPort,
                  log_repo: LogRepositoryPort,
@@ -826,15 +843,16 @@ class AskQueryUseCase:
             "diversity_filter_enabled": settings.DIVERSITY_FILTER_ENABLED,
             "diversity_filter_type": type(self.diversity_filter).__name__ if self.diversity_filter else "None",
             "map_reduce_enabled": settings.MAPREDUCE_ENABLED,
-            "map_reduce_threshold": settings.MAPREDUCE_ACTIVATION_THRESHOLD,
+            "map_reduce_token_threshold": settings.MAX_PROMPT_TOKENS, # Usaremos MAX_PROMPT_TOKENS para el umbral de tokens
+            "map_reduce_chunk_threshold": settings.MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS,
             "map_reduce_batch_size": settings.MAPREDUCE_CHUNK_BATCH_SIZE,
             "rag_prompt_path": settings.RAG_PROMPT_TEMPLATE_PATH,
             "general_prompt_path": settings.GENERAL_PROMPT_TEMPLATE_PATH,
             "map_prompt_path": settings.MAP_PROMPT_TEMPLATE_PATH,
             "reduce_prompt_path": settings.REDUCE_PROMPT_TEMPLATE_PATH,
             "gemini_model_name": settings.GEMINI_MODEL_NAME,
-            "max_context_chunks": settings.MAX_CONTEXT_CHUNKS,
-            "max_prompt_tokens": settings.MAX_PROMPT_TOKENS,
+            "max_context_chunks_direct_rag": settings.MAX_CONTEXT_CHUNKS,
+            "tiktoken_encoding_name": settings.TIKTOKEN_ENCODING_NAME,
         }
         log.info("AskQueryUseCase Initialized", **log_params)
         if settings.BM25_ENABLED and not self.sparse_retriever:
@@ -842,6 +860,105 @@ class AskQueryUseCase:
         if self.sparse_retriever and not self.chunk_content_repo:
             log.error("SparseRetriever is active but ChunkContentRepository is missing. Content fetching for sparse results will fail.")
 
+    def _get_tiktoken_encoding(self) -> tiktoken.Encoding:
+        if self._tiktoken_encoding is None:
+            try:
+                self._tiktoken_encoding = tiktoken.get_encoding(self.settings.TIKTOKEN_ENCODING_NAME)
+            except Exception as e:
+                log.error("Failed to load tiktoken encoding", encoding_name=self.settings.TIKTOKEN_ENCODING_NAME, error=str(e))
+                # Fallback a un encoding simple si falla la carga del específico (menos preciso)
+                self._tiktoken_encoding = tiktoken.get_encoding("gpt2") 
+                log.warning("Falling back to 'gpt2' tiktoken encoding due to previous error.")
+        return self._tiktoken_encoding
+
+    def _count_tokens_for_chunks(self, chunks: List[RetrievedChunk]) -> int:
+        if not chunks:
+            return 0
+        
+        # Filtrar chunks con contenido válido
+        valid_contents = [chunk.content for chunk in chunks if chunk.content and chunk.content.strip()]
+        if not valid_contents:
+            return 0
+        
+        try:
+            encoding = self._get_tiktoken_encoding()
+            
+            # Optimización con cache: verificar si ya tenemos algunos contenidos calculados
+            total_tokens = 0
+            uncached_contents = []
+            
+            for content in valid_contents:
+                # Crear un hash simple del contenido para el cache
+                import hashlib
+                content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
+                
+                if content_hash in self._token_count_cache:
+                    total_tokens += self._token_count_cache[content_hash]
+                else:
+                    uncached_contents.append((content, content_hash))
+            
+            # Procesar solo los contenidos no cacheados
+            if uncached_contents:
+                if len(uncached_contents) == 1:
+                    # Caso simple: un solo contenido no cacheado
+                    content, content_hash = uncached_contents[0]
+                    token_count = len(encoding.encode(content))
+                    self._token_count_cache[content_hash] = token_count
+                    total_tokens += token_count
+                else:
+                    # Procesamiento por lotes para múltiples contenidos
+                    batch_contents = [content for content, _ in uncached_contents]
+                    separator = "\n\n---CHUNK_SEP---\n\n"
+                    concatenated = separator.join(batch_contents)
+                    
+                    # Contar tokens del lote concatenado
+                    batch_total = len(encoding.encode(concatenated))
+                    
+                    # Restar tokens del separador
+                    if len(batch_contents) > 1:
+                        separator_tokens = len(encoding.encode(separator))
+                        batch_total -= separator_tokens * (len(batch_contents) - 1)
+                    
+                    # Estimar tokens por contenido individual (distribución proporcional)
+                    total_chars = sum(len(content) for content in batch_contents)
+                    
+                    for content, content_hash in uncached_contents:
+                        if total_chars > 0:
+                            # Distribución proporcional basada en longitud de caracteres
+                            content_ratio = len(content) / total_chars
+                            estimated_tokens = int(batch_total * content_ratio)
+                        else:
+                            estimated_tokens = 0
+                        
+                        self._token_count_cache[content_hash] = estimated_tokens
+                        total_tokens += estimated_tokens
+            
+            # Limitar el tamaño del cache para evitar consumo excesivo de memoria
+            if len(self._token_count_cache) > 1000:
+                # Mantener solo los 500 más recientes (aproximadamente)
+                cache_items = list(self._token_count_cache.items())
+                pass  # No manual trimming needed as BoundedCache handles it automatically
+            
+            return total_tokens
+            
+        except Exception as e:
+            log.error("Error counting tokens for chunks with tiktoken, falling back to estimation", 
+                     error=str(e), num_chunks=len(chunks), exc_info=False)
+            
+            # Estimación ultra-rápida basada en caracteres
+            # Ratios aproximados para diferentes idiomas:
+            # - Inglés: ~4 caracteres por token
+            # - Español: ~4.5 caracteres por token  
+            # - Código: ~3.5 caracteres por token
+            # Usamos 4 como promedio conservador
+            total_chars = sum(len(content) for content in valid_contents)
+            estimated_tokens = max(1, int(total_chars / 4))
+            
+            log.debug("Using fast character-based token estimation", 
+                     total_chars=total_chars, estimated_tokens=estimated_tokens,
+                     chars_per_token_ratio=4)
+            
+            return estimated_tokens
 
     def _initialize_prompt_builder_from_path(self, template_path: str) -> PromptBuilder:
         init_log = log.bind(action="_initialize_prompt_builder_from_path", path=template_path)
@@ -972,12 +1089,9 @@ class AskQueryUseCase:
             original_chunk_from_dense = dense_map.get(cid)
 
             if original_chunk_from_dense and original_chunk_from_dense.content:
-                # Crucial: Ensure embedding from dense result is preserved
                 original_chunk_from_dense.score = fused_score_val 
                 chunks_with_content.append(original_chunk_from_dense)
             else: 
-                # If chunk was not in dense_map or had no content, it's a placeholder
-                # Its embedding will be None unless it was in dense_map but content was missing.
                 chunk_placeholder = RetrievedChunk(
                     id=cid,
                     score=fused_score_val, 
@@ -1114,7 +1228,7 @@ class AskQueryUseCase:
                 "map_reduce_used": map_reduce_used,
                 "retriever_k_initial": retriever_k_effective,
                 "fusion_fetch_k": fusion_fetch_k_effective,
-                "max_context_chunks_limit_for_llm": self.settings.MAX_CONTEXT_CHUNKS, 
+                "max_context_chunks_direct_rag_limit": self.settings.MAX_CONTEXT_CHUNKS, 
                 "num_chunks_after_rerank_or_fusion_content_fetch": num_chunks_after_rerank_or_fusion_fetch_effective,
                 "num_final_chunks_sent_to_llm": num_final_chunks_sent_to_llm_effective,
                 "num_sources_shown_to_user": len(assistant_sources_for_db), 
@@ -1125,16 +1239,20 @@ class AskQueryUseCase:
                 "bm25_enabled_in_settings": self.settings.BM25_ENABLED,
             }
             log_id = await self.log_repo.log_query_interaction(
-                company_id=company_id, user_id=user_id, query=query, answer=answer_for_user,
-                retrieved_documents_data=docs_for_log_summary, 
-                chat_id=final_chat_id, metadata=log_metadata_details
+                user_id=user_id,
+                company_id=company_id,
+                query=query,
+                answer=answer_for_user,
+                retrieved_documents_data=docs_for_log_summary,
+                metadata=log_metadata_details,
+                chat_id=final_chat_id
             )
-            llm_handler_log.info("Interaction logged successfully", db_log_id=str(log_id))
-        except Exception as log_err_final:
-            llm_handler_log.error("Failed to log RAG interaction", error=str(log_err_final), exc_info=False)
+            llm_handler_log.info("Query interaction logged successfully.", log_id=str(log_id) if log_id else "None")
+        except Exception as e_log:
+            llm_handler_log.error("Failed to log query interaction", error=str(e_log), exc_info=True)
+            # log_id remains as initialized (None)
 
         return answer_for_user, retrieved_chunks_for_response, log_id
-
 
     async def execute(
         self, query: str, company_id: uuid.UUID, user_id: uuid.UUID,
@@ -1151,24 +1269,15 @@ class AskQueryUseCase:
         history_messages: List[ChatMessage] = []
 
         try:
-            if chat_id:
-                if not await self.chat_repo.check_chat_ownership(chat_id, user_id, company_id):
-                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Chat not found or access denied.")
-                final_chat_id = chat_id
-                if self.settings.MAX_CHAT_HISTORY_MESSAGES > 0:
-                    history_messages = await self.chat_repo.get_chat_messages(
-                        chat_id=final_chat_id, user_id=user_id, company_id=company_id,
-                        limit=self.settings.MAX_CHAT_HISTORY_MESSAGES, offset=0
-                    )
-                    chat_history_str = self._format_chat_history(history_messages)
-                    exec_log.info("Chat history retrieved", num_messages=len(history_messages))
-            else:
-                initial_title = f"Chat: {truncate_text(query, 40)}"
-                final_chat_id = await self.chat_repo.create_chat(user_id=user_id, company_id=company_id, title=initial_title)
-            exec_log = exec_log.bind(chat_id=str(final_chat_id))
-            await self.chat_repo.save_message(chat_id=final_chat_id, role='user', content=query)
-            exec_log.info("Chat state managed and user message saved", is_new_chat=(not chat_id))
+            final_chat_id, chat_history_str, history_messages = await self._manage_chat_state(
+                query, company_id, user_id, chat_id, exec_log
+            )
 
+            if GREETING_REGEX.match(query):
+                return await self._handle_greeting(query, company_id, user_id, final_chat_id, exec_log)
+
+            pipeline_stages_used.append("query_embedding (remote)")
+            query_embedding = await self._embed_query(query)
             if GREETING_REGEX.match(query):
                 answer = "¡Hola! ¿En qué puedo ayudarte hoy con la información de tus documentos?"
                 await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=None)
@@ -1203,7 +1312,7 @@ class AskQueryUseCase:
             exec_log.info("Retrieval phase done", dense_count=len(dense_chunks_domain), sparse_count=len(sparse_results_tuples))
 
             pipeline_stages_used.append("fusion (rrf)")
-            dense_map = {c.id: c for c in dense_chunks_domain if c.id and c.embedding is not None} # Ensure embedding exists for dense_map entries used in MMR
+            dense_map = {c.id: c for c in dense_chunks_domain if c.id and c.embedding is not None} 
             
             fused_scores: Dict[str, float] = self._reciprocal_rank_fusion(dense_chunks_domain, sparse_results_tuples)
             
@@ -1220,7 +1329,7 @@ class AskQueryUseCase:
             if not combined_chunks_with_content:
                 exec_log.warning("No chunks with content after fusion/fetch. Using general prompt.")
                 general_prompt = await self._build_prompt(query, [], chat_history=chat_history_str, builder=self._prompt_builder_general)
-                answer_str = await self.llm.generate(general_prompt) 
+                answer_str = await self.llm.generate(general_prompt, response_pydantic_schema=None) 
                 
                 await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer_str, sources=None)
                 no_docs_log_id = await self.log_repo.log_query_interaction(
@@ -1230,14 +1339,13 @@ class AskQueryUseCase:
                 )
                 return answer_str, [], no_docs_log_id, final_chat_id
             
-            chunks_for_llm_or_mapreduce = combined_chunks_with_content 
-            if self.settings.RERANKER_ENABLED and chunks_for_llm_or_mapreduce:
+            chunks_after_postprocessing = combined_chunks_with_content 
+            if self.settings.RERANKER_ENABLED and chunks_after_postprocessing:
                 pipeline_stages_used.append("reranking (remote_reranker_service)")
-                rerank_log = exec_log.bind(action="rerank_remote", num_chunks_to_rerank=len(chunks_for_llm_or_mapreduce))
+                rerank_log = exec_log.bind(action="rerank_remote", num_chunks_to_rerank=len(chunks_after_postprocessing))
                 
                 documents_for_reranker = []
-                map_id_to_original_chunk_before_rerank = {c.id: c for c in chunks_for_llm_or_mapreduce}
-
+                map_id_to_original_chunk_before_rerank = {c.id: c for c in chunks_after_postprocessing}
 
                 for chk_id, original_chunk_obj in map_id_to_original_chunk_before_rerank.items():
                     if original_chunk_obj.content and original_chunk_obj.id: 
@@ -1256,19 +1364,27 @@ class AskQueryUseCase:
                     try:
                         rerank_log.debug("Sending request to reranker service...")
                         base_reranker_url = str(settings.RERANKER_SERVICE_URL).rstrip('/')
-                        reranker_url = f"{base_reranker_url}/api/v1/rerank"
-                        if base_reranker_url.endswith("/api/v1"):
-                            reranker_url = f"{base_reranker_url.rsplit('/api/v1',1)[0]}/api/v1/rerank"
-                        elif base_reranker_url.endswith("/api"): 
-                            reranker_url = f"{base_reranker_url.rsplit('/api',1)[0]}/api/v1/rerank"
-
+                        
+                        # Simplified URL construction for reranker
+                        if "/api/v1/rerank" not in base_reranker_url:
+                            if base_reranker_url.endswith("/api/v1"):
+                                reranker_url = f"{base_reranker_url}/rerank"
+                            elif base_reranker_url.endswith("/api"):
+                                reranker_url = f"{base_reranker_url}/v1/rerank"
+                            else:
+                                reranker_url = f"{base_reranker_url}/api/v1/rerank"
+                        else: # Already contains full path
+                            reranker_url = base_reranker_url
 
                         rerank_log.debug(f"Final Reranker URL: {reranker_url}")
+
+                        # Use a more aggressive timeout for the reranker call specifically
+                        reranker_specific_timeout = httpx.Timeout(self.settings.RERANKER_CLIENT_TIMEOUT, connect=10.0)
 
                         reranker_response = await self.http_client.post(
                             reranker_url,
                             json=reranker_payload,
-                            timeout=self.settings.RERANKER_CLIENT_TIMEOUT
+                            timeout=reranker_specific_timeout
                         )
                         reranker_response.raise_for_status()
                         reranked_data = reranker_response.json()
@@ -1278,11 +1394,11 @@ class AskQueryUseCase:
                                                         
                             updated_reranked_chunks = []
                             for reranked_item_data in reranked_docs_from_service: 
-                                chunk_id = reranked_item_data.get("id")
+                                chunk_id_val = reranked_item_data.get("id")
                                 new_score = reranked_item_data.get("score")
                                 
-                                if chunk_id in map_id_to_original_chunk_before_rerank:
-                                    original_retrieved_chunk = map_id_to_original_chunk_before_rerank[chunk_id]
+                                if chunk_id_val in map_id_to_original_chunk_before_rerank:
+                                    original_retrieved_chunk = map_id_to_original_chunk_before_rerank[chunk_id_val]
                                     
                                     updated_chunk = RetrievedChunk(
                                         id=original_retrieved_chunk.id,
@@ -1300,37 +1416,48 @@ class AskQueryUseCase:
                                     )
                                     updated_reranked_chunks.append(updated_chunk)
                                 else:
-                                    rerank_log.warning("Reranked chunk ID not found in original map.", reranked_id=chunk_id)
+                                    rerank_log.warning("Reranked chunk ID not found in original map.", reranked_id=chunk_id_val)
 
                             if updated_reranked_chunks: 
-                                chunks_for_llm_or_mapreduce = updated_reranked_chunks
-                                rerank_log.info(f"Reranking successful. {len(chunks_for_llm_or_mapreduce)} chunks after reranking.")
+                                chunks_after_postprocessing = updated_reranked_chunks
+                                rerank_log.info(f"Reranking successful. {len(chunks_after_postprocessing)} chunks after reranking.")
                             else:
                                 rerank_log.warning("Reranking seemed successful but no chunks could be mapped back. Using pre-reranked chunks.")
                         else:
                             rerank_log.warning("Reranker service response format invalid.", response_data=reranked_data)
                     except httpx.HTTPStatusError as http_err:
-                        rerank_log.error("HTTP error from Reranker service", status_code=http_err.response.status_code, response_text=http_err.response.text, exc_info=False)
+                        rerank_log.error(
+                            "HTTP error from Reranker service",
+                            status_code=http_err.response.status_code,
+                            response_text=http_err.response.text,
+                            error_details=repr(http_err),
+                            exc_info=True
+                        )
                     except httpx.RequestError as req_err: 
-                        rerank_log.error("Request error contacting Reranker service", error_details=str(req_err), exc_info=False) 
+                        rerank_log.error(
+                            "Request error contacting Reranker service",
+                            error_details=repr(req_err),
+                            exc_info=True
+                        )
                     except Exception as e_rerank:
-                        rerank_log.exception("Unexpected error during reranking call.")
+                        rerank_log.error(
+                            "Unexpected error during reranking call.",
+                            error_details=repr(e_rerank),
+                            exc_info=True
+                        )
                 else:
                     rerank_log.warning("No valid documents with content/id to send for reranking.")
-
             else: 
                 pipeline_stages_used.append(f"reranking ({'disabled' if not self.settings.RERANKER_ENABLED else 'skipped_no_chunks_or_content'})")
             
-            num_chunks_after_rerank = len(chunks_for_llm_or_mapreduce)
+            num_chunks_after_rerank = len(chunks_after_postprocessing)
 
-            # --- BEGIN CORRECTION FOR MMRDiversityFilter EMBEDDING ---
-            # Populate embeddings for chunks before sending to MMRDiversityFilter
-            if chunks_for_llm_or_mapreduce and self.diversity_filter : # Only if there are chunks and filter is active
+            if chunks_after_postprocessing and self.diversity_filter : 
                 pipeline_stages_used.append("embedding_population_for_mmr")
                 mmr_prep_log = exec_log.bind(action="mmr_embedding_population")
                 
-                chunk_ids_for_mmr_filter = [doc.id for doc in chunks_for_llm_or_mapreduce if doc.id]
-                mmr_prep_log.debug("Preparing embeddings for MMR", num_chunks_input=len(chunks_for_llm_or_mapreduce), num_ids_to_fetch=len(chunk_ids_for_mmr_filter))
+                chunk_ids_for_mmr_filter = [doc.id for doc in chunks_after_postprocessing if doc.id]
+                mmr_prep_log.debug("Preparing embeddings for MMR", num_chunks_input=len(chunks_after_postprocessing), num_ids_to_fetch=len(chunk_ids_for_mmr_filter))
 
                 vectors_from_milvus_by_id: Dict[str, List[float]] = {}
                 if chunk_ids_for_mmr_filter:
@@ -1341,30 +1468,24 @@ class AskQueryUseCase:
                          mmr_prep_log.error("Failed to fetch vectors from Milvus for MMR, fallback may occur.", error=str(e_milvus_fetch))
 
                 texts_needing_embedding_generation: List[str] = []
-                # Keep a mapping from original index of text to chunk object to update it later
                 map_text_index_to_chunk_obj: Dict[int, RetrievedChunk] = {} 
-                
-                # Create a new list for chunks that will go to MMR, preserving original order as much as possible
-                # but ensuring they are reconstructed with the embedding field.
                 chunks_ready_for_mmr: List[RetrievedChunk] = []
 
-                for original_chunk in chunks_for_llm_or_mapreduce:
+                for original_chunk in chunks_after_postprocessing:
                     retrieved_embedding = vectors_from_milvus_by_id.get(original_chunk.id)
                     
-                    if retrieved_embedding is None and original_chunk.content: # If Milvus didn't have it, AND content exists
-                        if original_chunk.embedding is None: # Only add to fallback if no embedding was ever present
+                    if retrieved_embedding is None and original_chunk.content: 
+                        if original_chunk.embedding is None: 
                             map_text_index_to_chunk_obj[len(texts_needing_embedding_generation)] = original_chunk
                             texts_needing_embedding_generation.append(original_chunk.content)
                             
-                    # Reconstruct the chunk. If embedding was already there (e.g. from dense_map earlier),
-                    # or fetched from Milvus now, it will be included. Otherwise, it's None for now.
                     chunks_ready_for_mmr.append(
                         RetrievedChunk(
                             id=original_chunk.id,
                             content=original_chunk.content,
                             score=original_chunk.score,
                             metadata=original_chunk.metadata,
-                            embedding=retrieved_embedding if retrieved_embedding else original_chunk.embedding, # Prioritize fresh Milvus fetch, then existing
+                            embedding=retrieved_embedding if retrieved_embedding else original_chunk.embedding, 
                             document_id=original_chunk.document_id,
                             file_name=original_chunk.file_name,
                             company_id=original_chunk.company_id
@@ -1374,13 +1495,11 @@ class AskQueryUseCase:
                 if texts_needing_embedding_generation:
                     mmr_prep_log.info(f"Requesting {len(texts_needing_embedding_generation)} missing embeddings from embedding_adapter for MMR.")
                     try:
-                        # Call the embedding adapter to get embeddings for texts
                         generated_embeddings_list = await self.embedding_adapter.embed_texts(texts_needing_embedding_generation)
                         
                         if len(generated_embeddings_list) == len(texts_needing_embedding_generation):
                             for idx, generated_emb_vector in enumerate(generated_embeddings_list):
                                 chunk_to_update = map_text_index_to_chunk_obj[idx] 
-                                # Find the corresponding chunk in chunks_ready_for_mmr and update its embedding
                                 for ch_ready in chunks_ready_for_mmr:
                                     if ch_ready.id == chunk_to_update.id:
                                         ch_ready.embedding = generated_emb_vector
@@ -1392,56 +1511,80 @@ class AskQueryUseCase:
                                                generated_count=len(generated_embeddings_list))
                     except Exception as e_embed_fallback:
                         mmr_prep_log.error("Failed to generate embeddings via adapter for MMR fallback.", error=str(e_embed_fallback))
-                
-                # The list chunks_for_llm_or_mapreduce now contains chunks with embeddings populated
-                chunks_for_llm_or_mapreduce = chunks_ready_for_mmr
-            # --- END CORRECTION FOR MMRDiversityFilter EMBEDDING ---
-
-
-            # Log para depurar embeddings antes del filtro MMR
-            num_with_embeddings_before_mmr = sum(1 for c_chk in chunks_for_llm_or_mapreduce if c_chk.embedding is not None)
+                chunks_after_postprocessing = chunks_ready_for_mmr
+            
+            num_with_embeddings_before_mmr = sum(1 for c_chk in chunks_after_postprocessing if c_chk.embedding is not None)
             exec_log.debug(
                 "Chunks before diversity filter",
-                total_chunks=len(chunks_for_llm_or_mapreduce),
+                total_chunks=len(chunks_after_postprocessing),
                 chunks_with_embeddings=num_with_embeddings_before_mmr,
-                first_few_ids_and_embedding_status=[(c.id, c.embedding is not None) for c in chunks_for_llm_or_mapreduce[:min(5, len(chunks_for_llm_or_mapreduce))]]
+                first_few_ids_and_embedding_status=[(c.id, c.embedding is not None) for c in chunks_after_postprocessing[:min(5, len(chunks_after_postprocessing))]]
             )
 
-            if self.diversity_filter and chunks_for_llm_or_mapreduce:
+            if self.diversity_filter and chunks_after_postprocessing:
                  k_final_diversity = self.settings.MAX_CONTEXT_CHUNKS 
                  filter_type = type(self.diversity_filter).__name__
                  pipeline_stages_used.append(f"diversity_filter ({filter_type})")
-                 exec_log.debug(f"Applying {filter_type} k={k_final_diversity}...", count=len(chunks_for_llm_or_mapreduce))
-                 chunks_for_llm_or_mapreduce = await self.diversity_filter.filter(chunks_for_llm_or_mapreduce, k_final_diversity)
-                 exec_log.info(f"{filter_type} applied.", final_count=len(chunks_for_llm_or_mapreduce))
+                 exec_log.debug(f"Applying {filter_type} k={k_final_diversity}...", count=len(chunks_after_postprocessing))
+                 chunks_after_postprocessing = await self.diversity_filter.filter(chunks_after_postprocessing, k_final_diversity)
+                 exec_log.info(f"{filter_type} applied.", final_count=len(chunks_after_postprocessing))
             else: 
                  pipeline_stages_used.append(f"diversity_filter ({'disabled' if not self.settings.DIVERSITY_FILTER_ENABLED else 'skipped_no_chunks'})")
-                 chunks_for_llm_or_mapreduce = chunks_for_llm_or_mapreduce[:self.settings.MAX_CONTEXT_CHUNKS]
+                 chunks_after_postprocessing = chunks_after_postprocessing[:self.settings.MAX_CONTEXT_CHUNKS]
                  exec_log.info(f"Diversity filter not applied or no chunks. Truncating to MAX_CONTEXT_CHUNKS.", 
-                               count=len(chunks_for_llm_or_mapreduce), limit=self.settings.MAX_CONTEXT_CHUNKS)
+                               count=len(chunks_after_postprocessing), limit=self.settings.MAX_CONTEXT_CHUNKS)
 
-            final_chunks_for_processing = [c for c in chunks_for_llm_or_mapreduce if c.content and c.content.strip()]
+            final_chunks_for_processing = [c for c in chunks_after_postprocessing if c.content and c.content.strip()]
             num_final_chunks_for_llm_or_mapreduce = len(final_chunks_for_processing)
 
             if not final_chunks_for_processing: 
-                exec_log.warning("No chunks with content after reranking/filtering. Using general prompt.")
+                exec_log.warning("No chunks with content after all postprocessing. Using general prompt.")
+                # (Misma lógica de respuesta general que antes)
                 general_prompt = await self._build_prompt(query, [], chat_history=chat_history_str, builder=self._prompt_builder_general)
                 answer_str = await self.llm.generate(general_prompt, response_pydantic_schema=None)
                 await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer_str, sources=None)
                 no_docs_final_log_id = await self.log_repo.log_query_interaction(
                     company_id=company_id, user_id=user_id, query=query, answer=answer_str, 
                     retrieved_documents_data=[], chat_id=final_chat_id, 
-                    metadata={"pipeline_stages": pipeline_stages_used, "result_type": "no_docs_after_postprocessing", "map_reduce_used": False}
+                    metadata={"pipeline_stages": pipeline_stages_used, "result_type": "no_docs_after_all_postprocessing", "map_reduce_used": False}
                 )
                 return answer_str, [], no_docs_final_log_id, final_chat_id
 
             map_reduce_active = False
             json_answer_str: str
+            chunks_to_send_to_llm: List[RetrievedChunk] # Chunks que realmente irán al LLM            # Medir performance del conteo de tokens optimizado
+            token_count_start = time.perf_counter()
+            total_tokens_for_llm = self._count_tokens_for_chunks(final_chunks_for_processing)
+            token_count_duration = time.perf_counter() - token_count_start
+            
+            cache_stats = self._get_cache_stats()
+            exec_log.info("Token count for final list of processed chunks",
+                          num_chunks=num_final_chunks_for_llm_or_mapreduce,
+                          total_tokens=total_tokens_for_llm,
+                          token_count_duration_ms=round(token_count_duration * 1000, 2),
+                          cache_size=cache_stats["cache_size"],
+                          map_reduce_token_threshold=settings.MAX_PROMPT_TOKENS,
+                          map_reduce_chunk_threshold=settings.MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS)
+            
+            # Decisión MapReduce: Prioridad al umbral de tokens.
+            # Si el umbral de tokens se supera, se activa MapReduce.
+            # Si no, pero el número de chunks supera el umbral de chunks, también se activa.
+            should_activate_mapreduce_by_tokens = total_tokens_for_llm > self.settings.MAX_PROMPT_TOKENS
+            should_activate_mapreduce_by_chunks = num_final_chunks_for_llm_or_mapreduce > self.settings.MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS
 
-            if self.settings.MAPREDUCE_ENABLED and len(final_chunks_for_processing) > self.settings.MAPREDUCE_ACTIVATION_THRESHOLD:
-                exec_log.info(f"Activating MapReduce. Chunks: {len(final_chunks_for_processing)}, Threshold: {self.settings.MAPREDUCE_ACTIVATION_THRESHOLD}", flow_type="MapReduce")
+            if self.settings.MAPREDUCE_ENABLED and \
+               (should_activate_mapreduce_by_tokens or should_activate_mapreduce_by_chunks) and \
+               num_final_chunks_for_llm_or_mapreduce > 1: # MapReduce necesita >1 chunk
+                
+                trigger_reason = "token_count" if should_activate_mapreduce_by_tokens else "chunk_count"
+                exec_log.info(f"Activating MapReduce due to {trigger_reason}. "
+                              f"Chunks: {num_final_chunks_for_llm_or_mapreduce} (Chunk Threshold: {self.settings.MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS}), "
+                              f"Tokens: {total_tokens_for_llm} (Token Threshold: {self.settings.MAX_PROMPT_TOKENS})", 
+                              flow_type=f"MapReduce_{trigger_reason}")
+                
                 pipeline_stages_used.append("map_reduce_flow")
                 map_reduce_active = True
+                chunks_to_send_to_llm = final_chunks_for_processing # Todos los chunks van a la fase Map
 
                 pipeline_stages_used.append("map_phase")
                 mapped_responses_parts = []
@@ -1455,7 +1598,7 @@ class AskQueryUseCase:
                             "title": c.metadata.get("title") 
                         },
                         score=c.score
-                    ) for c in final_chunks_for_processing
+                    ) for c in chunks_to_send_to_llm # Usar chunks_to_send_to_llm
                 ]
                 
                 map_tasks = []
@@ -1479,15 +1622,14 @@ class AskQueryUseCase:
                 map_phase_results = await asyncio.gather(*[asyncio.shield(task) for task in llm_map_tasks], return_exceptions=True)
 
                 for idx, result in enumerate(map_phase_results):
-                    map_log = exec_log.bind(map_batch_index=idx)
+                    map_log_batch = exec_log.bind(map_batch_index=idx) # Corrected log binding
                     if isinstance(result, Exception):
-                        map_log.error("LLM call failed for map batch", error=str(result), exc_info=True)
+                        map_log_batch.error("LLM call failed for map batch", error=str(result), exc_info=True)
                     elif result and MAP_REDUCE_NO_RELEVANT_INFO not in result:
                         mapped_responses_parts.append(f"--- Extracto del Lote de Documentos {idx + 1} ---\n{result}\n")
-                        map_log.info("Map request processed for batch.", response_length=len(result), is_relevant=True)
+                        map_log_batch.info("Map request processed for batch.", response_length=len(result), is_relevant=True)
                     else:
-                         map_log.info("Map request processed for batch, no relevant info found by LLM.", response_length=len(result or ""))
-
+                         map_log_batch.info("Map request processed for batch, no relevant info found by LLM.", response_length=len(result or ""))
 
                 if not mapped_responses_parts:
                     exec_log.warning("MapReduce: All map steps reported no relevant information or failed.")
@@ -1496,20 +1638,25 @@ class AskQueryUseCase:
                     concatenated_mapped_responses = "\n".join(mapped_responses_parts)
 
                 pipeline_stages_used.append("reduce_phase")
+                # original_documents_for_citation en el prompt de reduce debe ser los chunks que fueron a la fase map
+                haystack_docs_for_reduce_citation = haystack_docs_for_map 
                 reduce_prompt_data = {
                     "original_query": query,
                     "chat_history": chat_history_str,
                     "mapped_responses": concatenated_mapped_responses,
-                    "original_documents_for_citation": haystack_docs_for_map 
+                    "original_documents_for_citation": haystack_docs_for_reduce_citation 
                 }
                 reduce_prompt_str = await self._build_prompt(query="", documents=[], prompt_data_override=reduce_prompt_data, builder=self._prompt_builder_reduce)
                 
                 exec_log.info("Sending reduce request to LLM for final JSON response.")
                 json_answer_str = await self.llm.generate(reduce_prompt_str, response_pydantic_schema=RespuestaEstructurada)
 
-            else: 
-                exec_log.info(f"Using Direct RAG strategy. Chunks: {len(final_chunks_for_processing)}", flow_type="DirectRAG")
+            else: # Direct RAG
+                exec_log.info(f"Using Direct RAG strategy. Chunks available: {num_final_chunks_for_llm_or_mapreduce}, Tokens: {total_tokens_for_llm}", flow_type="DirectRAG")
                 pipeline_stages_used.append("direct_rag_flow")
+                
+                chunks_to_send_to_llm = final_chunks_for_processing[:self.settings.MAX_CONTEXT_CHUNKS]
+                exec_log.info(f"Chunks for Direct RAG after truncating to MAX_CONTEXT_CHUNKS: {len(chunks_to_send_to_llm)} (limit: {self.settings.MAX_CONTEXT_CHUNKS})")
                 
                 haystack_docs_for_prompt = [
                     Document(
@@ -1521,7 +1668,7 @@ class AskQueryUseCase:
                             "title": c.metadata.get("title")
                         },
                         score=c.score
-                    ) for c in final_chunks_for_processing
+                    ) for c in chunks_to_send_to_llm
                 ]
                 direct_rag_prompt = await self._build_prompt(query, haystack_docs_for_prompt, chat_history_str, builder=self._prompt_builder_rag)
                 
@@ -1534,13 +1681,13 @@ class AskQueryUseCase:
                 company_id=company_id,
                 user_id=user_id,
                 final_chat_id=final_chat_id,
-                original_chunks_for_citation=final_chunks_for_processing, 
+                original_chunks_for_citation=chunks_to_send_to_llm, # Usar los chunks efectivamente enviados al LLM/MapReduce
                 pipeline_stages_used=pipeline_stages_used,
                 map_reduce_used=map_reduce_active,
                 retriever_k_effective=retriever_k_effective,
                 fusion_fetch_k_effective=fusion_fetch_k_effective,
                 num_chunks_after_rerank_or_fusion_fetch_effective=num_chunks_after_rerank, 
-                num_final_chunks_sent_to_llm_effective=num_final_chunks_for_llm_or_mapreduce,
+                num_final_chunks_sent_to_llm_effective=len(chunks_to_send_to_llm), # Log el número real
                 num_history_messages_effective=len(history_messages)
             )
             
@@ -1565,6 +1712,18 @@ class AskQueryUseCase:
         except Exception as e: 
             exec_log.exception("Unexpected error during use case execution") 
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An internal server error occurred: {type(e).__name__}. Please contact support if this persists.") from e
+
+    def _clear_token_cache(self) -> None:
+        """Limpia el cache de conteo de tokens para liberar memoria."""
+        self._token_count_cache.clear()
+        log.debug("Token count cache cleared")
+
+    def _get_cache_stats(self) -> Dict[str, Any]:
+        """Retorna estadísticas del cache para monitoreo."""
+        return {
+            "cache_size": len(self._token_count_cache),
+            "memory_usage_estimate_kb": len(self._token_count_cache) * 50 / 1024  # Estimación aprox
+        }
 ```
 
 ## File: `app\core\__init__.py`
@@ -1621,7 +1780,7 @@ DEFAULT_REDUCE_PROMPT_TEMPLATE_PATH = str(PROMPT_DIR / "reduce_prompt_template_v
 
 # Models
 DEFAULT_EMBEDDING_DIMENSION = 1536
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-preview-04-17" 
+DEFAULT_GEMINI_MODEL = "gemini-1.5-flash-latest" 
 
 # RAG Pipeline Parameters
 DEFAULT_RETRIEVER_TOP_K = 200 
@@ -1631,7 +1790,7 @@ DEFAULT_DIVERSITY_FILTER_ENABLED: bool = False
 DEFAULT_MAX_CONTEXT_CHUNKS: int = 200 
 DEFAULT_HYBRID_ALPHA: float = 0.5
 DEFAULT_DIVERSITY_LAMBDA: float = 0.5
-DEFAULT_MAX_PROMPT_TOKENS: int = 524288 
+DEFAULT_MAX_PROMPT_TOKENS: int = 500000 
 DEFAULT_MAX_CHAT_HISTORY_MESSAGES = 20 
 DEFAULT_NUM_SOURCES_TO_SHOW = 7
 
@@ -1639,6 +1798,7 @@ DEFAULT_NUM_SOURCES_TO_SHOW = 7
 DEFAULT_MAPREDUCE_ENABLED: bool = True 
 DEFAULT_MAPREDUCE_CHUNK_BATCH_SIZE: int = 5
 DEFAULT_MAPREDUCE_ACTIVATION_THRESHOLD: int = 25 
+DEFAULT_TIKTOKEN_ENCODING_NAME: str = "cl100k_base"
 
 
 class Settings(BaseSettings):
@@ -1725,7 +1885,7 @@ class Settings(BaseSettings):
 
     # --- Diversity Filter ---
     DIVERSITY_FILTER_ENABLED: bool = Field(default=DEFAULT_DIVERSITY_FILTER_ENABLED)
-    MAX_CONTEXT_CHUNKS: int = Field(default=DEFAULT_MAX_CONTEXT_CHUNKS, gt=0, description="Max number of retrieved/reranked chunks to pass to LLM context.")
+    MAX_CONTEXT_CHUNKS: int = Field(default=DEFAULT_MAX_CONTEXT_CHUNKS, gt=0, description="Max number of retrieved/reranked chunks to pass to LLM context in Direct RAG, or to Diversity Filter.")
     QUERY_DIVERSITY_LAMBDA: float = Field(default=DEFAULT_DIVERSITY_LAMBDA, ge=0.0, le=1.0, description="Lambda for MMR diversity (0=max diversity, 1=max relevance).")
 
     # --- RAG Pipeline Parameters ---
@@ -1738,14 +1898,17 @@ class Settings(BaseSettings):
     MAP_PROMPT_TEMPLATE_PATH: str = Field(default=DEFAULT_MAP_PROMPT_TEMPLATE_PATH)
     REDUCE_PROMPT_TEMPLATE_PATH: str = Field(default=DEFAULT_REDUCE_PROMPT_TEMPLATE_PATH)
 
-    MAX_PROMPT_TOKENS: Optional[int] = Field(default=DEFAULT_MAX_PROMPT_TOKENS)
+    MAX_PROMPT_TOKENS: Optional[int] = Field(default=DEFAULT_MAX_PROMPT_TOKENS, description="Token threshold to activate MapReduce if enabled. Also a general guide for LLM context window size.")
     MAX_CHAT_HISTORY_MESSAGES: int = Field(default=DEFAULT_MAX_CHAT_HISTORY_MESSAGES, ge=0)
     NUM_SOURCES_TO_SHOW: int = Field(default=DEFAULT_NUM_SOURCES_TO_SHOW, ge=0)
 
     # --- MapReduce Settings ---
     MAPREDUCE_ENABLED: bool = Field(default=DEFAULT_MAPREDUCE_ENABLED)
     MAPREDUCE_CHUNK_BATCH_SIZE: int = Field(default=DEFAULT_MAPREDUCE_CHUNK_BATCH_SIZE, gt=0)
-    MAPREDUCE_ACTIVATION_THRESHOLD: int = Field(default=DEFAULT_MAPREDUCE_ACTIVATION_THRESHOLD, gt=0)
+    # MAPREDUCE_ACTIVATION_THRESHOLD is now effectively replaced by MAX_PROMPT_TOKENS check for token count.
+    # We can keep it for chunk-based activation as a secondary or fallback condition if needed.
+    MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS: int = Field(default=DEFAULT_MAPREDUCE_ACTIVATION_THRESHOLD, gt=0, description="Chunk count threshold to activate MapReduce (secondary to token threshold).")
+    TIKTOKEN_ENCODING_NAME: str = Field(default=DEFAULT_TIKTOKEN_ENCODING_NAME, description="Encoding name for tiktoken.")
 
 
     # --- Service Client Config ---
@@ -1786,8 +1949,9 @@ class Settings(BaseSettings):
     @classmethod
     def check_max_context_chunks(cls, v: int, info: ValidationInfo) -> int:
         retriever_k = info.data.get('RETRIEVER_TOP_K', DEFAULT_RETRIEVER_TOP_K)
-        if v > retriever_k * 2 and info.data.get('MAPREDUCE_ENABLED', DEFAULT_MAPREDUCE_ENABLED) is False:
-             logging.warning(f"MAX_CONTEXT_CHUNKS ({v}) for direct RAG is significantly larger than typical fused results from RETRIEVER_TOP_K ({retriever_k}). Ensure this is intended.")
+        # This validation might be less relevant if MapReduce handles very large contexts
+        # if v > retriever_k * 2 and info.data.get('MAPREDUCE_ENABLED', DEFAULT_MAPREDUCE_ENABLED) is False:
+        #      logging.warning(f"MAX_CONTEXT_CHUNKS ({v}) for direct RAG is significantly larger than typical fused results from RETRIEVER_TOP_K ({retriever_k}). Ensure this is intended.")
         if v <= 0:
              raise ValueError("MAX_CONTEXT_CHUNKS must be a positive integer.")
         return v
@@ -1801,14 +1965,15 @@ class Settings(BaseSettings):
             logging.warning(f"MAPREDUCE_CHUNK_BATCH_SIZE ({v}) is quite large. Ensure LLM can handle this many docs in a single map prompt.")
         return v
         
-    @field_validator('MAPREDUCE_ACTIVATION_THRESHOLD')
+    @field_validator('MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS') # Renamed from MAPREDUCE_ACTIVATION_THRESHOLD
     @classmethod
-    def check_mapreduce_activation_threshold(cls, v: int, info: ValidationInfo) -> int:
-        max_context = info.data.get('MAX_CONTEXT_CHUNKS', DEFAULT_MAX_CONTEXT_CHUNKS)
-        if v > max_context:
-            logging.warning(f"MAPREDUCE_ACTIVATION_THRESHOLD ({v}) is greater than MAX_CONTEXT_CHUNKS ({max_context}). MapReduce may never activate if MAX_CONTEXT_CHUNKS is the effective limit for documents to process.")
+    def check_mapreduce_activation_threshold_chunks(cls, v: int, info: ValidationInfo) -> int:
+        max_prompt_toks = info.data.get('MAX_PROMPT_TOKENS', DEFAULT_MAX_PROMPT_TOKENS)
+        # This is now a secondary condition, so its relation to MAX_CONTEXT_CHUNKS is less direct for primary activation
+        # if v > max_context:
+        #     logging.warning(f"MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS ({v}) is greater than MAX_CONTEXT_CHUNKS ({max_context}). MapReduce may never activate if MAX_CONTEXT_CHUNKS is the effective limit for documents to process.")
         if v <= 0:
-            raise ValueError("MAPREDUCE_ACTIVATION_THRESHOLD must be positive.")
+            raise ValueError("MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS must be positive.")
         return v
 
 
@@ -1817,8 +1982,8 @@ class Settings(BaseSettings):
     def check_num_sources_to_show(cls, v: int, info: ValidationInfo) -> int:
         max_chunks = info.data.get('MAX_CONTEXT_CHUNKS', DEFAULT_MAX_CONTEXT_CHUNKS)
         if v > max_chunks:
-             logging.warning(f"NUM_SOURCES_TO_SHOW ({v}) is greater than MAX_CONTEXT_CHUNKS ({max_chunks}). Will only show up to {max_chunks} sources.")
-             return max_chunks
+             logging.warning(f"NUM_SOURCES_TO_SHOW ({v}) is greater than MAX_CONTEXT_CHUNKS ({max_chunks}). Will only show up to {max_chunks} sources if MapReduce is not used.")
+             # No need to cap it here, as the logic in _handle_llm_response handles showing a limited number of sources anyway.
         if v < 0:
             raise ValueError("NUM_SOURCES_TO_SHOW cannot be negative.")
         return v
@@ -3389,29 +3554,19 @@ class RemoteSparseRetrieverAdapter(SparseRetrieverPort):
 import structlog
 import asyncio
 from typing import List, Optional, Dict, Any
-import json # Importar json para la expresión 'in'
+import json 
 
 from pymilvus import Collection, connections, utility, MilvusException, DataType
-from haystack import Document # Keep Haystack Document for conversion ease initially
+from haystack import Document 
 
-# LLM_REFACTOR_STEP_2: Update import paths and add Port/Domain import
 from app.core.config import settings
 from app.application.ports.vector_store_port import VectorStorePort
-from app.domain.models import RetrievedChunk # Import domain model
+from app.domain.models import RetrievedChunk 
 
-# --- Import field name constants from ingest_pipeline for clarity (Read-Only) ---
-# These constants represent the actual field names used in the Milvus collection schema
-# defined by the ingest-service.
-# This improves maintainability if field names change in the ingest service.
-# LLM_FLAG: MANUALLY_VERIFIED_INGEST_SCHEMA_FIELDS_CONSISTENCY
 try:
-    # Attempt to import from a shared location if ingest-service fields are exposed
-    # For now, we assume these constants are defined based on ingest-service's current schema
-    # In a mono-repo or shared library, this would be more direct.
-    # Hardcoding them here as a fallback based on the ingest-service README and common practice.
     MILVUS_PK_FIELD = "pk_id"
-    MILVUS_VECTOR_FIELD = "embedding" # Corresponds to settings.MILVUS_EMBEDDING_FIELD from ingest
-    MILVUS_CONTENT_FIELD = "content" # Corresponds to settings.MILVUS_CONTENT_FIELD from ingest
+    MILVUS_VECTOR_FIELD = "embedding" 
+    MILVUS_CONTENT_FIELD = "content" 
     MILVUS_COMPANY_ID_FIELD = "company_id"
     MILVUS_DOCUMENT_ID_FIELD = "document_id"
     MILVUS_FILENAME_FIELD = "file_name"
@@ -3445,8 +3600,6 @@ except ImportError:
 log = structlog.get_logger(__name__)
 
 class MilvusAdapter(VectorStorePort):
-    """Adaptador concreto para interactuar con Milvus usando pymilvus."""
-
     _collection: Optional[Collection] = None
     _connected = False
     _alias = "query_service_milvus_adapter"
@@ -3459,7 +3612,6 @@ class MilvusAdapter(VectorStorePort):
 
 
     async def _ensure_connection(self):
-        """Ensures connection to Milvus is established."""
         if not self._connected or self._alias not in connections.list_connections():
             uri = str(settings.MILVUS_URI)
             connect_log = log.bind(adapter="MilvusAdapter", action="connect", uri=uri, alias=self._alias)
@@ -3468,7 +3620,7 @@ class MilvusAdapter(VectorStorePort):
                 connections.connect(
                     alias=self._alias,
                     uri=uri,
-                    token=settings.ZILLIZ_API_KEY.get_secret_value(), # MODIFIED: Added token
+                    token=settings.ZILLIZ_API_KEY.get_secret_value(), 
                     timeout=settings.MILVUS_GRPC_TIMEOUT
                 )
                 self._connected = True
@@ -3483,7 +3635,6 @@ class MilvusAdapter(VectorStorePort):
                 raise ConnectionError(f"Unexpected Milvus (Zilliz) connection error: {e}") from e
 
     async def _get_collection(self) -> Collection:
-        """Gets the Milvus collection object, ensuring connection and loading."""
         await self._ensure_connection()
 
         if self._collection is None:
@@ -3503,21 +3654,20 @@ class MilvusAdapter(VectorStorePort):
 
             except MilvusException as e:
                 collection_log.error("Failed to get or load Milvus collection", error_code=e.code, error_message=e.message)
-                if "multiple indexes" in e.message.lower(): # LLM_FLAG: SENSITIVE_ERROR_HANDLING
+                if "multiple indexes" in e.message.lower(): 
                     collection_log.critical("Potential 'Ambiguous Index' error encountered. Please check Milvus indices for this collection.")
                 raise RuntimeError(f"Milvus collection access error (Code: {e.code}): {e.message}") from e
             except Exception as e:
                  collection_log.exception("Unexpected error accessing Milvus collection")
                  raise RuntimeError(f"Unexpected error accessing Milvus collection: {e}") from e
 
-        if not isinstance(self._collection, Collection): # LLM_FLAG: ROBUSTNESS_CHECK
+        if not isinstance(self._collection, Collection): 
             log.critical("Milvus collection object is unexpectedly None or invalid type after initialization attempt.")
             raise RuntimeError("Failed to obtain a valid Milvus collection object.")
 
         return self._collection
 
     async def search(self, embedding: List[float], company_id: str, top_k: int) -> List[RetrievedChunk]:
-        """Busca chunks relevantes usando pymilvus y los convierte al modelo de dominio."""
         search_log = log.bind(adapter="MilvusAdapter", action="search", company_id=company_id, top_k=top_k)
         try:
             collection = await self._get_collection()
@@ -3534,8 +3684,15 @@ class MilvusAdapter(VectorStorePort):
                 INGEST_SCHEMA_FIELDS["document"],
                 INGEST_SCHEMA_FIELDS["filename"],
             }
-            required_output_fields_set.update(settings.MILVUS_METADATA_FIELDS)
+            required_output_fields_set.update(settings.MILVUS_METADATA_FIELDS) # Incluye page, title, etc.
             output_fields_list = list(required_output_fields_set)
+            
+            # Asegurar que los campos de documento y nombre de archivo se pidan explícitamente si no están ya.
+            if INGEST_SCHEMA_FIELDS["document"] not in output_fields_list:
+                output_fields_list.append(INGEST_SCHEMA_FIELDS["document"])
+            if INGEST_SCHEMA_FIELDS["filename"] not in output_fields_list:
+                output_fields_list.append(INGEST_SCHEMA_FIELDS["filename"])
+            output_fields_list = list(set(output_fields_list)) # Evitar duplicados
 
             search_log.debug("Performing Milvus vector search...",
                              vector_field=self._vector_field_name,
@@ -3560,18 +3717,24 @@ class MilvusAdapter(VectorStorePort):
             domain_chunks: List[RetrievedChunk] = []
             if search_results and search_results[0]:
                 for hit in search_results[0]:
+                    # El método to_dict() en la entidad del hit es preferible si está disponible
                     entity_data = hit.entity.to_dict() if hasattr(hit, 'entity') and hasattr(hit.entity, 'to_dict') else {}
                     
-                    # hit.id es el PK
-                    pk_id = str(hit.id) 
-                    content = entity_data.get(INGEST_SCHEMA_FIELDS["content"], "")
-                    embedding_vector = entity_data.get(self._vector_field_name)
+                    # Si entity_data está vacío, intentar obtener los campos directamente del hit
+                    if not entity_data:
+                        entity_data = {field: hit.get(field) for field in output_fields_list if hit.get(field) is not None}
 
+                    pk_id = str(hit.id) # hit.id es el PK (pk_id)
+                    content = entity_data.get(INGEST_SCHEMA_FIELDS["content"], "")
+                    embedding_vector = entity_data.get(self._vector_field_name) # El embedding en sí
+                    
+                    # Mapear todos los campos recuperados a metadata, excluyendo el vector.
                     metadata_dict = {k: v for k, v in entity_data.items() if k != self._vector_field_name}
                     
-                    doc_id_val = metadata_dict.get(INGEST_SCHEMA_FIELDS["document"])
-                    comp_id_val = metadata_dict.get(INGEST_SCHEMA_FIELDS["company"])
-                    fname_val = metadata_dict.get(INGEST_SCHEMA_FIELDS["filename"])
+                    # Asignar explícitamente los campos principales del chunk
+                    doc_id_val = entity_data.get(INGEST_SCHEMA_FIELDS["document"])
+                    comp_id_val = entity_data.get(INGEST_SCHEMA_FIELDS["company"])
+                    fname_val = entity_data.get(INGEST_SCHEMA_FIELDS["filename"])
 
                     chunk = RetrievedChunk(
                         id=pk_id,
@@ -3601,9 +3764,6 @@ class MilvusAdapter(VectorStorePort):
         *,
         collection_name: str | None = None,
     ) -> Dict[str, List[float]]:
-        """
-        Devuelve un dict {id: embedding}. Si Milvus no encuentra alguno, no lo incluye.
-        """
         fetch_log = log.bind(adapter="MilvusAdapter", action="fetch_vectors_by_ids", num_ids=len(ids))
         if not ids:
             fetch_log.debug("No IDs provided, returning empty dict.")
@@ -3611,8 +3771,6 @@ class MilvusAdapter(VectorStorePort):
 
         try:
             _collection_obj = await self._get_collection()
-            
-            # Milvus 'in' operator expects a list of strings or numbers. JSON dump for safety with strings.
             ids_json_array_str = json.dumps(ids)
             expr = f'{self._pk_field_name} in {ids_json_array_str}'
             
@@ -3630,9 +3788,7 @@ class MilvusAdapter(VectorStorePort):
                 )
             )
             
-            # Milvus query devuelve List[Dict]; lo convertimos a {id: vec}
-            # El PK devuelto por query estará en el campo self._pk_field_name
-            fetched_vectors = {row[self._pk_field_name]: row[self._vector_field_name] for row in res if self._pk_field_name in row and self._vector_field_name in row}
+            fetched_vectors = {str(row[self._pk_field_name]): row[self._vector_field_name] for row in res if self._pk_field_name in row and self._vector_field_name in row}
             fetch_log.info(f"Fetched {len(fetched_vectors)} vectors from Milvus out of {len(ids)} requested.")
             return fetched_vectors
         except MilvusException as me:
@@ -3644,11 +3800,9 @@ class MilvusAdapter(VectorStorePort):
 
 
     async def connect(self):
-        """Explicitly ensures connection (can be called during startup if needed)."""
         await self._ensure_connection()
 
     async def disconnect(self):
-        """Disconnects from Milvus."""
         if self._connected and self._alias in connections.list_connections():
             log.info("Disconnecting from Milvus...", adapter="MilvusAdapter", alias=self._alias)
             try:
@@ -4153,13 +4307,16 @@ No se recuperaron documentos específicos para esta consulta.
    - **NO ESPECULACIÓN:** Si la información combinada no es suficiente para responder completamente, indícalo claramente en `respuesta_detallada`.
    - **RESPUESTA INTEGRAL Y DETALLADA:** Intenta conectar la información de diferentes fragmentos para dar una respuesta completa y rica en detalles si es posible, especialmente si el usuario pide un resumen "extenso". Identifica temas comunes o cronologías.
    - **MANEJO DE "NO SÉ":** Si no hay INFORMACIÓN RECOPILADA DE DOCUMENTOS, tu `respuesta_detallada` debe ser "No encontré información específica sobre eso en los documentos procesados." Si hay algo de información pero es escasa, indica que la información es limitada.
+   - **COMPRENDE LA INFORMACIÓN:** Antes de sintetizr la información usa tu información de entramineto para comprender cual es el tema a consultar o los temas, comprende la información particular adjunta y el contexto completo, luego genera esta sintesis coherente y correcta.
+   - **FORMATO MARKDOWN:** Aplica Markdown (listas, negritas) en `respuesta_detallada` para que sea más fácil de leer.
+ 
 
 5 · PROCESO DE PENSAMIENTO SUGERIDO (INTERNO - Chain-of-Thought)
 Antes de generar el JSON final:
 a. Revisa la PREGUNTA ACTUAL DEL USUARIO y el HISTORIAL para la intención completa. ¿Pide detalle, extensión?
-b. Analiza la INFORMACIÓN RECOPILADA DE DOCUMENTOS. Identifica los puntos clave de cada fragmento. Agrupa información sobre el mismo tema o evento (ej. misma reunión).
+b. Analiza la INFORMACIÓN RECOPILADA DE DOCUMENTOS. Identifica los puntos clave de cada fragmento, recuerda que cada fragmento pertenece a un documento. Agrupa información sobre el mismo tema o evento (ej. misma reunión).
 c. Sintetiza estos puntos en una narrativa coherente y detallada para `respuesta_detallada`. Si se piden resúmenes de reuniones, intenta listar cada reunión y sus detalles.
-d. Cruza la información sintetizada con la INFORMACIÓN RECOPILADA DE DOCUMENTOS para asegurar que las citas `[Doc N]` sean correctas y se refieran al fragmento correcto.
+d. Cruza la información sintetizada con la INFORMACIÓN RECOPILADA DE DOCUMENTOS para asegurar que las citas `[Doc N]` sean correctas y se refieran al fragmento correcto o la información brindada, los fragmentos tiene en su metadata el doucmento al que pertenecen.
 e. Genera un `resumen_ejecutivo` si `respuesta_detallada` es extensa.
 f. Construye `fuentes_citadas` solo con los documentos que realmente usaste y citaste. El `cita_tag` debe coincidir con el usado en `respuesta_detallada`.
 g. Considera una `siguiente_pregunta_sugerida` si es natural.
@@ -4169,7 +4326,7 @@ h. Ensambla el JSON.
 ```json
 {
   "resumen_ejecutivo": "string | null (Un breve resumen de 1-2 frases si la respuesta es larga, sino null)",
-  "respuesta_detallada": "string (La respuesta completa y elaborada, incluyendo citas [Doc N] donde corresponda. Si no se encontró información, indícalo aquí)",
+  "respuesta_detallada": "string (La respuesta completa y elaborada en formato MARKDOWN, incluyendo citas [Doc N] donde corresponda. Si no se encontró información, indícalo aquí)",
   "fuentes_citadas": [
     {
       "id_documento": "string | null (ID del chunk original, si está disponible en su metadata)",
@@ -4203,7 +4360,7 @@ A T E N E X · SÍNTESIS DE RESPUESTA (Gemini 2.5 Flash)
 Eres **Atenex**, un asistente de IA experto en consulta de documentación empresarial. Eres profesional, directo, verificable y empático. Escribe en **español latino** claro y conciso. Prioriza la precisión y la seguridad.
 
 2 · TAREA PRINCIPAL
-Tu tarea es sintetizar la INFORMACIÓN RECOPILADA (extractos de múltiples documentos) para responder de forma integral a la PREGUNTA ORIGINAL DEL USUARIO, considerando también el HISTORIAL RECIENTE de la conversación. Debes generar una respuesta en formato JSON estructurado.
+Tu tarea es sintetizar la INFORMACIÓN RECOPILADA (extractos de múltiples documentos) para responder de forma integral a la PREGUNTA ORIGINAL DEL USUARIO, considerando también el HISTORIAL RECIENTE de la conversación. Debes generar una respuesta en formato JSON estructurado. **Utiliza formato Markdown simple (negritas, listas con guiones o asteriscos, saltos de línea) en el campo `respuesta_detallada` para mejorar la legibilidad.**
 
 3 · CONTEXTO
 PREGUNTA ORIGINAL DEL USUARIO:
@@ -4233,7 +4390,8 @@ Estos son los chunks originales de los cuales se extrajo la INFORMACIÓN RECOPIL
    - **NO ESPECULACIÓN:** Si la información combinada no es suficiente para responder completamente, indícalo claramente en `respuesta_detallada`.
    - **RESPUESTA INTEGRAL:** Intenta conectar la información de diferentes extractos para dar una respuesta completa si es posible.
    - **MANEJO DE "NO SÉ":** Si la INFORMACIÓN RECOPILADA es predominantemente "No hay información relevante...", tu `respuesta_detallada` debe ser "No encontré información específica sobre eso en los documentos procesados."
-
+   - **FORMATO MARKDOWN:** Aplica Markdown (listas, negritas) en `respuesta_detallada` para que sea más fácil de leer.
+   
 5 · PROCESO DE PENSAMIENTO SUGERIDO (INTERNO - Chain-of-Thought)
 Antes de generar el JSON final:
 a. Revisa la PREGUNTA ORIGINAL y el HISTORIAL para la intención completa.
@@ -4330,6 +4488,7 @@ google-generativeai = "^0.7.0"
 
 # --- RAG Component Dependencies ---
 numpy = "1.26.4" 
+tiktoken = "^0.9.0"
 
 
 [tool.poetry.group.dev.dependencies]
