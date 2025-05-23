@@ -1,6 +1,6 @@
 # embedding-service/Dockerfile
 # ---- Stage 1: Builder ----
-FROM python:3.10-slim as builder
+FROM python:3.10-slim AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -10,7 +10,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     POETRY_NO_INTERACTION=1 \
     POETRY_VIRTUALENVS_CREATE=false
 
-# onnxruntime puede necesitar libgomp1, PyTorch might need it too.
+# Instalar dependencias base para compilar algunos paquetes de Python si es necesario.
+# Aunque el objetivo es una imagen ligera para OpenAI, algunas dependencias transitivas aún podrían necesitarlas.
+# libgomp1 es para OpenMP, puede ser requerida por alguna librería subyacente.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl build-essential libgomp1 && \
     rm -rf /var/lib/apt/lists/*
@@ -21,6 +23,9 @@ RUN poetry --version
 WORKDIR /build
 
 COPY pyproject.toml poetry.lock ./
+# Por defecto, solo instala las dependencias del grupo 'main'.
+# Si se necesitara construir una imagen con Sentence Transformers, este comando debería ser:
+# RUN poetry install --no-root --only main --with st
 RUN poetry install --no-root --only main
 
 # ---- Stage 2: Final Image ----
@@ -30,15 +35,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     APP_HOME="/app" \
     EMBEDDING_PORT=8003 \
-    # HuggingFace cache directories variables, defined for clarity and use by the app
-    # The actual creation path will use ${APP_HOME} directly in RUN for robustness
     HF_HOME_SUBPATH=".cache/huggingface/hub" \
     TRANSFORMERS_CACHE_SUBPATH=".cache/huggingface/transformers" \
     SENTENCE_TRANSFORMERS_HOME_SUBPATH=".cache/sentence_transformers"
 
 WORKDIR ${APP_HOME}
 
-# Reinstalar libgomp1 si es estrictamente necesario en runtime.
+# Reinstalar libgomp1 si es estrictamente necesario en runtime para alguna dependencia.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends libgomp1 && \
     rm -rf /var/lib/apt/lists/*
@@ -47,9 +50,13 @@ COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 COPY ./app ${APP_HOME}/app
+# Asumiendo que gunicorn_conf.py está en la raíz del contexto de build (junto al Dockerfile)
+COPY ./gunicorn_conf.py ${APP_HOME}/gunicorn_conf.py
 
-# Create cache directories and set permissions
-# Use APP_HOME directly to ensure correct path creation.
+
+# Crear directorios de caché. Aunque Sentence Transformers no se instale por defecto,
+# estos directorios son inofensivos si están vacíos y simplifican el Dockerfile
+# para un futuro cambio de proveedor sin modificar esta sección.
 RUN mkdir -p ${APP_HOME}/${HF_HOME_SUBPATH} \
              ${APP_HOME}/${TRANSFORMERS_CACHE_SUBPATH} \
              ${APP_HOME}/${SENTENCE_TRANSFORMERS_HOME_SUBPATH} && \
@@ -58,7 +65,4 @@ RUN mkdir -p ${APP_HOME}/${HF_HOME_SUBPATH} \
 
 EXPOSE ${EMBEDDING_PORT}
 
-# Use gunicorn_conf.py for configuration
-# Ensure gunicorn_conf.py is copied into the APP_HOME directory
-# The COPY ./app ${APP_HOME}/app command should handle gunicorn_conf.py if it's inside ./app
-CMD ["gunicorn", "-c", "app/gunicorn_conf.py", "app.main:app"]
+CMD ["gunicorn", "-c", "gunicorn_conf.py", "app.main:app"]

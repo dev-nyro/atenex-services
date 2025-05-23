@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "embedding-service"
-version = "1.1.1" # Se mantiene la versión, podría incrementarse a 1.2.0 tras este cambio.
+version = "1.1.1"
 description = "Atenex Embedding Service using FastAPI and choice of embedding models (OpenAI, Sentence Transformers)"
 authors = ["Atenex Team <dev@atenex.com>"]
 readme = "README.md"
@@ -17,8 +17,14 @@ tenacity = "^8.2.3"
 
 # --- Embedding Engine ---
 openai = "^1.14.0" # OpenAI Python client library
-sentence-transformers = "^2.7.0" # Para modelos como E5
-# torch se instalará como dependencia de sentence-transformers
+
+
+[tool.poetry.group.st] # Grupo opcional para Sentence Transformers
+optional = true
+
+[tool.poetry.group.st.dependencies]
+sentence-transformers = "^2.7.0" 
+# torch se instalará como dependencia de sentence-transformers si este grupo se incluye
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"
