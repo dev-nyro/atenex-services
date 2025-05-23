@@ -3,7 +3,7 @@ import structlog
 import asyncio
 import uuid
 import re
-import time # Para medir el tiempo del conteo de tokens
+import time 
 from typing import Dict, Any, List, Tuple, Optional, Type, Set
 from datetime import datetime, timezone, timedelta
 import httpx
@@ -11,9 +11,8 @@ import os
 import json 
 from pydantic import ValidationError 
 import tiktoken 
-from collections import OrderedDict # Para BoundedCache
+from collections import OrderedDict 
 
-# Import Ports and Domain Models
 from app.application.ports import (
     ChatRepositoryPort, LogRepositoryPort, VectorStorePort, LLMPort,
     SparseRetrieverPort, DiversityFilterPort, ChunkContentRepositoryPort,
@@ -55,7 +54,6 @@ def format_time_delta(dt: datetime) -> str:
 class AskQueryUseCase:
     _tiktoken_encoding: Optional[tiktoken.Encoding] = None
 
-    # Clase interna para un caché LRU simple y limitado en tamaño
     class BoundedCache(OrderedDict):
         def __init__(self, max_size: int, *args, **kwargs):
             self.max_size = max_size
@@ -63,12 +61,12 @@ class AskQueryUseCase:
 
         def __setitem__(self, key, value):
             if len(self) >= self.max_size and key not in self:
-                self.popitem(last=False) # Elimina el más antiguo si está lleno y es una nueva key
+                self.popitem(last=False) 
             super().__setitem__(key, value)
-            if key in self: # Mover al final si la key ya existe
+            if key in self: 
                 self.move_to_end(key)
 
-    _token_count_cache: BoundedCache = BoundedCache(max_size=500) # Cache para tokens de chunks individuales
+    _token_count_cache: BoundedCache = BoundedCache(max_size=1000) # Cache for tokens of individual chunk contents
 
     def __init__(self,
                  chat_repo: ChatRepositoryPort,
@@ -108,7 +106,7 @@ class AskQueryUseCase:
             "diversity_filter_enabled": settings.DIVERSITY_FILTER_ENABLED,
             "diversity_filter_type": type(self.diversity_filter).__name__ if self.diversity_filter else "None",
             "map_reduce_enabled": settings.MAPREDUCE_ENABLED,
-            "map_reduce_token_threshold": settings.MAX_PROMPT_TOKENS,
+            "map_reduce_token_threshold": settings.MAX_PROMPT_TOKENS, 
             "map_reduce_chunk_threshold": settings.MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS,
             "map_reduce_batch_size": settings.MAPREDUCE_CHUNK_BATCH_SIZE,
             "rag_prompt_path": settings.RAG_PROMPT_TEMPLATE_PATH,
@@ -136,18 +134,14 @@ class AskQueryUseCase:
         return self._tiktoken_encoding
 
     def _count_tokens_for_chunks(self, chunks: List[RetrievedChunk]) -> int:
-        if not chunks:
-            return 0
-        
+        if not chunks: return 0
         total_tokens = 0
         try:
             encoding = self._get_tiktoken_encoding()
-            # Calcular tokens para cada chunk, usando caché si es posible
             for chunk in chunks:
                 if chunk.content and chunk.content.strip():
-                    import hashlib
+                    import hashlib # Mover import aquí para evitar dependencia a nivel de clase si solo se usa aquí
                     content_hash = hashlib.md5(chunk.content.encode('utf-8')).hexdigest()
-                    
                     cached_token_count = self._token_count_cache.get(content_hash)
                     if cached_token_count is not None:
                         total_tokens += cached_token_count
@@ -156,16 +150,11 @@ class AskQueryUseCase:
                         self._token_count_cache[content_hash] = token_count
                         total_tokens += token_count
             return total_tokens
-            
         except Exception as e:
             log.error("Error counting tokens for chunks with tiktoken, falling back to char-based estimation", 
                      error=str(e), num_chunks=len(chunks), exc_info=False)
             total_chars = sum(len(c.content) for c in chunks if c.content)
-            estimated_tokens = max(1, int(total_chars / 4)) # Estimación muy aproximada
-            log.debug("Using fast character-based token estimation", 
-                     total_chars=total_chars, estimated_tokens=estimated_tokens,
-                     chars_per_token_ratio=4)
-            return estimated_tokens
+            return max(1, int(total_chars / 4))
             
     def _initialize_prompt_builder_from_path(self, template_path: str) -> PromptBuilder:
         init_log = log.bind(action="_initialize_prompt_builder_from_path", path=template_path)
@@ -232,6 +221,15 @@ class AskQueryUseCase:
             final_prompt_data.update(prompt_data_override)
         else: 
             if documents:
+                # Ensure 'document_id' and 'file_name' are in meta for Haystack Document
+                for doc_haystack in documents:
+                    if "document_id" not in doc_haystack.meta:
+                        doc_haystack.meta["document_id"] = "N/A" # Default if missing
+                    if "file_name" not in doc_haystack.meta:
+                         doc_haystack.meta["file_name"] = "Archivo Desconocido"
+                    if "title" not in doc_haystack.meta:
+                         doc_haystack.meta["title"] = "Sin Título"
+
                 final_prompt_data["documents"] = documents
             if chat_history:
                 final_prompt_data["chat_history"] = chat_history
@@ -285,7 +283,7 @@ class AskQueryUseCase:
         fetch_log.debug("Top IDs after fusion", top_ids_count=len(top_ids_with_scores_tuples))
 
         chunks_with_content: List[RetrievedChunk] = []
-        ids_needing_content: List[str] = []
+        ids_needing_data: List[str] = [] # Renamed from ids_needing_content
         placeholder_map: Dict[str, RetrievedChunk] = {}
 
         for cid, fused_score_val in top_ids_with_scores_tuples:
@@ -299,6 +297,7 @@ class AskQueryUseCase:
                 original_chunk_from_dense.score = fused_score_val 
                 chunks_with_content.append(original_chunk_from_dense)
             else: 
+                # Create placeholder, document_id and file_name might come from dense_map if present
                 chunk_placeholder = RetrievedChunk(
                     id=cid,
                     score=fused_score_val, 
@@ -307,30 +306,48 @@ class AskQueryUseCase:
                     embedding=original_chunk_from_dense.embedding if original_chunk_from_dense and original_chunk_from_dense.embedding else None,
                     document_id=original_chunk_from_dense.document_id if original_chunk_from_dense else None,
                     file_name=original_chunk_from_dense.file_name if original_chunk_from_dense else None,
-                    company_id=original_chunk_from_dense.company_id if original_chunk_from_dense else None
+                    company_id=original_chunk_from_dense.company_id if original_chunk_from_dense else None 
                 )
                 chunks_with_content.append(chunk_placeholder) 
                 placeholder_map[cid] = chunk_placeholder 
-                ids_needing_content.append(cid)
+                ids_needing_data.append(cid) # Add to list to fetch data from PG
 
-        if ids_needing_content and self.chunk_content_repo:
-             fetch_log.info("Fetching content for chunks missing content", count=len(ids_needing_content))
+        if ids_needing_data and self.chunk_content_repo:
+             fetch_log.info("Fetching content and metadata for chunks missing data", count=len(ids_needing_data))
              try:
-                 content_map = await self.chunk_content_repo.get_chunk_contents_by_ids(ids_needing_content)
-                 for cid_item, content_val in content_map.items():
+                 # Fetch content AND metadata (document_id, file_name)
+                 chunk_data_map: Dict[str, Dict[str, Any]] = await self.chunk_content_repo.get_chunk_contents_by_ids(ids_needing_data)
+                 
+                 for cid_item, data in chunk_data_map.items():
                      if cid_item in placeholder_map: 
-                          placeholder_map[cid_item].content = content_val
-                          if placeholder_map[cid_item].metadata.get("retrieval_source") == "sparse_or_fused_no_initial_meta":
-                            placeholder_map[cid_item].metadata["content_fetched_for_sparse"] = True
-                          else:
-                            placeholder_map[cid_item].metadata["content_fetched"] = True
-                 missing_after_fetch = [cid_item_check for cid_item_check in ids_needing_content if cid_item_check not in content_map or not content_map[cid_item_check]]
+                          placeholder_map[cid_item].content = data.get("content")
+                          # Update document_id and file_name if fetched and not already set from dense_map
+                          if not placeholder_map[cid_item].document_id:
+                            placeholder_map[cid_item].document_id = data.get("document_id")
+                          if not placeholder_map[cid_item].file_name:
+                            placeholder_map[cid_item].file_name = data.get("file_name")
+                          
+                          # Update metadata in placeholder
+                          if placeholder_map[cid_item].metadata:
+                            placeholder_map[cid_item].metadata.update({
+                                "content_fetched_for_sparse": True,
+                                "fetched_document_id": data.get("document_id"),
+                                "fetched_file_name": data.get("file_name")
+                            })
+                          else: # Should not happen if initialized correctly
+                            placeholder_map[cid_item].metadata = {
+                                "content_fetched_for_sparse": True,
+                                "fetched_document_id": data.get("document_id"),
+                                "fetched_file_name": data.get("file_name")
+                            }
+
+                 missing_after_fetch = [cid_item_check for cid_item_check in ids_needing_data if cid_item_check not in chunk_data_map or not chunk_data_map[cid_item_check].get("content")]
                  if missing_after_fetch:
-                      fetch_log.warning("Content not found or empty for some chunks after fetch", missing_ids=missing_after_fetch)
+                      fetch_log.warning("Content/metadata not found or empty for some chunks after fetch", missing_ids=missing_after_fetch)
              except Exception as e_content_fetch:
-                 fetch_log.exception("Failed to fetch content for fused results", error=str(e_content_fetch))
-        elif ids_needing_content:
-            fetch_log.warning("Cannot fetch content for sparse/fused results, ChunkContentRepository not available.")
+                 fetch_log.exception("Failed to fetch content/metadata for fused results", error=str(e_content_fetch))
+        elif ids_needing_data:
+            fetch_log.warning("Cannot fetch content/metadata for sparse/fused results, ChunkContentRepository not available.")
 
         final_chunks_with_content = [c for c in chunks_with_content if c.content and c.content.strip()]
         fetch_log.debug("Chunks remaining after content check and fetch", count=len(final_chunks_with_content))
@@ -465,10 +482,6 @@ class AskQueryUseCase:
         self, query: str, company_id: uuid.UUID, user_id: uuid.UUID,
         chat_id_param: Optional[uuid.UUID], exec_log: structlog.BoundLogger
     ) -> Tuple[uuid.UUID, Optional[str], List[ChatMessage]]:
-        """
-        Manages chat state: creates or loads chat, retrieves history, saves user message.
-        Returns: final_chat_id, chat_history_str, history_messages
-        """
         final_chat_id: uuid.UUID
         chat_history_str: Optional[str] = None
         history_messages: List[ChatMessage] = []
@@ -490,9 +503,10 @@ class AskQueryUseCase:
             final_chat_id = await self.chat_repo.create_chat(user_id=user_id, company_id=company_id, title=initial_title)
             exec_log.info("New chat created", new_chat_id=str(final_chat_id))
         
-        exec_log = exec_log.bind(chat_id=str(final_chat_id)) # Rebind log with final_chat_id
+        # Actualizar exec_log para tener el chat_id correcto
+        exec_log = exec_log.bind(chat_id=str(final_chat_id))
         await self.chat_repo.save_message(chat_id=final_chat_id, role='user', content=query)
-        exec_log.info("User message saved", is_new_chat=(not chat_id_param))
+        exec_log.info("User message saved", is_new_chat=(not chat_id_param)) # Corrected based on if chat_id_param was initially None
         
         return final_chat_id, chat_history_str, history_messages
 
@@ -500,7 +514,6 @@ class AskQueryUseCase:
         self, query: str, company_id: uuid.UUID, user_id: uuid.UUID,
         final_chat_id: uuid.UUID, exec_log: structlog.BoundLogger
     ) -> Tuple[str, List[RetrievedChunk], Optional[uuid.UUID], uuid.UUID]:
-        """Handles simple greetings by responding directly."""
         answer = "¡Hola! ¿En qué puedo ayudarte hoy con la información de tus documentos?"
         await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=None)
         exec_log.info("Greeting detected, responded directly.")
@@ -523,14 +536,14 @@ class AskQueryUseCase:
         pipeline_stages_used: List[str] = []
         
         try:
-            # --- CORRECCIÓN: Integrar lógica de _manage_chat_state aquí ---
+            # Lógica de _manage_chat_state integrada:
             final_chat_id: uuid.UUID
             chat_history_str: Optional[str] = None
             history_messages: List[ChatMessage] = []
 
             if chat_id:
                 if not await self.chat_repo.check_chat_ownership(chat_id, user_id, company_id):
-                    exec_log.warning("Chat ownership check failed.", provided_chat_id=str(chat_id))
+                    exec_log.warning("Chat ownership check failed for existing chat.", provided_chat_id=str(chat_id))
                     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Chat not found or access denied.")
                 final_chat_id = chat_id
                 if self.settings.MAX_CHAT_HISTORY_MESSAGES > 0:
@@ -539,16 +552,16 @@ class AskQueryUseCase:
                         limit=self.settings.MAX_CHAT_HISTORY_MESSAGES, offset=0
                     )
                     chat_history_str = self._format_chat_history(history_messages)
-                    exec_log.info("Existing chat, history retrieved", num_messages=len(history_messages))
+                exec_log.info("Using existing chat. History retrieved.", num_messages=len(history_messages), chat_id=str(final_chat_id))
             else:
                 initial_title = f"Chat: {truncate_text(query, 40)}"
                 final_chat_id = await self.chat_repo.create_chat(user_id=user_id, company_id=company_id, title=initial_title)
-                exec_log.info("New chat created", new_chat_id=str(final_chat_id))
+                exec_log.info("New chat created.", new_chat_id=str(final_chat_id))
             
-            exec_log = exec_log.bind(chat_id=str(final_chat_id)) # Rebind con el final_chat_id
+            # Rebind exec_log con el final_chat_id definitivo
+            exec_log = exec_log.bind(chat_id=str(final_chat_id))
             await self.chat_repo.save_message(chat_id=final_chat_id, role='user', content=query)
-            exec_log.info("User message saved", is_new_chat=(not chat_id))
-            # --- Fin de la lógica de _manage_chat_state integrada ---
+            exec_log.info("User message saved.", is_new_chat=(not chat_id)) # Log if it was a new chat or existing one
 
             if GREETING_REGEX.match(query):
                 return await self._handle_greeting(query, company_id, user_id, final_chat_id, exec_log)
@@ -693,13 +706,13 @@ class AskQueryUseCase:
                             status_code=http_err.response.status_code,
                             response_text=truncate_text(http_err.response.text, 200),
                             error_details=repr(http_err),
-                            exc_info=True
+                            exc_info=True 
                         )
                     except httpx.RequestError as req_err: 
                         rerank_log.error(
                             "Request error contacting Reranker service",
                             error_details=repr(req_err),
-                            exc_info=True
+                            exc_info=True 
                         )
                     except Exception as e_rerank:
                         rerank_log.error(
@@ -819,12 +832,13 @@ class AskQueryUseCase:
             total_tokens_for_llm = self._count_tokens_for_chunks(final_chunks_for_processing)
             token_count_duration = time.perf_counter() - token_count_start
             
-            cache_stats = self._get_cache_stats() # Obtener estadísticas del caché
+            cache_stats = self._get_cache_stats() 
             exec_log.info("Token count for final list of processed chunks",
                           num_chunks=num_final_chunks_for_llm_or_mapreduce,
                           total_tokens=total_tokens_for_llm,
                           token_count_duration_ms=round(token_count_duration * 1000, 2),
                           cache_size=cache_stats["cache_size"],
+                          cache_max_size=cache_stats["cache_max_size"],
                           map_reduce_token_threshold=settings.MAX_PROMPT_TOKENS,
                           map_reduce_chunk_threshold=settings.MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS)
             
@@ -854,7 +868,8 @@ class AskQueryUseCase:
                         meta={ 
                             "file_name": c.file_name, 
                             "page": c.metadata.get("page"), 
-                            "title": c.metadata.get("title") 
+                            "title": c.metadata.get("title"),
+                            "document_id": c.document_id # Asegurar que document_id está en meta
                         },
                         score=c.score
                     ) for c in chunks_to_send_to_llm
@@ -923,7 +938,8 @@ class AskQueryUseCase:
                         meta={ 
                             "file_name": c.file_name, 
                             "page": c.metadata.get("page"),
-                            "title": c.metadata.get("title")
+                            "title": c.metadata.get("title"),
+                            "document_id": c.document_id # Asegurar que document_id está en meta
                         },
                         score=c.score
                     ) for c in chunks_to_send_to_llm
@@ -976,9 +992,6 @@ class AskQueryUseCase:
         log.debug("Token count cache cleared")
 
     def _get_cache_stats(self) -> Dict[str, Any]:
-        # Aproximación del uso de memoria, ya que Python no da tamaño de objeto directo fácil
-        # Cada entrada es un hash (32 bytes) + int (28 bytes) + overhead de dict. ~100 bytes/entrada
-        # Esto es muy aproximado.
         memory_usage_bytes = len(self._token_count_cache) * 100 
         return {
             "cache_size": len(self._token_count_cache),

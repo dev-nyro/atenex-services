@@ -565,7 +565,7 @@ class LLMPort(abc.ABC):
 # query-service/app/application/ports/repository_ports.py
 import abc
 import uuid
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple # Añadir Tuple
 # LLM_REFACTOR_STEP_2: Importar modelos de dominio
 from app.domain.models import ChatMessage, ChatSummary, QueryLog
 
@@ -607,28 +607,29 @@ class LogRepositoryPort(abc.ABC):
         company_id: uuid.UUID,
         query: str,
         answer: str,
-        retrieved_documents_data: List[Dict[str, Any]], # Mantener Dict por simplicidad del log
+        retrieved_documents_data: List[Dict[str, Any]], 
         metadata: Optional[Dict[str, Any]] = None,
         chat_id: Optional[uuid.UUID] = None,
     ) -> uuid.UUID:
         raise NotImplementedError
 
-# LLM_REFACTOR_STEP_2: Añadir puerto para obtener contenido de chunks para BM25
+
 class ChunkContentRepositoryPort(abc.ABC):
-    """Puerto abstracto para obtener contenido textual de chunks desde la persistencia."""
+    """Puerto abstracto para obtener contenido textual y metadatos de chunks desde la persistencia."""
 
     @abc.abstractmethod
-    async def get_chunk_contents_by_company(self, company_id: uuid.UUID) -> Dict[str, str]:
+    async def get_chunk_contents_by_company(self, company_id: uuid.UUID) -> Dict[str, Dict[str, Any]]:
         """
-        Obtiene un diccionario de {chunk_id: content} para una compañía.
-        Necesario para construir índices BM25 en memoria.
-        Considerar alternativas si esto es muy costoso (ej: obtener por IDs específicos).
+        Obtiene un diccionario de {chunk_id: {'content': str, 'document_id': str, 'file_name': str}} para una compañía.
         """
         raise NotImplementedError
 
     @abc.abstractmethod
-    async def get_chunk_contents_by_ids(self, chunk_ids: List[str]) -> Dict[str, str]:
-        """Obtiene un diccionario de {chunk_id: content} para una lista de IDs."""
+    async def get_chunk_contents_by_ids(self, chunk_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        Obtiene un diccionario de {chunk_id: {'content': str, 'document_id': str, 'file_name': str}} para una lista de IDs.
+        Los chunk_ids aquí son los embedding_id de Milvus.
+        """
         raise NotImplementedError
 ```
 
@@ -741,16 +742,16 @@ import structlog
 import asyncio
 import uuid
 import re
-import time
+import time 
 from typing import Dict, Any, List, Tuple, Optional, Type, Set
 from datetime import datetime, timezone, timedelta
 import httpx
 import os 
 import json 
 from pydantic import ValidationError 
-import tiktoken # Import tiktoken
+import tiktoken 
+from collections import OrderedDict 
 
-# Import Ports and Domain Models
 from app.application.ports import (
     ChatRepositoryPort, LogRepositoryPort, VectorStorePort, LLMPort,
     SparseRetrieverPort, DiversityFilterPort, ChunkContentRepositoryPort,
@@ -790,8 +791,7 @@ def format_time_delta(dt: datetime) -> str:
 
 
 class AskQueryUseCase:
-    _tiktoken_encoding: Optional[tiktoken.Encoding] = None # Cache for tiktoken encoding
-    from collections import OrderedDict
+    _tiktoken_encoding: Optional[tiktoken.Encoding] = None
 
     class BoundedCache(OrderedDict):
         def __init__(self, max_size: int, *args, **kwargs):
@@ -799,11 +799,13 @@ class AskQueryUseCase:
             super().__init__(*args, **kwargs)
 
         def __setitem__(self, key, value):
-            if len(self) >= self.max_size:
-                self.popitem(last=False)
+            if len(self) >= self.max_size and key not in self:
+                self.popitem(last=False) 
             super().__setitem__(key, value)
+            if key in self: 
+                self.move_to_end(key)
 
-    _token_count_cache: BoundedCache = BoundedCache(max_size=500) # Cache for token counts by content hash
+    _token_count_cache: BoundedCache = BoundedCache(max_size=1000) # Cache for tokens of individual chunk contents
 
     def __init__(self,
                  chat_repo: ChatRepositoryPort,
@@ -843,7 +845,7 @@ class AskQueryUseCase:
             "diversity_filter_enabled": settings.DIVERSITY_FILTER_ENABLED,
             "diversity_filter_type": type(self.diversity_filter).__name__ if self.diversity_filter else "None",
             "map_reduce_enabled": settings.MAPREDUCE_ENABLED,
-            "map_reduce_token_threshold": settings.MAX_PROMPT_TOKENS, # Usaremos MAX_PROMPT_TOKENS para el umbral de tokens
+            "map_reduce_token_threshold": settings.MAX_PROMPT_TOKENS, 
             "map_reduce_chunk_threshold": settings.MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS,
             "map_reduce_batch_size": settings.MAPREDUCE_CHUNK_BATCH_SIZE,
             "rag_prompt_path": settings.RAG_PROMPT_TEMPLATE_PATH,
@@ -866,100 +868,33 @@ class AskQueryUseCase:
                 self._tiktoken_encoding = tiktoken.get_encoding(self.settings.TIKTOKEN_ENCODING_NAME)
             except Exception as e:
                 log.error("Failed to load tiktoken encoding", encoding_name=self.settings.TIKTOKEN_ENCODING_NAME, error=str(e))
-                # Fallback a un encoding simple si falla la carga del específico (menos preciso)
                 self._tiktoken_encoding = tiktoken.get_encoding("gpt2") 
                 log.warning("Falling back to 'gpt2' tiktoken encoding due to previous error.")
         return self._tiktoken_encoding
 
     def _count_tokens_for_chunks(self, chunks: List[RetrievedChunk]) -> int:
-        if not chunks:
-            return 0
-        
-        # Filtrar chunks con contenido válido
-        valid_contents = [chunk.content for chunk in chunks if chunk.content and chunk.content.strip()]
-        if not valid_contents:
-            return 0
-        
+        if not chunks: return 0
+        total_tokens = 0
         try:
             encoding = self._get_tiktoken_encoding()
-            
-            # Optimización con cache: verificar si ya tenemos algunos contenidos calculados
-            total_tokens = 0
-            uncached_contents = []
-            
-            for content in valid_contents:
-                # Crear un hash simple del contenido para el cache
-                import hashlib
-                content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
-                
-                if content_hash in self._token_count_cache:
-                    total_tokens += self._token_count_cache[content_hash]
-                else:
-                    uncached_contents.append((content, content_hash))
-            
-            # Procesar solo los contenidos no cacheados
-            if uncached_contents:
-                if len(uncached_contents) == 1:
-                    # Caso simple: un solo contenido no cacheado
-                    content, content_hash = uncached_contents[0]
-                    token_count = len(encoding.encode(content))
-                    self._token_count_cache[content_hash] = token_count
-                    total_tokens += token_count
-                else:
-                    # Procesamiento por lotes para múltiples contenidos
-                    batch_contents = [content for content, _ in uncached_contents]
-                    separator = "\n\n---CHUNK_SEP---\n\n"
-                    concatenated = separator.join(batch_contents)
-                    
-                    # Contar tokens del lote concatenado
-                    batch_total = len(encoding.encode(concatenated))
-                    
-                    # Restar tokens del separador
-                    if len(batch_contents) > 1:
-                        separator_tokens = len(encoding.encode(separator))
-                        batch_total -= separator_tokens * (len(batch_contents) - 1)
-                    
-                    # Estimar tokens por contenido individual (distribución proporcional)
-                    total_chars = sum(len(content) for content in batch_contents)
-                    
-                    for content, content_hash in uncached_contents:
-                        if total_chars > 0:
-                            # Distribución proporcional basada en longitud de caracteres
-                            content_ratio = len(content) / total_chars
-                            estimated_tokens = int(batch_total * content_ratio)
-                        else:
-                            estimated_tokens = 0
-                        
-                        self._token_count_cache[content_hash] = estimated_tokens
-                        total_tokens += estimated_tokens
-            
-            # Limitar el tamaño del cache para evitar consumo excesivo de memoria
-            if len(self._token_count_cache) > 1000:
-                # Mantener solo los 500 más recientes (aproximadamente)
-                cache_items = list(self._token_count_cache.items())
-                pass  # No manual trimming needed as BoundedCache handles it automatically
-            
+            for chunk in chunks:
+                if chunk.content and chunk.content.strip():
+                    import hashlib # Mover import aquí para evitar dependencia a nivel de clase si solo se usa aquí
+                    content_hash = hashlib.md5(chunk.content.encode('utf-8')).hexdigest()
+                    cached_token_count = self._token_count_cache.get(content_hash)
+                    if cached_token_count is not None:
+                        total_tokens += cached_token_count
+                    else:
+                        token_count = len(encoding.encode(chunk.content))
+                        self._token_count_cache[content_hash] = token_count
+                        total_tokens += token_count
             return total_tokens
-            
         except Exception as e:
-            log.error("Error counting tokens for chunks with tiktoken, falling back to estimation", 
+            log.error("Error counting tokens for chunks with tiktoken, falling back to char-based estimation", 
                      error=str(e), num_chunks=len(chunks), exc_info=False)
+            total_chars = sum(len(c.content) for c in chunks if c.content)
+            return max(1, int(total_chars / 4))
             
-            # Estimación ultra-rápida basada en caracteres
-            # Ratios aproximados para diferentes idiomas:
-            # - Inglés: ~4 caracteres por token
-            # - Español: ~4.5 caracteres por token  
-            # - Código: ~3.5 caracteres por token
-            # Usamos 4 como promedio conservador
-            total_chars = sum(len(content) for content in valid_contents)
-            estimated_tokens = max(1, int(total_chars / 4))
-            
-            log.debug("Using fast character-based token estimation", 
-                     total_chars=total_chars, estimated_tokens=estimated_tokens,
-                     chars_per_token_ratio=4)
-            
-            return estimated_tokens
-
     def _initialize_prompt_builder_from_path(self, template_path: str) -> PromptBuilder:
         init_log = log.bind(action="_initialize_prompt_builder_from_path", path=template_path)
         init_log.debug("Initializing PromptBuilder from path...")
@@ -1025,6 +960,15 @@ class AskQueryUseCase:
             final_prompt_data.update(prompt_data_override)
         else: 
             if documents:
+                # Ensure 'document_id' and 'file_name' are in meta for Haystack Document
+                for doc_haystack in documents:
+                    if "document_id" not in doc_haystack.meta:
+                        doc_haystack.meta["document_id"] = "N/A" # Default if missing
+                    if "file_name" not in doc_haystack.meta:
+                         doc_haystack.meta["file_name"] = "Archivo Desconocido"
+                    if "title" not in doc_haystack.meta:
+                         doc_haystack.meta["title"] = "Sin Título"
+
                 final_prompt_data["documents"] = documents
             if chat_history:
                 final_prompt_data["chat_history"] = chat_history
@@ -1078,7 +1022,7 @@ class AskQueryUseCase:
         fetch_log.debug("Top IDs after fusion", top_ids_count=len(top_ids_with_scores_tuples))
 
         chunks_with_content: List[RetrievedChunk] = []
-        ids_needing_content: List[str] = []
+        ids_needing_data: List[str] = [] # Renamed from ids_needing_content
         placeholder_map: Dict[str, RetrievedChunk] = {}
 
         for cid, fused_score_val in top_ids_with_scores_tuples:
@@ -1092,6 +1036,7 @@ class AskQueryUseCase:
                 original_chunk_from_dense.score = fused_score_val 
                 chunks_with_content.append(original_chunk_from_dense)
             else: 
+                # Create placeholder, document_id and file_name might come from dense_map if present
                 chunk_placeholder = RetrievedChunk(
                     id=cid,
                     score=fused_score_val, 
@@ -1100,30 +1045,48 @@ class AskQueryUseCase:
                     embedding=original_chunk_from_dense.embedding if original_chunk_from_dense and original_chunk_from_dense.embedding else None,
                     document_id=original_chunk_from_dense.document_id if original_chunk_from_dense else None,
                     file_name=original_chunk_from_dense.file_name if original_chunk_from_dense else None,
-                    company_id=original_chunk_from_dense.company_id if original_chunk_from_dense else None
+                    company_id=original_chunk_from_dense.company_id if original_chunk_from_dense else None 
                 )
                 chunks_with_content.append(chunk_placeholder) 
                 placeholder_map[cid] = chunk_placeholder 
-                ids_needing_content.append(cid)
+                ids_needing_data.append(cid) # Add to list to fetch data from PG
 
-        if ids_needing_content and self.chunk_content_repo:
-             fetch_log.info("Fetching content for chunks missing content", count=len(ids_needing_content))
+        if ids_needing_data and self.chunk_content_repo:
+             fetch_log.info("Fetching content and metadata for chunks missing data", count=len(ids_needing_data))
              try:
-                 content_map = await self.chunk_content_repo.get_chunk_contents_by_ids(ids_needing_content)
-                 for cid_item, content_val in content_map.items():
+                 # Fetch content AND metadata (document_id, file_name)
+                 chunk_data_map: Dict[str, Dict[str, Any]] = await self.chunk_content_repo.get_chunk_contents_by_ids(ids_needing_data)
+                 
+                 for cid_item, data in chunk_data_map.items():
                      if cid_item in placeholder_map: 
-                          placeholder_map[cid_item].content = content_val
-                          if placeholder_map[cid_item].metadata.get("retrieval_source") == "sparse_or_fused_no_initial_meta":
-                            placeholder_map[cid_item].metadata["content_fetched_for_sparse"] = True
-                          else:
-                            placeholder_map[cid_item].metadata["content_fetched"] = True
-                 missing_after_fetch = [cid_item_check for cid_item_check in ids_needing_content if cid_item_check not in content_map or not content_map[cid_item_check]]
+                          placeholder_map[cid_item].content = data.get("content")
+                          # Update document_id and file_name if fetched and not already set from dense_map
+                          if not placeholder_map[cid_item].document_id:
+                            placeholder_map[cid_item].document_id = data.get("document_id")
+                          if not placeholder_map[cid_item].file_name:
+                            placeholder_map[cid_item].file_name = data.get("file_name")
+                          
+                          # Update metadata in placeholder
+                          if placeholder_map[cid_item].metadata:
+                            placeholder_map[cid_item].metadata.update({
+                                "content_fetched_for_sparse": True,
+                                "fetched_document_id": data.get("document_id"),
+                                "fetched_file_name": data.get("file_name")
+                            })
+                          else: # Should not happen if initialized correctly
+                            placeholder_map[cid_item].metadata = {
+                                "content_fetched_for_sparse": True,
+                                "fetched_document_id": data.get("document_id"),
+                                "fetched_file_name": data.get("file_name")
+                            }
+
+                 missing_after_fetch = [cid_item_check for cid_item_check in ids_needing_data if cid_item_check not in chunk_data_map or not chunk_data_map[cid_item_check].get("content")]
                  if missing_after_fetch:
-                      fetch_log.warning("Content not found or empty for some chunks after fetch", missing_ids=missing_after_fetch)
+                      fetch_log.warning("Content/metadata not found or empty for some chunks after fetch", missing_ids=missing_after_fetch)
              except Exception as e_content_fetch:
-                 fetch_log.exception("Failed to fetch content for fused results", error=str(e_content_fetch))
-        elif ids_needing_content:
-            fetch_log.warning("Cannot fetch content for sparse/fused results, ChunkContentRepository not available.")
+                 fetch_log.exception("Failed to fetch content/metadata for fused results", error=str(e_content_fetch))
+        elif ids_needing_data:
+            fetch_log.warning("Cannot fetch content/metadata for sparse/fused results, ChunkContentRepository not available.")
 
         final_chunks_with_content = [c for c in chunks_with_content if c.content and c.content.strip()]
         fetch_log.debug("Chunks remaining after content check and fetch", count=len(final_chunks_with_content))
@@ -1254,6 +1217,52 @@ class AskQueryUseCase:
 
         return answer_for_user, retrieved_chunks_for_response, log_id
 
+    async def _manage_chat_state(
+        self, query: str, company_id: uuid.UUID, user_id: uuid.UUID,
+        chat_id_param: Optional[uuid.UUID], exec_log: structlog.BoundLogger
+    ) -> Tuple[uuid.UUID, Optional[str], List[ChatMessage]]:
+        final_chat_id: uuid.UUID
+        chat_history_str: Optional[str] = None
+        history_messages: List[ChatMessage] = []
+
+        if chat_id_param:
+            if not await self.chat_repo.check_chat_ownership(chat_id_param, user_id, company_id):
+                exec_log.warning("Chat ownership check failed.", provided_chat_id=str(chat_id_param))
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Chat not found or access denied.")
+            final_chat_id = chat_id_param
+            if self.settings.MAX_CHAT_HISTORY_MESSAGES > 0:
+                history_messages = await self.chat_repo.get_chat_messages(
+                    chat_id=final_chat_id, user_id=user_id, company_id=company_id,
+                    limit=self.settings.MAX_CHAT_HISTORY_MESSAGES, offset=0
+                )
+                chat_history_str = self._format_chat_history(history_messages)
+                exec_log.info("Existing chat, history retrieved", num_messages=len(history_messages))
+        else:
+            initial_title = f"Chat: {truncate_text(query, 40)}"
+            final_chat_id = await self.chat_repo.create_chat(user_id=user_id, company_id=company_id, title=initial_title)
+            exec_log.info("New chat created", new_chat_id=str(final_chat_id))
+        
+        # Actualizar exec_log para tener el chat_id correcto
+        exec_log = exec_log.bind(chat_id=str(final_chat_id))
+        await self.chat_repo.save_message(chat_id=final_chat_id, role='user', content=query)
+        exec_log.info("User message saved", is_new_chat=(not chat_id_param)) # Corrected based on if chat_id_param was initially None
+        
+        return final_chat_id, chat_history_str, history_messages
+
+    async def _handle_greeting(
+        self, query: str, company_id: uuid.UUID, user_id: uuid.UUID,
+        final_chat_id: uuid.UUID, exec_log: structlog.BoundLogger
+    ) -> Tuple[str, List[RetrievedChunk], Optional[uuid.UUID], uuid.UUID]:
+        answer = "¡Hola! ¿En qué puedo ayudarte hoy con la información de tus documentos?"
+        await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=None)
+        exec_log.info("Greeting detected, responded directly.")
+        simple_log_id = await self.log_repo.log_query_interaction(
+            user_id=user_id, company_id=company_id, query=query, answer=answer,
+            retrieved_documents_data=[], metadata={"type": "greeting"}, chat_id=final_chat_id
+        )
+        return answer, [], simple_log_id, final_chat_id
+
+
     async def execute(
         self, query: str, company_id: uuid.UUID, user_id: uuid.UUID,
         chat_id: Optional[uuid.UUID] = None, top_k: Optional[int] = None
@@ -1264,29 +1273,37 @@ class AskQueryUseCase:
         exec_log = exec_log.bind(effective_retriever_k=retriever_k_effective)
 
         pipeline_stages_used: List[str] = []
-        final_chat_id: uuid.UUID
-        chat_history_str: Optional[str] = None
-        history_messages: List[ChatMessage] = []
-
+        
         try:
-            final_chat_id, chat_history_str, history_messages = await self._manage_chat_state(
-                query, company_id, user_id, chat_id, exec_log
-            )
+            # Lógica de _manage_chat_state integrada:
+            final_chat_id: uuid.UUID
+            chat_history_str: Optional[str] = None
+            history_messages: List[ChatMessage] = []
+
+            if chat_id:
+                if not await self.chat_repo.check_chat_ownership(chat_id, user_id, company_id):
+                    exec_log.warning("Chat ownership check failed for existing chat.", provided_chat_id=str(chat_id))
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Chat not found or access denied.")
+                final_chat_id = chat_id
+                if self.settings.MAX_CHAT_HISTORY_MESSAGES > 0:
+                    history_messages = await self.chat_repo.get_chat_messages(
+                        chat_id=final_chat_id, user_id=user_id, company_id=company_id,
+                        limit=self.settings.MAX_CHAT_HISTORY_MESSAGES, offset=0
+                    )
+                    chat_history_str = self._format_chat_history(history_messages)
+                exec_log.info("Using existing chat. History retrieved.", num_messages=len(history_messages), chat_id=str(final_chat_id))
+            else:
+                initial_title = f"Chat: {truncate_text(query, 40)}"
+                final_chat_id = await self.chat_repo.create_chat(user_id=user_id, company_id=company_id, title=initial_title)
+                exec_log.info("New chat created.", new_chat_id=str(final_chat_id))
+            
+            # Rebind exec_log con el final_chat_id definitivo
+            exec_log = exec_log.bind(chat_id=str(final_chat_id))
+            await self.chat_repo.save_message(chat_id=final_chat_id, role='user', content=query)
+            exec_log.info("User message saved.", is_new_chat=(not chat_id)) # Log if it was a new chat or existing one
 
             if GREETING_REGEX.match(query):
                 return await self._handle_greeting(query, company_id, user_id, final_chat_id, exec_log)
-
-            pipeline_stages_used.append("query_embedding (remote)")
-            query_embedding = await self._embed_query(query)
-            if GREETING_REGEX.match(query):
-                answer = "¡Hola! ¿En qué puedo ayudarte hoy con la información de tus documentos?"
-                await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer, sources=None)
-                exec_log.info("Greeting detected, responded directly.")
-                simple_log_id = await self.log_repo.log_query_interaction(
-                    user_id=user_id, company_id=company_id, query=query, answer=answer,
-                    retrieved_documents_data=[], metadata={"type": "greeting"}, chat_id=final_chat_id
-                )
-                return answer, [], simple_log_id, final_chat_id
 
             pipeline_stages_used.append("query_embedding (remote)")
             query_embedding = await self._embed_query(query)
@@ -1365,7 +1382,6 @@ class AskQueryUseCase:
                         rerank_log.debug("Sending request to reranker service...")
                         base_reranker_url = str(settings.RERANKER_SERVICE_URL).rstrip('/')
                         
-                        # Simplified URL construction for reranker
                         if "/api/v1/rerank" not in base_reranker_url:
                             if base_reranker_url.endswith("/api/v1"):
                                 reranker_url = f"{base_reranker_url}/rerank"
@@ -1373,12 +1389,10 @@ class AskQueryUseCase:
                                 reranker_url = f"{base_reranker_url}/v1/rerank"
                             else:
                                 reranker_url = f"{base_reranker_url}/api/v1/rerank"
-                        else: # Already contains full path
+                        else: 
                             reranker_url = base_reranker_url
 
                         rerank_log.debug(f"Final Reranker URL: {reranker_url}")
-
-                        # Use a more aggressive timeout for the reranker call specifically
                         reranker_specific_timeout = httpx.Timeout(self.settings.RERANKER_CLIENT_TIMEOUT, connect=10.0)
 
                         reranker_response = await self.http_client.post(
@@ -1429,15 +1443,15 @@ class AskQueryUseCase:
                         rerank_log.error(
                             "HTTP error from Reranker service",
                             status_code=http_err.response.status_code,
-                            response_text=http_err.response.text,
+                            response_text=truncate_text(http_err.response.text, 200),
                             error_details=repr(http_err),
-                            exc_info=True
+                            exc_info=True 
                         )
                     except httpx.RequestError as req_err: 
                         rerank_log.error(
                             "Request error contacting Reranker service",
                             error_details=repr(req_err),
-                            exc_info=True
+                            exc_info=True 
                         )
                     except Exception as e_rerank:
                         rerank_log.error(
@@ -1539,7 +1553,6 @@ class AskQueryUseCase:
 
             if not final_chunks_for_processing: 
                 exec_log.warning("No chunks with content after all postprocessing. Using general prompt.")
-                # (Misma lógica de respuesta general que antes)
                 general_prompt = await self._build_prompt(query, [], chat_history=chat_history_str, builder=self._prompt_builder_general)
                 answer_str = await self.llm.generate(general_prompt, response_pydantic_schema=None)
                 await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer_str, sources=None)
@@ -1552,29 +1565,28 @@ class AskQueryUseCase:
 
             map_reduce_active = False
             json_answer_str: str
-            chunks_to_send_to_llm: List[RetrievedChunk] # Chunks que realmente irán al LLM            # Medir performance del conteo de tokens optimizado
+            chunks_to_send_to_llm: List[RetrievedChunk] 
+            
             token_count_start = time.perf_counter()
             total_tokens_for_llm = self._count_tokens_for_chunks(final_chunks_for_processing)
             token_count_duration = time.perf_counter() - token_count_start
             
-            cache_stats = self._get_cache_stats()
+            cache_stats = self._get_cache_stats() 
             exec_log.info("Token count for final list of processed chunks",
                           num_chunks=num_final_chunks_for_llm_or_mapreduce,
                           total_tokens=total_tokens_for_llm,
                           token_count_duration_ms=round(token_count_duration * 1000, 2),
                           cache_size=cache_stats["cache_size"],
+                          cache_max_size=cache_stats["cache_max_size"],
                           map_reduce_token_threshold=settings.MAX_PROMPT_TOKENS,
                           map_reduce_chunk_threshold=settings.MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS)
             
-            # Decisión MapReduce: Prioridad al umbral de tokens.
-            # Si el umbral de tokens se supera, se activa MapReduce.
-            # Si no, pero el número de chunks supera el umbral de chunks, también se activa.
             should_activate_mapreduce_by_tokens = total_tokens_for_llm > self.settings.MAX_PROMPT_TOKENS
             should_activate_mapreduce_by_chunks = num_final_chunks_for_llm_or_mapreduce > self.settings.MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS
 
             if self.settings.MAPREDUCE_ENABLED and \
                (should_activate_mapreduce_by_tokens or should_activate_mapreduce_by_chunks) and \
-               num_final_chunks_for_llm_or_mapreduce > 1: # MapReduce necesita >1 chunk
+               num_final_chunks_for_llm_or_mapreduce > 1: 
                 
                 trigger_reason = "token_count" if should_activate_mapreduce_by_tokens else "chunk_count"
                 exec_log.info(f"Activating MapReduce due to {trigger_reason}. "
@@ -1584,7 +1596,7 @@ class AskQueryUseCase:
                 
                 pipeline_stages_used.append("map_reduce_flow")
                 map_reduce_active = True
-                chunks_to_send_to_llm = final_chunks_for_processing # Todos los chunks van a la fase Map
+                chunks_to_send_to_llm = final_chunks_for_processing 
 
                 pipeline_stages_used.append("map_phase")
                 mapped_responses_parts = []
@@ -1595,10 +1607,11 @@ class AskQueryUseCase:
                         meta={ 
                             "file_name": c.file_name, 
                             "page": c.metadata.get("page"), 
-                            "title": c.metadata.get("title") 
+                            "title": c.metadata.get("title"),
+                            "document_id": c.document_id # Asegurar que document_id está en meta
                         },
                         score=c.score
-                    ) for c in chunks_to_send_to_llm # Usar chunks_to_send_to_llm
+                    ) for c in chunks_to_send_to_llm
                 ]
                 
                 map_tasks = []
@@ -1622,7 +1635,7 @@ class AskQueryUseCase:
                 map_phase_results = await asyncio.gather(*[asyncio.shield(task) for task in llm_map_tasks], return_exceptions=True)
 
                 for idx, result in enumerate(map_phase_results):
-                    map_log_batch = exec_log.bind(map_batch_index=idx) # Corrected log binding
+                    map_log_batch = exec_log.bind(map_batch_index=idx) 
                     if isinstance(result, Exception):
                         map_log_batch.error("LLM call failed for map batch", error=str(result), exc_info=True)
                     elif result and MAP_REDUCE_NO_RELEVANT_INFO not in result:
@@ -1638,7 +1651,6 @@ class AskQueryUseCase:
                     concatenated_mapped_responses = "\n".join(mapped_responses_parts)
 
                 pipeline_stages_used.append("reduce_phase")
-                # original_documents_for_citation en el prompt de reduce debe ser los chunks que fueron a la fase map
                 haystack_docs_for_reduce_citation = haystack_docs_for_map 
                 reduce_prompt_data = {
                     "original_query": query,
@@ -1665,7 +1677,8 @@ class AskQueryUseCase:
                         meta={ 
                             "file_name": c.file_name, 
                             "page": c.metadata.get("page"),
-                            "title": c.metadata.get("title")
+                            "title": c.metadata.get("title"),
+                            "document_id": c.document_id # Asegurar que document_id está en meta
                         },
                         score=c.score
                     ) for c in chunks_to_send_to_llm
@@ -1681,13 +1694,13 @@ class AskQueryUseCase:
                 company_id=company_id,
                 user_id=user_id,
                 final_chat_id=final_chat_id,
-                original_chunks_for_citation=chunks_to_send_to_llm, # Usar los chunks efectivamente enviados al LLM/MapReduce
+                original_chunks_for_citation=chunks_to_send_to_llm, 
                 pipeline_stages_used=pipeline_stages_used,
                 map_reduce_used=map_reduce_active,
                 retriever_k_effective=retriever_k_effective,
                 fusion_fetch_k_effective=fusion_fetch_k_effective,
                 num_chunks_after_rerank_or_fusion_fetch_effective=num_chunks_after_rerank, 
-                num_final_chunks_sent_to_llm_effective=len(chunks_to_send_to_llm), # Log el número real
+                num_final_chunks_sent_to_llm_effective=len(chunks_to_send_to_llm), 
                 num_history_messages_effective=len(history_messages)
             )
             
@@ -1714,15 +1727,15 @@ class AskQueryUseCase:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An internal server error occurred: {type(e).__name__}. Please contact support if this persists.") from e
 
     def _clear_token_cache(self) -> None:
-        """Limpia el cache de conteo de tokens para liberar memoria."""
         self._token_count_cache.clear()
         log.debug("Token count cache cleared")
 
     def _get_cache_stats(self) -> Dict[str, Any]:
-        """Retorna estadísticas del cache para monitoreo."""
+        memory_usage_bytes = len(self._token_count_cache) * 100 
         return {
             "cache_size": len(self._token_count_cache),
-            "memory_usage_estimate_kb": len(self._token_count_cache) * 50 / 1024  # Estimación aprox
+            "cache_max_size": self._token_count_cache.max_size,
+            "memory_usage_estimate_kb": round(memory_usage_bytes / 1024, 2) 
         }
 ```
 
@@ -3425,10 +3438,14 @@ class PostgresLogRepository(LogRepositoryPort):
 class PostgresChunkContentRepository(ChunkContentRepositoryPort):
     """Implementación concreta para obtener contenido de chunks desde PostgreSQL."""
 
-    async def get_chunk_contents_by_company(self, company_id: uuid.UUID) -> Dict[str, str]:
+    async def get_chunk_contents_by_company(self, company_id: uuid.UUID) -> Dict[str, Dict[str, Any]]:
         pool = await get_db_pool()
         query = """
-        SELECT dc.embedding_id, dc.content
+        SELECT 
+            dc.embedding_id, 
+            dc.content,
+            d.id as document_id,
+            d.file_name
         FROM document_chunks dc
         JOIN documents d ON dc.document_id = d.id
         WHERE d.company_id = $1 AND dc.embedding_id IS NOT NULL;
@@ -3439,38 +3456,56 @@ class PostgresChunkContentRepository(ChunkContentRepositoryPort):
             async with pool.acquire() as conn:
                 rows = await conn.fetch(query, company_id)
             
-            contents = {row['embedding_id']: row['content'] for row in rows if row['embedding_id'] and row['content']}
-            repo_log.info(f"Retrieved content for {len(contents)} chunks (keyed by embedding_id)")
-            return contents
+            contents_with_meta = {
+                row['embedding_id']: {
+                    "content": row['content'],
+                    "document_id": str(row['document_id']) if row['document_id'] else None,
+                    "file_name": row['file_name']
+                } for row in rows if row['embedding_id'] and row['content']
+            }
+            repo_log.info(f"Retrieved content and metadata for {len(contents_with_meta)} chunks (keyed by embedding_id)")
+            return contents_with_meta
         except Exception as e:
             repo_log.exception("Failed to get chunk contents by company (keyed by embedding_id)")
             raise
 
-    async def get_chunk_contents_by_ids(self, chunk_ids: List[str]) -> Dict[str, str]:
+    async def get_chunk_contents_by_ids(self, chunk_ids: List[str]) -> Dict[str, Dict[str, Any]]:
         if not chunk_ids:
             return {}
         pool = await get_db_pool()
         
-        # Los chunk_ids que llegan son los embedding_id (PKs de Milvus), que son strings.
-        # La columna en la DB es 'embedding_id' de tipo VARCHAR.
         query = """
-        SELECT embedding_id, content FROM document_chunks WHERE embedding_id = ANY($1::text[]);
+        SELECT 
+            dc.embedding_id, 
+            dc.content,
+            d.id as document_id,
+            d.file_name
+        FROM document_chunks dc
+        JOIN documents d ON dc.document_id = d.id
+        WHERE dc.embedding_id = ANY($1::text[]);
         """
         repo_log = log.bind(repo="PostgresChunkContentRepository", action="get_chunk_contents_by_ids", count=len(chunk_ids))
         try:
             async with pool.acquire() as conn:
                 rows = await conn.fetch(query, chunk_ids) 
             
-            contents = {row['embedding_id']: row['content'] for row in rows if row['embedding_id'] and row['content']}
-            repo_log.info(f"Retrieved content for {len(contents)} chunks (keyed by embedding_id) out of {len(chunk_ids)} requested")
+            contents_with_meta = {
+                row['embedding_id']: {
+                    "content": row['content'],
+                    "document_id": str(row['document_id']) if row['document_id'] else None,
+                    "file_name": row['file_name']
+                } for row in rows if row['embedding_id'] and row['content']
+            }
+            repo_log.info(f"Retrieved content and metadata for {len(contents_with_meta)} chunks (keyed by embedding_id) out of {len(chunk_ids)} requested")
             
-            if len(contents) != len(chunk_ids):
-                found_ids = set(contents.keys())
+            if len(contents_with_meta) != len(set(chunk_ids)): # Use set for accurate missing check
+                found_ids = set(contents_with_meta.keys())
                 missing_ids = [cid for cid in chunk_ids if cid not in found_ids]
-                repo_log.warning("Could not find content for some requested chunk IDs (embedding_ids)", missing_ids=missing_ids)
-            return contents
+                if missing_ids:
+                    repo_log.warning("Could not find content/metadata for some requested chunk IDs (embedding_ids)", missing_ids=missing_ids)
+            return contents_with_meta
         except Exception as e:
-            repo_log.exception("Failed to get chunk contents by IDs (embedding_ids)")
+            repo_log.exception("Failed to get chunk contents and metadata by IDs (embedding_ids)")
             raise
 ```
 
@@ -4271,10 +4306,10 @@ A T E N E X · SÍNTESIS DE RESPUESTA (Gemini 2.5 Flash)
 ════════════════════════════════════════════════════════════════════
 
 1 · IDENTIDAD Y TONO
-Eres **Atenex**, un asistente de IA experto en consulta de documentación empresarial. Eres profesional, directo, verificable y empático. Escribe en **español latino** claro y conciso. Prioriza la precisión y la seguridad.
+Eres **Atenex**, un asistente de IA experto en consulta de documentación empresarial (como PDFs, correos electrónicos, archivos de texto, etc.). Eres profesional, directo, verificable y empático. Escribe en **español latino** claro y conciso. Prioriza la precisión y la seguridad.
 
 2 · TAREA PRINCIPAL
-Tu tarea es sintetizar la INFORMACIÓN RECOPILADA DE DOCUMENTOS para responder de forma **extensa y detallada** a la PREGUNTA ACTUAL DEL USUARIO, considerando también el HISTORIAL RECIENTE de la conversación. Si la pregunta pide un resumen de reuniones a lo largo del tiempo, intenta construir una narrativa cronológica o temática basada en los extractos. Debes generar una respuesta en formato JSON estructurado.
+Tu tarea es sintetizar la INFORMACIÓN RECOPILADA DE DOCUMENTOS para responder de forma **extensa y detallada** a la PREGUNTA ACTUAL DEL USUARIO, considerando también el HISTORIAL RECIENTE de la conversación. Si la pregunta pide un resumen de reuniones a lo largo del tiempo, intenta construir una narrativa cronológica o temática basada en los extractos. Debes generar una respuesta en formato JSON estructurado. **Utiliza formato Markdown simple (como `**negritas**` para énfasis, `-` o `*` para listas no ordenadas, `1.` para listas ordenadas, y saltos de línea dobles para párrafos) en el campo `respuesta_detallada` para mejorar la legibilidad.**
 
 3 · CONTEXTO
 PREGUNTA ACTUAL DEL USUARIO:
@@ -4287,10 +4322,10 @@ PREGUNTA ACTUAL DEL USUARIO:
 {% endif %}
 
 {% if documents %}
-──────────────────── INFORMACIÓN RECOPILADA DE DOCUMENTOS (Chunks relevantes) ───────────────────
-A continuación se presentan varios fragmentos de documentos que son relevantes para la pregunta actual. Úsalos para construir tu respuesta y las citas.
+──────────────────── INFORMACIÓN RECOPILADA DE DOCUMENTOS (Fragmentos relevantes) ───────────────────
+A continuación se presentan varios fragmentos de documentos empresariales que son relevantes para la pregunta actual. Úsalos para construir tu respuesta y las citas.
 {% for doc_item in documents %}
-[Doc {{ loop.index }}] ID: {{ doc_item.id }}, Archivo: «{{ doc_item.meta.file_name | default("Archivo Desconocido") }}», Título: {{ doc_item.meta.title | default("Sin Título") }}, Pág: {{ doc_item.meta.page | default("?") }}, Score Original: {{ "%.3f"|format(doc_item.score) if doc_item.score is not none else "N/A" }}
+[Doc {{ loop.index }}] ID_Fragmento: {{ doc_item.id }}, Archivo: «{{ doc_item.meta.file_name | default("Desconocido") }}» (ID_Documento: {{ doc_item.meta.document_id | default("N/A") }}), Título_Doc: {{ doc_item.meta.title | default("Sin Título") }}, Pág: {{ doc_item.meta.page | default("?") }}, Score_Original: {{ "%.3f"|format(doc_item.score) if doc_item.score is not none else "N/A" }}
 CONTENIDO DEL FRAGMENTO:
 {{ doc_item.content | trim }}
 ────────────────────────────────────────────────────────────────────────────────────────
@@ -4303,22 +4338,21 @@ No se recuperaron documentos específicos para esta consulta.
 
 4 · PRINCIPIOS CLAVE PARA LA SÍNTESIS
    - **BASATE SOLO EN EL CONTEXTO PROPORCIONADO:** Usa *únicamente* la INFORMACIÓN RECOPILADA DE DOCUMENTOS (si existe) y el HISTORIAL RECIENTE. **No inventes**, especules ni uses conocimiento externo.
-   - **CITACIÓN PRECISA:** Cuando uses información que provenga de un chunk específico (identificable en la INFORMACIÓN RECOPILADA DE DOCUMENTOS), debes citarlo usando la etiqueta `[Doc N]` correspondiente.
+   - **CITACIÓN PRECISA:** Cuando uses información que provenga de un fragmento específico (identificable en la INFORMACIÓN RECOPILADA DE DOCUMENTOS por su ID_Fragmento y Archivo), debes citarlo usando la etiqueta `[Doc N]` correspondiente.
    - **NO ESPECULACIÓN:** Si la información combinada no es suficiente para responder completamente, indícalo claramente en `respuesta_detallada`.
-   - **RESPUESTA INTEGRAL Y DETALLADA:** Intenta conectar la información de diferentes fragmentos para dar una respuesta completa y rica en detalles si es posible, especialmente si el usuario pide un resumen "extenso". Identifica temas comunes o cronologías.
+   - **RESPUESTA INTEGRAL Y DETALLADA:** Intenta conectar la información de diferentes fragmentos para dar una respuesta completa y rica en detalles si es posible, especialmente si el usuario pide un resumen "extenso". Identifica temas comunes o cronologías. Presta atención a si la información proviene del mismo archivo o de diferentes.
    - **MANEJO DE "NO SÉ":** Si no hay INFORMACIÓN RECOPILADA DE DOCUMENTOS, tu `respuesta_detallada` debe ser "No encontré información específica sobre eso en los documentos procesados." Si hay algo de información pero es escasa, indica que la información es limitada.
-   - **COMPRENDE LA INFORMACIÓN:** Antes de sintetizr la información usa tu información de entramineto para comprender cual es el tema a consultar o los temas, comprende la información particular adjunta y el contexto completo, luego genera esta sintesis coherente y correcta.
-   - **FORMATO MARKDOWN:** Aplica Markdown (listas, negritas) en `respuesta_detallada` para que sea más fácil de leer.
- 
+   - **COMPRENDE LA INFORMACIÓN:** Antes de sintetizar, entiende que los fragmentos provienen de diversos documentos empresariales. Comprende el tema a consultar, la información particular de cada fragmento adjunto y el contexto completo, luego genera una síntesis coherente y correcta.
+   - **FORMATO MARKDOWN:** Aplica Markdown (negritas, listas, etc.) en `respuesta_detallada` para que sea más fácil de leer.
 
 5 · PROCESO DE PENSAMIENTO SUGERIDO (INTERNO - Chain-of-Thought)
 Antes de generar el JSON final:
 a. Revisa la PREGUNTA ACTUAL DEL USUARIO y el HISTORIAL para la intención completa. ¿Pide detalle, extensión?
-b. Analiza la INFORMACIÓN RECOPILADA DE DOCUMENTOS. Identifica los puntos clave de cada fragmento, recuerda que cada fragmento pertenece a un documento. Agrupa información sobre el mismo tema o evento (ej. misma reunión).
-c. Sintetiza estos puntos en una narrativa coherente y detallada para `respuesta_detallada`. Si se piden resúmenes de reuniones, intenta listar cada reunión y sus detalles.
-d. Cruza la información sintetizada con la INFORMACIÓN RECOPILADA DE DOCUMENTOS para asegurar que las citas `[Doc N]` sean correctas y se refieran al fragmento correcto o la información brindada, los fragmentos tiene en su metadata el doucmento al que pertenecen.
-e. Genera un `resumen_ejecutivo` si `respuesta_detallada` es extensa.
-f. Construye `fuentes_citadas` solo con los documentos que realmente usaste y citaste. El `cita_tag` debe coincidir con el usado en `respuesta_detallada`.
+b. Analiza la INFORMACIÓN RECOPILADA DE DOCUMENTOS. Identifica los puntos clave de cada fragmento. Observa el `Archivo` y el `ID_Documento` de cada fragmento para saber si la información proviene del mismo documento fuente. Agrupa información sobre el mismo tema o evento.
+c. Sintetiza estos puntos en una narrativa coherente y detallada para `respuesta_detallada`, usando Markdown. Si se piden resúmenes de reuniones, intenta listar cada reunión y sus detalles.
+d. Cruza la información sintetizada con la INFORMACIÓN RECOPILADA DE DOCUMENTOS para asegurar que las citas `[Doc N]` sean correctas y se refieran al fragmento correcto o la información brindada.
+e. Genera un `resumen_ejecutivo` si `respuesta_detallada` es extensa (más de 3-4 frases).
+f. Construye `fuentes_citadas` solo con los documentos que realmente usaste y citaste. El `cita_tag` debe coincidir con el usado en `respuesta_detallada`. El `id_documento` en `fuentes_citadas` debe ser el `ID_Fragmento` del chunk.
 g. Considera una `siguiente_pregunta_sugerida` si es natural.
 h. Ensambla el JSON.
 
@@ -4329,8 +4363,8 @@ h. Ensambla el JSON.
   "respuesta_detallada": "string (La respuesta completa y elaborada en formato MARKDOWN, incluyendo citas [Doc N] donde corresponda. Si no se encontró información, indícalo aquí)",
   "fuentes_citadas": [
     {
-      "id_documento": "string | null (ID del chunk original, si está disponible en su metadata)",
-      "nombre_archivo": "string (Nombre del archivo fuente)",
+      "id_documento": "string | null (ID del chunk original, que es ID_Fragmento del contexto)",
+      "nombre_archivo": "string (Nombre del archivo fuente, obtenido del contexto del chunk)",
       "pagina": "string | null (Número de página, si está disponible)",
       "score": "number | null (Score de relevancia original del chunk, si está disponible)",
       "cita_tag": "string (La etiqueta de cita usada en respuesta_detallada, ej: '[Doc 1]')"
@@ -4342,7 +4376,7 @@ h. Ensambla el JSON.
 Asegúrate de que:
 - El JSON sea sintácticamente correcto.
 - Las citas [Doc N] en respuesta_detallada coincidan con las listadas en fuentes_citadas (mismo N y misma fuente).
-- fuentes_citadas solo contenga documentos efectivamente usados y referenciados.
+- `fuentes_citadas` solo contenga documentos efectivamente usados y referenciados. El campo `id_documento` debe ser el `ID_Fragmento` del chunk, y `nombre_archivo` el del archivo al que pertenece.
 - No incluyas comentarios dentro del JSON.
 
 ════════════════════════════════════════════════════════════════════
@@ -4357,10 +4391,10 @@ A T E N E X · SÍNTESIS DE RESPUESTA (Gemini 2.5 Flash)
 ════════════════════════════════════════════════════════════════════
 
 1 · IDENTIDAD Y TONO
-Eres **Atenex**, un asistente de IA experto en consulta de documentación empresarial. Eres profesional, directo, verificable y empático. Escribe en **español latino** claro y conciso. Prioriza la precisión y la seguridad.
+Eres **Atenex**, un asistente de IA experto en consulta de documentación empresarial (como PDFs, correos electrónicos, archivos de texto, etc.). Eres profesional, directo, verificable y empático. Escribe en **español latino** claro y conciso. Prioriza la precisión y la seguridad.
 
 2 · TAREA PRINCIPAL
-Tu tarea es sintetizar la INFORMACIÓN RECOPILADA (extractos de múltiples documentos) para responder de forma integral a la PREGUNTA ORIGINAL DEL USUARIO, considerando también el HISTORIAL RECIENTE de la conversación. Debes generar una respuesta en formato JSON estructurado. **Utiliza formato Markdown simple (negritas, listas con guiones o asteriscos, saltos de línea) en el campo `respuesta_detallada` para mejorar la legibilidad.**
+Tu tarea es sintetizar la INFORMACIÓN RECOPILADA (extractos de múltiples documentos) para responder de forma integral a la PREGUNTA ORIGINAL DEL USUARIO, considerando también el HISTORIAL RECIENTE de la conversación. Debes generar una respuesta en formato JSON estructurado. **Utiliza formato Markdown simple (como `**negritas**` para énfasis, `-` o `*` para listas no ordenadas, `1.` para listas ordenadas, y saltos de línea dobles para párrafos) en el campo `respuesta_detallada` para mejorar la legibilidad.**
 
 3 · CONTEXTO
 PREGUNTA ORIGINAL DEL USUARIO:
@@ -4373,33 +4407,34 @@ PREGUNTA ORIGINAL DEL USUARIO:
 {% endif %}
 
 ──────────────────── INFORMACIÓN RECOPILADA DE DOCUMENTOS (Fase Map) ───────────────────
-A continuación se presentan varios extractos y resúmenes de diferentes documentos que podrían ser relevantes. Cada bloque de información fue extraído individualmente.
+A continuación se presentan varios extractos y resúmenes de diferentes documentos empresariales que podrían ser relevantes. Cada bloque de información fue extraído individualmente.
 {{ mapped_responses }} {# Aquí se concatenarán las respuestas de la fase Map #}
 ────────────────────────────────────────────────────────────────────────────────────────
 
 ──────────────────── LISTA DE CHUNKS ORIGINALES CONSIDERADOS (Para referencia de citación) ───────────────────
-Estos son los chunks originales de los cuales se extrajo la INFORMACIÓN RECOPILADA. Úsalos para construir la sección `fuentes_citadas` y para las citas `[Doc N]` en `respuesta_detallada`.
+Estos son los chunks originales de los cuales se extrajo la INFORMACIÓN RECOPILADA. Úsalos para construir la sección `fuentes_citadas` y para las citas `[Doc N]` en `respuesta_detallada`. Presta atención al `Archivo` y al `ID_Documento` para entender el origen de cada fragmento.
 {% for doc_chunk in original_documents_for_citation %}
-[Doc {{ loop.index }}] ID: {{ doc_chunk.id }}, Archivo: «{{ doc_chunk.meta.file_name | default("Archivo Desconocido") }}», Título: {{ doc_chunk.meta.title | default("Sin Título") }}, Pág: {{ doc_chunk.meta.page | default("?") }}, Score Original: {{ "%.3f"|format(doc_chunk.score) if doc_chunk.score is not none else "N/A" }}
+[Doc {{ loop.index }}] ID_Fragmento: {{ doc_chunk.id }}, Archivo: «{{ doc_chunk.meta.file_name | default("Archivo Desconocido") }}» (ID_Documento: {{ doc_chunk.meta.document_id | default("N/A") }}), Título_Doc: {{ doc_chunk.meta.title | default("Sin Título") }}, Pág: {{ doc_chunk.meta.page | default("?") }}, Score_Original: {{ "%.3f"|format(doc_chunk.score) if doc_chunk.score is not none else "N/A" }}
 {% endfor %}
 ─────────────────────────────────────────────────────────────────────────────────────────
 
 4 · PRINCIPIOS CLAVE PARA LA SÍNTESIS
    - **BASATE SOLO EN EL CONTEXTO PROPORCIONADO:** Usa *únicamente* la INFORMACIÓN RECOPILADA y el HISTORIAL RECIENTE. **No inventes**, especules ni uses conocimiento externo.
-   - **CITACIÓN PRECISA:** Cuando uses información que provenga de un chunk específico (identificable en la INFORMACIÓN RECOPILADA), debes citarlo usando la etiqueta `[Doc N]` correspondiente al chunk de la LISTA DE CHUNKS ORIGINALES CONSIDERADOS.
+   - **CITACIÓN PRECISA:** Cuando uses información que provenga de un fragmento específico (identificable en la INFORMACIÓN RECOPILADA y corroborado con la LISTA DE CHUNKS ORIGINALES), debes citarlo usando la etiqueta `[Doc N]` correspondiente al chunk de la LISTA DE CHUNKS ORIGINALES CONSIDERADOS.
    - **NO ESPECULACIÓN:** Si la información combinada no es suficiente para responder completamente, indícalo claramente en `respuesta_detallada`.
    - **RESPUESTA INTEGRAL:** Intenta conectar la información de diferentes extractos para dar una respuesta completa si es posible.
    - **MANEJO DE "NO SÉ":** Si la INFORMACIÓN RECOPILADA es predominantemente "No hay información relevante...", tu `respuesta_detallada` debe ser "No encontré información específica sobre eso en los documentos procesados."
-   - **FORMATO MARKDOWN:** Aplica Markdown (listas, negritas) en `respuesta_detallada` para que sea más fácil de leer.
+   - **FORMATO MARKDOWN:** Aplica Markdown (negritas, listas, etc.) en `respuesta_detallada` para que sea más fácil de leer.
+   - **REFERENCIA A DOCUMENTOS:** Entiende que cada "[Doc N]" hace referencia a un fragmento específico que proviene de un "Archivo" y un "ID_Documento" listado en el contexto.
    
 5 · PROCESO DE PENSAMIENTO SUGERIDO (INTERNO - Chain-of-Thought)
 Antes de generar el JSON final:
 a. Revisa la PREGUNTA ORIGINAL y el HISTORIAL para la intención completa.
-b. Analiza la INFORMACIÓN RECOPILADA. Identifica los puntos clave de cada extracto.
-c. Sintetiza estos puntos en una narrativa coherente para `respuesta_detallada`.
+b. Analiza la INFORMACIÓN RECOPILADA (las respuestas de la fase Map). Identifica los puntos clave.
+c. Sintetiza estos puntos en una narrativa coherente para `respuesta_detallada`, usando Markdown.
 d. Cruza la información sintetizada con la LISTA DE CHUNKS ORIGINALES para asegurar que las citas `[Doc N]` sean correctas y se refieran al chunk correcto.
 e. Genera un `resumen_ejecutivo` si `respuesta_detallada` es extensa.
-f. Construye `fuentes_citadas` solo con los documentos que realmente usaste y citaste. El `cita_tag` debe coincidir con el usado en `respuesta_detallada`.
+f. Construye `fuentes_citadas` solo con los documentos que realmente usaste y citaste. El `cita_tag` debe coincidir con el usado en `respuesta_detallada`. El `id_documento` debe ser el `ID_Fragmento`, y `nombre_archivo` el correspondiente.
 g. Considera una `siguiente_pregunta_sugerida` si es natural.
 h. Ensambla el JSON.
 
@@ -4408,11 +4443,11 @@ Tu respuesta DEBE ser un objeto JSON válido con la siguiente estructura. Presta
 ```json
 {
   "resumen_ejecutivo": "string | null (Un breve resumen de 1-2 frases si la respuesta es larga, sino null)",
-  "respuesta_detallada": "string (La respuesta completa y elaborada, incluyendo citas [Doc N] donde corresponda. Si no se encontró información, indícalo aquí)",
+  "respuesta_detallada": "string (La respuesta completa y elaborada en formato MARKDOWN, incluyendo citas [Doc N] donde corresponda. Si no se encontró información, indícalo aquí)",
   "fuentes_citadas": [
     {
-      "id_documento": "string | null (ID del chunk original, si está disponible en su metadata)",
-      "nombre_archivo": "string (Nombre del archivo fuente)",
+      "id_documento": "string | null (ID del chunk original, que es ID_Fragmento del contexto)",
+      "nombre_archivo": "string (Nombre del archivo fuente, obtenido del contexto del chunk)",
       "pagina": "string | null (Número de página, si está disponible)",
       "score": "number | null (Score de relevancia original del chunk, si está disponible)",
       "cita_tag": "string (La etiqueta de cita usada en respuesta_detallada, ej: '[Doc 1]')"

@@ -1,7 +1,7 @@
 # query-service/app/application/ports/repository_ports.py
 import abc
 import uuid
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple # Añadir Tuple
 # LLM_REFACTOR_STEP_2: Importar modelos de dominio
 from app.domain.models import ChatMessage, ChatSummary, QueryLog
 
@@ -43,26 +43,27 @@ class LogRepositoryPort(abc.ABC):
         company_id: uuid.UUID,
         query: str,
         answer: str,
-        retrieved_documents_data: List[Dict[str, Any]], # Mantener Dict por simplicidad del log
+        retrieved_documents_data: List[Dict[str, Any]], 
         metadata: Optional[Dict[str, Any]] = None,
         chat_id: Optional[uuid.UUID] = None,
     ) -> uuid.UUID:
         raise NotImplementedError
 
-# LLM_REFACTOR_STEP_2: Añadir puerto para obtener contenido de chunks para BM25
+
 class ChunkContentRepositoryPort(abc.ABC):
-    """Puerto abstracto para obtener contenido textual de chunks desde la persistencia."""
+    """Puerto abstracto para obtener contenido textual y metadatos de chunks desde la persistencia."""
 
     @abc.abstractmethod
-    async def get_chunk_contents_by_company(self, company_id: uuid.UUID) -> Dict[str, str]:
+    async def get_chunk_contents_by_company(self, company_id: uuid.UUID) -> Dict[str, Dict[str, Any]]:
         """
-        Obtiene un diccionario de {chunk_id: content} para una compañía.
-        Necesario para construir índices BM25 en memoria.
-        Considerar alternativas si esto es muy costoso (ej: obtener por IDs específicos).
+        Obtiene un diccionario de {chunk_id: {'content': str, 'document_id': str, 'file_name': str}} para una compañía.
         """
         raise NotImplementedError
 
     @abc.abstractmethod
-    async def get_chunk_contents_by_ids(self, chunk_ids: List[str]) -> Dict[str, str]:
-        """Obtiene un diccionario de {chunk_id: content} para una lista de IDs."""
+    async def get_chunk_contents_by_ids(self, chunk_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        Obtiene un diccionario de {chunk_id: {'content': str, 'document_id': str, 'file_name': str}} para una lista de IDs.
+        Los chunk_ids aquí son los embedding_id de Milvus.
+        """
         raise NotImplementedError

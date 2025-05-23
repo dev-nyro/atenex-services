@@ -245,10 +245,14 @@ class PostgresLogRepository(LogRepositoryPort):
 class PostgresChunkContentRepository(ChunkContentRepositoryPort):
     """Implementación concreta para obtener contenido de chunks desde PostgreSQL."""
 
-    async def get_chunk_contents_by_company(self, company_id: uuid.UUID) -> Dict[str, str]:
+    async def get_chunk_contents_by_company(self, company_id: uuid.UUID) -> Dict[str, Dict[str, Any]]:
         pool = await get_db_pool()
         query = """
-        SELECT dc.embedding_id, dc.content
+        SELECT 
+            dc.embedding_id, 
+            dc.content,
+            d.id as document_id,
+            d.file_name
         FROM document_chunks dc
         JOIN documents d ON dc.document_id = d.id
         WHERE d.company_id = $1 AND dc.embedding_id IS NOT NULL;
@@ -259,36 +263,54 @@ class PostgresChunkContentRepository(ChunkContentRepositoryPort):
             async with pool.acquire() as conn:
                 rows = await conn.fetch(query, company_id)
             
-            contents = {row['embedding_id']: row['content'] for row in rows if row['embedding_id'] and row['content']}
-            repo_log.info(f"Retrieved content for {len(contents)} chunks (keyed by embedding_id)")
-            return contents
+            contents_with_meta = {
+                row['embedding_id']: {
+                    "content": row['content'],
+                    "document_id": str(row['document_id']) if row['document_id'] else None,
+                    "file_name": row['file_name']
+                } for row in rows if row['embedding_id'] and row['content']
+            }
+            repo_log.info(f"Retrieved content and metadata for {len(contents_with_meta)} chunks (keyed by embedding_id)")
+            return contents_with_meta
         except Exception as e:
             repo_log.exception("Failed to get chunk contents by company (keyed by embedding_id)")
             raise
 
-    async def get_chunk_contents_by_ids(self, chunk_ids: List[str]) -> Dict[str, str]:
+    async def get_chunk_contents_by_ids(self, chunk_ids: List[str]) -> Dict[str, Dict[str, Any]]:
         if not chunk_ids:
             return {}
         pool = await get_db_pool()
         
-        # Los chunk_ids que llegan son los embedding_id (PKs de Milvus), que son strings.
-        # La columna en la DB es 'embedding_id' de tipo VARCHAR.
         query = """
-        SELECT embedding_id, content FROM document_chunks WHERE embedding_id = ANY($1::text[]);
+        SELECT 
+            dc.embedding_id, 
+            dc.content,
+            d.id as document_id,
+            d.file_name
+        FROM document_chunks dc
+        JOIN documents d ON dc.document_id = d.id
+        WHERE dc.embedding_id = ANY($1::text[]);
         """
         repo_log = log.bind(repo="PostgresChunkContentRepository", action="get_chunk_contents_by_ids", count=len(chunk_ids))
         try:
             async with pool.acquire() as conn:
                 rows = await conn.fetch(query, chunk_ids) 
             
-            contents = {row['embedding_id']: row['content'] for row in rows if row['embedding_id'] and row['content']}
-            repo_log.info(f"Retrieved content for {len(contents)} chunks (keyed by embedding_id) out of {len(chunk_ids)} requested")
+            contents_with_meta = {
+                row['embedding_id']: {
+                    "content": row['content'],
+                    "document_id": str(row['document_id']) if row['document_id'] else None,
+                    "file_name": row['file_name']
+                } for row in rows if row['embedding_id'] and row['content']
+            }
+            repo_log.info(f"Retrieved content and metadata for {len(contents_with_meta)} chunks (keyed by embedding_id) out of {len(chunk_ids)} requested")
             
-            if len(contents) != len(chunk_ids):
-                found_ids = set(contents.keys())
+            if len(contents_with_meta) != len(set(chunk_ids)): # Use set for accurate missing check
+                found_ids = set(contents_with_meta.keys())
                 missing_ids = [cid for cid in chunk_ids if cid not in found_ids]
-                repo_log.warning("Could not find content for some requested chunk IDs (embedding_ids)", missing_ids=missing_ids)
-            return contents
+                if missing_ids:
+                    repo_log.warning("Could not find content/metadata for some requested chunk IDs (embedding_ids)", missing_ids=missing_ids)
+            return contents_with_meta
         except Exception as e:
-            repo_log.exception("Failed to get chunk contents by IDs (embedding_ids)")
+            repo_log.exception("Failed to get chunk contents and metadata by IDs (embedding_ids)")
             raise
