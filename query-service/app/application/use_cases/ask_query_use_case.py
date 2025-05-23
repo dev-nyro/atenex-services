@@ -9,6 +9,7 @@ import httpx
 import os 
 import json 
 from pydantic import ValidationError 
+import tiktoken # Import tiktoken
 
 # Import Ports and Domain Models
 from app.application.ports import (
@@ -50,6 +51,8 @@ def format_time_delta(dt: datetime) -> str:
 
 
 class AskQueryUseCase:
+    _tiktoken_encoding: Optional[tiktoken.Encoding] = None # Cache for tiktoken encoding
+
     def __init__(self,
                  chat_repo: ChatRepositoryPort,
                  log_repo: LogRepositoryPort,
@@ -88,15 +91,16 @@ class AskQueryUseCase:
             "diversity_filter_enabled": settings.DIVERSITY_FILTER_ENABLED,
             "diversity_filter_type": type(self.diversity_filter).__name__ if self.diversity_filter else "None",
             "map_reduce_enabled": settings.MAPREDUCE_ENABLED,
-            "map_reduce_threshold": settings.MAPREDUCE_ACTIVATION_THRESHOLD,
+            "map_reduce_token_threshold": settings.MAX_PROMPT_TOKENS, # Usaremos MAX_PROMPT_TOKENS para el umbral de tokens
+            "map_reduce_chunk_threshold": settings.MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS,
             "map_reduce_batch_size": settings.MAPREDUCE_CHUNK_BATCH_SIZE,
             "rag_prompt_path": settings.RAG_PROMPT_TEMPLATE_PATH,
             "general_prompt_path": settings.GENERAL_PROMPT_TEMPLATE_PATH,
             "map_prompt_path": settings.MAP_PROMPT_TEMPLATE_PATH,
             "reduce_prompt_path": settings.REDUCE_PROMPT_TEMPLATE_PATH,
             "gemini_model_name": settings.GEMINI_MODEL_NAME,
-            "max_context_chunks": settings.MAX_CONTEXT_CHUNKS,
-            "max_prompt_tokens": settings.MAX_PROMPT_TOKENS,
+            "max_context_chunks_direct_rag": settings.MAX_CONTEXT_CHUNKS,
+            "tiktoken_encoding_name": settings.TIKTOKEN_ENCODING_NAME,
         }
         log.info("AskQueryUseCase Initialized", **log_params)
         if settings.BM25_ENABLED and not self.sparse_retriever:
@@ -104,6 +108,33 @@ class AskQueryUseCase:
         if self.sparse_retriever and not self.chunk_content_repo:
             log.error("SparseRetriever is active but ChunkContentRepository is missing. Content fetching for sparse results will fail.")
 
+    def _get_tiktoken_encoding(self) -> tiktoken.Encoding:
+        if self._tiktoken_encoding is None:
+            try:
+                self._tiktoken_encoding = tiktoken.get_encoding(self.settings.TIKTOKEN_ENCODING_NAME)
+            except Exception as e:
+                log.error("Failed to load tiktoken encoding", encoding_name=self.settings.TIKTOKEN_ENCODING_NAME, error=str(e))
+                # Fallback a un encoding simple si falla la carga del específico (menos preciso)
+                self._tiktoken_encoding = tiktoken.get_encoding("gpt2") 
+                log.warning("Falling back to 'gpt2' tiktoken encoding due to previous error.")
+        return self._tiktoken_encoding
+
+    def _count_tokens_for_chunks(self, chunks: List[RetrievedChunk]) -> int:
+        if not chunks:
+            return 0
+        total_tokens = 0
+        try:
+            encoding = self._get_tiktoken_encoding()
+            for chunk in chunks:
+                if chunk.content:
+                    total_tokens += len(encoding.encode(chunk.content))
+        except Exception as e:
+            log.error("Error counting tokens for chunks", error=str(e), exc_info=True)
+            # Estimación muy cruda si tiktoken falla: N chunks * X palabras/chunk * Y tokens/palabra
+            # O simplemente devolver un valor alto para forzar MapReduce si es crítico no exceder.
+            # Por ahora, si falla el conteo, asumimos que no se supera el umbral para evitar MapReduce innecesario.
+            return 0 # O manejar el error de forma más robusta
+        return total_tokens
 
     def _initialize_prompt_builder_from_path(self, template_path: str) -> PromptBuilder:
         init_log = log.bind(action="_initialize_prompt_builder_from_path", path=template_path)
@@ -234,12 +265,9 @@ class AskQueryUseCase:
             original_chunk_from_dense = dense_map.get(cid)
 
             if original_chunk_from_dense and original_chunk_from_dense.content:
-                # Crucial: Ensure embedding from dense result is preserved
                 original_chunk_from_dense.score = fused_score_val 
                 chunks_with_content.append(original_chunk_from_dense)
             else: 
-                # If chunk was not in dense_map or had no content, it's a placeholder
-                # Its embedding will be None unless it was in dense_map but content was missing.
                 chunk_placeholder = RetrievedChunk(
                     id=cid,
                     score=fused_score_val, 
@@ -376,7 +404,7 @@ class AskQueryUseCase:
                 "map_reduce_used": map_reduce_used,
                 "retriever_k_initial": retriever_k_effective,
                 "fusion_fetch_k": fusion_fetch_k_effective,
-                "max_context_chunks_limit_for_llm": self.settings.MAX_CONTEXT_CHUNKS, 
+                "max_context_chunks_direct_rag_limit": self.settings.MAX_CONTEXT_CHUNKS, 
                 "num_chunks_after_rerank_or_fusion_content_fetch": num_chunks_after_rerank_or_fusion_fetch_effective,
                 "num_final_chunks_sent_to_llm": num_final_chunks_sent_to_llm_effective,
                 "num_sources_shown_to_user": len(assistant_sources_for_db), 
@@ -465,7 +493,7 @@ class AskQueryUseCase:
             exec_log.info("Retrieval phase done", dense_count=len(dense_chunks_domain), sparse_count=len(sparse_results_tuples))
 
             pipeline_stages_used.append("fusion (rrf)")
-            dense_map = {c.id: c for c in dense_chunks_domain if c.id and c.embedding is not None} # Ensure embedding exists for dense_map entries used in MMR
+            dense_map = {c.id: c for c in dense_chunks_domain if c.id and c.embedding is not None} 
             
             fused_scores: Dict[str, float] = self._reciprocal_rank_fusion(dense_chunks_domain, sparse_results_tuples)
             
@@ -482,7 +510,7 @@ class AskQueryUseCase:
             if not combined_chunks_with_content:
                 exec_log.warning("No chunks with content after fusion/fetch. Using general prompt.")
                 general_prompt = await self._build_prompt(query, [], chat_history=chat_history_str, builder=self._prompt_builder_general)
-                answer_str = await self.llm.generate(general_prompt) 
+                answer_str = await self.llm.generate(general_prompt, response_pydantic_schema=None) 
                 
                 await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer_str, sources=None)
                 no_docs_log_id = await self.log_repo.log_query_interaction(
@@ -492,14 +520,13 @@ class AskQueryUseCase:
                 )
                 return answer_str, [], no_docs_log_id, final_chat_id
             
-            chunks_for_llm_or_mapreduce = combined_chunks_with_content 
-            if self.settings.RERANKER_ENABLED and chunks_for_llm_or_mapreduce:
+            chunks_after_postprocessing = combined_chunks_with_content 
+            if self.settings.RERANKER_ENABLED and chunks_after_postprocessing:
                 pipeline_stages_used.append("reranking (remote_reranker_service)")
-                rerank_log = exec_log.bind(action="rerank_remote", num_chunks_to_rerank=len(chunks_for_llm_or_mapreduce))
+                rerank_log = exec_log.bind(action="rerank_remote", num_chunks_to_rerank=len(chunks_after_postprocessing))
                 
                 documents_for_reranker = []
-                map_id_to_original_chunk_before_rerank = {c.id: c for c in chunks_for_llm_or_mapreduce}
-
+                map_id_to_original_chunk_before_rerank = {c.id: c for c in chunks_after_postprocessing}
 
                 for chk_id, original_chunk_obj in map_id_to_original_chunk_before_rerank.items():
                     if original_chunk_obj.content and original_chunk_obj.id: 
@@ -518,19 +545,27 @@ class AskQueryUseCase:
                     try:
                         rerank_log.debug("Sending request to reranker service...")
                         base_reranker_url = str(settings.RERANKER_SERVICE_URL).rstrip('/')
-                        reranker_url = f"{base_reranker_url}/api/v1/rerank"
-                        if base_reranker_url.endswith("/api/v1"):
-                            reranker_url = f"{base_reranker_url.rsplit('/api/v1',1)[0]}/api/v1/rerank"
-                        elif base_reranker_url.endswith("/api"): 
-                            reranker_url = f"{base_reranker_url.rsplit('/api',1)[0]}/api/v1/rerank"
-
+                        
+                        # Simplified URL construction for reranker
+                        if "/api/v1/rerank" not in base_reranker_url:
+                            if base_reranker_url.endswith("/api/v1"):
+                                reranker_url = f"{base_reranker_url}/rerank"
+                            elif base_reranker_url.endswith("/api"):
+                                reranker_url = f"{base_reranker_url}/v1/rerank"
+                            else:
+                                reranker_url = f"{base_reranker_url}/api/v1/rerank"
+                        else: # Already contains full path
+                            reranker_url = base_reranker_url
 
                         rerank_log.debug(f"Final Reranker URL: {reranker_url}")
+
+                        # Use a more aggressive timeout for the reranker call specifically
+                        reranker_specific_timeout = httpx.Timeout(self.settings.RERANKER_CLIENT_TIMEOUT, connect=10.0)
 
                         reranker_response = await self.http_client.post(
                             reranker_url,
                             json=reranker_payload,
-                            timeout=self.settings.RERANKER_CLIENT_TIMEOUT
+                            timeout=reranker_specific_timeout
                         )
                         reranker_response.raise_for_status()
                         reranked_data = reranker_response.json()
@@ -540,11 +575,11 @@ class AskQueryUseCase:
                                                         
                             updated_reranked_chunks = []
                             for reranked_item_data in reranked_docs_from_service: 
-                                chunk_id = reranked_item_data.get("id")
+                                chunk_id_val = reranked_item_data.get("id")
                                 new_score = reranked_item_data.get("score")
                                 
-                                if chunk_id in map_id_to_original_chunk_before_rerank:
-                                    original_retrieved_chunk = map_id_to_original_chunk_before_rerank[chunk_id]
+                                if chunk_id_val in map_id_to_original_chunk_before_rerank:
+                                    original_retrieved_chunk = map_id_to_original_chunk_before_rerank[chunk_id_val]
                                     
                                     updated_chunk = RetrievedChunk(
                                         id=original_retrieved_chunk.id,
@@ -562,11 +597,11 @@ class AskQueryUseCase:
                                     )
                                     updated_reranked_chunks.append(updated_chunk)
                                 else:
-                                    rerank_log.warning("Reranked chunk ID not found in original map.", reranked_id=chunk_id)
+                                    rerank_log.warning("Reranked chunk ID not found in original map.", reranked_id=chunk_id_val)
 
                             if updated_reranked_chunks: 
-                                chunks_for_llm_or_mapreduce = updated_reranked_chunks
-                                rerank_log.info(f"Reranking successful. {len(chunks_for_llm_or_mapreduce)} chunks after reranking.")
+                                chunks_after_postprocessing = updated_reranked_chunks
+                                rerank_log.info(f"Reranking successful. {len(chunks_after_postprocessing)} chunks after reranking.")
                             else:
                                 rerank_log.warning("Reranking seemed successful but no chunks could be mapped back. Using pre-reranked chunks.")
                         else:
@@ -579,20 +614,17 @@ class AskQueryUseCase:
                         rerank_log.exception("Unexpected error during reranking call.")
                 else:
                     rerank_log.warning("No valid documents with content/id to send for reranking.")
-
             else: 
                 pipeline_stages_used.append(f"reranking ({'disabled' if not self.settings.RERANKER_ENABLED else 'skipped_no_chunks_or_content'})")
             
-            num_chunks_after_rerank = len(chunks_for_llm_or_mapreduce)
+            num_chunks_after_rerank = len(chunks_after_postprocessing)
 
-            # --- BEGIN CORRECTION FOR MMRDiversityFilter EMBEDDING ---
-            # Populate embeddings for chunks before sending to MMRDiversityFilter
-            if chunks_for_llm_or_mapreduce and self.diversity_filter : # Only if there are chunks and filter is active
+            if chunks_after_postprocessing and self.diversity_filter : 
                 pipeline_stages_used.append("embedding_population_for_mmr")
                 mmr_prep_log = exec_log.bind(action="mmr_embedding_population")
                 
-                chunk_ids_for_mmr_filter = [doc.id for doc in chunks_for_llm_or_mapreduce if doc.id]
-                mmr_prep_log.debug("Preparing embeddings for MMR", num_chunks_input=len(chunks_for_llm_or_mapreduce), num_ids_to_fetch=len(chunk_ids_for_mmr_filter))
+                chunk_ids_for_mmr_filter = [doc.id for doc in chunks_after_postprocessing if doc.id]
+                mmr_prep_log.debug("Preparing embeddings for MMR", num_chunks_input=len(chunks_after_postprocessing), num_ids_to_fetch=len(chunk_ids_for_mmr_filter))
 
                 vectors_from_milvus_by_id: Dict[str, List[float]] = {}
                 if chunk_ids_for_mmr_filter:
@@ -603,30 +635,24 @@ class AskQueryUseCase:
                          mmr_prep_log.error("Failed to fetch vectors from Milvus for MMR, fallback may occur.", error=str(e_milvus_fetch))
 
                 texts_needing_embedding_generation: List[str] = []
-                # Keep a mapping from original index of text to chunk object to update it later
                 map_text_index_to_chunk_obj: Dict[int, RetrievedChunk] = {} 
-                
-                # Create a new list for chunks that will go to MMR, preserving original order as much as possible
-                # but ensuring they are reconstructed with the embedding field.
                 chunks_ready_for_mmr: List[RetrievedChunk] = []
 
-                for original_chunk in chunks_for_llm_or_mapreduce:
+                for original_chunk in chunks_after_postprocessing:
                     retrieved_embedding = vectors_from_milvus_by_id.get(original_chunk.id)
                     
-                    if retrieved_embedding is None and original_chunk.content: # If Milvus didn't have it, AND content exists
-                        if original_chunk.embedding is None: # Only add to fallback if no embedding was ever present
+                    if retrieved_embedding is None and original_chunk.content: 
+                        if original_chunk.embedding is None: 
                             map_text_index_to_chunk_obj[len(texts_needing_embedding_generation)] = original_chunk
                             texts_needing_embedding_generation.append(original_chunk.content)
                             
-                    # Reconstruct the chunk. If embedding was already there (e.g. from dense_map earlier),
-                    # or fetched from Milvus now, it will be included. Otherwise, it's None for now.
                     chunks_ready_for_mmr.append(
                         RetrievedChunk(
                             id=original_chunk.id,
                             content=original_chunk.content,
                             score=original_chunk.score,
                             metadata=original_chunk.metadata,
-                            embedding=retrieved_embedding if retrieved_embedding else original_chunk.embedding, # Prioritize fresh Milvus fetch, then existing
+                            embedding=retrieved_embedding if retrieved_embedding else original_chunk.embedding, 
                             document_id=original_chunk.document_id,
                             file_name=original_chunk.file_name,
                             company_id=original_chunk.company_id
@@ -636,13 +662,11 @@ class AskQueryUseCase:
                 if texts_needing_embedding_generation:
                     mmr_prep_log.info(f"Requesting {len(texts_needing_embedding_generation)} missing embeddings from embedding_adapter for MMR.")
                     try:
-                        # Call the embedding adapter to get embeddings for texts
                         generated_embeddings_list = await self.embedding_adapter.embed_texts(texts_needing_embedding_generation)
                         
                         if len(generated_embeddings_list) == len(texts_needing_embedding_generation):
                             for idx, generated_emb_vector in enumerate(generated_embeddings_list):
                                 chunk_to_update = map_text_index_to_chunk_obj[idx] 
-                                # Find the corresponding chunk in chunks_ready_for_mmr and update its embedding
                                 for ch_ready in chunks_ready_for_mmr:
                                     if ch_ready.id == chunk_to_update.id:
                                         ch_ready.embedding = generated_emb_vector
@@ -654,56 +678,75 @@ class AskQueryUseCase:
                                                generated_count=len(generated_embeddings_list))
                     except Exception as e_embed_fallback:
                         mmr_prep_log.error("Failed to generate embeddings via adapter for MMR fallback.", error=str(e_embed_fallback))
-                
-                # The list chunks_for_llm_or_mapreduce now contains chunks with embeddings populated
-                chunks_for_llm_or_mapreduce = chunks_ready_for_mmr
-            # --- END CORRECTION FOR MMRDiversityFilter EMBEDDING ---
-
-
-            # Log para depurar embeddings antes del filtro MMR
-            num_with_embeddings_before_mmr = sum(1 for c_chk in chunks_for_llm_or_mapreduce if c_chk.embedding is not None)
+                chunks_after_postprocessing = chunks_ready_for_mmr
+            
+            num_with_embeddings_before_mmr = sum(1 for c_chk in chunks_after_postprocessing if c_chk.embedding is not None)
             exec_log.debug(
                 "Chunks before diversity filter",
-                total_chunks=len(chunks_for_llm_or_mapreduce),
+                total_chunks=len(chunks_after_postprocessing),
                 chunks_with_embeddings=num_with_embeddings_before_mmr,
-                first_few_ids_and_embedding_status=[(c.id, c.embedding is not None) for c in chunks_for_llm_or_mapreduce[:min(5, len(chunks_for_llm_or_mapreduce))]]
+                first_few_ids_and_embedding_status=[(c.id, c.embedding is not None) for c in chunks_after_postprocessing[:min(5, len(chunks_after_postprocessing))]]
             )
 
-            if self.diversity_filter and chunks_for_llm_or_mapreduce:
+            if self.diversity_filter and chunks_after_postprocessing:
                  k_final_diversity = self.settings.MAX_CONTEXT_CHUNKS 
                  filter_type = type(self.diversity_filter).__name__
                  pipeline_stages_used.append(f"diversity_filter ({filter_type})")
-                 exec_log.debug(f"Applying {filter_type} k={k_final_diversity}...", count=len(chunks_for_llm_or_mapreduce))
-                 chunks_for_llm_or_mapreduce = await self.diversity_filter.filter(chunks_for_llm_or_mapreduce, k_final_diversity)
-                 exec_log.info(f"{filter_type} applied.", final_count=len(chunks_for_llm_or_mapreduce))
+                 exec_log.debug(f"Applying {filter_type} k={k_final_diversity}...", count=len(chunks_after_postprocessing))
+                 chunks_after_postprocessing = await self.diversity_filter.filter(chunks_after_postprocessing, k_final_diversity)
+                 exec_log.info(f"{filter_type} applied.", final_count=len(chunks_after_postprocessing))
             else: 
                  pipeline_stages_used.append(f"diversity_filter ({'disabled' if not self.settings.DIVERSITY_FILTER_ENABLED else 'skipped_no_chunks'})")
-                 chunks_for_llm_or_mapreduce = chunks_for_llm_or_mapreduce[:self.settings.MAX_CONTEXT_CHUNKS]
+                 chunks_after_postprocessing = chunks_after_postprocessing[:self.settings.MAX_CONTEXT_CHUNKS]
                  exec_log.info(f"Diversity filter not applied or no chunks. Truncating to MAX_CONTEXT_CHUNKS.", 
-                               count=len(chunks_for_llm_or_mapreduce), limit=self.settings.MAX_CONTEXT_CHUNKS)
+                               count=len(chunks_after_postprocessing), limit=self.settings.MAX_CONTEXT_CHUNKS)
 
-            final_chunks_for_processing = [c for c in chunks_for_llm_or_mapreduce if c.content and c.content.strip()]
+            final_chunks_for_processing = [c for c in chunks_after_postprocessing if c.content and c.content.strip()]
             num_final_chunks_for_llm_or_mapreduce = len(final_chunks_for_processing)
 
             if not final_chunks_for_processing: 
-                exec_log.warning("No chunks with content after reranking/filtering. Using general prompt.")
+                exec_log.warning("No chunks with content after all postprocessing. Using general prompt.")
+                # (Misma lógica de respuesta general que antes)
                 general_prompt = await self._build_prompt(query, [], chat_history=chat_history_str, builder=self._prompt_builder_general)
                 answer_str = await self.llm.generate(general_prompt, response_pydantic_schema=None)
                 await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer_str, sources=None)
                 no_docs_final_log_id = await self.log_repo.log_query_interaction(
                     company_id=company_id, user_id=user_id, query=query, answer=answer_str, 
                     retrieved_documents_data=[], chat_id=final_chat_id, 
-                    metadata={"pipeline_stages": pipeline_stages_used, "result_type": "no_docs_after_postprocessing", "map_reduce_used": False}
+                    metadata={"pipeline_stages": pipeline_stages_used, "result_type": "no_docs_after_all_postprocessing", "map_reduce_used": False}
                 )
                 return answer_str, [], no_docs_final_log_id, final_chat_id
 
             map_reduce_active = False
             json_answer_str: str
+            chunks_to_send_to_llm: List[RetrievedChunk] # Chunks que realmente irán al LLM
 
-            if self.settings.MAPREDUCE_ENABLED and len(final_chunks_for_processing) > self.settings.MAPREDUCE_ACTIVATION_THRESHOLD:
-                exec_log.info(f"Activating MapReduce. Chunks: {len(final_chunks_for_processing)}, Threshold: {self.settings.MAPREDUCE_ACTIVATION_THRESHOLD}", flow_type="MapReduce")
+            total_tokens_for_llm = self._count_tokens_for_chunks(final_chunks_for_processing)
+            exec_log.info("Token count for final list of processed chunks",
+                          num_chunks=num_final_chunks_for_llm_or_mapreduce,
+                          total_tokens=total_tokens_for_llm,
+                          map_reduce_token_threshold=settings.MAX_PROMPT_TOKENS,
+                          map_reduce_chunk_threshold=settings.MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS)
+            
+            # Decisión MapReduce: Prioridad al umbral de tokens.
+            # Si el umbral de tokens se supera, se activa MapReduce.
+            # Si no, pero el número de chunks supera el umbral de chunks, también se activa.
+            should_activate_mapreduce_by_tokens = total_tokens_for_llm > self.settings.MAX_PROMPT_TOKENS
+            should_activate_mapreduce_by_chunks = num_final_chunks_for_llm_or_mapreduce > self.settings.MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS
+
+            if self.settings.MAPREDUCE_ENABLED and \
+               (should_activate_mapreduce_by_tokens or should_activate_mapreduce_by_chunks) and \
+               num_final_chunks_for_llm_or_mapreduce > 1: # MapReduce necesita >1 chunk
+                
+                trigger_reason = "token_count" if should_activate_mapreduce_by_tokens else "chunk_count"
+                exec_log.info(f"Activating MapReduce due to {trigger_reason}. "
+                              f"Chunks: {num_final_chunks_for_llm_or_mapreduce} (Chunk Threshold: {self.settings.MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS}), "
+                              f"Tokens: {total_tokens_for_llm} (Token Threshold: {self.settings.MAX_PROMPT_TOKENS})", 
+                              flow_type=f"MapReduce_{trigger_reason}")
+                
                 pipeline_stages_used.append("map_reduce_flow")
                 map_reduce_active = True
+                chunks_to_send_to_llm = final_chunks_for_processing # Todos los chunks van a la fase Map
 
                 pipeline_stages_used.append("map_phase")
                 mapped_responses_parts = []
@@ -717,7 +760,7 @@ class AskQueryUseCase:
                             "title": c.metadata.get("title") 
                         },
                         score=c.score
-                    ) for c in final_chunks_for_processing
+                    ) for c in chunks_to_send_to_llm # Usar chunks_to_send_to_llm
                 ]
                 
                 map_tasks = []
@@ -741,15 +784,14 @@ class AskQueryUseCase:
                 map_phase_results = await asyncio.gather(*[asyncio.shield(task) for task in llm_map_tasks], return_exceptions=True)
 
                 for idx, result in enumerate(map_phase_results):
-                    map_log = exec_log.bind(map_batch_index=idx)
+                    map_log_batch = exec_log.bind(map_batch_index=idx) # Corrected log binding
                     if isinstance(result, Exception):
-                        map_log.error("LLM call failed for map batch", error=str(result), exc_info=True)
+                        map_log_batch.error("LLM call failed for map batch", error=str(result), exc_info=True)
                     elif result and MAP_REDUCE_NO_RELEVANT_INFO not in result:
                         mapped_responses_parts.append(f"--- Extracto del Lote de Documentos {idx + 1} ---\n{result}\n")
-                        map_log.info("Map request processed for batch.", response_length=len(result), is_relevant=True)
+                        map_log_batch.info("Map request processed for batch.", response_length=len(result), is_relevant=True)
                     else:
-                         map_log.info("Map request processed for batch, no relevant info found by LLM.", response_length=len(result or ""))
-
+                         map_log_batch.info("Map request processed for batch, no relevant info found by LLM.", response_length=len(result or ""))
 
                 if not mapped_responses_parts:
                     exec_log.warning("MapReduce: All map steps reported no relevant information or failed.")
@@ -758,20 +800,25 @@ class AskQueryUseCase:
                     concatenated_mapped_responses = "\n".join(mapped_responses_parts)
 
                 pipeline_stages_used.append("reduce_phase")
+                # original_documents_for_citation en el prompt de reduce debe ser los chunks que fueron a la fase map
+                haystack_docs_for_reduce_citation = haystack_docs_for_map 
                 reduce_prompt_data = {
                     "original_query": query,
                     "chat_history": chat_history_str,
                     "mapped_responses": concatenated_mapped_responses,
-                    "original_documents_for_citation": haystack_docs_for_map 
+                    "original_documents_for_citation": haystack_docs_for_reduce_citation 
                 }
                 reduce_prompt_str = await self._build_prompt(query="", documents=[], prompt_data_override=reduce_prompt_data, builder=self._prompt_builder_reduce)
                 
                 exec_log.info("Sending reduce request to LLM for final JSON response.")
                 json_answer_str = await self.llm.generate(reduce_prompt_str, response_pydantic_schema=RespuestaEstructurada)
 
-            else: 
-                exec_log.info(f"Using Direct RAG strategy. Chunks: {len(final_chunks_for_processing)}", flow_type="DirectRAG")
+            else: # Direct RAG
+                exec_log.info(f"Using Direct RAG strategy. Chunks available: {num_final_chunks_for_llm_or_mapreduce}, Tokens: {total_tokens_for_llm}", flow_type="DirectRAG")
                 pipeline_stages_used.append("direct_rag_flow")
+                
+                chunks_to_send_to_llm = final_chunks_for_processing[:self.settings.MAX_CONTEXT_CHUNKS]
+                exec_log.info(f"Chunks for Direct RAG after truncating to MAX_CONTEXT_CHUNKS: {len(chunks_to_send_to_llm)} (limit: {self.settings.MAX_CONTEXT_CHUNKS})")
                 
                 haystack_docs_for_prompt = [
                     Document(
@@ -783,7 +830,7 @@ class AskQueryUseCase:
                             "title": c.metadata.get("title")
                         },
                         score=c.score
-                    ) for c in final_chunks_for_processing
+                    ) for c in chunks_to_send_to_llm
                 ]
                 direct_rag_prompt = await self._build_prompt(query, haystack_docs_for_prompt, chat_history_str, builder=self._prompt_builder_rag)
                 
@@ -796,13 +843,13 @@ class AskQueryUseCase:
                 company_id=company_id,
                 user_id=user_id,
                 final_chat_id=final_chat_id,
-                original_chunks_for_citation=final_chunks_for_processing, 
+                original_chunks_for_citation=chunks_to_send_to_llm, # Usar los chunks efectivamente enviados al LLM/MapReduce
                 pipeline_stages_used=pipeline_stages_used,
                 map_reduce_used=map_reduce_active,
                 retriever_k_effective=retriever_k_effective,
                 fusion_fetch_k_effective=fusion_fetch_k_effective,
                 num_chunks_after_rerank_or_fusion_fetch_effective=num_chunks_after_rerank, 
-                num_final_chunks_sent_to_llm_effective=num_final_chunks_for_llm_or_mapreduce,
+                num_final_chunks_sent_to_llm_effective=len(chunks_to_send_to_llm), # Log el número real
                 num_history_messages_effective=len(history_messages)
             )
             

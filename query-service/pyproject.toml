@@ -29,6 +29,7 @@ google-generativeai = "^0.7.0"
 
 # --- RAG Component Dependencies ---
 numpy = "1.26.4" 
+tiktoken = "^0.9.0"
 
 
 [tool.poetry.group.dev.dependencies]

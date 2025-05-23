@@ -45,7 +45,7 @@ DEFAULT_REDUCE_PROMPT_TEMPLATE_PATH = str(PROMPT_DIR / "reduce_prompt_template_v
 
 # Models
 DEFAULT_EMBEDDING_DIMENSION = 1536
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-preview-04-17" 
+DEFAULT_GEMINI_MODEL = "gemini-1.5-flash-latest" 
 
 # RAG Pipeline Parameters
 DEFAULT_RETRIEVER_TOP_K = 200 
@@ -55,7 +55,7 @@ DEFAULT_DIVERSITY_FILTER_ENABLED: bool = False
 DEFAULT_MAX_CONTEXT_CHUNKS: int = 200 
 DEFAULT_HYBRID_ALPHA: float = 0.5
 DEFAULT_DIVERSITY_LAMBDA: float = 0.5
-DEFAULT_MAX_PROMPT_TOKENS: int = 524288 
+DEFAULT_MAX_PROMPT_TOKENS: int = 500000 
 DEFAULT_MAX_CHAT_HISTORY_MESSAGES = 20 
 DEFAULT_NUM_SOURCES_TO_SHOW = 7
 
@@ -63,6 +63,7 @@ DEFAULT_NUM_SOURCES_TO_SHOW = 7
 DEFAULT_MAPREDUCE_ENABLED: bool = True 
 DEFAULT_MAPREDUCE_CHUNK_BATCH_SIZE: int = 5
 DEFAULT_MAPREDUCE_ACTIVATION_THRESHOLD: int = 25 
+DEFAULT_TIKTOKEN_ENCODING_NAME: str = "cl100k_base"
 
 
 class Settings(BaseSettings):
@@ -149,7 +150,7 @@ class Settings(BaseSettings):
 
     # --- Diversity Filter ---
     DIVERSITY_FILTER_ENABLED: bool = Field(default=DEFAULT_DIVERSITY_FILTER_ENABLED)
-    MAX_CONTEXT_CHUNKS: int = Field(default=DEFAULT_MAX_CONTEXT_CHUNKS, gt=0, description="Max number of retrieved/reranked chunks to pass to LLM context.")
+    MAX_CONTEXT_CHUNKS: int = Field(default=DEFAULT_MAX_CONTEXT_CHUNKS, gt=0, description="Max number of retrieved/reranked chunks to pass to LLM context in Direct RAG, or to Diversity Filter.")
     QUERY_DIVERSITY_LAMBDA: float = Field(default=DEFAULT_DIVERSITY_LAMBDA, ge=0.0, le=1.0, description="Lambda for MMR diversity (0=max diversity, 1=max relevance).")
 
     # --- RAG Pipeline Parameters ---
@@ -162,14 +163,17 @@ class Settings(BaseSettings):
     MAP_PROMPT_TEMPLATE_PATH: str = Field(default=DEFAULT_MAP_PROMPT_TEMPLATE_PATH)
     REDUCE_PROMPT_TEMPLATE_PATH: str = Field(default=DEFAULT_REDUCE_PROMPT_TEMPLATE_PATH)
 
-    MAX_PROMPT_TOKENS: Optional[int] = Field(default=DEFAULT_MAX_PROMPT_TOKENS)
+    MAX_PROMPT_TOKENS: Optional[int] = Field(default=DEFAULT_MAX_PROMPT_TOKENS, description="Token threshold to activate MapReduce if enabled. Also a general guide for LLM context window size.")
     MAX_CHAT_HISTORY_MESSAGES: int = Field(default=DEFAULT_MAX_CHAT_HISTORY_MESSAGES, ge=0)
     NUM_SOURCES_TO_SHOW: int = Field(default=DEFAULT_NUM_SOURCES_TO_SHOW, ge=0)
 
     # --- MapReduce Settings ---
     MAPREDUCE_ENABLED: bool = Field(default=DEFAULT_MAPREDUCE_ENABLED)
     MAPREDUCE_CHUNK_BATCH_SIZE: int = Field(default=DEFAULT_MAPREDUCE_CHUNK_BATCH_SIZE, gt=0)
-    MAPREDUCE_ACTIVATION_THRESHOLD: int = Field(default=DEFAULT_MAPREDUCE_ACTIVATION_THRESHOLD, gt=0)
+    # MAPREDUCE_ACTIVATION_THRESHOLD is now effectively replaced by MAX_PROMPT_TOKENS check for token count.
+    # We can keep it for chunk-based activation as a secondary or fallback condition if needed.
+    MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS: int = Field(default=DEFAULT_MAPREDUCE_ACTIVATION_THRESHOLD, gt=0, description="Chunk count threshold to activate MapReduce (secondary to token threshold).")
+    TIKTOKEN_ENCODING_NAME: str = Field(default=DEFAULT_TIKTOKEN_ENCODING_NAME, description="Encoding name for tiktoken.")
 
 
     # --- Service Client Config ---
@@ -210,8 +214,9 @@ class Settings(BaseSettings):
     @classmethod
     def check_max_context_chunks(cls, v: int, info: ValidationInfo) -> int:
         retriever_k = info.data.get('RETRIEVER_TOP_K', DEFAULT_RETRIEVER_TOP_K)
-        if v > retriever_k * 2 and info.data.get('MAPREDUCE_ENABLED', DEFAULT_MAPREDUCE_ENABLED) is False:
-             logging.warning(f"MAX_CONTEXT_CHUNKS ({v}) for direct RAG is significantly larger than typical fused results from RETRIEVER_TOP_K ({retriever_k}). Ensure this is intended.")
+        # This validation might be less relevant if MapReduce handles very large contexts
+        # if v > retriever_k * 2 and info.data.get('MAPREDUCE_ENABLED', DEFAULT_MAPREDUCE_ENABLED) is False:
+        #      logging.warning(f"MAX_CONTEXT_CHUNKS ({v}) for direct RAG is significantly larger than typical fused results from RETRIEVER_TOP_K ({retriever_k}). Ensure this is intended.")
         if v <= 0:
              raise ValueError("MAX_CONTEXT_CHUNKS must be a positive integer.")
         return v
@@ -225,14 +230,15 @@ class Settings(BaseSettings):
             logging.warning(f"MAPREDUCE_CHUNK_BATCH_SIZE ({v}) is quite large. Ensure LLM can handle this many docs in a single map prompt.")
         return v
         
-    @field_validator('MAPREDUCE_ACTIVATION_THRESHOLD')
+    @field_validator('MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS') # Renamed from MAPREDUCE_ACTIVATION_THRESHOLD
     @classmethod
-    def check_mapreduce_activation_threshold(cls, v: int, info: ValidationInfo) -> int:
-        max_context = info.data.get('MAX_CONTEXT_CHUNKS', DEFAULT_MAX_CONTEXT_CHUNKS)
-        if v > max_context:
-            logging.warning(f"MAPREDUCE_ACTIVATION_THRESHOLD ({v}) is greater than MAX_CONTEXT_CHUNKS ({max_context}). MapReduce may never activate if MAX_CONTEXT_CHUNKS is the effective limit for documents to process.")
+    def check_mapreduce_activation_threshold_chunks(cls, v: int, info: ValidationInfo) -> int:
+        max_prompt_toks = info.data.get('MAX_PROMPT_TOKENS', DEFAULT_MAX_PROMPT_TOKENS)
+        # This is now a secondary condition, so its relation to MAX_CONTEXT_CHUNKS is less direct for primary activation
+        # if v > max_context:
+        #     logging.warning(f"MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS ({v}) is greater than MAX_CONTEXT_CHUNKS ({max_context}). MapReduce may never activate if MAX_CONTEXT_CHUNKS is the effective limit for documents to process.")
         if v <= 0:
-            raise ValueError("MAPREDUCE_ACTIVATION_THRESHOLD must be positive.")
+            raise ValueError("MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS must be positive.")
         return v
 
 
@@ -241,8 +247,8 @@ class Settings(BaseSettings):
     def check_num_sources_to_show(cls, v: int, info: ValidationInfo) -> int:
         max_chunks = info.data.get('MAX_CONTEXT_CHUNKS', DEFAULT_MAX_CONTEXT_CHUNKS)
         if v > max_chunks:
-             logging.warning(f"NUM_SOURCES_TO_SHOW ({v}) is greater than MAX_CONTEXT_CHUNKS ({max_chunks}). Will only show up to {max_chunks} sources.")
-             return max_chunks
+             logging.warning(f"NUM_SOURCES_TO_SHOW ({v}) is greater than MAX_CONTEXT_CHUNKS ({max_chunks}). Will only show up to {max_chunks} sources if MapReduce is not used.")
+             # No need to cap it here, as the logic in _handle_llm_response handles showing a limited number of sources anyway.
         if v < 0:
             raise ValueError("NUM_SOURCES_TO_SHOW cannot be negative.")
         return v
