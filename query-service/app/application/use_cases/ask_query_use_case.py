@@ -607,11 +607,25 @@ class AskQueryUseCase:
                         else:
                             rerank_log.warning("Reranker service response format invalid.", response_data=reranked_data)
                     except httpx.HTTPStatusError as http_err:
-                        rerank_log.error("HTTP error from Reranker service", status_code=http_err.response.status_code, response_text=http_err.response.text, exc_info=False)
+                        rerank_log.error(
+                            "HTTP error from Reranker service",
+                            status_code=http_err.response.status_code,
+                            response_text=http_err.response.text,
+                            error_details=repr(http_err),
+                            exc_info=True
+                        )
                     except httpx.RequestError as req_err: 
-                        rerank_log.error("Request error contacting Reranker service", error_details=str(req_err), exc_info=False) 
+                        rerank_log.error(
+                            "Request error contacting Reranker service",
+                            error_details=repr(req_err),
+                            exc_info=True
+                        )
                     except Exception as e_rerank:
-                        rerank_log.exception("Unexpected error during reranking call.")
+                        rerank_log.error(
+                            "Unexpected error during reranking call.",
+                            error_details=repr(e_rerank),
+                            exc_info=True
+                        )
                 else:
                     rerank_log.warning("No valid documents with content/id to send for reranking.")
             else: 
