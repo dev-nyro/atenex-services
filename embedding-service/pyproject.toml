@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "embedding-service"
-version = "1.1.1" # Puedes incrementar a 1.1.2 o 1.2.0 si consideras este un cambio significativo
+version = "1.1.1"
 description = "Atenex Embedding Service using FastAPI and choice of embedding models (OpenAI, Sentence Transformers)"
 authors = ["Atenex Team <dev@atenex.com>"]
 readme = "README.md"
