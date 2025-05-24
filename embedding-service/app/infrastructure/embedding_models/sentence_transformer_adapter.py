@@ -15,7 +15,7 @@ from app.api.v1.schemas import TextType
 log = structlog.get_logger(__name__)
 
 class SentenceTransformerAdapter(EmbeddingModelPort):
-    _model: Optional[SentenceTransformer] = None
+    _model: Optional[Any] = None  # type: ignore  # SentenceTransformer is imported locally
     _model_name: str
     _model_dimension: int
     _device: str
