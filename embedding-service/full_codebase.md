@@ -333,7 +333,23 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, field_validator, ValidationError, ValidationInfo, SecretStr
 import sys
 import json
-import torch # For CUDA check
+# LLM_FLAG: CONDITIONAL_IMPORT_START
+# Import torch only if sentence_transformer is the active provider
+# This will be checked after settings are partially loaded.
+_torch_imported = False
+try:
+    if os.getenv("EMBEDDING_ACTIVE_EMBEDDING_PROVIDER", "openai").lower() == "sentence_transformer":
+        import torch
+        _torch_imported = True
+except ImportError:
+    # This case should ideally not happen if the Docker image is built correctly
+    # for sentence_transformer provider, but good to have a fallback log.
+    logging.getLogger("embedding_service.config.loader").warning(
+        "Torch import failed even though sentence_transformer might be active. Ensure torch is installed if using ST."
+    )
+    _torch_imported = False
+# LLM_FLAG: CONDITIONAL_IMPORT_END
+
 
 # --- Defaults ---
 DEFAULT_PROJECT_NAME = "Atenex Embedding Service"
@@ -436,6 +452,20 @@ class Settings(BaseSettings):
     @field_validator('ST_MODEL_DEVICE')
     @classmethod
     def check_st_model_device(cls, v: str, info: ValidationInfo) -> str:
+        # LLM_FLAG: CONDITIONAL_CUDA_CHECK_START
+        active_provider = info.data.get('ACTIVE_EMBEDDING_PROVIDER', DEFAULT_ACTIVE_EMBEDDING_PROVIDER)
+        if active_provider != "sentence_transformer":
+            # If not using ST, this validation is less critical or can be skipped.
+            # However, we still validate the format if provided.
+            if v.lower() not in ["cpu", "cuda"] and not v.lower().startswith("cuda:"):
+                 logging.getLogger("embedding_service.config.validator").warning(f"ST_MODEL_DEVICE '{v}' provided but ST is not active. Value will be ignored.")
+            return v # Return as is, will be ignored by ST adapter if ST not active.
+
+        if not _torch_imported:
+            logging.getLogger("embedding_service.config.validator").warning("Torch not imported. Cannot perform CUDA checks for ST_MODEL_DEVICE. Assuming 'cpu'.")
+            return "cpu"
+        # LLM_FLAG: CONDITIONAL_CUDA_CHECK_END
+
         device_str = v.lower()
         if device_str.startswith("cuda"):
             if not torch.cuda.is_available():
@@ -473,6 +503,12 @@ class Settings(BaseSettings):
     @field_validator('ST_BATCH_SIZE')
     @classmethod
     def set_st_batch_size_based_on_device(cls, v: int, info: ValidationInfo) -> int:
+        # LLM_FLAG: CONDITIONAL_CUDA_CHECK_START
+        active_provider = info.data.get('ACTIVE_EMBEDDING_PROVIDER', DEFAULT_ACTIVE_EMBEDDING_PROVIDER)
+        if active_provider != "sentence_transformer":
+            return v # No adjustment if ST is not active
+        # LLM_FLAG: CONDITIONAL_CUDA_CHECK_END
+        
         st_device = info.data.get('ST_MODEL_DEVICE', DEFAULT_ST_MODEL_DEVICE)
         if st_device.startswith("cuda") and v == DEFAULT_ST_BATCH_SIZE_CPU:
             logging.info(f"ST_MODEL_DEVICE is CUDA, adjusting ST_BATCH_SIZE to default CUDA value: {DEFAULT_ST_BATCH_SIZE_CUDA}")
@@ -498,7 +534,6 @@ class Settings(BaseSettings):
 
             final_expected_dim = expected_dimension_openai
             if openai_dimensions_override is not None:
-                # If override is set, it IS the expected dimension.
                 final_expected_dim = openai_dimensions_override
             
             if final_expected_dim is not None and v != final_expected_dim:
@@ -507,7 +542,7 @@ class Settings(BaseSettings):
                     f"for OpenAI model '{openai_model_name}' (considering override: {openai_dimensions_override}). "
                     "Update EMBEDDING_DIMENSION in your environment/ConfigMap to match."
                 )
-            elif final_expected_dim is None: # Unknown OpenAI model, EMBEDDING_DIMENSION must be set correctly by user
+            elif final_expected_dim is None: 
                 logging.warning(f"OpenAI model '{openai_model_name}' has no default dimension in config. EMBEDDING_DIMENSION is {v}. Ensure this is correct.")
 
         elif active_provider == "sentence_transformer":
@@ -532,20 +567,12 @@ class Settings(BaseSettings):
     @field_validator('OPENAI_API_KEY', mode='before')
     @classmethod
     def check_openai_api_key_if_provider(cls, v: Optional[str], info: ValidationInfo) -> Optional[SecretStr]:
-        active_provider = info.data.get('ACTIVE_EMBEDDING_PROVIDER', DEFAULT_ACTIVE_EMBEDDING_PROVIDER)
-        # This validator runs based on how Pydantic processes fields.
-        # We need to ensure ACTIVE_EMBEDDING_PROVIDER is available in info.data.
-        # If it's not (e.g., due to declaration order or how .env is parsed), we might use a default.
-        # However, the `mode='after'` on EMBEDDING_DIMENSION's validator is more critical for the final check.
-        
-        # Check if active_provider has been loaded into info.data yet
         current_active_provider = info.data.get('ACTIVE_EMBEDDING_PROVIDER', DEFAULT_ACTIVE_EMBEDDING_PROVIDER)
         
         if current_active_provider == "openai":
-            if v is None or (isinstance(v, str) and not v.strip()): # Check for empty string too
+            if v is None or (isinstance(v, str) and not v.strip()): 
                 raise ValueError("OPENAI_API_KEY (EMBEDDING_OPENAI_API_KEY) is required when ACTIVE_EMBEDDING_PROVIDER is 'openai'.")
             return SecretStr(v)
-        # If not OpenAI provider, API key can be None
         if v is not None and isinstance(v, str) and v.strip():
             return SecretStr(v)
         return None
