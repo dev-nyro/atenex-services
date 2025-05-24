@@ -6,8 +6,7 @@ import time
 import os
 import numpy as np
 
-from sentence_transformers import SentenceTransformer
-import torch
+
 
 from app.application.ports.embedding_model_port import EmbeddingModelPort
 from app.core.config import settings 
@@ -29,13 +28,20 @@ class SentenceTransformerAdapter(EmbeddingModelPort):
     _model_load_error: Optional[str] = None
 
     def __init__(self):
+        # Import sentence_transformers and torch only when this adapter is instantiated
+        global SentenceTransformer, torch
+        try:
+            from sentence_transformers import SentenceTransformer
+            import torch
+        except ImportError as e:
+            log.critical("sentence_transformers or torch not installed. This adapter requires them.", error=str(e))
+            raise
         self._model_name = settings.ST_MODEL_NAME
         self._model_dimension = settings.EMBEDDING_DIMENSION 
         self._device = settings.ST_MODEL_DEVICE 
         self._cache_dir = settings.ST_HF_CACHE_DIR
         self._batch_size = settings.ST_BATCH_SIZE
         self._normalize_embeddings = settings.ST_NORMALIZE_EMBEDDINGS
-        
         
         log.info(
             "SentenceTransformerAdapter instance created (model not loaded yet)",
