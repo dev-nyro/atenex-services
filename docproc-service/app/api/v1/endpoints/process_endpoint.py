@@ -5,7 +5,7 @@ from fastapi import (
 )
 from typing import Optional
 
-from app.core.config import settings
+from app.core.config import settings # Importa la instancia configurada globalmente
 from app.domain.models import ProcessResponse
 from app.application.use_cases.process_document_use_case import ProcessDocumentUseCase
 from app.application.ports.extraction_port import UnsupportedContentTypeError, ExtractionError
@@ -49,15 +49,22 @@ async def process_document_endpoint(
             detail="Missing one or more required fields: file, original_filename, content_type."
         )
     
-    # Normalizar el content_type a minúsculas para la comparación
     normalized_content_type = content_type.lower()
 
-    # settings.SUPPORTED_CONTENT_TYPES ya está en minúsculas gracias al validador
+    # Loguear explícitamente los tipos soportados por settings EN ESTE PUNTO
+    endpoint_log.debug("Endpoint validation: Checking content_type against settings.SUPPORTED_CONTENT_TYPES", 
+                       received_content_type=content_type,
+                       normalized_content_type_to_check=normalized_content_type,
+                       settings_supported_content_types=settings.SUPPORTED_CONTENT_TYPES)
+
     if normalized_content_type not in settings.SUPPORTED_CONTENT_TYPES:
-        endpoint_log.warning("Received unsupported content type", received_type=content_type, normalized_type=normalized_content_type, supported_types=settings.SUPPORTED_CONTENT_TYPES)
+        endpoint_log.warning("Received unsupported content type after explicit check in endpoint", 
+                             received_type=content_type, 
+                             normalized_type=normalized_content_type, 
+                             supported_types_from_settings=settings.SUPPORTED_CONTENT_TYPES)
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail=f"Content type '{content_type}' is not supported. Supported types: {', '.join(settings.SUPPORTED_CONTENT_TYPES)}"
+            detail=f"Content type '{content_type}' is not supported. Supported types from settings: {', '.join(settings.SUPPORTED_CONTENT_TYPES)}"
         )
 
     try:
@@ -74,7 +81,7 @@ async def process_document_endpoint(
         response_data = await use_case.execute(
             file_bytes=file_bytes,
             original_filename=original_filename,
-            content_type=content_type, # Pasamos el content_type original al use_case, el FlexibleExtractionPort también normalizará
+            content_type=content_type, 
             document_id_trace=document_id,
             company_id_trace=company_id
         )
