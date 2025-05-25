@@ -16,7 +16,9 @@ DEFAULT_SUPPORTED_CONTENT_TYPES = [
     "application/msword",  # DOC (will also be handled by docx_extractor typically)
     "text/plain",
     "text/markdown",
-    "text/html"
+    "text/html",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", # XLSX
+    "application/vnd.ms-excel" # XLS
 ]
 
 class Settings(BaseSettings):
@@ -56,16 +58,19 @@ class Settings(BaseSettings):
                 parsed_list = json.loads(v)
                 if not isinstance(parsed_list, list) or not all(isinstance(item, str) for item in parsed_list):
                     raise ValueError("If string, must be a JSON array of strings.")
-                return parsed_list
+                # Convert to lowercase for consistent comparison
+                return [s.strip().lower() for s in parsed_list if s.strip()]
             except json.JSONDecodeError:
-                # Fallback to comma-separated if JSON parsing fails and it's a simple string
-                if '[' not in v and ']' not in v: # Avoid trying to parse malformed JSON array as CSV
-                    return [s.strip() for s in v.split(',') if s.strip()]
+                if '[' not in v and ']' not in v:
+                     # Convert to lowercase for consistent comparison
+                    return [s.strip().lower() for s in v.split(',') if s.strip()]
                 raise ValueError("SUPPORTED_CONTENT_TYPES must be a valid JSON array of strings or a comma-separated string.")
         elif isinstance(v, list) and all(isinstance(item, str) for item in v):
-            return v
-        elif v is None: # Not set, use default
-            return DEFAULT_SUPPORTED_CONTENT_TYPES
+            # Convert to lowercase for consistent comparison
+            return [s.strip().lower() for s in v if s.strip()]
+        elif v is None: 
+            # Convert to lowercase for consistent comparison
+            return [s.lower() for s in DEFAULT_SUPPORTED_CONTENT_TYPES]
         raise ValueError("SUPPORTED_CONTENT_TYPES must be a list of strings or a JSON string array.")
 
     @field_validator('CHUNK_SIZE', 'CHUNK_OVERLAP')

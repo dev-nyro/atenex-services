@@ -86,7 +86,9 @@ class Settings(BaseSettings):
         "application/msword",
         "text/plain",
         "text/markdown",
-        "text/html"
+        "text/html",        
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", # XLSX
+        "application/vnd.ms-excel"
     ])
 
     @field_validator("LOG_LEVEL")

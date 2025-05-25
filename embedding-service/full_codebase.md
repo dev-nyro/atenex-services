@@ -1118,8 +1118,7 @@ import time
 import os
 import numpy as np
 
-from sentence_transformers import SentenceTransformer
-import torch
+
 
 from app.application.ports.embedding_model_port import EmbeddingModelPort
 from app.core.config import settings 
@@ -1128,7 +1127,7 @@ from app.api.v1.schemas import TextType
 log = structlog.get_logger(__name__)
 
 class SentenceTransformerAdapter(EmbeddingModelPort):
-    _model: Optional[SentenceTransformer] = None
+    _model: Optional[Any] = None  # type: ignore  # SentenceTransformer is imported locally
     _model_name: str
     _model_dimension: int
     _device: str
@@ -1141,13 +1140,20 @@ class SentenceTransformerAdapter(EmbeddingModelPort):
     _model_load_error: Optional[str] = None
 
     def __init__(self):
+        # Import sentence_transformers and torch only when this adapter is instantiated
+        global SentenceTransformer, torch
+        try:
+            from sentence_transformers import SentenceTransformer
+            import torch
+        except ImportError as e:
+            log.critical("sentence_transformers or torch not installed. This adapter requires them.", error=str(e))
+            raise
         self._model_name = settings.ST_MODEL_NAME
         self._model_dimension = settings.EMBEDDING_DIMENSION 
         self._device = settings.ST_MODEL_DEVICE 
         self._cache_dir = settings.ST_HF_CACHE_DIR
         self._batch_size = settings.ST_BATCH_SIZE
         self._normalize_embeddings = settings.ST_NORMALIZE_EMBEDDINGS
-        
         
         log.info(
             "SentenceTransformerAdapter instance created (model not loaded yet)",
@@ -1590,6 +1596,7 @@ pydantic = {extras = ["email"], version = "^2.6.4"}
 pydantic-settings = "^2.2.1"
 structlog = "^24.1.0"
 tenacity = "^8.2.3"
+numpy = "^1.26.0" # Añadido numpy como dependencia principal
 
 # --- Embedding Engine ---
 openai = "^1.14.0" # OpenAI Python client library
