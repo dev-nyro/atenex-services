@@ -36,6 +36,7 @@ app/
 │       ├── __init__.py
 │       ├── base_extractor.py
 │       ├── docx_adapter.py
+│       ├── excel_adapter.py
 │       ├── html_adapter.py
 │       ├── md_adapter.py
 │       ├── pdf_adapter.py
@@ -461,7 +462,9 @@ DEFAULT_SUPPORTED_CONTENT_TYPES = [
     "application/msword",  # DOC (will also be handled by docx_extractor typically)
     "text/plain",
     "text/markdown",
-    "text/html"
+    "text/html",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", # XLSX
+    "application/vnd.ms-excel" # XLS
 ]
 
 class Settings(BaseSettings):
@@ -501,16 +504,19 @@ class Settings(BaseSettings):
                 parsed_list = json.loads(v)
                 if not isinstance(parsed_list, list) or not all(isinstance(item, str) for item in parsed_list):
                     raise ValueError("If string, must be a JSON array of strings.")
-                return parsed_list
+                # Convert to lowercase for consistent comparison
+                return [s.strip().lower() for s in parsed_list if s.strip()]
             except json.JSONDecodeError:
-                # Fallback to comma-separated if JSON parsing fails and it's a simple string
-                if '[' not in v and ']' not in v: # Avoid trying to parse malformed JSON array as CSV
-                    return [s.strip() for s in v.split(',') if s.strip()]
+                if '[' not in v and ']' not in v:
+                     # Convert to lowercase for consistent comparison
+                    return [s.strip().lower() for s in v.split(',') if s.strip()]
                 raise ValueError("SUPPORTED_CONTENT_TYPES must be a valid JSON array of strings or a comma-separated string.")
         elif isinstance(v, list) and all(isinstance(item, str) for item in v):
-            return v
-        elif v is None: # Not set, use default
-            return DEFAULT_SUPPORTED_CONTENT_TYPES
+            # Convert to lowercase for consistent comparison
+            return [s.strip().lower() for s in v if s.strip()]
+        elif v is None: 
+            # Convert to lowercase for consistent comparison
+            return [s.lower() for s in DEFAULT_SUPPORTED_CONTENT_TYPES]
         raise ValueError("SUPPORTED_CONTENT_TYPES must be a list of strings or a JSON string array.")
 
     @field_validator('CHUNK_SIZE', 'CHUNK_OVERLAP')
@@ -647,7 +653,7 @@ def setup_logging():
 ## File: `app\dependencies.py`
 ```py
 from functools import lru_cache
-from typing import Dict, Type
+from typing import Dict, Type, Optional # Optional importado
 
 from app.application.ports.extraction_port import ExtractionPort
 from app.application.ports.chunking_port import ChunkingPort
@@ -658,6 +664,7 @@ from app.infrastructure.extractors.docx_adapter import DocxAdapter
 from app.infrastructure.extractors.txt_adapter import TxtAdapter
 from app.infrastructure.extractors.html_adapter import HtmlAdapter
 from app.infrastructure.extractors.md_adapter import MdAdapter
+from app.infrastructure.extractors.excel_adapter import ExcelAdapter # NUEVO
 from app.infrastructure.chunkers.default_chunker_adapter import DefaultChunkerAdapter
 
 from app.core.config import settings
@@ -665,45 +672,7 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
-class CompositeExtractionAdapter(ExtractionPort):
-    """
-    Un adaptador de extracción compuesto que delega al adaptador apropiado
-    basado en el content_type.
-    """
-    def __init__(self, adapters: Dict[str, ExtractionPort]):
-        self.adapters = adapters
-        self.log = log.bind(component="CompositeExtractionAdapter")
-
-    def extract_text(self, file_bytes: bytes, filename: str, content_type: str):
-        self.log.debug("Attempting extraction", filename=filename, content_type=content_type)
-        
-        # Find adapter that supports this content type
-        selected_adapter: Optional[ExtractionPort] = None
-        for adapter_instance in self.adapters.values():
-            # Adapters should ideally expose their supported types or be selected more directly
-            # For now, we assume adapters raise UnsupportedContentTypeError if they can't handle it
-            # A better approach would be to register adapters with their supported MIME types.
-            # Here, we try them or have specific logic.
-            # For this example, we'll rely on a pre-defined mapping in the factory.
-            # This Composite adapter is more of a dispatcher.
-            # A simpler way in the factory is to just pick the right one.
-            # Let's re-think: the factory should provide the *specific* adapter,
-            # or this composite adapter needs a way to know which one to call.
-
-            # Simplified: Assume the ProcessDocumentUseCase will choose one.
-            # This composite is not strictly needed if the use case itself can select.
-            # However, to keep the use case clean from knowing *all* adapters,
-            # a factory function for ExtractionPort in dependencies.py is better.
-
-            # Let's refine: This Composite is not used. Instead, a factory creates the right one.
-            # Keeping this class for conceptual reference, but get_extraction_port is the way.
-            pass # This class will not be directly used as a port implementation for DI to use case
-
-        # This method will not be called if the factory directly provides the correct adapter.
-        # This is more for a scenario where the UseCase gets *this* composite.
-        # For now, it's unused.
-        raise NotImplementedError("CompositeExtractionAdapter.extract_text should not be called directly if factory provides specific adapter.")
-
+# Eliminada la clase CompositeExtractionAdapter ya que no se usa
 
 @lru_cache()
 def get_pdf_adapter() -> PdfAdapter:
@@ -725,40 +694,30 @@ def get_html_adapter() -> HtmlAdapter:
 def get_md_adapter() -> MdAdapter:
     return MdAdapter()
 
+@lru_cache()
+def get_excel_adapter() -> ExcelAdapter: # NUEVO
+    return ExcelAdapter()
 
-# Factory function to provide the correct ExtractionPort based on content_type
-# This is not directly injectable into FastAPI's Depends if content_type is runtime data.
-# So, the ProcessDocumentUseCase will need access to all relevant adapters
-# or a way to request one. Let's provide all to the use case for now, or make the use case resolve it.
-
-# For simplicity, the UseCase will have a mapping or similar logic.
-# Or, the endpoint can determine the adapter and pass it.
-# Let's make the UseCase smarter with a dictionary of available extractors.
 
 @lru_cache()
 def get_all_extraction_adapters() -> Dict[str, ExtractionPort]:
-    """Returns a dictionary of all configured extraction adapters, keyed by a representative content type."""
-    # This is a simplified mapping. A more robust solution might involve
-    # querying adapters for their supported types.
     adapters = {
         "application/pdf": get_pdf_adapter(),
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document": get_docx_adapter(),
-        "application/msword": get_docx_adapter(), # DOCX adapter might handle some .doc
+        "application/msword": get_docx_adapter(), 
         "text/plain": get_txt_adapter(),
         "text/html": get_html_adapter(),
         "text/markdown": get_md_adapter(),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": get_excel_adapter(), # XLSX
+        "application/vnd.ms-excel": get_excel_adapter(), # XLS
     }
-    # Filter by configured supported types
+    # Filter by configured supported types (que ahora están en minúsculas en config)
     return {
-        ct: adapter for ct, adapter in adapters.items() if ct in settings.SUPPORTED_CONTENT_TYPES
+        ct.lower(): adapter for ct, adapter in adapters.items() if ct.lower() in settings.SUPPORTED_CONTENT_TYPES
     }
 
 
 class FlexibleExtractionPort(ExtractionPort):
-    """
-    An ExtractionPort implementation that dynamically selects the correct adapter.
-    This is what will be injected into the UseCase.
-    """
     def __init__(self):
         self.adapters_map = get_all_extraction_adapters()
         self.log = log.bind(component="FlexibleExtractionPort")
@@ -766,24 +725,23 @@ class FlexibleExtractionPort(ExtractionPort):
 
 
     def extract_text(self, file_bytes: bytes, filename: str, content_type: str):
-        self.log.debug("FlexibleExtractionPort: Attempting extraction", filename=filename, content_type=content_type)
+        content_type_lower = content_type.lower() # Comparar en minúsculas
+        self.log.debug("FlexibleExtractionPort: Attempting extraction", filename=filename, content_type=content_type_lower)
         
-        adapter_to_use = None
-        # Prioritize exact match
-        if content_type in self.adapters_map:
-            adapter_to_use = self.adapters_map[content_type]
-        else:
-            # Fallback for similar types, e.g. if only specific docx mimetype is registered
-            # but a more generic one is passed. This logic can be expanded.
-            if content_type.startswith("text/"): # Generic text might be plain
-                 adapter_to_use = self.adapters_map.get("text/plain")
+        adapter_to_use: Optional[ExtractionPort] = self.adapters_map.get(content_type_lower)
+        
+        # Fallback simple para application/msword si solo está registrado el de docx.
+        # Esto es solo un ejemplo, la lógica de `get_all_extraction_adapters` ya debería manejar esto.
+        if not adapter_to_use and content_type_lower == "application/msword":
+             adapter_to_use = self.adapters_map.get("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
 
         if adapter_to_use:
-            self.log.info(f"Using adapter {type(adapter_to_use).__name__} for {content_type}")
-            return adapter_to_use.extract_text(file_bytes, filename, content_type)
+            self.log.info(f"Using adapter {type(adapter_to_use).__name__} for {content_type_lower}")
+            return adapter_to_use.extract_text(file_bytes, filename, content_type_lower) # Pasar content_type original o lower? Pasamos lower para consistencia interna del adapter
         else:
-            self.log.warning("No suitable adapter found for content type", content_type=content_type)
-            from app.application.ports.extraction_port import UnsupportedContentTypeError
+            self.log.warning("No suitable adapter found for content type", content_type_provided=content_type, content_type_lower=content_type_lower, available_adapters=list(self.adapters_map.keys()))
+            from app.application.ports.extraction_port import UnsupportedContentTypeError # Importación local
             raise UnsupportedContentTypeError(f"No configured adapter for content type: {content_type}")
 
 
@@ -798,7 +756,6 @@ def get_default_chunker_adapter() -> ChunkingPort:
 
 @lru_cache()
 def get_process_document_use_case() -> ProcessDocumentUseCase:
-    # This is where specific adapters are chosen or a composite/flexible one is passed
     extraction_port = get_flexible_extraction_port()
     chunking_port = get_default_chunker_adapter()
     
@@ -960,7 +917,23 @@ class DefaultChunkerAdapter(ChunkingPort):
 
 ## File: `app\infrastructure\extractors\__init__.py`
 ```py
+from .base_extractor import BaseExtractorAdapter
+from .pdf_adapter import PdfAdapter
+from .docx_adapter import DocxAdapter
+from .txt_adapter import TxtAdapter
+from .html_adapter import HtmlAdapter
+from .md_adapter import MdAdapter
+from .excel_adapter import ExcelAdapter # NUEVA LÍNEA
 
+__all__ = [
+    "BaseExtractorAdapter",
+    "PdfAdapter",
+    "DocxAdapter",
+    "TxtAdapter",
+    "HtmlAdapter",
+    "MdAdapter",
+    "ExcelAdapter", # NUEVA LÍNEA
+]
 ```
 
 ## File: `app\infrastructure\extractors\base_extractor.py`
@@ -1022,6 +995,84 @@ class DocxAdapter(BaseExtractorAdapter):
             if content_type == "application/msword":
                 log.warning("DocxAdapter: Failed to process .doc file. This format has limited support.", filename=filename, error=str(e))
             raise self._handle_extraction_error(e, filename, "DocxAdapter")
+```
+
+## File: `app\infrastructure\extractors\excel_adapter.py`
+```py
+import io
+import pandas as pd
+import structlog
+from typing import List, Tuple, Dict, Any
+
+from app.application.ports.extraction_port import ExtractionPort, ExtractionError, UnsupportedContentTypeError
+from app.infrastructure.extractors.base_extractor import BaseExtractorAdapter
+
+log = structlog.get_logger(__name__)
+
+class ExcelAdapter(BaseExtractorAdapter):
+    """Adaptador para extraer texto de archivos Excel (XLSX, XLS)."""
+
+    SUPPORTED_CONTENT_TYPES = [
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # .xlsx
+        "application/vnd.ms-excel"  # .xls
+    ]
+
+    def extract_text(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        content_type: str
+    ) -> Tuple[List[Tuple[int, str]], Dict[str, Any]]:
+        content_type_lower = content_type.lower()
+        if content_type_lower not in self.SUPPORTED_CONTENT_TYPES:
+            raise UnsupportedContentTypeError(f"ExcelAdapter does not support content type: {content_type}")
+
+        log.debug("ExcelAdapter: Extracting text from Excel bytes", filename=filename, content_type=content_type)
+        pages_content: List[Tuple[int, str]] = []
+        extraction_metadata: Dict[str, Any] = {
+            "total_sheets_extracted": 0,
+            "sheet_names": []
+        }
+
+        try:
+            # Pandas usa openpyxl para xlsx y puede usar xlrd para xls.
+            # Si se necesita específicamente xlrd para .xls antiguos, asegurar que esté instalado.
+            # Por defecto, pandas intentará el motor apropiado.
+            excel_file = pd.ExcelFile(io.BytesIO(file_bytes))
+            sheet_names = excel_file.sheet_names
+            extraction_metadata["sheet_names"] = sheet_names
+            
+            log.info("ExcelAdapter: Processing Excel file", filename=filename, num_sheets=len(sheet_names), sheet_names_list=sheet_names)
+
+            for i, sheet_name in enumerate(sheet_names):
+                page_num_one_based = i + 1
+                try:
+                    df = excel_file.parse(sheet_name)
+                    if not df.empty:
+                        # Convertir DataFrame a Markdown. Incluir el índice puede ser útil o no.
+                        # index=False evita escribir el índice numérico del DataFrame.
+                        # tablefmt="pipe" es un formato común de Markdown para tablas.
+                        markdown_text = df.to_markdown(index=False, tablefmt="pipe")
+                        
+                        # Añadir un título con el nombre de la hoja al principio del texto Markdown
+                        sheet_title_md = f"# Hoja: {sheet_name}\n\n"
+                        full_sheet_text = sheet_title_md + markdown_text
+
+                        if full_sheet_text.strip():
+                            pages_content.append((page_num_one_based, full_sheet_text))
+                            log.debug("ExcelAdapter: Extracted text from sheet", sheet_name=sheet_name, page_num=page_num_one_based, length=len(full_sheet_text))
+                        else:
+                            log.debug("ExcelAdapter: Skipping empty sheet after markdown conversion", sheet_name=sheet_name, page_num=page_num_one_based)
+                    else:
+                        log.debug("ExcelAdapter: Skipping empty DataFrame for sheet", sheet_name=sheet_name, page_num=page_num_one_based)
+                except Exception as sheet_err:
+                    log.warning("ExcelAdapter: Error extracting text from sheet", filename=filename, sheet_name=sheet_name, page_num=page_num_one_based, error=str(sheet_err))
+            
+            extraction_metadata["total_sheets_extracted"] = len(pages_content)
+            log.info("ExcelAdapter: Excel extraction successful", filename=filename, sheets_with_text=len(pages_content), total_doc_sheets=len(sheet_names))
+            return pages_content, extraction_metadata
+        except Exception as e:
+            raise self._handle_extraction_error(e, filename, "ExcelAdapter")
 ```
 
 ## File: `app\infrastructure\extractors\html_adapter.py`
@@ -1415,6 +1466,8 @@ python-docx = ">=1.1.0,<2.0.0"
 markdown = ">=3.5.1,<4.0.0"
 beautifulsoup4 = ">=4.12.3,<5.0.0"
 html2text = ">=2024.1.0,<2025.0.0"
+pandas = "^2.2.0" # Para procesar Excel
+openpyxl = "^3.1.0" # Requerido por pandas para .xlsx
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"

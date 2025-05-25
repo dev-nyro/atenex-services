@@ -10,7 +10,7 @@ from app.domain.models import ProcessResponse
 from app.application.use_cases.process_document_use_case import ProcessDocumentUseCase
 from app.application.ports.extraction_port import UnsupportedContentTypeError, ExtractionError
 from app.application.ports.chunking_port import ChunkingError
-from app.dependencies import get_process_document_use_case # Corrected import
+from app.dependencies import get_process_document_use_case 
 
 router = APIRouter()
 log = structlog.get_logger(__name__)
@@ -33,10 +33,7 @@ async def process_document_endpoint(
     content_type: str = Form(..., description="MIME content type of the document."),
     document_id: Optional[str] = Form(None, description="Optional document ID for tracing purposes."),
     company_id: Optional[str] = Form(None, description="Optional company ID for tracing purposes."),
-    # Chunking parameters can be made optional and taken from Form data
-    # chunk_size: Optional[int] = Form(None, description=f"Optional chunk size (words/tokens). Defaults to service config: {settings.CHUNK_SIZE}."),
-    # chunk_overlap: Optional[int] = Form(None, description=f"Optional chunk overlap. Defaults to service config: {settings.CHUNK_OVERLAP}."),
-    use_case: ProcessDocumentUseCase = Depends(get_process_document_use_case) # Corrected dependency
+    use_case: ProcessDocumentUseCase = Depends(get_process_document_use_case) 
 ):
     endpoint_log = log.bind(
         original_filename=original_filename,
@@ -47,14 +44,17 @@ async def process_document_endpoint(
     endpoint_log.info("Received document processing request")
 
     if not file or not original_filename or not content_type:
-        # FastAPI usually handles this with 422 for missing File/Form fields
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Missing one or more required fields: file, original_filename, content_type."
         )
     
-    if content_type not in settings.SUPPORTED_CONTENT_TYPES:
-        endpoint_log.warning("Received unsupported content type")
+    # Normalizar el content_type a minúsculas para la comparación
+    normalized_content_type = content_type.lower()
+
+    # settings.SUPPORTED_CONTENT_TYPES ya está en minúsculas gracias al validador
+    if normalized_content_type not in settings.SUPPORTED_CONTENT_TYPES:
+        endpoint_log.warning("Received unsupported content type", received_type=content_type, normalized_type=normalized_content_type, supported_types=settings.SUPPORTED_CONTENT_TYPES)
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
             detail=f"Content type '{content_type}' is not supported. Supported types: {', '.join(settings.SUPPORTED_CONTENT_TYPES)}"
@@ -71,14 +71,10 @@ async def process_document_endpoint(
 
         endpoint_log.debug("File read into bytes", file_size=len(file_bytes))
 
-        # Pass optional chunk_size and chunk_overlap if they were part of the Form
-        # For now, they are not, so use_case will use service defaults.
         response_data = await use_case.execute(
             file_bytes=file_bytes,
             original_filename=original_filename,
-            content_type=content_type,
-            # chunk_size=chunk_size, # Pass if defined in Form
-            # chunk_overlap=chunk_overlap, # Pass if defined in Form
+            content_type=content_type, # Pasamos el content_type original al use_case, el FlexibleExtractionPort también normalizará
             document_id_trace=document_id,
             company_id_trace=company_id
         )
@@ -89,10 +85,10 @@ async def process_document_endpoint(
     except UnsupportedContentTypeError as e:
         endpoint_log.warning("Use case reported unsupported content type", error=str(e))
         raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail=str(e))
-    except (ExtractionError, ChunkingError) as e: # Catch specific processing errors
+    except (ExtractionError, ChunkingError) as e: 
         endpoint_log.error("Processing error (extraction/chunking)", error_type=type(e).__name__, error_detail=str(e), exc_info=True)
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Failed to process document: {str(e)}")
-    except HTTPException as e: # Re-raise HTTPExceptions directly
+    except HTTPException as e: 
         raise e
     except Exception as e:
         endpoint_log.exception("Unexpected error during document processing")
