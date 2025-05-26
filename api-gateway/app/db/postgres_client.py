@@ -356,3 +356,34 @@ async def check_email_exists(email: str) -> bool:
     except Exception as e:
         log.error("Error checking email existence", error=str(e), email=email, exc_info=True)
         raise
+
+async def get_users_by_company_id_paginated(
+    company_id: uuid.UUID,
+    limit: int = 50,
+    offset: int = 0
+) -> List[Dict[str, Any]]:
+    """
+    Recupera usuarios por company_id con paginación.
+    Devuelve una lista de diccionarios con datos de usuarios o una lista vacía.
+    Los campos seleccionados coinciden con el modelo UserResponse.
+    """
+    pool = await get_db_pool()
+    query = """
+        SELECT id, email, full_name AS name, company_id, is_active, created_at, roles
+        FROM users
+        WHERE company_id = $1
+        ORDER BY created_at DESC, id
+        LIMIT $2 OFFSET $3;
+    """
+    db_log = log.bind(target_company_id=str(company_id), limit=limit, offset=offset)
+    db_log.debug("Executing get_users_by_company_id_paginated query")
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(query, company_id, limit, offset)
+        db_log.info(f"Retrieved {len(rows)} users for company.")
+        # asyncpg maneja la conversión de TEXT[] a List[str] para roles
+        return [dict(row) for row in rows]
+    except Exception as e:
+        db_log.error("Error getting users by company ID", error=str(e), exc_info=True)
+        # Relanzar para que el router lo maneje como un error 500
+        raise
