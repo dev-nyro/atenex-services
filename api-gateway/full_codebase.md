@@ -1034,6 +1034,37 @@ async def check_email_exists(email: str) -> bool:
     except Exception as e:
         log.error("Error checking email existence", error=str(e), email=email, exc_info=True)
         raise
+
+async def get_users_by_company_id_paginated(
+    company_id: uuid.UUID,
+    limit: int = 50,
+    offset: int = 0
+) -> List[Dict[str, Any]]:
+    """
+    Recupera usuarios por company_id con paginación.
+    Devuelve una lista de diccionarios con datos de usuarios o una lista vacía.
+    Los campos seleccionados coinciden con el modelo UserResponse.
+    """
+    pool = await get_db_pool()
+    query = """
+        SELECT id, email, full_name AS name, company_id, is_active, created_at, roles
+        FROM users
+        WHERE company_id = $1
+        ORDER BY created_at DESC, id
+        LIMIT $2 OFFSET $3;
+    """
+    db_log = log.bind(target_company_id=str(company_id), limit=limit, offset=offset)
+    db_log.debug("Executing get_users_by_company_id_paginated query")
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(query, company_id, limit, offset)
+        db_log.info(f"Retrieved {len(rows)} users for company.")
+        # asyncpg maneja la conversión de TEXT[] a List[str] para roles
+        return [dict(row) for row in rows]
+    except Exception as e:
+        db_log.error("Error getting users by company ID", error=str(e), exc_info=True)
+        # Relanzar para que el router lo maneje como un error 500
+        raise
 ```
 
 ## File: `app\main.py`
@@ -1441,7 +1472,7 @@ class DocumentStatsResponse(BaseModel):
 ```py
 # File: app/routers/admin_router.py
 # api-gateway/app/routers/admin_router.py
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Path, Query
 from typing import List, Dict, Any
 import structlog
 import uuid
@@ -1455,7 +1486,7 @@ from app.auth.auth_service import get_password_hash
 # --- Modelos Pydantic ---
 from app.models.admin_models import (
     CompanyCreateRequest, CompanyResponse, CompanySelectItem,
-    UserCreateRequest, UserResponse,
+    UserCreateRequest, UserResponse, # UserResponse será usado por el nuevo endpoint
     UsersPerCompanyStat, AdminStatsResponse
 )
 
@@ -1472,9 +1503,9 @@ router = APIRouter() # No añadir prefijo aquí, se añade en main.py
 )
 async def get_admin_stats(
     request: Request,
-    admin_user: AdminAuth # Protegido: Solo admins pueden acceder
+    admin_user_payload: AdminAuth # Protegido: Solo admins pueden acceder
 ):
-    admin_id = admin_user.get("sub")
+    admin_id = admin_user_payload.get("sub")
     req_id = getattr(request.state, 'request_id', 'N/A')
     stats_log = log.bind(request_id=req_id, admin_user_id=admin_id)
     stats_log.info("Admin requested platform statistics.")
@@ -1503,18 +1534,16 @@ async def get_admin_stats(
 async def create_new_company(
     request: Request,
     company_data: CompanyCreateRequest,
-    admin_user: AdminAuth # Protegido
+    admin_user_payload: AdminAuth # Protegido
 ):
-    admin_id = admin_user.get("sub")
+    admin_id = admin_user_payload.get("sub")
     req_id = getattr(request.state, 'request_id', 'N/A')
     company_log = log.bind(request_id=req_id, admin_user_id=admin_id, company_name=company_data.name)
     company_log.info("Admin attempting to create a new company.")
 
-    # Validación del nombre ya la hace Pydantic (min_length=1)
     try:
         new_company = await postgres_client.create_company(name=company_data.name)
         company_log.info("Company created successfully", new_company_id=str(new_company['id']))
-        # Convertir a CompanyResponse (Pydantic v2 usa model_validate)
         return CompanyResponse.model_validate(new_company)
     except asyncpg.UniqueViolationError:
          company_log.warning("Failed to create company: Name likely already exists.")
@@ -1532,9 +1561,9 @@ async def create_new_company(
 )
 async def list_companies_for_select(
     request: Request,
-    admin_user: AdminAuth # Protegido
+    admin_user_payload: AdminAuth # Protegido
 ):
-    admin_id = admin_user.get("sub")
+    admin_id = admin_user_payload.get("sub")
     req_id = getattr(request.state, 'request_id', 'N/A')
     list_log = log.bind(request_id=req_id, admin_user_id=admin_id)
     list_log.info("Admin requested list of active companies for select.")
@@ -1542,7 +1571,6 @@ async def list_companies_for_select(
     try:
         companies = await postgres_client.get_active_companies_select()
         list_log.info(f"Retrieved {len(companies)} companies for select.")
-        # FastAPI maneja la conversión a List[CompanySelectItem] si los dicts coinciden
         return companies
     except Exception as e:
         list_log.exception("Error retrieving companies for select", error=str(e))
@@ -1559,15 +1587,13 @@ async def list_companies_for_select(
 async def create_new_user(
     request: Request,
     user_data: UserCreateRequest,
-    admin_user: AdminAuth # Protegido
+    admin_user_payload: AdminAuth # Protegido
 ):
-    admin_id = admin_user.get("sub")
+    admin_id = admin_user_payload.get("sub")
     req_id = getattr(request.state, 'request_id', 'N/A')
     user_log = log.bind(request_id=req_id, admin_user_id=admin_id, new_user_email=user_data.email, target_company_id=str(user_data.company_id))
     user_log.info("Admin attempting to create a new user.")
 
-    # --- Validaciones Adicionales ---
-    # 1. Verificar si el email ya existe
     try:
         email_exists = await postgres_client.check_email_exists(user_data.email)
         if email_exists:
@@ -1577,7 +1603,6 @@ async def create_new_user(
         user_log.exception("Error checking email existence during user creation", error=str(e))
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error checking email availability.")
 
-    # 2. Verificar si la compañía existe
     try:
         company = await postgres_client.get_company_by_id(user_data.company_id)
         if not company:
@@ -1590,32 +1615,96 @@ async def create_new_user(
         user_log.exception("Error checking company existence during user creation", error=str(e))
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error verifying target company.")
 
-    # --- Creación del Usuario ---
     try:
-        # Hashear contraseña
         hashed_password = get_password_hash(user_data.password)
-
-        # Crear usuario en DB
         new_user = await postgres_client.create_user(
             email=user_data.email,
             hashed_password=hashed_password,
             name=user_data.name,
             company_id=user_data.company_id,
-            roles=user_data.roles # Pasa la lista de roles
+            roles=user_data.roles
         )
         user_log.info("User created successfully", new_user_id=str(new_user['id']))
-        # Convertir a UserResponse (Pydantic v2 usa model_validate)
         return UserResponse.model_validate(new_user)
 
-    except asyncpg.UniqueViolationError: # Ya controlado arriba, pero por si acaso
+    except asyncpg.UniqueViolationError:
          user_log.warning("User creation conflict (likely email).")
          raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Email '{user_data.email}' already registered.")
-    except asyncpg.ForeignKeyViolationError: # Ya controlado arriba, pero por si acaso
+    except asyncpg.ForeignKeyViolationError:
          user_log.warning("User creation failed due to non-existent company ID.")
          raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Company with ID '{user_data.company_id}' not found.")
     except Exception as e:
         user_log.exception("Error creating user in database", error=str(e))
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create user.")
+
+# --- NUEVO ENDPOINT ---
+@router.get(
+    "/users/by_company/{companyId}",
+    response_model=List[UserResponse],
+    summary="Listar usuarios por ID de compañía",
+    description="Obtiene una lista paginada de usuarios pertenecientes a una compañía específica. Requiere rol de administrador."
+)
+async def list_users_by_company(
+    request: Request,
+    companyId: uuid.UUID = Path(..., description="ID de la compañía cuyos usuarios se desean listar."),
+    limit: int = Query(50, ge=1, le=200, description="Número máximo de usuarios a devolver."),
+    offset: int = Query(0, ge=0, description="Offset para paginación."),
+    admin_user_payload: AdminAuth = Depends() # Autenticación y autorización de Admin
+):
+    admin_id_from_token = admin_user_payload.get("sub")
+    # X-Company-ID del admin (opcional para auditoría), viene del token si existe.
+    admin_company_id_for_audit = admin_user_payload.get("company_id")
+    # X-User-ID header es el ID del admin, que es admin_id_from_token
+    # X-Company-ID header (opcional para auditoria) es admin_company_id_for_audit
+
+    req_id = getattr(request.state, 'request_id', 'N/A')
+
+    endpoint_log = log.bind(
+        request_id=req_id,
+        admin_user_id=admin_id_from_token,
+        admin_company_id_for_audit=str(admin_company_id_for_audit) if admin_company_id_for_audit else "N/A",
+        target_company_id_path=str(companyId),
+        limit_query=limit,
+        offset_query=offset
+    )
+    endpoint_log.info("Admin request to list users by company.")
+
+    # 1. Verificar que la compañía (del path param) exista
+    target_company = await postgres_client.get_company_by_id(companyId)
+    if not target_company:
+        endpoint_log.warning("Target company specified in path not found.", company_id_path=str(companyId))
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Company with ID '{companyId}' not found."
+        )
+    
+    # (Opcional) Podrías querer verificar si la compañía está activa si es un requisito.
+    # if not target_company.get('is_active', False):
+    #     endpoint_log.warning("Target company is not active.")
+    #     raise HTTPException(
+    #         status_code=status.HTTP_400_BAD_REQUEST,
+    #         detail=f"Company with ID '{companyId}' is not active. Cannot list users for inactive company."
+    #     )
+
+    # 2. Obtener usuarios de la compañía especificada en el path
+    try:
+        users_data = await postgres_client.get_users_by_company_id_paginated(
+            company_id=companyId, # Usar el companyId del path
+            limit=limit,
+            offset=offset
+        )
+        endpoint_log.info(f"Successfully retrieved {len(users_data)} users from DB for target company.")
+        
+        # FastAPI se encargará de validar cada item de la lista contra UserResponse
+        # y serializarlo correctamente.
+        return users_data
+        
+    except Exception as e:
+        endpoint_log.exception("Error retrieving users by company from database.", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve users for the company."
+        )
 ```
 
 ## File: `app\routers\auth_router.py`
