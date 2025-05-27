@@ -257,15 +257,13 @@ from fastapi import APIRouter, Depends, HTTPException, status, Header, Body, Req
 
 from app.api.v1 import schemas
 from app.core.config import settings
-# LLM_REFACTOR_STEP_3: Import use case and dependencies for injection (example)
 from app.application.use_cases.ask_query_use_case import AskQueryUseCase
 from app.infrastructure.persistence.postgres_repositories import (
     PostgresChatRepository, PostgresLogRepository, PostgresChunkContentRepository
 )
 from app.infrastructure.vectorstores.milvus_adapter import MilvusAdapter
 from app.infrastructure.llms.gemini_adapter import GeminiAdapter
-# LLM_REFACTOR_STEP_3: Import domain model for mapping
-from app.domain.models import RetrievedChunk
+from app.domain.models import RetrievedChunk # Ya existe
 
 from app.utils.helpers import truncate_text
 from .chat import get_current_company_id, get_current_user_id
@@ -277,11 +275,8 @@ router = APIRouter()
 GREETING_REGEX = re.compile(r"^\s*(hola|hello|hi|buenos días|buenas tardes|buenas noches|hey|qué tal|hi there)\s*[\.,!?]*\s*$", re.IGNORECASE)
 
 
-# --- Dependency Injection Setup ---
-# Usar el singleton global inicializado y calentado en main.py, vía dependencies.py
 from app.dependencies import get_ask_query_use_case
 
-# --- Endpoint Refactored to use AskQueryUseCase ---
 @router.post(
     "/ask",
     response_model=schemas.QueryResponse,
@@ -293,9 +288,8 @@ async def process_query(
     request_body: schemas.QueryRequest = Body(...),
     company_id: uuid.UUID = Depends(get_current_company_id),
     user_id: uuid.UUID = Depends(get_current_user_id),
-    # LLM_REFACTOR_STEP_3: Inject the use case instance
     use_case: AskQueryUseCase = Depends(get_ask_query_use_case),
-    request: Request = None # Keep for request ID
+    request: Request = None 
 ):
     request_id = request.headers.get("x-request-id", str(uuid.uuid4())) if request else str(uuid.uuid4())
     endpoint_log = log.bind(
@@ -308,7 +302,6 @@ async def process_query(
     endpoint_log.info("Processing query request via Use Case")
 
     try:
-        # LLM_REFACTOR_STEP_3: Call the use case execute method
         answer, retrieved_chunks_domain, log_id, final_chat_id = await use_case.execute(
             query=request_body.query,
             company_id=company_id,
@@ -317,17 +310,20 @@ async def process_query(
             top_k=request_body.retriever_top_k
         )
 
-        # LLM_REFACTOR_STEP_3: Map domain results (RetrievedChunk) to API schema (RetrievedDocument)
-        retrieved_docs_api = [
-            schemas.RetrievedDocument(
-                id=chunk.id,
-                score=chunk.score,
-                content_preview=truncate_text(chunk.content, 150) if chunk.content else None,
-                metadata=chunk.metadata,
-                document_id=chunk.document_id,
-                file_name=chunk.file_name
-            ) for chunk in retrieved_chunks_domain
-        ]
+        retrieved_docs_api = []
+        if retrieved_chunks_domain: # Solo mapear si hay chunks
+            retrieved_docs_api = [
+                schemas.RetrievedDocument(
+                    id=chunk.id,
+                    score=chunk.score,
+                    content_preview=truncate_text(chunk.content, 150) if chunk.content else None,
+                    content=chunk.content, # Pasar contenido completo
+                    metadata=chunk.metadata,
+                    document_id=chunk.document_id,
+                    file_name=chunk.file_name,
+                    cita_tag=chunk.cita_tag # Pasar cita_tag
+                ) for chunk in retrieved_chunks_domain
+            ]
 
         endpoint_log.info("Use case executed successfully, returning response", num_retrieved=len(retrieved_docs_api))
         return schemas.QueryResponse(
@@ -337,16 +333,12 @@ async def process_query(
             chat_id=final_chat_id
         )
 
-    # Keep specific error handling, Use Case should raise appropriate exceptions
     except HTTPException as http_exc:
-        # Re-raise HTTP exceptions directly (like 403, 400 from UseCase)
         raise http_exc
     except ConnectionError as ce:
-        # Catch connection errors raised by adapters via UseCase
         endpoint_log.error("Dependency connection error reported by Use Case", error=str(ce), exc_info=True)
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"A required service is unavailable.")
     except Exception as e:
-        # Catch unexpected errors from UseCase
         endpoint_log.exception("Unhandled exception during use case execution")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An internal error occurred.")
 ```
@@ -906,7 +898,7 @@ class AskQueryUseCase:
             encoding = self._get_tiktoken_encoding()
             for chunk in chunks:
                 if chunk.content and chunk.content.strip():
-                    import hashlib # Mover import aquí para evitar dependencia a nivel de clase si solo se usa aquí
+                    import hashlib 
                     content_hash = hashlib.md5(chunk.content.encode('utf-8')).hexdigest()
                     cached_token_count = self._token_count_cache.get(content_hash)
                     if cached_token_count is not None:
@@ -1049,7 +1041,7 @@ class AskQueryUseCase:
         fetch_log.debug("Top IDs after fusion", top_ids_count=len(top_ids_with_scores_tuples))
 
         chunks_with_content: List[RetrievedChunk] = []
-        ids_needing_data: List[str] = [] # Renamed from ids_needing_content
+        ids_needing_data: List[str] = [] 
         placeholder_map: Dict[str, RetrievedChunk] = {}
 
         for cid, fused_score_val in top_ids_with_scores_tuples:
@@ -1063,7 +1055,7 @@ class AskQueryUseCase:
                 original_chunk_from_dense.score = fused_score_val 
                 chunks_with_content.append(original_chunk_from_dense)
             else: 
-                # Create placeholder, document_id and file_name might come from dense_map if present
+                
                 chunk_placeholder = RetrievedChunk(
                     id=cid,
                     score=fused_score_val, 
@@ -1076,31 +1068,31 @@ class AskQueryUseCase:
                 )
                 chunks_with_content.append(chunk_placeholder) 
                 placeholder_map[cid] = chunk_placeholder 
-                ids_needing_data.append(cid) # Add to list to fetch data from PG
+                ids_needing_data.append(cid) 
 
         if ids_needing_data and self.chunk_content_repo:
              fetch_log.info("Fetching content and metadata for chunks missing data", count=len(ids_needing_data))
              try:
-                 # Fetch content AND metadata (document_id, file_name)
+                 
                  chunk_data_map: Dict[str, Dict[str, Any]] = await self.chunk_content_repo.get_chunk_contents_by_ids(ids_needing_data)
                  
                  for cid_item, data in chunk_data_map.items():
                      if cid_item in placeholder_map: 
                           placeholder_map[cid_item].content = data.get("content")
-                          # Update document_id and file_name if fetched and not already set from dense_map
+                          
                           if not placeholder_map[cid_item].document_id:
                             placeholder_map[cid_item].document_id = data.get("document_id")
                           if not placeholder_map[cid_item].file_name:
                             placeholder_map[cid_item].file_name = data.get("file_name")
                           
-                          # Update metadata in placeholder
+                          
                           if placeholder_map[cid_item].metadata:
                             placeholder_map[cid_item].metadata.update({
                                 "content_fetched_for_sparse": True,
                                 "fetched_document_id": data.get("document_id"),
                                 "fetched_file_name": data.get("file_name")
                             })
-                          else: # Should not happen if initialized correctly
+                          else: 
                             placeholder_map[cid_item].metadata = {
                                 "content_fetched_for_sparse": True,
                                 "fetched_document_id": data.get("document_id"),
@@ -1140,79 +1132,94 @@ class AskQueryUseCase:
         
         llm_handler_log = log.bind(action="_handle_llm_response", chat_id=str(final_chat_id))
         answer_for_user: str
-        retrieved_chunks_for_response: List[RetrievedChunk] = []
+        retrieved_chunks_for_api_response: List[RetrievedChunk] = []
         assistant_sources_for_db: List[Dict[str, Any]] = []
         log_id: Optional[uuid.UUID] = None
         
+        # Log the raw JSON for debugging if parsing fails. Be careful with sensitive data in production.
+        raw_json_preview_on_error = truncate_text(json_answer_str, 1000)
+
         try:
             structured_answer_obj = RespuestaEstructurada.model_validate_json(json_answer_str)
             answer_for_user = structured_answer_obj.respuesta_detallada
             
-            llm_handler_log.info("LLM response successfully parsed and validated into RespuestaEstructurada.",
+            llm_handler_log.info("LLM response successfully parsed as RespuestaEstructurada.",
                                  has_summary=bool(structured_answer_obj.resumen_ejecutivo),
                                  num_fuentes_citadas_by_llm=len(structured_answer_obj.fuentes_citadas),
                                  siguiente_pregunta_sugerida=structured_answer_obj.siguiente_pregunta_sugerida)
 
-            assistant_sources_for_db = [f.model_dump(exclude_none=True) for f in structured_answer_obj.fuentes_citadas]
-            
-            map_chunk_id_to_original = {chunk.id: chunk for chunk in original_chunks_for_citation}
+            # Use fuentues_citadas from LLM response as the primary source for building `retrieved_chunks_for_api_response`
+            map_id_to_original_chunk = {chunk.id: chunk for chunk in original_chunks_for_citation if chunk.id and chunk.content}
             
             processed_chunk_ids_for_response = set()
 
-            for cited_source_by_llm in structured_answer_obj.fuentes_citadas:
-                if cited_source_by_llm.id_documento and cited_source_by_llm.id_documento in map_chunk_id_to_original:
-                    original_chunk = map_chunk_id_to_original[cited_source_by_llm.id_documento]
-                    if original_chunk.id not in processed_chunk_ids_for_response:
-                       retrieved_chunks_for_response.append(original_chunk)
-                       processed_chunk_ids_for_response.add(original_chunk.id)
-
-            if not retrieved_chunks_for_response and structured_answer_obj.fuentes_citadas:
-                llm_handler_log.warning("LLM cited sources, but no direct match found by id_documento. Using filename as fallback or top N.")
-                for cited_source_by_llm in structured_answer_obj.fuentes_citadas:
-                    if len(retrieved_chunks_for_response) >= self.settings.NUM_SOURCES_TO_SHOW: break
-                    found_by_name = False
-                    for orig_chunk in original_chunks_for_citation:
-                        if orig_chunk.id not in processed_chunk_ids_for_response and \
-                           orig_chunk.file_name == cited_source_by_llm.nombre_archivo:
-                             retrieved_chunks_for_response.append(orig_chunk)
-                             processed_chunk_ids_for_response.add(orig_chunk.id)
-                             found_by_name = True
-                             break 
-                    if not found_by_name:
-                         llm_handler_log.info("LLM cited source not found by filename either", cited_source_name=cited_source_by_llm.nombre_archivo)
+            if structured_answer_obj.fuentes_citadas:
+                for cited_source_from_llm in structured_answer_obj.fuentes_citadas:
+                    # The `id_documento` from LLM's FuenteCitada should be the `RetrievedChunk.id`
+                    chunk_id_from_llm = cited_source_from_llm.id_documento
+                    
+                    if chunk_id_from_llm and chunk_id_from_llm in map_id_to_original_chunk:
+                        original_chunk = map_id_to_original_chunk[chunk_id_from_llm]
+                        # Create a new RetrievedChunk instance for the API response, or modify a copy.
+                        # This ensures content and other details are from the original chunk,
+                        # and we add the cita_tag.
+                        api_chunk = RetrievedChunk(
+                            id=original_chunk.id,
+                            content=original_chunk.content, # Crucial: ensure full content is here
+                            score=cited_source_from_llm.score if cited_source_from_llm.score is not None else original_chunk.score,
+                            metadata=original_chunk.metadata, # Keep original metadata
+                            embedding=None, # Not needed for API response usually
+                            document_id=original_chunk.document_id,
+                            file_name=original_chunk.file_name,
+                            company_id=original_chunk.company_id,
+                            cita_tag=cited_source_from_llm.cita_tag # Add the cita_tag
+                        )
+                        retrieved_chunks_for_api_response.append(api_chunk)
+                        processed_chunk_ids_for_response.add(original_chunk.id)
+                    else:
+                        llm_handler_log.warning("LLM cited a source (id_documento) not found in original_chunks_for_citation or chunk has no content.",
+                                                cited_id=chunk_id_from_llm,
+                                                cited_tag=cited_source_from_llm.cita_tag,
+                                                available_ids=list(map_id_to_original_chunk.keys()))
+            else: # No fuentes_citadas from LLM
+                llm_handler_log.info("LLM response did not include any 'fuentes_citadas'.")
             
-            if len(retrieved_chunks_for_response) < self.settings.NUM_SOURCES_TO_SHOW and original_chunks_for_citation:
-                llm_handler_log.debug("Filling remaining source slots with top original chunks provided to LLM/MapReduce.")
-                for chunk in original_chunks_for_citation:
-                    if len(retrieved_chunks_for_response) >= self.settings.NUM_SOURCES_TO_SHOW: break
-                    if chunk.id not in processed_chunk_ids_for_response:
-                        retrieved_chunks_for_response.append(chunk)
-                        processed_chunk_ids_for_response.add(chunk.id)
+            # Limitar el número de fuentes mostradas si es necesario, pero ahora basado en lo que el LLM citó.
+            retrieved_chunks_for_api_response = retrieved_chunks_for_api_response[:self.settings.NUM_SOURCES_TO_SHOW]
+            assistant_sources_for_db = [f.model_dump(exclude_none=True) for f in structured_answer_obj.fuentes_citadas][:self.settings.NUM_SOURCES_TO_SHOW]
 
 
-        except ValidationError as pydantic_err:
-            llm_handler_log.error("LLM JSON response failed Pydantic validation", raw_response=truncate_text(json_answer_str, 500), errors=pydantic_err.errors())
-            answer_for_user = "La respuesta del asistente no tuvo el formato esperado. Por favor, intenta de nuevo."
-            assistant_sources_for_db = [{"error": "Pydantic validation failed", "details": pydantic_err.errors()}]
-            retrieved_chunks_for_response = original_chunks_for_citation[:self.settings.NUM_SOURCES_TO_SHOW] 
-        except json.JSONDecodeError as json_err:
-            llm_handler_log.error("Failed to parse JSON response from LLM", raw_response=truncate_text(json_answer_str, 500), error=str(json_err))
-            answer_for_user = f"Hubo un error al procesar la respuesta del asistente (JSON malformado): {truncate_text(json_answer_str,100)}. Por favor, intenta de nuevo."
-            assistant_sources_for_db = [{"error": "JSON decode error", "details": str(json_err)}]
-            retrieved_chunks_for_response = original_chunks_for_citation[:self.settings.NUM_SOURCES_TO_SHOW] 
+        except (ValidationError, json.JSONDecodeError) as validation_json_err:
+            error_type = type(validation_json_err).__name__
+            llm_handler_log.error(f"LLM response failed parsing or validation ({error_type})",
+                                  raw_response_preview=raw_json_preview_on_error, 
+                                  error_details=str(validation_json_err))
+            answer_for_user = ("La respuesta del asistente no tuvo el formato esperado y no pudo ser procesada. "
+                               "Por favor, intenta simplificar tu pregunta o contacta a soporte si el problema persiste.")
+            assistant_sources_for_db = [{"error": f"{error_type} en respuesta del LLM", "details": str(validation_json_err)}]
+            retrieved_chunks_for_api_response = [] # No enviar fuentes si el parseo falló
 
+        # Guardar el mensaje del asistente en el chat
         await self.chat_repo.save_message(
             chat_id=final_chat_id, role='assistant',
             content=answer_for_user, 
-            sources=assistant_sources_for_db[:self.settings.NUM_SOURCES_TO_SHOW] if assistant_sources_for_db else None
+            sources=assistant_sources_for_db # Usar las fuentes procesadas
         )
-        llm_handler_log.info(f"Assistant message saved with up to {self.settings.NUM_SOURCES_TO_SHOW} sources.")
+        llm_handler_log.info("Assistant message saved to DB.", num_sources_saved_to_db=len(assistant_sources_for_db))
 
+        # Loguear la interacción
         try:
-            docs_for_log_summary = [
-                RetrievedDocumentSchema(**chunk.model_dump(exclude={'embedding'}, exclude_none=True)).model_dump(exclude_none=True) 
-                for chunk in retrieved_chunks_for_response 
-            ]
+            # Preparar los retrieved_documents_data para el log
+            # Usa retrieved_chunks_for_api_response que ahora sí está alineado con lo que el LLM citó
+            docs_for_log_summary = []
+            if retrieved_chunks_for_api_response: # Solo si hay fuentes validadas
+                docs_for_log_summary = [
+                     # Usar model_dump para serializar el RetrievedChunk a dict para el log.
+                     # El schema RetrievedDocumentSchema no es necesario aquí, solo un dict.
+                    chunk.model_dump(exclude={'embedding'}, exclude_none=True)
+                    for chunk in retrieved_chunks_for_api_response
+                ]
+
             log_metadata_details = {
                 "pipeline_stages": pipeline_stages_used,
                 "map_reduce_used": map_reduce_used,
@@ -1221,12 +1228,10 @@ class AskQueryUseCase:
                 "max_context_chunks_direct_rag_limit": self.settings.MAX_CONTEXT_CHUNKS, 
                 "num_chunks_after_rerank_or_fusion_content_fetch": num_chunks_after_rerank_or_fusion_fetch_effective,
                 "num_final_chunks_sent_to_llm": num_final_chunks_sent_to_llm_effective,
-                "num_sources_shown_to_user": len(assistant_sources_for_db), 
-                "num_retrieved_docs_in_api_response": len(retrieved_chunks_for_response),
+                "num_sources_processed_from_llm_response": len(assistant_sources_for_db),
+                "num_retrieved_docs_in_api_response": len(retrieved_chunks_for_api_response),
                 "chat_history_messages_included_in_prompt": num_history_messages_effective,
-                "diversity_filter_enabled_in_settings": self.settings.DIVERSITY_FILTER_ENABLED,
-                "reranker_enabled_in_settings": self.settings.RERANKER_ENABLED,
-                "bm25_enabled_in_settings": self.settings.BM25_ENABLED,
+                "llm_json_parse_error": "ValidationError" if isinstance(validation_json_err, ValidationError) else "JSONDecodeError" if isinstance(validation_json_err, json.JSONDecodeError) else None if 'validation_json_err' not in locals() or validation_json_err is None else "UnknownParseError",
             }
             log_id = await self.log_repo.log_query_interaction(
                 user_id=user_id,
@@ -1242,7 +1247,7 @@ class AskQueryUseCase:
             llm_handler_log.error("Failed to log query interaction", error=str(e_log), exc_info=True)
             # log_id remains as initialized (None)
 
-        return answer_for_user, retrieved_chunks_for_response, log_id
+        return answer_for_user, retrieved_chunks_for_api_response, log_id
 
     async def _manage_chat_state(
         self, query: str, company_id: uuid.UUID, user_id: uuid.UUID,
@@ -1272,7 +1277,7 @@ class AskQueryUseCase:
         # Actualizar exec_log para tener el chat_id correcto
         exec_log = exec_log.bind(chat_id=str(final_chat_id))
         await self.chat_repo.save_message(chat_id=final_chat_id, role='user', content=query)
-        exec_log.info("User message saved", is_new_chat=(not chat_id_param)) # Corrected based on if chat_id_param was initially None
+        exec_log.info("User message saved", is_new_chat=(not chat_id_param)) 
         
         return final_chat_id, chat_history_str, history_messages
 
@@ -1324,10 +1329,9 @@ class AskQueryUseCase:
                 final_chat_id = await self.chat_repo.create_chat(user_id=user_id, company_id=company_id, title=initial_title)
                 exec_log.info("New chat created.", new_chat_id=str(final_chat_id))
             
-            # Rebind exec_log con el final_chat_id definitivo
             exec_log = exec_log.bind(chat_id=str(final_chat_id))
             await self.chat_repo.save_message(chat_id=final_chat_id, role='user', content=query)
-            exec_log.info("User message saved.", is_new_chat=(not chat_id)) # Log if it was a new chat or existing one
+            exec_log.info("User message saved.", is_new_chat=(not chat_id)) 
 
             if GREETING_REGEX.match(query):
                 return await self._handle_greeting(query, company_id, user_id, final_chat_id, exec_log)
@@ -1373,15 +1377,21 @@ class AskQueryUseCase:
             if not combined_chunks_with_content:
                 exec_log.warning("No chunks with content after fusion/fetch. Using general prompt.")
                 general_prompt = await self._build_prompt(query, [], chat_history=chat_history_str, builder=self._prompt_builder_general)
-                answer_str = await self.llm.generate(general_prompt, response_pydantic_schema=None) 
-                
-                await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer_str, sources=None)
-                no_docs_log_id = await self.log_repo.log_query_interaction(
-                    company_id=company_id, user_id=user_id, query=query, answer=answer_str, 
-                    retrieved_documents_data=[], chat_id=final_chat_id, 
-                    metadata={"pipeline_stages": pipeline_stages_used, "result_type": "no_docs_for_rag", "map_reduce_used": False}
+                # Para _handle_llm_response, cuando no hay chunks, json_answer_str será la respuesta directa del LLM, no un JSON
+                json_answer_str = await self.llm.generate(general_prompt, response_pydantic_schema=None) 
+                # En este caso, _handle_llm_response no podrá parsear json_answer_str como RespuestaEstructurada
+                # Debería caer en el fallback de JSONDecodeError o ValidationError
+                # Lo importante es que `original_chunks_for_citation` sea vacío.
+                return await self._handle_llm_response(
+                    json_answer_str=json_answer_str, # Este no será JSON si se usa _prompt_builder_general
+                    query=query, company_id=company_id, user_id=user_id, final_chat_id=final_chat_id,
+                    original_chunks_for_citation=[], # No chunks fueron usados
+                    pipeline_stages_used=pipeline_stages_used, map_reduce_used=False,
+                    retriever_k_effective=retriever_k_effective, fusion_fetch_k_effective=fusion_fetch_k_effective,
+                    num_chunks_after_rerank_or_fusion_fetch_effective=0, num_final_chunks_sent_to_llm_effective=0,
+                    num_history_messages_effective=len(history_messages)
                 )
-                return answer_str, [], no_docs_log_id, final_chat_id
+
             
             chunks_after_postprocessing = combined_chunks_with_content 
             if self.settings.RERANKER_ENABLED and chunks_after_postprocessing:
@@ -1503,8 +1513,12 @@ class AskQueryUseCase:
                 vectors_from_milvus_by_id: Dict[str, List[float]] = {}
                 if chunk_ids_for_mmr_filter:
                     try:
-                        vectors_from_milvus_by_id = await self.vector_store.fetch_vectors_by_ids(chunk_ids_for_mmr_filter)
-                        mmr_prep_log.info(f"Fetched {len(vectors_from_milvus_by_id)} vectors from Milvus for MMR.")
+                        # Assuming VectorStorePort has fetch_vectors_by_ids
+                        if hasattr(self.vector_store, 'fetch_vectors_by_ids'):
+                            vectors_from_milvus_by_id = await self.vector_store.fetch_vectors_by_ids(chunk_ids_for_mmr_filter)
+                            mmr_prep_log.info(f"Fetched {len(vectors_from_milvus_by_id)} vectors from Milvus for MMR.")
+                        else:
+                            mmr_prep_log.warning("VectorStorePort does not have 'fetch_vectors_by_ids'. Embeddings for MMR might be incomplete.")
                     except Exception as e_milvus_fetch:
                          mmr_prep_log.error("Failed to fetch vectors from Milvus for MMR, fallback may occur.", error=str(e_milvus_fetch))
 
@@ -1581,14 +1595,15 @@ class AskQueryUseCase:
             if not final_chunks_for_processing: 
                 exec_log.warning("No chunks with content after all postprocessing. Using general prompt.")
                 general_prompt = await self._build_prompt(query, [], chat_history=chat_history_str, builder=self._prompt_builder_general)
-                answer_str = await self.llm.generate(general_prompt, response_pydantic_schema=None)
-                await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer_str, sources=None)
-                no_docs_final_log_id = await self.log_repo.log_query_interaction(
-                    company_id=company_id, user_id=user_id, query=query, answer=answer_str, 
-                    retrieved_documents_data=[], chat_id=final_chat_id, 
-                    metadata={"pipeline_stages": pipeline_stages_used, "result_type": "no_docs_after_all_postprocessing", "map_reduce_used": False}
+                json_answer_str = await self.llm.generate(general_prompt, response_pydantic_schema=None)
+                return await self._handle_llm_response(
+                    json_answer_str=json_answer_str, query=query, company_id=company_id, user_id=user_id, final_chat_id=final_chat_id,
+                    original_chunks_for_citation=[], pipeline_stages_used=pipeline_stages_used, map_reduce_used=False,
+                    retriever_k_effective=retriever_k_effective, fusion_fetch_k_effective=fusion_fetch_k_effective,
+                    num_chunks_after_rerank_or_fusion_fetch_effective=0, num_final_chunks_sent_to_llm_effective=0,
+                    num_history_messages_effective=len(history_messages)
                 )
-                return answer_str, [], no_docs_final_log_id, final_chat_id
+
 
             map_reduce_active = False
             json_answer_str: str
@@ -1610,7 +1625,7 @@ class AskQueryUseCase:
             
             should_activate_mapreduce_by_tokens = total_tokens_for_llm > self.settings.MAX_PROMPT_TOKENS
 
-            # MapReduce solo se activa si se supera el umbral de tokens, no por chunks
+            
             if self.settings.MAPREDUCE_ENABLED and should_activate_mapreduce_by_tokens and num_final_chunks_for_llm_or_mapreduce > 1:
                 trigger_reason = "token_count"
                 exec_log.info(f"Activating MapReduce due to {trigger_reason}. "
@@ -1632,7 +1647,7 @@ class AskQueryUseCase:
                             "file_name": c.file_name, 
                             "page": c.metadata.get("page"), 
                             "title": c.metadata.get("title"),
-                            "document_id": c.document_id # Asegurar que document_id está en meta
+                            "document_id": c.document_id 
                         },
                         score=c.score
                     ) for c in chunks_to_send_to_llm
@@ -1702,7 +1717,7 @@ class AskQueryUseCase:
                             "file_name": c.file_name, 
                             "page": c.metadata.get("page"),
                             "title": c.metadata.get("title"),
-                            "document_id": c.document_id # Asegurar que document_id está en meta
+                            "document_id": c.document_id 
                         },
                         score=c.score
                     ) for c in chunks_to_send_to_llm
@@ -2846,12 +2861,13 @@ class StubDiversityFilter(DiversityFilterPort):
 # query-service/app/infrastructure/llms/gemini_adapter.py
 import google.generativeai as genai
 from google.generativeai import types as genai_types
-from google.api_core import exceptions as google_api_exceptions # Para errores más específicos
+from google.api_core import exceptions as google_api_exceptions 
 
 import structlog
 from typing import Optional, List, Type, Any, Dict, AsyncGenerator
 from pydantic import BaseModel
 import json
+import logging # Para before_sleep_log
 
 from app.core.config import settings
 from app.application.ports.llm_port import LLMPort
@@ -2970,7 +2986,7 @@ class GeminiAdapter(LLMPort):
         try:
             if self._api_key:
                 genai.configure(api_key=self._api_key)
-                safety_settings = [ # REFACTOR_5_4: More permissive safety settings to reduce blockages
+                safety_settings = [ 
                     {
                         "category": "HARM_CATEGORY_HARASSMENT",
                         "threshold": "BLOCK_ONLY_HIGH",
@@ -2996,6 +3012,16 @@ class GeminiAdapter(LLMPort):
             log.error("Failed to configure Gemini client (GenerativeModel)", error=str(e), exc_info=True)
             self._model = None
     
+    def _create_error_json_response(self, error_message: str, detailed_message: str) -> str:
+        """Helper para crear un JSON de error estructurado."""
+        return json.dumps({
+            "error_message": error_message,
+            "respuesta_detallada": detailed_message,
+            "fuentes_citadas": [],
+            "resumen_ejecutivo": None,
+            "siguiente_pregunta_sugerida": None
+        })
+
     @retry(
         stop=stop_after_attempt(settings.HTTP_CLIENT_MAX_RETRIES + 1),
         wait=wait_exponential(multiplier=settings.HTTP_CLIENT_BACKOFF_FACTOR, min=2, max=10),
@@ -3004,11 +3030,11 @@ class GeminiAdapter(LLMPort):
             genai_types.HttpError, 
             google_api_exceptions.DeadlineExceeded,
             google_api_exceptions.ServiceUnavailable,
-            google_api_exceptions.InternalServerError, # REFACTOR_5_4
-            google_api_exceptions.ResourceExhausted # REFACTOR_5_4: e.g. quota
+            google_api_exceptions.InternalServerError, 
+            google_api_exceptions.ResourceExhausted 
         )),
         reraise=True,
-        before_sleep=before_sleep_log(log, logging.WARNING) # REFACTOR_5_4
+        before_sleep=before_sleep_log(log, logging.WARNING) 
     )
     async def generate(self, prompt: str,
                        response_pydantic_schema: Optional[Type[BaseModel]] = None
@@ -3065,7 +3091,7 @@ class GeminiAdapter(LLMPort):
                 
                 generate_log.info("Gemini API response received.", 
                                   num_candidates=len(response.candidates) if response.candidates else 0,
-                                  prompt_feedback=str(response.prompt_feedback) if response.prompt_feedback else "N/A",
+                                  prompt_feedback_block_reason=str(getattr(response.prompt_feedback, 'block_reason', 'N/A')),
                                   usage_prompt_tokens=prompt_token_count,
                                   usage_candidates_tokens=candidates_token_count,
                                   usage_total_tokens=total_token_count)
@@ -3079,33 +3105,46 @@ class GeminiAdapter(LLMPort):
                  generate_log.warning("Gemini response potentially blocked (no candidates)",
                                       finish_reason=finish_reason_str, safety_ratings=safety_ratings_str)
                  if response_pydantic_schema:
-                     return json.dumps({
-                         "error_message": f"Respuesta bloqueada por Gemini (sin candidatos). Razón: {finish_reason_str}",
-                         "respuesta_detallada": f"La generación de la respuesta fue bloqueada. Por favor, reformula tu pregunta o contacta a soporte si el problema persiste. Razón: {finish_reason_str}.",
-                         "fuentes_citadas": []
-                     })
+                     return self._create_error_json_response(
+                         error_message=f"Respuesta bloqueada por Gemini (sin candidatos). Razón: {finish_reason_str}",
+                         detailed_message=f"La generación de la respuesta fue bloqueada. Por favor, reformula tu pregunta o contacta a soporte si el problema persiste. Razón: {finish_reason_str}."
+                     )
                  return f"[Respuesta bloqueada por Gemini (sin candidatos). Razón: {finish_reason_str}]"
 
             candidate = response.candidates[0]
             
             candidate_finish_reason = candidate.finish_reason.name if candidate.finish_reason else "UNKNOWN"
+            candidate_safety_ratings = str(candidate.safety_ratings) if candidate.safety_ratings else "N/A"
             generate_log.info("Gemini candidate details", finish_reason=candidate_finish_reason,
-                              safety_ratings=str(candidate.safety_ratings) if candidate.safety_ratings else "N/A")
+                              safety_ratings=candidate_safety_ratings)
             
             if candidate_finish_reason == "MAX_TOKENS" and self._max_output_tokens:
-                generate_log.warning(f"Gemini response was truncated due to max_output_tokens limit ({self._max_output_tokens}). Consider increasing this limit if possible or shortening the expected response content via prompt engineering.")
-            elif candidate_finish_reason == "SAFETY": # REFACTOR_5_4: Explicit log for safety blocking
-                generate_log.warning(f"Gemini response candidate blocked due to SAFETY. Safety ratings: {str(candidate.safety_ratings)}")
+                warn_msg = (f"Gemini response TRUNCATED due to max_output_tokens ({self._max_output_tokens}). "
+                            "This can lead to malformed JSON or incomplete answers.")
+                generate_log.warning(warn_msg)
+                # Si esperamos JSON, un truncamiento casi seguro lo romperá.
+                if response_pydantic_schema:
+                    return self._create_error_json_response(
+                        error_message="Respuesta truncada por el LLM (límite de tokens alcanzado).",
+                        detailed_message=f"El asistente no pudo generar una respuesta completa debido a limitaciones de longitud. {warn_msg}"
+                    )
+            elif candidate_finish_reason == "SAFETY": 
+                generate_log.warning(f"Gemini response candidate blocked due to SAFETY. Safety ratings: {candidate_safety_ratings}")
+                if response_pydantic_schema:
+                    return self._create_error_json_response(
+                        error_message="Respuesta bloqueada por políticas de seguridad del LLM.",
+                        detailed_message=f"La generación de la respuesta fue bloqueada debido a políticas de contenido. Ajusta tu consulta. Ratings: {candidate_safety_ratings}"
+                    )
+                return f"[Respuesta bloqueada por seguridad de Gemini. Ratings: {candidate_safety_ratings}]"
             
             if not candidate.content or not candidate.content.parts:
                 generate_log.warning("Gemini response candidate empty or missing parts",
                                      candidate_details=str(candidate))
                 if response_pydantic_schema:
-                     return json.dumps({
-                         "error_message": f"Respuesta vacía de Gemini (candidato sin contenido). Razón: {candidate_finish_reason}",
-                         "respuesta_detallada": f"El asistente no pudo generar una respuesta completa. Razón: {candidate_finish_reason}.",
-                         "fuentes_citadas": []
-                     })
+                     return self._create_error_json_response(
+                         error_message=f"Respuesta vacía de Gemini (candidato sin contenido). Razón: {candidate_finish_reason}",
+                         detailed_message=f"El asistente no pudo generar una respuesta completa. Razón: {candidate_finish_reason}."
+                     )
                 return f"[Respuesta vacía de Gemini (candidato sin contenido). Razón: {candidate_finish_reason}]"
             
             if candidate.content.parts[0].text:
@@ -3113,11 +3152,10 @@ class GeminiAdapter(LLMPort):
             else:
                 generate_log.error("Gemini response part exists but has no text content.")
                 if response_pydantic_schema:
-                    return json.dumps({
-                        "error_message": "Respuesta del LLM incompleta o en formato inesperado.",
-                        "respuesta_detallada": "Error: El asistente devolvió una respuesta sin contenido textual.",
-                        "fuentes_citadas": []
-                    })
+                    return self._create_error_json_response(
+                        error_message="Respuesta del LLM incompleta o en formato inesperado (sin texto).",
+                        detailed_message="Error: El asistente devolvió una respuesta sin contenido textual."
+                    )
                 return "[Respuesta del LLM incompleta o sin contenido textual]"
 
             if response_pydantic_schema:
@@ -3134,32 +3172,33 @@ class GeminiAdapter(LLMPort):
                                  error_details=str(security_err),
                                  finish_reason=finish_reason_err_str)
             if response_pydantic_schema:
-                return json.dumps({
-                    "error_message": f"Contenido bloqueado o detenido por Gemini: {type(security_err).__name__}",
-                    "respuesta_detallada": f"La generación de la respuesta fue bloqueada o detenida por políticas de contenido. Por favor, ajusta tu consulta. (Razón: {finish_reason_err_str})",
-                    "fuentes_citadas": []
-                })
+                return self._create_error_json_response(
+                    error_message=f"Contenido bloqueado o detenido por Gemini: {type(security_err).__name__}",
+                    detailed_message=f"La generación de la respuesta fue bloqueada o detenida por políticas de contenido. Por favor, ajusta tu consulta. (Razón: {finish_reason_err_str})"
+                )
             return f"[Contenido bloqueado o detenido por Gemini: {type(security_err).__name__}. Razón: {finish_reason_err_str}]"
         except genai_types.HttpError as http_err_gemini:
-            generate_log.error("Gemini API call failed with HTTP error", error_details=str(http_err_gemini), exc_info=True) # REFACTOR_5_4: Added error_details
+            generate_log.error("Gemini API call failed with HTTP error", error_details=str(http_err_gemini), exc_info=True) 
             raise ConnectionError(f"Gemini API HTTP error: {http_err_gemini}") from http_err_gemini
-        # REFACTOR_5_4: Capturar errores más específicos de google.api_core
         except google_api_exceptions.RetryError as retry_err:
             generate_log.error("Gemini API call failed after retries (RetryError)", error_details=str(retry_err), exc_info=True)
             raise ConnectionError(f"Gemini API RetryError: {retry_err}") from retry_err
         except google_api_exceptions.InvalidArgument as invalid_arg_err:
-            generate_log.error("Gemini API call failed due to invalid argument", error_details=str(invalid_arg_err), exc_info=True)
-            # Esto podría ser un JSON Schema malformado que pasó la limpieza pero Gemini no aceptó.
-            # O un problema con el prompt mismo no relacionado con seguridad.
+            # Log a preview of the prompt to help debug if it's prompt-related
+            prompt_preview_for_error = truncate_text(prompt, 200)
+            generate_log.error("Gemini API call failed due to invalid argument. This could be due to the prompt or JSON schema if provided.",
+                               error_details=str(invalid_arg_err), 
+                               prompt_preview=prompt_preview_for_error,
+                               json_schema_expected=response_pydantic_schema.__name__ if response_pydantic_schema else "None",
+                               exc_info=True)
             raise ValueError(f"Gemini API InvalidArgument: {invalid_arg_err}") from invalid_arg_err
         except Exception as e: 
             generate_log.exception("Unhandled error during Gemini API call")
             if response_pydantic_schema: 
-                return json.dumps({
-                    "error_message": f"Error inesperado en la API de Gemini: {type(e).__name__}",
-                    "respuesta_detallada": f"Error interno al comunicarse con el asistente: {type(e).__name__} - {str(e)[:100]}.",
-                    "fuentes_citadas": []
-                })
+                return self._create_error_json_response(
+                    error_message=f"Error inesperado en la API de Gemini: {type(e).__name__}",
+                    detailed_message=f"Error interno al comunicarse con el asistente: {type(e).__name__} - {truncate_text(str(e),100)}."
+                )
             raise ConnectionError(f"Gemini API call failed unexpectedly: {e}") from e
 
     async def generate_stream(self, prompt: str) -> AsyncGenerator[str, None]:
@@ -3191,21 +3230,16 @@ class GeminiAdapter(LLMPort):
             async for chunk in response_stream:
                 if chunk.text:
                     yield chunk.text
-                # REFACTOR_5_4: Considerar loguear `chunk.prompt_feedback` si está presente y es relevante
                 if chunk.prompt_feedback and chunk.prompt_feedback.block_reason:
                     stream_log.warning("Stream chunk indicated prompt blocking", reason=chunk.prompt_feedback.block_reason)
             
             stream_log.debug("Streaming finished.")
-            # REFACTOR_5_4: Loguear el `finish_reason` final del stream si está disponible en el último chunk o response.
-            # El SDK actual `google-generativeai` para `generate_content_async(stream=True)` no parece exponer
-            # un `finish_reason` agregado para el stream completo de la misma forma que la respuesta no-stream.
-            # Esto se maneja a nivel de candidato dentro del bucle.
 
         except (genai_types.generation_types.BlockedPromptException, genai_types.generation_types.StopCandidateException) as security_err:
             finish_reason_err_str = getattr(security_err, 'finish_reason', 'N/A') if hasattr(security_err, 'finish_reason') else 'Unknown security block'
             stream_log.warning("Gemini stream blocked or stopped.", error_type=type(security_err).__name__, reason=finish_reason_err_str)
             yield f"[STREAM ERROR: Contenido bloqueado por Gemini. Razón: {finish_reason_err_str}]"
-        except google_api_exceptions.GoogleAPICallError as e: # REFACTOR_5_4: Catch more specific API errors
+        except google_api_exceptions.GoogleAPICallError as e: 
             stream_log.error("Gemini API stream call failed with GoogleAPICallError", error_details=str(e), exc_info=True)
             yield f"[STREAM ERROR: Error de API de Gemini - {type(e).__name__}]"
         except Exception as e:

@@ -167,7 +167,8 @@ class GeminiAdapter(LLMPort):
         wait=wait_exponential(multiplier=settings.HTTP_CLIENT_BACKOFF_FACTOR, min=2, max=10),
         retry=retry_if_exception_type((
             TimeoutError,
-            genai_types.HttpError, 
+            # google.generativeai.types.HttpError -- REMOVED/CORRECTED
+            google_api_exceptions.GoogleAPICallError, # Captura errores HTTP y otros de la API
             google_api_exceptions.DeadlineExceeded,
             google_api_exceptions.ServiceUnavailable,
             google_api_exceptions.InternalServerError, 
@@ -317,14 +318,12 @@ class GeminiAdapter(LLMPort):
                     detailed_message=f"La generación de la respuesta fue bloqueada o detenida por políticas de contenido. Por favor, ajusta tu consulta. (Razón: {finish_reason_err_str})"
                 )
             return f"[Contenido bloqueado o detenido por Gemini: {type(security_err).__name__}. Razón: {finish_reason_err_str}]"
-        except genai_types.HttpError as http_err_gemini:
-            generate_log.error("Gemini API call failed with HTTP error", error_details=str(http_err_gemini), exc_info=True) 
-            raise ConnectionError(f"Gemini API HTTP error: {http_err_gemini}") from http_err_gemini
-        except google_api_exceptions.RetryError as retry_err:
-            generate_log.error("Gemini API call failed after retries (RetryError)", error_details=str(retry_err), exc_info=True)
-            raise ConnectionError(f"Gemini API RetryError: {retry_err}") from retry_err
+        
+        except google_api_exceptions.GoogleAPICallError as api_call_err:
+            # Captura errores más genéricos de la API de Google, que pueden incluir errores HTTP no capturados por las más específicas.
+            generate_log.error("Gemini API call failed with GoogleAPICallError", error_details=str(api_call_err), exc_info=True)
+            raise ConnectionError(f"Gemini API call error: {api_call_err}") from api_call_err
         except google_api_exceptions.InvalidArgument as invalid_arg_err:
-            # Log a preview of the prompt to help debug if it's prompt-related
             prompt_preview_for_error = truncate_text(prompt, 200)
             generate_log.error("Gemini API call failed due to invalid argument. This could be due to the prompt or JSON schema if provided.",
                                error_details=str(invalid_arg_err), 
