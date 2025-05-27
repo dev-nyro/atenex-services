@@ -28,11 +28,11 @@ MILVUS_DEFAULT_SEARCH_PARAMS = {"metric_type": "IP", "params": {"nprobe": 10}}
 MILVUS_DEFAULT_METADATA_FIELDS = ["company_id", "document_id", "file_name", "page", "title"]
 
 # Embedding Service
-EMBEDDING_SERVICE_K8S_URL_DEFAULT = "http://embedding-service.nyro-develop.svc.cluster.local:80" # Puerto 80 por el service K8s
+EMBEDDING_SERVICE_K8S_URL_DEFAULT = "http://embedding-service.nyro-develop.svc.cluster.local:80" 
 # Reranker Service
-RERANKER_SERVICE_K8S_URL_DEFAULT = "http://reranker-service.nyro-develop.svc.cluster.local:80" # Puerto 80 por el service K8s
+RERANKER_SERVICE_K8S_URL_DEFAULT = "http://reranker-service.nyro-develop.svc.cluster.local:80" 
 # Sparse Search Service
-SPARSE_SEARCH_SERVICE_K8S_URL_DEFAULT = "http://sparse-search-service.nyro-develop.svc.cluster.local:80" # Puerto 80 por el service K8s
+SPARSE_SEARCH_SERVICE_K8S_URL_DEFAULT = "http://sparse-search-service.nyro-develop.svc.cluster.local:80" 
 
 
 # --- Paths for Prompt Templates ---
@@ -46,6 +46,7 @@ DEFAULT_REDUCE_PROMPT_TEMPLATE_PATH = str(PROMPT_DIR / "reduce_prompt_template_v
 # Models
 DEFAULT_EMBEDDING_DIMENSION = 1536
 DEFAULT_GEMINI_MODEL = "gemini-1.5-flash-latest" 
+DEFAULT_GEMINI_MAX_OUTPUT_TOKENS: Optional[int] = 8000 # Ajustado a un valor común para Flash, pero puede ser None
 
 # RAG Pipeline Parameters
 DEFAULT_RETRIEVER_TOP_K = 200 
@@ -56,7 +57,7 @@ DEFAULT_MAX_CONTEXT_CHUNKS: int = 200
 DEFAULT_HYBRID_ALPHA: float = 0.5
 DEFAULT_DIVERSITY_LAMBDA: float = 0.5
 DEFAULT_MAX_PROMPT_TOKENS: int = 500000 
-DEFAULT_MAX_CHAT_HISTORY_MESSAGES = 20 
+DEFAULT_MAX_CHAT_HISTORY_MESSAGES = 10 # Reducido de 20 para ser más conservador con el tamaño del prompt
 DEFAULT_NUM_SOURCES_TO_SHOW = 7
 
 # MapReduce settings
@@ -97,7 +98,7 @@ class Settings(BaseSettings):
         if not isinstance(v, str):
             raise ValueError("MILVUS_URI must be a string.")
         v_strip = v.strip()
-        if not v_strip.startswith("https://"): # Zilliz Cloud URIs son https
+        if not v_strip.startswith("https://"): 
             raise ValueError(f"Invalid Zilliz URI: Must start with https://. Received: '{v_strip}'")
         try:
             validated_url = AnyHttpUrl(v_strip)
@@ -136,6 +137,7 @@ class Settings(BaseSettings):
     # --- LLM (Google Gemini) ---
     GEMINI_API_KEY: SecretStr
     GEMINI_MODEL_NAME: str = Field(default=DEFAULT_GEMINI_MODEL)
+    GEMINI_MAX_OUTPUT_TOKENS: Optional[int] = Field(default=DEFAULT_GEMINI_MAX_OUTPUT_TOKENS, description="Optional: Maximum number of tokens to generate in the LLM response.")
 
     # --- Reranker Settings ---
     RERANKER_ENABLED: bool = Field(default=DEFAULT_RERANKER_ENABLED)
@@ -170,8 +172,6 @@ class Settings(BaseSettings):
     # --- MapReduce Settings ---
     MAPREDUCE_ENABLED: bool = Field(default=DEFAULT_MAPREDUCE_ENABLED)
     MAPREDUCE_CHUNK_BATCH_SIZE: int = Field(default=DEFAULT_MAPREDUCE_CHUNK_BATCH_SIZE, gt=0)
-    # MAPREDUCE_ACTIVATION_THRESHOLD is now effectively replaced by MAX_PROMPT_TOKENS check for token count.
-    # We can keep it for chunk-based activation as a secondary or fallback condition if needed.
     MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS: int = Field(default=DEFAULT_MAPREDUCE_ACTIVATION_THRESHOLD, gt=0, description="Chunk count threshold to activate MapReduce (secondary to token threshold).")
     TIKTOKEN_ENCODING_NAME: str = Field(default=DEFAULT_TIKTOKEN_ENCODING_NAME, description="Encoding name for tiktoken.")
 
@@ -213,10 +213,6 @@ class Settings(BaseSettings):
     @field_validator('MAX_CONTEXT_CHUNKS')
     @classmethod
     def check_max_context_chunks(cls, v: int, info: ValidationInfo) -> int:
-        retriever_k = info.data.get('RETRIEVER_TOP_K', DEFAULT_RETRIEVER_TOP_K)
-        # This validation might be less relevant if MapReduce handles very large contexts
-        # if v > retriever_k * 2 and info.data.get('MAPREDUCE_ENABLED', DEFAULT_MAPREDUCE_ENABLED) is False:
-        #      logging.warning(f"MAX_CONTEXT_CHUNKS ({v}) for direct RAG is significantly larger than typical fused results from RETRIEVER_TOP_K ({retriever_k}). Ensure this is intended.")
         if v <= 0:
              raise ValueError("MAX_CONTEXT_CHUNKS must be a positive integer.")
         return v
@@ -230,13 +226,9 @@ class Settings(BaseSettings):
             logging.warning(f"MAPREDUCE_CHUNK_BATCH_SIZE ({v}) is quite large. Ensure LLM can handle this many docs in a single map prompt.")
         return v
         
-    @field_validator('MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS') # Renamed from MAPREDUCE_ACTIVATION_THRESHOLD
+    @field_validator('MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS') 
     @classmethod
     def check_mapreduce_activation_threshold_chunks(cls, v: int, info: ValidationInfo) -> int:
-        max_prompt_toks = info.data.get('MAX_PROMPT_TOKENS', DEFAULT_MAX_PROMPT_TOKENS)
-        # This is now a secondary condition, so its relation to MAX_CONTEXT_CHUNKS is less direct for primary activation
-        # if v > max_context:
-        #     logging.warning(f"MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS ({v}) is greater than MAX_CONTEXT_CHUNKS ({max_context}). MapReduce may never activate if MAX_CONTEXT_CHUNKS is the effective limit for documents to process.")
         if v <= 0:
             raise ValueError("MAPREDUCE_ACTIVATION_THRESHOLD_CHUNKS must be positive.")
         return v
@@ -248,9 +240,15 @@ class Settings(BaseSettings):
         max_chunks = info.data.get('MAX_CONTEXT_CHUNKS', DEFAULT_MAX_CONTEXT_CHUNKS)
         if v > max_chunks:
              logging.warning(f"NUM_SOURCES_TO_SHOW ({v}) is greater than MAX_CONTEXT_CHUNKS ({max_chunks}). Will only show up to {max_chunks} sources if MapReduce is not used.")
-             # No need to cap it here, as the logic in _handle_llm_response handles showing a limited number of sources anyway.
         if v < 0:
             raise ValueError("NUM_SOURCES_TO_SHOW cannot be negative.")
+        return v
+
+    @field_validator('GEMINI_MAX_OUTPUT_TOKENS')
+    @classmethod
+    def check_gemini_max_output_tokens(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v <= 0:
+            raise ValueError("GEMINI_MAX_OUTPUT_TOKENS, if set, must be a positive integer.")
         return v
 
 # --- Global Settings Instance ---

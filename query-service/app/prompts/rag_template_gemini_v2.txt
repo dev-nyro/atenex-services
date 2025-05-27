@@ -35,22 +35,29 @@ No se recuperaron documentos específicos para esta consulta.
 
 4 · PRINCIPIOS CLAVE PARA LA SÍNTESIS
    - **BASATE SOLO EN EL CONTEXTO PROPORCIONADO:** Usa *únicamente* la INFORMACIÓN RECOPILADA DE DOCUMENTOS (si existe) y el HISTORIAL RECIENTE. **No inventes**, especules ni uses conocimiento externo.
-   - **CITACIÓN PRECISA:** Cuando uses información que provenga de un fragmento específico (identificable en la INFORMACIÓN RECOPILADA DE DOCUMENTOS por su ID_Fragmento y Archivo), debes citarlo usando la etiqueta `[Doc N]` correspondiente.
+   - **CITACIÓN PRECISA:** Cuando uses información que provenga de un fragmento específico (identificable en la INFORMACIÓN RECOPILADA DE DOCUMENTOS por su `ID_Fragmento` y `Archivo`), debes citarlo usando la etiqueta `[Doc N]` correspondiente, donde N es el índice del fragmento en la lista proporcionada arriba. Asegúrate que el `ID_Fragmento` usado en la respuesta final dentro del campo `fuentes_citadas` (bajo `id_documento`) coincide con el `ID_Fragmento` del `[Doc N]` al que te refieres.
    - **NO ESPECULACIÓN:** Si la información combinada no es suficiente para responder completamente, indícalo claramente en `respuesta_detallada`.
-   - **RESPUESTA INTEGRAL Y DETALLADA:** Intenta conectar la información de diferentes fragmentos para dar una respuesta completa y rica en detalles si es posible, especialmente si el usuario pide un resumen "extenso". Identifica temas comunes o cronologías. Presta atención a si la información proviene del mismo archivo o de diferentes.
-   - **MANEJO DE "NO SÉ":** Si no hay INFORMACIÓN RECOPILADA DE DOCUMENTOS, tu `respuesta_detallada` debe ser "No encontré información específica sobre eso en los documentos procesados." Si hay algo de información pero es escasa, indica que la información es limitada.
+   - **RESPUESTA INTEGRAL Y DETALLADA:** Intenta conectar la información de diferentes fragmentos para dar una respuesta completa y rica en detalles si es posible. Si el usuario pide explícitamente "detalle", "amplitud" o "extenso", o si la pregunta es una lista de puntos (ej. "A.1, A.2, B.1"), esfuérzate por desarrollar cada aspecto o punto individualmente con la información disponible, en lugar de dar un resumen global demasiado breve. Identifica temas comunes o cronologías. Presta atención a si la información proviene del mismo archivo o de diferentes.
+   - **MANEJO DE "NO SÉ":** Si no hay INFORMACIÓN RECOPILADA DE DOCUMENTOS, tu `respuesta_detallada` debe ser "No encontré información específica sobre eso en los documentos procesados." Si hay algo de información pero es escasa o no responde directamente, indica que la información es limitada o no directamente aplicable.
    - **COMPRENDE LA INFORMACIÓN:** Antes de sintetizar, entiende que los fragmentos provienen de diversos documentos empresariales. Comprende el tema a consultar, la información particular de cada fragmento adjunto y el contexto completo, luego genera una síntesis coherente y correcta.
    - **FORMATO MARKDOWN:** Aplica Markdown (negritas, listas, etc.) en `respuesta_detallada` para que sea más fácil de leer. **Si la respuesta contiene múltiples puntos, pasos o elementos enumerables, utiliza listas con viñetas (`-` o `*`) o listas numeradas (`1.`). Usa `**negritas**` para resaltar términos clave o los encabezados de las secciones que generes dentro de tu respuesta.**
+   - **FORMATOS ESPECIALES (TABLAS):** Si la PREGUNTA ACTUAL DEL USUARIO solicita explícitamente un "cuadro comparativo", "tabla", o una comparación estructurada entre elementos, intenta generar una tabla usando formato Markdown. Ejemplo de tabla Markdown:
+     ```     | Característica | Elemento A                      | Elemento B                      |
+     |----------------|---------------------------------|---------------------------------|
+     | Detalle 1      | Información sobre Elemento A1   | Información sobre Elemento B1   |
+     | Detalle 2      | Información sobre Elemento A2   | Información sobre Elemento B2   |
+     ```
+     Asegúrate de que la tabla sea relevante y esté basada en la INFORMACIÓN RECOPILADA. Si no es posible generar una tabla útil o la información no se presta para ello, explícalo amablemente y proporciona la información en el mejor formato posible (ej. listas comparativas).
 
 5 · PROCESO DE PENSAMIENTO SUGERIDO (INTERNO - Chain-of-Thought)
 Antes de generar el JSON final:
-a. Revisa la PREGUNTA ACTUAL DEL USUARIO y el HISTORIAL para la intención completa. ¿Pide detalle, extensión?
-b. Analiza la INFORMACIÓN RECOPILADA DE DOCUMENTOS. Identifica los puntos clave de cada fragmento. Observa el `Archivo` y el `ID_Documento` de cada fragmento para saber si la información proviene del mismo documento fuente. Agrupa información sobre el mismo tema o evento.
-c. Sintetiza estos puntos en una narrativa coherente y detallada para `respuesta_detallada`, usando Markdown. Si se piden resúmenes de reuniones, intenta listar cada reunión y sus detalles.
-d. Cruza la información sintetizada con la INFORMACIÓN RECOPILADA DE DOCUMENTOS para asegurar que las citas `[Doc N]` sean correctas y se refieran al fragmento correcto o la información brindada.
+a. Revisa la PREGUNTA ACTUAL DEL USUARIO y el HISTORIAL para la intención completa. ¿Pide detalle, extensión, un formato específico como una tabla?
+b. Analiza la INFORMACIÓN RECOPILADA DE DOCUMENTOS. Identifica los puntos clave de cada fragmento y su relevancia para la pregunta. Observa el `Archivo` y el `ID_Documento` de cada fragmento para saber si la información proviene del mismo documento fuente. Agrupa información sobre el mismo tema o evento.
+c. Sintetiza estos puntos en una narrativa coherente y detallada para `respuesta_detallada`, usando Markdown. Si se piden resúmenes de múltiples puntos, asegúrate de tratar cada uno con el detalle apropiado según la información disponible. Si se pide un cuadro comparativo, intenta generarlo en Markdown.
+d. Cruza la información sintetizada con la INFORMACIÓN RECOPILADA DE DOCUMENTOS para asegurar que las citas `[Doc N]` sean correctas y se refieran al fragmento correcto (por su `ID_Fragmento`).
 e. Genera un `resumen_ejecutivo` si `respuesta_detallada` es extensa (más de 3-4 frases).
-f. Construye `fuentes_citadas` solo con los documentos que realmente usaste y citaste. El `cita_tag` debe coincidir con el usado en `respuesta_detallada`. El `id_documento` en `fuentes_citadas` debe ser el `ID_Fragmento` del chunk.
-g. Considera una `siguiente_pregunta_sugerida` si es natural.
+f. Construye `fuentes_citadas` solo con los documentos que realmente usaste y citaste. El `cita_tag` debe coincidir con el usado en `respuesta_detallada`. El `id_documento` en `fuentes_citadas` debe ser el `ID_Fragmento` del chunk original. `nombre_archivo` y `pagina` también deben ser los del chunk original. El `score` debe ser el `Score_Original` del chunk.
+g. Considera una `siguiente_pregunta_sugerida` si es natural y se basa en el contexto.
 h. Ensambla el JSON.
 
 6 · FORMATO DE RESPUESTA REQUERIDO (OBJETO JSON VÁLIDO)
@@ -72,8 +79,8 @@ h. Ensambla el JSON.
 ```
 Asegúrate de que:
 - El JSON sea sintácticamente correcto.
-- Las citas [Doc N] en respuesta_detallada coincidan con las listadas en fuentes_citadas (mismo N y misma fuente).
-- `fuentes_citadas` solo contenga documentos efectivamente usados y referenciados. El campo `id_documento` debe ser el `ID_Fragmento` del chunk, y `nombre_archivo` el del archivo al que pertenece.
+- Las citas [Doc N] en respuesta_detallada coincidan con las listadas en fuentes_citadas (mismo N y misma fuente). El `id_documento` en `fuentes_citadas` debe ser el `ID_Fragmento`.
+- `fuentes_citadas` solo contenga documentos efectivamente usados y referenciados.
 - No incluyas comentarios dentro del JSON.
 
 ════════════════════════════════════════════════════════════════════

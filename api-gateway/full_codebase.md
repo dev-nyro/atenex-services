@@ -1646,10 +1646,10 @@ async def create_new_user(
 )
 async def list_users_by_company(
     request: Request,
+    admin_user_payload: AdminAuth, # Moved before parameters with default values
     companyId: uuid.UUID = Path(..., description="ID de la compañía cuyos usuarios se desean listar."),
     limit: int = Query(50, ge=1, le=200, description="Número máximo de usuarios a devolver."),
-    offset: int = Query(0, ge=0, description="Offset para paginación."),
-    admin_user_payload: AdminAuth = Depends() # Autenticación y autorización de Admin
+    offset: int = Query(0, ge=0, description="Offset para paginación.")
 ):
     admin_id_from_token = admin_user_payload.get("sub")
     # X-Company-ID del admin (opcional para auditoría), viene del token si existe.

@@ -126,13 +126,15 @@ async def lifespan(app: FastAPI):
             if emb_service_healthy:
                 log.info("Embedding Service client and adapter initialized, health check passed.")
             else:
-                critical_failure_message = "Embedding Service health check failed during startup."
-                log.critical(f"CRITICAL: {critical_failure_message} URL: {settings.EMBEDDING_SERVICE_URL}")
-                dependencies_ok = False
+                # REFACTOR_5_4: Log as critical, but service *can* start if other core components are fine.
+                # User queries needing new embeddings will fail later.
+                critical_failure_message += " Embedding Service health check failed during startup."
+                log.critical(f"CRITICAL (but non-blocking for startup): {critical_failure_message} URL: {settings.EMBEDDING_SERVICE_URL}")
+                # dependencies_ok = False # Non-blocking, allow startup if other critical parts OK
         except Exception as e_embed:
-            critical_failure_message = "Failed to initialize Embedding Service client/adapter."
-            log.critical(f"CRITICAL: {critical_failure_message}", error=str(e_embed), exc_info=True, url=settings.EMBEDDING_SERVICE_URL)
-            dependencies_ok = False
+            critical_failure_message += " Failed to initialize Embedding Service client/adapter."
+            log.critical(f"CRITICAL (but non-blocking for startup): {critical_failure_message}", error=str(e_embed), exc_info=True, url=settings.EMBEDDING_SERVICE_URL)
+            # dependencies_ok = False
 
     # 2.B. Initialize Sparse Search Service Client & Adapter
     if dependencies_ok and settings.BM25_ENABLED: 
@@ -147,7 +149,8 @@ async def lifespan(app: FastAPI):
             if sparse_service_healthy:
                 log.info("Sparse Search Service client and adapter initialized, health check passed.")
             else:
-                log.warning(f"Sparse Search Service health check failed during startup. URL: {settings.SPARSE_SEARCH_SERVICE_URL}. Sparse search may be unavailable.")
+                log.warning(f"Sparse Search Service health check failed during startup. URL: {settings.SPARSE_SEARCH_SERVICE_URL}. Sparse search may be unavailable but service will continue.")
+                # Do not set dependencies_ok = False, as sparse search is optional enhancement
         except Exception as e_sparse:
             log.error(f"Failed to initialize Sparse Search Service client/adapter. Sparse search will be unavailable.", error=str(e_sparse), exc_info=True, url=str(settings.SPARSE_SEARCH_SERVICE_URL))
             sparse_retriever_instance = None 
@@ -159,7 +162,7 @@ async def lifespan(app: FastAPI):
             await vector_store_instance.connect() 
             log.info("Milvus Adapter initialized and collection checked/loaded.")
         except Exception as e_milvus:
-            critical_failure_message = "Failed to initialize Milvus Adapter or load collection."
+            critical_failure_message += " Failed to initialize Milvus Adapter or load collection."
             log.critical(
                 f"CRITICAL: {critical_failure_message} Ensure collection '{settings.MILVUS_COLLECTION_NAME}' exists and is accessible.",
                 error=str(e_milvus), exc_info=True, adapter_error=getattr(e_milvus, 'message', 'N/A')
@@ -170,26 +173,25 @@ async def lifespan(app: FastAPI):
     if dependencies_ok:
         try:
             llm_instance = GeminiAdapter()
-            # --- CORRECTION: Access _model (internal attribute) instead of model ---
             if not llm_instance._model: 
-                 critical_failure_message = "Gemini Adapter initialized but model failed to load (check API key or adapter's _configure_client)."
+                 critical_failure_message += " Gemini Adapter initialized but model failed to load (check API key or adapter's _configure_client)."
                  log.critical(f"CRITICAL: {critical_failure_message}")
                  dependencies_ok = False
             else:
                  log.info("Gemini Adapter initialized successfully.")
         except Exception as e_llm:
-            critical_failure_message = "Failed to initialize Gemini Adapter."
+            critical_failure_message += " Failed to initialize Gemini Adapter."
             log.critical(f"CRITICAL: {critical_failure_message}", error=str(e_llm), exc_info=True)
             dependencies_ok = False
     
     # Initialize optional components (Diversity Filter)
-    if dependencies_ok:
+    if dependencies_ok: # Check dependencies_ok before initializing optional that might depend on critical ones
         if settings.DIVERSITY_FILTER_ENABLED:
             try:
                 if embedding_adapter_instance and embedding_adapter_instance.get_embedding_dimension() > 0 :
                     diversity_filter_instance = MMRDiversityFilter(lambda_mult=settings.QUERY_DIVERSITY_LAMBDA)
                     log.info("MMR Diversity Filter initialized.")
-                else:
+                else: # REFACTOR_5_4: Log warning if embedding adapter not ready for MMR
                     log.warning("MMR Diversity Filter enabled but embedding adapter is not available or has no dimension. Falling back to StubDiversityFilter.")
                     diversity_filter_instance = StubDiversityFilter()
             except Exception as e_diversity:
@@ -202,8 +204,12 @@ async def lifespan(app: FastAPI):
     # 5. Instantiate Use Case
     if dependencies_ok:
          try:
-             if not http_client_instance:
+             if not http_client_instance: # This check should pass due to earlier initialization
                  raise RuntimeError("HTTP client instance is not available for AskQueryUseCase.")
+             if not chat_repo_instance or not log_repo_instance or not vector_store_instance or \
+                not llm_instance or not embedding_adapter_instance or not chunk_content_repo_instance: # REFACTOR_5_4: Add chunk_content_repo
+                 raise RuntimeError("One or more critical repository/adapter instances are missing for AskQueryUseCase.")
+
 
              ask_query_use_case_instance = AskQueryUseCase(
                  chat_repo=chat_repo_instance,
@@ -212,9 +218,9 @@ async def lifespan(app: FastAPI):
                  llm=llm_instance,
                  embedding_adapter=embedding_adapter_instance,
                  http_client=http_client_instance,
-                 sparse_retriever=sparse_retriever_instance,
+                 sparse_retriever=sparse_retriever_instance, # Can be None if BM25_ENABLED=false or init failed
                  chunk_content_repo=chunk_content_repo_instance, 
-                 diversity_filter=diversity_filter_instance
+                 diversity_filter=diversity_filter_instance # Can be StubDiversityFilter
              )
              log.info("AskQueryUseCase instantiated successfully.")
              SERVICE_READY = True 
@@ -222,11 +228,13 @@ async def lifespan(app: FastAPI):
              log.info(f"{settings.PROJECT_NAME} service components initialized. SERVICE READY.")
 
          except Exception as e_usecase:
-              critical_failure_message = "Failed to instantiate AskQueryUseCase."
+              critical_failure_message += " Failed to instantiate AskQueryUseCase." # REFACTOR_5_4: Append to message
               log.critical(f"CRITICAL: {critical_failure_message}", error=str(e_usecase), exc_info=True)
               SERVICE_READY = False
               set_ask_query_use_case_instance(None, False)
     else:
+        # Log critical failure if not already caught by a more specific message
+        if not critical_failure_message: critical_failure_message = "Unknown critical dependency failure during startup."
         log.critical(f"{settings.PROJECT_NAME} startup sequence aborted due to critical failure: {critical_failure_message}")
         log.critical("SERVICE NOT READY.")
         set_ask_query_use_case_instance(None, False)
@@ -333,35 +341,33 @@ async def read_root():
     health_log = log.bind(check="liveness_readiness_root")
     if not SERVICE_READY:
         health_log.warning("Health check (root) failed: Service not ready.", service_ready_flag=SERVICE_READY)
-        raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service Not Ready")
+        raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service Not Ready. Check startup logs for critical failures.")
 
-    # Check Embedding Service Health
-    if embedding_adapter_instance:
-        emb_adapter_healthy = await embedding_adapter_instance.health_check()
-        if not emb_adapter_healthy:
-            health_log.error("Health check (root) failed: Embedding Adapter reports unhealthy dependency (Embedding Service).")
-            raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Critical dependency (Embedding Service) is unhealthy.")
-    else: 
-        health_log.error("Health check (root) warning: Embedding Adapter instance not available, inconsistent with SERVICE_READY state.")
-        raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service inconsistency: Embedding adapter missing.")
-
-    # ELIMINADO: Health check al reranker-service.
-    # El query-service ahora no dependerá del health del reranker para su propia salud.
-    # Manejará errores de reranker en tiempo de ejecución si es necesario.
+    # Check Embedding Service Health (Considered critical for RAG)
+    if not embedding_adapter_instance :
+        health_log.error("Health check (root) CRITICAL: Embedding Adapter instance not available, inconsistent with SERVICE_READY state.")
+        raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Critical dependency (Embedding Adapter) missing.")
     
-    # Check Sparse Search Service Health (if enabled)
+    emb_adapter_healthy = await embedding_adapter_instance.health_check()
+    if not emb_adapter_healthy:
+        health_log.error("Health check (root) CRITICAL: Embedding Adapter reports unhealthy dependency (Embedding Service).")
+        # REFACTOR_5_4: If embedding service is critical for any response, this should fail the health check.
+        raise HTTPException(status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE, detail="Critical dependency (Embedding Service) is unhealthy.")
+    
+    # Check Sparse Search Service Health (if enabled, but non-blocking for overall service health)
     if settings.BM25_ENABLED: 
         if sparse_search_service_client_instance: 
             sparse_service_healthy = await sparse_search_service_client_instance.check_health()
             if not sparse_service_healthy:
-                health_log.warning("Health check (root) warning: Sparse Search Service reports unhealthy. Sparse search functionality may be impaired but service can continue.")
+                health_log.warning("Health check (root) warning: Sparse Search Service reports unhealthy. Sparse search functionality may be impaired but service can continue if RAG is primary.")
             else:
                 health_log.debug("Sparse Search Service health check successful via root.")
-        elif settings.BM25_ENABLED: 
-            health_log.error("Health check (root) failed: BM25_ENABLED is true, but Sparse Search Service client is not available.")
+        else: 
+             # This indicates BM25_ENABLED is true, but the client didn't initialize, which is a configuration/startup issue.
+             # While non-blocking for a basic RAG response, it's a degradation of expected functionality.
+            health_log.warning("Health check (root) warning: BM25_ENABLED is true, but Sparse Search Service client is not available. Sparse search functionality will be missing.")
 
-
-    health_log.debug("Health check (root) passed.")
+    health_log.debug("Health check (root) passed (core dependencies OK).")
     return PlainTextResponse("OK", status_code=fastapi_status.HTTP_200_OK)
 
 if __name__ == "__main__":
@@ -369,5 +375,3 @@ if __name__ == "__main__":
     log_level_str = settings.LOG_LEVEL.lower()
     print(f"----- Starting {settings.PROJECT_NAME} locally on port {port} -----")
     uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True, log_level=log_level_str)
-
-# jfu

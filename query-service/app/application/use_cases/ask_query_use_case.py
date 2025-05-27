@@ -140,7 +140,7 @@ class AskQueryUseCase:
             encoding = self._get_tiktoken_encoding()
             for chunk in chunks:
                 if chunk.content and chunk.content.strip():
-                    import hashlib # Mover import aquí para evitar dependencia a nivel de clase si solo se usa aquí
+                    import hashlib 
                     content_hash = hashlib.md5(chunk.content.encode('utf-8')).hexdigest()
                     cached_token_count = self._token_count_cache.get(content_hash)
                     if cached_token_count is not None:
@@ -283,7 +283,7 @@ class AskQueryUseCase:
         fetch_log.debug("Top IDs after fusion", top_ids_count=len(top_ids_with_scores_tuples))
 
         chunks_with_content: List[RetrievedChunk] = []
-        ids_needing_data: List[str] = [] # Renamed from ids_needing_content
+        ids_needing_data: List[str] = [] 
         placeholder_map: Dict[str, RetrievedChunk] = {}
 
         for cid, fused_score_val in top_ids_with_scores_tuples:
@@ -297,7 +297,7 @@ class AskQueryUseCase:
                 original_chunk_from_dense.score = fused_score_val 
                 chunks_with_content.append(original_chunk_from_dense)
             else: 
-                # Create placeholder, document_id and file_name might come from dense_map if present
+                
                 chunk_placeholder = RetrievedChunk(
                     id=cid,
                     score=fused_score_val, 
@@ -310,31 +310,31 @@ class AskQueryUseCase:
                 )
                 chunks_with_content.append(chunk_placeholder) 
                 placeholder_map[cid] = chunk_placeholder 
-                ids_needing_data.append(cid) # Add to list to fetch data from PG
+                ids_needing_data.append(cid) 
 
         if ids_needing_data and self.chunk_content_repo:
              fetch_log.info("Fetching content and metadata for chunks missing data", count=len(ids_needing_data))
              try:
-                 # Fetch content AND metadata (document_id, file_name)
+                 
                  chunk_data_map: Dict[str, Dict[str, Any]] = await self.chunk_content_repo.get_chunk_contents_by_ids(ids_needing_data)
                  
                  for cid_item, data in chunk_data_map.items():
                      if cid_item in placeholder_map: 
                           placeholder_map[cid_item].content = data.get("content")
-                          # Update document_id and file_name if fetched and not already set from dense_map
+                          
                           if not placeholder_map[cid_item].document_id:
                             placeholder_map[cid_item].document_id = data.get("document_id")
                           if not placeholder_map[cid_item].file_name:
                             placeholder_map[cid_item].file_name = data.get("file_name")
                           
-                          # Update metadata in placeholder
+                          
                           if placeholder_map[cid_item].metadata:
                             placeholder_map[cid_item].metadata.update({
                                 "content_fetched_for_sparse": True,
                                 "fetched_document_id": data.get("document_id"),
                                 "fetched_file_name": data.get("file_name")
                             })
-                          else: # Should not happen if initialized correctly
+                          else: 
                             placeholder_map[cid_item].metadata = {
                                 "content_fetched_for_sparse": True,
                                 "fetched_document_id": data.get("document_id"),
@@ -374,79 +374,94 @@ class AskQueryUseCase:
         
         llm_handler_log = log.bind(action="_handle_llm_response", chat_id=str(final_chat_id))
         answer_for_user: str
-        retrieved_chunks_for_response: List[RetrievedChunk] = []
+        retrieved_chunks_for_api_response: List[RetrievedChunk] = []
         assistant_sources_for_db: List[Dict[str, Any]] = []
         log_id: Optional[uuid.UUID] = None
         
+        # Log the raw JSON for debugging if parsing fails. Be careful with sensitive data in production.
+        raw_json_preview_on_error = truncate_text(json_answer_str, 1000)
+
         try:
             structured_answer_obj = RespuestaEstructurada.model_validate_json(json_answer_str)
             answer_for_user = structured_answer_obj.respuesta_detallada
             
-            llm_handler_log.info("LLM response successfully parsed and validated into RespuestaEstructurada.",
+            llm_handler_log.info("LLM response successfully parsed as RespuestaEstructurada.",
                                  has_summary=bool(structured_answer_obj.resumen_ejecutivo),
                                  num_fuentes_citadas_by_llm=len(structured_answer_obj.fuentes_citadas),
                                  siguiente_pregunta_sugerida=structured_answer_obj.siguiente_pregunta_sugerida)
 
-            assistant_sources_for_db = [f.model_dump(exclude_none=True) for f in structured_answer_obj.fuentes_citadas]
-            
-            map_chunk_id_to_original = {chunk.id: chunk for chunk in original_chunks_for_citation}
+            # Use fuentues_citadas from LLM response as the primary source for building `retrieved_chunks_for_api_response`
+            map_id_to_original_chunk = {chunk.id: chunk for chunk in original_chunks_for_citation if chunk.id and chunk.content}
             
             processed_chunk_ids_for_response = set()
 
-            for cited_source_by_llm in structured_answer_obj.fuentes_citadas:
-                if cited_source_by_llm.id_documento and cited_source_by_llm.id_documento in map_chunk_id_to_original:
-                    original_chunk = map_chunk_id_to_original[cited_source_by_llm.id_documento]
-                    if original_chunk.id not in processed_chunk_ids_for_response:
-                       retrieved_chunks_for_response.append(original_chunk)
-                       processed_chunk_ids_for_response.add(original_chunk.id)
-
-            if not retrieved_chunks_for_response and structured_answer_obj.fuentes_citadas:
-                llm_handler_log.warning("LLM cited sources, but no direct match found by id_documento. Using filename as fallback or top N.")
-                for cited_source_by_llm in structured_answer_obj.fuentes_citadas:
-                    if len(retrieved_chunks_for_response) >= self.settings.NUM_SOURCES_TO_SHOW: break
-                    found_by_name = False
-                    for orig_chunk in original_chunks_for_citation:
-                        if orig_chunk.id not in processed_chunk_ids_for_response and \
-                           orig_chunk.file_name == cited_source_by_llm.nombre_archivo:
-                             retrieved_chunks_for_response.append(orig_chunk)
-                             processed_chunk_ids_for_response.add(orig_chunk.id)
-                             found_by_name = True
-                             break 
-                    if not found_by_name:
-                         llm_handler_log.info("LLM cited source not found by filename either", cited_source_name=cited_source_by_llm.nombre_archivo)
+            if structured_answer_obj.fuentes_citadas:
+                for cited_source_from_llm in structured_answer_obj.fuentes_citadas:
+                    # The `id_documento` from LLM's FuenteCitada should be the `RetrievedChunk.id`
+                    chunk_id_from_llm = cited_source_from_llm.id_documento
+                    
+                    if chunk_id_from_llm and chunk_id_from_llm in map_id_to_original_chunk:
+                        original_chunk = map_id_to_original_chunk[chunk_id_from_llm]
+                        # Create a new RetrievedChunk instance for the API response, or modify a copy.
+                        # This ensures content and other details are from the original chunk,
+                        # and we add the cita_tag.
+                        api_chunk = RetrievedChunk(
+                            id=original_chunk.id,
+                            content=original_chunk.content, # Crucial: ensure full content is here
+                            score=cited_source_from_llm.score if cited_source_from_llm.score is not None else original_chunk.score,
+                            metadata=original_chunk.metadata, # Keep original metadata
+                            embedding=None, # Not needed for API response usually
+                            document_id=original_chunk.document_id,
+                            file_name=original_chunk.file_name,
+                            company_id=original_chunk.company_id,
+                            cita_tag=cited_source_from_llm.cita_tag # Add the cita_tag
+                        )
+                        retrieved_chunks_for_api_response.append(api_chunk)
+                        processed_chunk_ids_for_response.add(original_chunk.id)
+                    else:
+                        llm_handler_log.warning("LLM cited a source (id_documento) not found in original_chunks_for_citation or chunk has no content.",
+                                                cited_id=chunk_id_from_llm,
+                                                cited_tag=cited_source_from_llm.cita_tag,
+                                                available_ids=list(map_id_to_original_chunk.keys()))
+            else: # No fuentes_citadas from LLM
+                llm_handler_log.info("LLM response did not include any 'fuentes_citadas'.")
             
-            if len(retrieved_chunks_for_response) < self.settings.NUM_SOURCES_TO_SHOW and original_chunks_for_citation:
-                llm_handler_log.debug("Filling remaining source slots with top original chunks provided to LLM/MapReduce.")
-                for chunk in original_chunks_for_citation:
-                    if len(retrieved_chunks_for_response) >= self.settings.NUM_SOURCES_TO_SHOW: break
-                    if chunk.id not in processed_chunk_ids_for_response:
-                        retrieved_chunks_for_response.append(chunk)
-                        processed_chunk_ids_for_response.add(chunk.id)
+            # Limitar el número de fuentes mostradas si es necesario, pero ahora basado en lo que el LLM citó.
+            retrieved_chunks_for_api_response = retrieved_chunks_for_api_response[:self.settings.NUM_SOURCES_TO_SHOW]
+            assistant_sources_for_db = [f.model_dump(exclude_none=True) for f in structured_answer_obj.fuentes_citadas][:self.settings.NUM_SOURCES_TO_SHOW]
 
 
-        except ValidationError as pydantic_err:
-            llm_handler_log.error("LLM JSON response failed Pydantic validation", raw_response=truncate_text(json_answer_str, 500), errors=pydantic_err.errors())
-            answer_for_user = "La respuesta del asistente no tuvo el formato esperado. Por favor, intenta de nuevo."
-            assistant_sources_for_db = [{"error": "Pydantic validation failed", "details": pydantic_err.errors()}]
-            retrieved_chunks_for_response = original_chunks_for_citation[:self.settings.NUM_SOURCES_TO_SHOW] 
-        except json.JSONDecodeError as json_err:
-            llm_handler_log.error("Failed to parse JSON response from LLM", raw_response=truncate_text(json_answer_str, 500), error=str(json_err))
-            answer_for_user = f"Hubo un error al procesar la respuesta del asistente (JSON malformado): {truncate_text(json_answer_str,100)}. Por favor, intenta de nuevo."
-            assistant_sources_for_db = [{"error": "JSON decode error", "details": str(json_err)}]
-            retrieved_chunks_for_response = original_chunks_for_citation[:self.settings.NUM_SOURCES_TO_SHOW] 
+        except (ValidationError, json.JSONDecodeError) as validation_json_err:
+            error_type = type(validation_json_err).__name__
+            llm_handler_log.error(f"LLM response failed parsing or validation ({error_type})",
+                                  raw_response_preview=raw_json_preview_on_error, 
+                                  error_details=str(validation_json_err))
+            answer_for_user = ("La respuesta del asistente no tuvo el formato esperado y no pudo ser procesada. "
+                               "Por favor, intenta simplificar tu pregunta o contacta a soporte si el problema persiste.")
+            assistant_sources_for_db = [{"error": f"{error_type} en respuesta del LLM", "details": str(validation_json_err)}]
+            retrieved_chunks_for_api_response = [] # No enviar fuentes si el parseo falló
 
+        # Guardar el mensaje del asistente en el chat
         await self.chat_repo.save_message(
             chat_id=final_chat_id, role='assistant',
             content=answer_for_user, 
-            sources=assistant_sources_for_db[:self.settings.NUM_SOURCES_TO_SHOW] if assistant_sources_for_db else None
+            sources=assistant_sources_for_db # Usar las fuentes procesadas
         )
-        llm_handler_log.info(f"Assistant message saved with up to {self.settings.NUM_SOURCES_TO_SHOW} sources.")
+        llm_handler_log.info("Assistant message saved to DB.", num_sources_saved_to_db=len(assistant_sources_for_db))
 
+        # Loguear la interacción
         try:
-            docs_for_log_summary = [
-                RetrievedDocumentSchema(**chunk.model_dump(exclude={'embedding'}, exclude_none=True)).model_dump(exclude_none=True) 
-                for chunk in retrieved_chunks_for_response 
-            ]
+            # Preparar los retrieved_documents_data para el log
+            # Usa retrieved_chunks_for_api_response que ahora sí está alineado con lo que el LLM citó
+            docs_for_log_summary = []
+            if retrieved_chunks_for_api_response: # Solo si hay fuentes validadas
+                docs_for_log_summary = [
+                     # Usar model_dump para serializar el RetrievedChunk a dict para el log.
+                     # El schema RetrievedDocumentSchema no es necesario aquí, solo un dict.
+                    chunk.model_dump(exclude={'embedding'}, exclude_none=True)
+                    for chunk in retrieved_chunks_for_api_response
+                ]
+
             log_metadata_details = {
                 "pipeline_stages": pipeline_stages_used,
                 "map_reduce_used": map_reduce_used,
@@ -455,12 +470,10 @@ class AskQueryUseCase:
                 "max_context_chunks_direct_rag_limit": self.settings.MAX_CONTEXT_CHUNKS, 
                 "num_chunks_after_rerank_or_fusion_content_fetch": num_chunks_after_rerank_or_fusion_fetch_effective,
                 "num_final_chunks_sent_to_llm": num_final_chunks_sent_to_llm_effective,
-                "num_sources_shown_to_user": len(assistant_sources_for_db), 
-                "num_retrieved_docs_in_api_response": len(retrieved_chunks_for_response),
+                "num_sources_processed_from_llm_response": len(assistant_sources_for_db),
+                "num_retrieved_docs_in_api_response": len(retrieved_chunks_for_api_response),
                 "chat_history_messages_included_in_prompt": num_history_messages_effective,
-                "diversity_filter_enabled_in_settings": self.settings.DIVERSITY_FILTER_ENABLED,
-                "reranker_enabled_in_settings": self.settings.RERANKER_ENABLED,
-                "bm25_enabled_in_settings": self.settings.BM25_ENABLED,
+                "llm_json_parse_error": "ValidationError" if isinstance(validation_json_err, ValidationError) else "JSONDecodeError" if isinstance(validation_json_err, json.JSONDecodeError) else None if 'validation_json_err' not in locals() or validation_json_err is None else "UnknownParseError",
             }
             log_id = await self.log_repo.log_query_interaction(
                 user_id=user_id,
@@ -476,7 +489,7 @@ class AskQueryUseCase:
             llm_handler_log.error("Failed to log query interaction", error=str(e_log), exc_info=True)
             # log_id remains as initialized (None)
 
-        return answer_for_user, retrieved_chunks_for_response, log_id
+        return answer_for_user, retrieved_chunks_for_api_response, log_id
 
     async def _manage_chat_state(
         self, query: str, company_id: uuid.UUID, user_id: uuid.UUID,
@@ -506,7 +519,7 @@ class AskQueryUseCase:
         # Actualizar exec_log para tener el chat_id correcto
         exec_log = exec_log.bind(chat_id=str(final_chat_id))
         await self.chat_repo.save_message(chat_id=final_chat_id, role='user', content=query)
-        exec_log.info("User message saved", is_new_chat=(not chat_id_param)) # Corrected based on if chat_id_param was initially None
+        exec_log.info("User message saved", is_new_chat=(not chat_id_param)) 
         
         return final_chat_id, chat_history_str, history_messages
 
@@ -558,10 +571,9 @@ class AskQueryUseCase:
                 final_chat_id = await self.chat_repo.create_chat(user_id=user_id, company_id=company_id, title=initial_title)
                 exec_log.info("New chat created.", new_chat_id=str(final_chat_id))
             
-            # Rebind exec_log con el final_chat_id definitivo
             exec_log = exec_log.bind(chat_id=str(final_chat_id))
             await self.chat_repo.save_message(chat_id=final_chat_id, role='user', content=query)
-            exec_log.info("User message saved.", is_new_chat=(not chat_id)) # Log if it was a new chat or existing one
+            exec_log.info("User message saved.", is_new_chat=(not chat_id)) 
 
             if GREETING_REGEX.match(query):
                 return await self._handle_greeting(query, company_id, user_id, final_chat_id, exec_log)
@@ -607,15 +619,21 @@ class AskQueryUseCase:
             if not combined_chunks_with_content:
                 exec_log.warning("No chunks with content after fusion/fetch. Using general prompt.")
                 general_prompt = await self._build_prompt(query, [], chat_history=chat_history_str, builder=self._prompt_builder_general)
-                answer_str = await self.llm.generate(general_prompt, response_pydantic_schema=None) 
-                
-                await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer_str, sources=None)
-                no_docs_log_id = await self.log_repo.log_query_interaction(
-                    company_id=company_id, user_id=user_id, query=query, answer=answer_str, 
-                    retrieved_documents_data=[], chat_id=final_chat_id, 
-                    metadata={"pipeline_stages": pipeline_stages_used, "result_type": "no_docs_for_rag", "map_reduce_used": False}
+                # Para _handle_llm_response, cuando no hay chunks, json_answer_str será la respuesta directa del LLM, no un JSON
+                json_answer_str = await self.llm.generate(general_prompt, response_pydantic_schema=None) 
+                # En este caso, _handle_llm_response no podrá parsear json_answer_str como RespuestaEstructurada
+                # Debería caer en el fallback de JSONDecodeError o ValidationError
+                # Lo importante es que `original_chunks_for_citation` sea vacío.
+                return await self._handle_llm_response(
+                    json_answer_str=json_answer_str, # Este no será JSON si se usa _prompt_builder_general
+                    query=query, company_id=company_id, user_id=user_id, final_chat_id=final_chat_id,
+                    original_chunks_for_citation=[], # No chunks fueron usados
+                    pipeline_stages_used=pipeline_stages_used, map_reduce_used=False,
+                    retriever_k_effective=retriever_k_effective, fusion_fetch_k_effective=fusion_fetch_k_effective,
+                    num_chunks_after_rerank_or_fusion_fetch_effective=0, num_final_chunks_sent_to_llm_effective=0,
+                    num_history_messages_effective=len(history_messages)
                 )
-                return answer_str, [], no_docs_log_id, final_chat_id
+
             
             chunks_after_postprocessing = combined_chunks_with_content 
             if self.settings.RERANKER_ENABLED and chunks_after_postprocessing:
@@ -737,8 +755,12 @@ class AskQueryUseCase:
                 vectors_from_milvus_by_id: Dict[str, List[float]] = {}
                 if chunk_ids_for_mmr_filter:
                     try:
-                        vectors_from_milvus_by_id = await self.vector_store.fetch_vectors_by_ids(chunk_ids_for_mmr_filter)
-                        mmr_prep_log.info(f"Fetched {len(vectors_from_milvus_by_id)} vectors from Milvus for MMR.")
+                        # Assuming VectorStorePort has fetch_vectors_by_ids
+                        if hasattr(self.vector_store, 'fetch_vectors_by_ids'):
+                            vectors_from_milvus_by_id = await self.vector_store.fetch_vectors_by_ids(chunk_ids_for_mmr_filter)
+                            mmr_prep_log.info(f"Fetched {len(vectors_from_milvus_by_id)} vectors from Milvus for MMR.")
+                        else:
+                            mmr_prep_log.warning("VectorStorePort does not have 'fetch_vectors_by_ids'. Embeddings for MMR might be incomplete.")
                     except Exception as e_milvus_fetch:
                          mmr_prep_log.error("Failed to fetch vectors from Milvus for MMR, fallback may occur.", error=str(e_milvus_fetch))
 
@@ -815,14 +837,15 @@ class AskQueryUseCase:
             if not final_chunks_for_processing: 
                 exec_log.warning("No chunks with content after all postprocessing. Using general prompt.")
                 general_prompt = await self._build_prompt(query, [], chat_history=chat_history_str, builder=self._prompt_builder_general)
-                answer_str = await self.llm.generate(general_prompt, response_pydantic_schema=None)
-                await self.chat_repo.save_message(chat_id=final_chat_id, role='assistant', content=answer_str, sources=None)
-                no_docs_final_log_id = await self.log_repo.log_query_interaction(
-                    company_id=company_id, user_id=user_id, query=query, answer=answer_str, 
-                    retrieved_documents_data=[], chat_id=final_chat_id, 
-                    metadata={"pipeline_stages": pipeline_stages_used, "result_type": "no_docs_after_all_postprocessing", "map_reduce_used": False}
+                json_answer_str = await self.llm.generate(general_prompt, response_pydantic_schema=None)
+                return await self._handle_llm_response(
+                    json_answer_str=json_answer_str, query=query, company_id=company_id, user_id=user_id, final_chat_id=final_chat_id,
+                    original_chunks_for_citation=[], pipeline_stages_used=pipeline_stages_used, map_reduce_used=False,
+                    retriever_k_effective=retriever_k_effective, fusion_fetch_k_effective=fusion_fetch_k_effective,
+                    num_chunks_after_rerank_or_fusion_fetch_effective=0, num_final_chunks_sent_to_llm_effective=0,
+                    num_history_messages_effective=len(history_messages)
                 )
-                return answer_str, [], no_docs_final_log_id, final_chat_id
+
 
             map_reduce_active = False
             json_answer_str: str
@@ -844,7 +867,7 @@ class AskQueryUseCase:
             
             should_activate_mapreduce_by_tokens = total_tokens_for_llm > self.settings.MAX_PROMPT_TOKENS
 
-            # MapReduce solo se activa si se supera el umbral de tokens, no por chunks
+            
             if self.settings.MAPREDUCE_ENABLED and should_activate_mapreduce_by_tokens and num_final_chunks_for_llm_or_mapreduce > 1:
                 trigger_reason = "token_count"
                 exec_log.info(f"Activating MapReduce due to {trigger_reason}. "
@@ -866,7 +889,7 @@ class AskQueryUseCase:
                             "file_name": c.file_name, 
                             "page": c.metadata.get("page"), 
                             "title": c.metadata.get("title"),
-                            "document_id": c.document_id # Asegurar que document_id está en meta
+                            "document_id": c.document_id 
                         },
                         score=c.score
                     ) for c in chunks_to_send_to_llm
@@ -936,7 +959,7 @@ class AskQueryUseCase:
                             "file_name": c.file_name, 
                             "page": c.metadata.get("page"),
                             "title": c.metadata.get("title"),
-                            "document_id": c.document_id # Asegurar que document_id está en meta
+                            "document_id": c.document_id 
                         },
                         score=c.score
                     ) for c in chunks_to_send_to_llm

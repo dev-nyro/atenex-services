@@ -53,10 +53,16 @@ class MilvusAdapter(VectorStorePort):
     _alias = "query_service_milvus_adapter"
     _pk_field_name: str
     _vector_field_name: str
+    _content_field_name: str # REFACTOR_5_2: Added
+    _doc_id_field_name: str  # REFACTOR_5_2: Added
+    _filename_field_name: str# REFACTOR_5_2: Added
 
     def __init__(self):
         self._pk_field_name = INGEST_SCHEMA_FIELDS["pk"]
         self._vector_field_name = INGEST_SCHEMA_FIELDS["vector"]
+        self._content_field_name = INGEST_SCHEMA_FIELDS["content"] # REFACTOR_5_2
+        self._doc_id_field_name = INGEST_SCHEMA_FIELDS["document"] # REFACTOR_5_2
+        self._filename_field_name = INGEST_SCHEMA_FIELDS["filename"] # REFACTOR_5_2
 
 
     async def _ensure_connection(self):
@@ -124,24 +130,24 @@ class MilvusAdapter(VectorStorePort):
             filter_expr = f'{INGEST_SCHEMA_FIELDS["company"]} == "{company_id}"'
             search_log.debug("Using filter expression", expr=filter_expr)
 
-            required_output_fields_set = {
-                self._pk_field_name,
-                self._vector_field_name,
-                INGEST_SCHEMA_FIELDS["content"],
-                INGEST_SCHEMA_FIELDS["company"],
-                INGEST_SCHEMA_FIELDS["document"],
-                INGEST_SCHEMA_FIELDS["filename"],
-            }
-            required_output_fields_set.update(settings.MILVUS_METADATA_FIELDS) # Incluye page, title, etc.
-            output_fields_list = list(required_output_fields_set)
+            # REFACTOR_5_2: Ensure all necessary fields for RetrievedChunk are fetched
+            # including the ones previously only in MILVUS_METADATA_FIELDS
+            # self._content_field_name, self._doc_id_field_name, self._filename_field_name
+            # should be explicitly requested if they are not already part of INGEST_SCHEMA_FIELDS for general metadata
+            output_fields_list = list(
+                set(
+                    [
+                        self._pk_field_name,
+                        self._vector_field_name, # Needed for MMR or other post-processing
+                        self._content_field_name,
+                        INGEST_SCHEMA_FIELDS["company"], # company_id
+                        self._doc_id_field_name,   # document_id
+                        self._filename_field_name, # file_name
+                    ]
+                    + settings.MILVUS_METADATA_FIELDS # Adds page, title etc.
+                )
+            )
             
-            # Asegurar que los campos de documento y nombre de archivo se pidan explícitamente si no están ya.
-            if INGEST_SCHEMA_FIELDS["document"] not in output_fields_list:
-                output_fields_list.append(INGEST_SCHEMA_FIELDS["document"])
-            if INGEST_SCHEMA_FIELDS["filename"] not in output_fields_list:
-                output_fields_list.append(INGEST_SCHEMA_FIELDS["filename"])
-            output_fields_list = list(set(output_fields_list)) # Evitar duplicados
-
             search_log.debug("Performing Milvus vector search...",
                              vector_field=self._vector_field_name,
                              output_fields=output_fields_list)
@@ -165,28 +171,25 @@ class MilvusAdapter(VectorStorePort):
             domain_chunks: List[RetrievedChunk] = []
             if search_results and search_results[0]:
                 for hit in search_results[0]:
-                    # El método to_dict() en la entidad del hit es preferible si está disponible
                     entity_data = hit.entity.to_dict() if hasattr(hit, 'entity') and hasattr(hit.entity, 'to_dict') else {}
                     
-                    # Si entity_data está vacío, intentar obtener los campos directamente del hit
-                    if not entity_data:
+                    if not entity_data: # Fallback
                         entity_data = {field: hit.get(field) for field in output_fields_list if hit.get(field) is not None}
 
-                    pk_id = str(hit.id) # hit.id es el PK (pk_id)
-                    content = entity_data.get(INGEST_SCHEMA_FIELDS["content"], "")
-                    embedding_vector = entity_data.get(self._vector_field_name) # El embedding en sí
+                    pk_id = str(hit.id) 
+                    content = entity_data.get(self._content_field_name, "") # REFACTOR_5_2 Use specific field
+                    embedding_vector = entity_data.get(self._vector_field_name) 
                     
-                    # Mapear todos los campos recuperados a metadata, excluyendo el vector.
-                    metadata_dict = {k: v for k, v in entity_data.items() if k != self._vector_field_name}
+                    metadata_dict = {k: v for k, v in entity_data.items() if k not in [self._vector_field_name, self._pk_field_name, self._content_field_name]}
                     
-                    # Asignar explícitamente los campos principales del chunk
-                    doc_id_val = entity_data.get(INGEST_SCHEMA_FIELDS["document"])
+                    doc_id_val = entity_data.get(self._doc_id_field_name) # REFACTOR_5_2 Use specific field
                     comp_id_val = entity_data.get(INGEST_SCHEMA_FIELDS["company"])
-                    fname_val = entity_data.get(INGEST_SCHEMA_FIELDS["filename"])
+                    fname_val = entity_data.get(self._filename_field_name) # REFACTOR_5_2 Use specific field
 
+                    # REFACTOR_5_2: Populate content field directly in RetrievedChunk
                     chunk = RetrievedChunk(
                         id=pk_id,
-                        content=content,
+                        content=content, # Populate content
                         score=hit.score,
                         metadata=metadata_dict,
                         embedding=embedding_vector,

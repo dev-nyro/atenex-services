@@ -15,7 +15,6 @@ class Chat(BaseModel):
     updated_at: datetime
 
 class ChatSummary(BaseModel):
-    # Similar a schemas.ChatSummary pero como objeto de dominio si se necesita diferenciar
     id: uuid.UUID
     title: Optional[str]
     updated_at: datetime
@@ -39,6 +38,9 @@ class RetrievedChunk(BaseModel):
     document_id: Optional[str] = Field(None, alias="document_id") 
     file_name: Optional[str] = Field(None, alias="file_name")
     company_id: Optional[str] = Field(None, alias="company_id")
+    # REFACTOR_5_1: Add cita_tag
+    cita_tag: Optional[str] = Field(None, description="La etiqueta de cita [Doc N] usada por el LLM para este chunk.")
+
 
     model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
 

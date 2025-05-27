@@ -9,15 +9,13 @@ from fastapi import APIRouter, Depends, HTTPException, status, Header, Body, Req
 
 from app.api.v1 import schemas
 from app.core.config import settings
-# LLM_REFACTOR_STEP_3: Import use case and dependencies for injection (example)
 from app.application.use_cases.ask_query_use_case import AskQueryUseCase
 from app.infrastructure.persistence.postgres_repositories import (
     PostgresChatRepository, PostgresLogRepository, PostgresChunkContentRepository
 )
 from app.infrastructure.vectorstores.milvus_adapter import MilvusAdapter
 from app.infrastructure.llms.gemini_adapter import GeminiAdapter
-# LLM_REFACTOR_STEP_3: Import domain model for mapping
-from app.domain.models import RetrievedChunk
+from app.domain.models import RetrievedChunk # Ya existe
 
 from app.utils.helpers import truncate_text
 from .chat import get_current_company_id, get_current_user_id
@@ -29,11 +27,8 @@ router = APIRouter()
 GREETING_REGEX = re.compile(r"^\s*(hola|hello|hi|buenos días|buenas tardes|buenas noches|hey|qué tal|hi there)\s*[\.,!?]*\s*$", re.IGNORECASE)
 
 
-# --- Dependency Injection Setup ---
-# Usar el singleton global inicializado y calentado en main.py, vía dependencies.py
 from app.dependencies import get_ask_query_use_case
 
-# --- Endpoint Refactored to use AskQueryUseCase ---
 @router.post(
     "/ask",
     response_model=schemas.QueryResponse,
@@ -45,9 +40,8 @@ async def process_query(
     request_body: schemas.QueryRequest = Body(...),
     company_id: uuid.UUID = Depends(get_current_company_id),
     user_id: uuid.UUID = Depends(get_current_user_id),
-    # LLM_REFACTOR_STEP_3: Inject the use case instance
     use_case: AskQueryUseCase = Depends(get_ask_query_use_case),
-    request: Request = None # Keep for request ID
+    request: Request = None 
 ):
     request_id = request.headers.get("x-request-id", str(uuid.uuid4())) if request else str(uuid.uuid4())
     endpoint_log = log.bind(
@@ -60,7 +54,6 @@ async def process_query(
     endpoint_log.info("Processing query request via Use Case")
 
     try:
-        # LLM_REFACTOR_STEP_3: Call the use case execute method
         answer, retrieved_chunks_domain, log_id, final_chat_id = await use_case.execute(
             query=request_body.query,
             company_id=company_id,
@@ -69,17 +62,20 @@ async def process_query(
             top_k=request_body.retriever_top_k
         )
 
-        # LLM_REFACTOR_STEP_3: Map domain results (RetrievedChunk) to API schema (RetrievedDocument)
-        retrieved_docs_api = [
-            schemas.RetrievedDocument(
-                id=chunk.id,
-                score=chunk.score,
-                content_preview=truncate_text(chunk.content, 150) if chunk.content else None,
-                metadata=chunk.metadata,
-                document_id=chunk.document_id,
-                file_name=chunk.file_name
-            ) for chunk in retrieved_chunks_domain
-        ]
+        retrieved_docs_api = []
+        if retrieved_chunks_domain: # Solo mapear si hay chunks
+            retrieved_docs_api = [
+                schemas.RetrievedDocument(
+                    id=chunk.id,
+                    score=chunk.score,
+                    content_preview=truncate_text(chunk.content, 150) if chunk.content else None,
+                    content=chunk.content, # Pasar contenido completo
+                    metadata=chunk.metadata,
+                    document_id=chunk.document_id,
+                    file_name=chunk.file_name,
+                    cita_tag=chunk.cita_tag # Pasar cita_tag
+                ) for chunk in retrieved_chunks_domain
+            ]
 
         endpoint_log.info("Use case executed successfully, returning response", num_retrieved=len(retrieved_docs_api))
         return schemas.QueryResponse(
@@ -89,15 +85,11 @@ async def process_query(
             chat_id=final_chat_id
         )
 
-    # Keep specific error handling, Use Case should raise appropriate exceptions
     except HTTPException as http_exc:
-        # Re-raise HTTP exceptions directly (like 403, 400 from UseCase)
         raise http_exc
     except ConnectionError as ce:
-        # Catch connection errors raised by adapters via UseCase
         endpoint_log.error("Dependency connection error reported by Use Case", error=str(ce), exc_info=True)
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"A required service is unavailable.")
     except Exception as e:
-        # Catch unexpected errors from UseCase
         endpoint_log.exception("Unhandled exception during use case execution")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An internal error occurred.")
