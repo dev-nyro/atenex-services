@@ -2,7 +2,8 @@
 import asyncio
 import uuid
 from contextlib import asynccontextmanager
-
+import os
+import sys
 import structlog
 import uvicorn
 from app.api.v1 import schemas
@@ -21,6 +22,7 @@ from app.application.ports.embedding_model_port import EmbeddingModelPort
 from app.application.use_cases.embed_texts_use_case import EmbedTextsUseCase
 from app.infrastructure.embedding_models.openai_adapter import OpenAIAdapter
 from app.infrastructure.embedding_models.sentence_transformer_adapter import SentenceTransformerAdapter
+from app.infrastructure.embedding_models.instructor_adapter import InstructorAdapter # IMPORT_NEW_ADAPTER
 from app.dependencies import set_embedding_service_dependencies
 
 log = structlog.get_logger("embedding_service.main")
@@ -47,6 +49,8 @@ async def lifespan(app: FastAPI):
             model_adapter_instance = OpenAIAdapter()
     elif settings.ACTIVE_EMBEDDING_PROVIDER == "sentence_transformer":
         model_adapter_instance = SentenceTransformerAdapter()
+    elif settings.ACTIVE_EMBEDDING_PROVIDER == "instructor": # ADD_NEW_PROVIDER_CONDITION
+        model_adapter_instance = InstructorAdapter()
     else:
         log.critical(f"Unsupported ACTIVE_EMBEDDING_PROVIDER: {settings.ACTIVE_EMBEDDING_PROVIDER}")
         SERVICE_MODEL_READY = False
@@ -64,14 +68,16 @@ async def lifespan(app: FastAPI):
                 "embedding model client during startup.",
                 error=str(e), exc_info=True
             )
-    else: # Handle case where provider was unsupported or OpenAI key missing
+    else: 
         SERVICE_MODEL_READY = False
-        log.error("No valid embedding model adapter could be instantiated based on configuration.")
+        if settings.ACTIVE_EMBEDDING_PROVIDER != "openai" or (settings.OPENAI_API_KEY and settings.OPENAI_API_KEY.get_secret_value()):
+             # Log this only if it's not the known case of missing OpenAI key
+            log.error("No valid embedding model adapter could be instantiated based on configuration.")
 
 
     if embedding_model_adapter and SERVICE_MODEL_READY:
         use_case_instance = EmbedTextsUseCase(embedding_model=embedding_model_adapter)
-        embed_texts_use_case = use_case_instance # Assign to global
+        embed_texts_use_case = use_case_instance 
         set_embedding_service_dependencies(use_case_instance=use_case_instance, ready_flag=True)
         log.info(f"EmbedTextsUseCase instantiated and dependencies set with {type(embedding_model_adapter).__name__}.")
     else:
@@ -87,13 +93,14 @@ async def lifespan(app: FastAPI):
             log.info("OpenAI async client closed successfully.")
         except Exception as e:
             log.error("Error closing OpenAI async client.", error=str(e), exc_info=True)
-    # Add cleanup for SentenceTransformerAdapter if needed (e.g. releasing GPU memory, though Python GC usually handles it)
+    # Cleanup for other adapters (e.g., SentenceTransformer, INSTRUCTOR) if needed
+    # (e.g. releasing GPU memory explicitly, though Python GC usually handles ST/Instructor models)
     log.info("Shutdown complete.")
 
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    version="1.2.0", # Incremented version
+    version="1.2.0", 
     description=f"Atenex Embedding Service. Active provider: {settings.ACTIVE_EMBEDDING_PROVIDER}",
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
     lifespan=lifespan
@@ -139,31 +146,34 @@ async def request_context_middleware(request: Request, call_next):
 # --- Exception Handlers ---
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    log.error("HTTP Exception caught", status_code=exc.status_code, detail=exc.detail)
+    request_id_ctx = structlog.contextvars.get_contextvars().get("request_id")
+    log.error("HTTP Exception caught", status_code=exc.status_code, detail=exc.detail, request_id_from_ctx=request_id_ctx)
     return JSONResponse(
         status_code=exc.status_code,
-        content={"detail": exc.detail, "request_id": structlog.contextvars.get_contextvars().get("request_id")},
+        content={"detail": exc.detail, "request_id": request_id_ctx},
         headers=getattr(exc, "headers", None)
     )
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    log.warning("Request Validation Error", errors=exc.errors())
+    request_id_ctx = structlog.contextvars.get_contextvars().get("request_id")
+    log.warning("Request Validation Error", errors=exc.errors(), request_id_from_ctx=request_id_ctx)
     return JSONResponse(
         status_code=fastapi_status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
             "detail": "Validation Error",
             "errors": exc.errors(),
-            "request_id": structlog.contextvars.get_contextvars().get("request_id")
+            "request_id": request_id_ctx
         },
     )
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    log.exception("Generic Unhandled Exception caught")
+    request_id_ctx = structlog.contextvars.get_contextvars().get("request_id")
+    log.exception("Generic Unhandled Exception caught", request_id_from_ctx=request_id_ctx)
     return JSONResponse(
         status_code=fastapi_status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": "An unexpected internal server error occurred.", "request_id": structlog.contextvars.get_contextvars().get("request_id")}
+        content={"detail": "An unexpected internal server error occurred.", "request_id": request_id_ctx}
     )
 
 
@@ -184,34 +194,37 @@ async def health_check():
     health_log = log.bind(check="health_status")
 
     model_status_str = "client_not_initialized"
-    model_name_str = None
-    model_dim_int = None
-    service_overall_status = "error" # Default to error
+    model_name_str: Optional[str] = None
+    model_dim_int: Optional[int] = None
+    service_overall_status = "error" 
 
     if embedding_model_adapter: 
         is_healthy, status_msg = await embedding_model_adapter.health_check()
-        model_info = embedding_model_adapter.get_model_info() # Get info regardless of health
+        model_info = embedding_model_adapter.get_model_info() 
         model_name_str = model_info.get("model_name")
         model_dim_int = model_info.get("dimension")
 
-        if is_healthy and SERVICE_MODEL_READY: # Check both adapter health and global service readiness
+        if is_healthy and SERVICE_MODEL_READY:
             model_status_str = "client_ready"
             service_overall_status = "ok"
         elif is_healthy and not SERVICE_MODEL_READY:
-             model_status_str = "client_initialization_pending_or_failed" # Adapter might be ok, but global state isn't
+             model_status_str = "client_initialization_pending_or_failed" 
              health_log.error("Health check: Adapter client healthy but service global flag indicates not ready.")
-        else: # Adapter not healthy
-            model_status_str = "client_error" # Use this or status_msg for more detail
-            health_log.error("Health check: Embedding model client error.", model_status_message=status_msg)
+        else: 
+            model_status_str = "client_error" 
+            health_log.error("Health check: Embedding model client error.", model_status_message=status_msg, model_name=model_name_str)
     else: 
-        health_log.warning("Health check: Embedding model adapter not initialized (no valid provider configured or initial error).")
-        SERVICE_MODEL_READY = False # Ensure flag is accurate
-        # Try to get default model name/dim from config if adapter is None
+        health_log.warning("Health check: Embedding model adapter not initialized (no valid provider configured or initial error during startup).")
+        SERVICE_MODEL_READY = False 
+        
+        # Try to get default model name/dim from config if adapter is None for better health info
         if settings.ACTIVE_EMBEDDING_PROVIDER == "openai":
             model_name_str = settings.OPENAI_EMBEDDING_MODEL_NAME
         elif settings.ACTIVE_EMBEDDING_PROVIDER == "sentence_transformer":
             model_name_str = settings.ST_MODEL_NAME
-        model_dim_int = settings.EMBEDDING_DIMENSION
+        elif settings.ACTIVE_EMBEDDING_PROVIDER == "instructor": # HEALTH_CHECK_PROVIDER_INFO
+            model_name_str = settings.INSTRUCTOR_MODEL_NAME
+        model_dim_int = settings.EMBEDDING_DIMENSION # Global dimension
 
 
     response_payload = schemas.HealthCheckResponse(
@@ -222,15 +235,17 @@ async def health_check():
         model_dimension=model_dim_int 
     ).model_dump(exclude_none=True)
 
+    http_status_code = fastapi_status.HTTP_200_OK
     if not SERVICE_MODEL_READY or service_overall_status == "error":
-        health_log.error("Service not ready.", current_status=model_status_str, service_model_ready_flag=SERVICE_MODEL_READY)
-        return JSONResponse(
-            status_code=fastapi_status.HTTP_503_SERVICE_UNAVAILABLE,
-            content=response_payload
-        )
-
-    health_log.info("Health check successful.", model_status=model_status_str)
-    return response_payload
+        health_log.error("Service health check indicates an issue.", **response_payload)
+        http_status_code = fastapi_status.HTTP_503_SERVICE_UNAVAILABLE
+    else:
+        health_log.info("Health check successful.", **response_payload)
+        
+    return JSONResponse(
+        status_code=http_status_code,
+        content=response_payload
+    )
 
 # --- Root Endpoint (Simple Ack)  ---
 @app.get("/", tags=["Root"], response_class=PlainTextResponse, include_in_schema=False)
@@ -239,18 +254,25 @@ async def root():
 
 
 if __name__ == "__main__":
-    # Uvicorn is typically run by Gunicorn in production. This is for local dev.
-    # Gunicorn config (workers, etc.) will be handled by gunicorn_conf.py when deployed.
     port_to_run = settings.PORT
     log_level_main = settings.LOG_LEVEL.lower()
+    reload_flag = True # Typically true for local dev
+    workers_uvicorn = 1 # Uvicorn manages its own loop for dev; Gunicorn handles workers in prod
+
+    # Check if running in an environment where reload might be problematic (e.g. some debuggers)
+    # or if a specific env var is set to disable it for Windows debugging.
+    if os.getenv("APP_ENV_PROD_LIKE_LOCAL_DEV") == "true" or sys.platform == "win32" and os.getenv("POETRY_ACTIVE"):
+        # Could disable reload on Windows if it causes issues with debugger or CUDA context
+        # reload_flag = False 
+        pass
+
+
     print(f"----- Starting {settings.PROJECT_NAME} locally on port {port_to_run} (Provider: {settings.ACTIVE_EMBEDDING_PROVIDER}) -----")
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
         port=port_to_run,
-        reload=True, # Reload for local dev
+        reload=reload_flag, 
         log_level=log_level_main,
-        workers=1 # For local dev, uvicorn manages its own loop. Gunicorn workers setting is for prod.
+        workers=workers_uvicorn
     )
-
-# JFU 2

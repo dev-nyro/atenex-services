@@ -1,24 +1,32 @@
 # embedding-service/app/core/config.py
-import logging
+
+# --- Load .env variables at import time ---
 import os
+try:
+    from dotenv import load_dotenv
+    load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '../../.env'))
+except ImportError:
+    pass
+import logging
+# DEBUG: Print all EMBEDDING_* env vars at import time
+print("DEBUG ENV:", {k: v for k, v in os.environ.items() if k.startswith("EMBEDDING")})
+
 from typing import Optional, List, Any, Dict
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, field_validator, ValidationError, ValidationInfo, SecretStr
 import sys
 import json
 # LLM_FLAG: CONDITIONAL_IMPORT_START
-# Import torch only if sentence_transformer is the active provider
-# This will be checked after settings are partially loaded.
 _torch_imported = False
 try:
-    if os.getenv("EMBEDDING_ACTIVE_EMBEDDING_PROVIDER", "openai").lower() == "sentence_transformer":
+    # Check if any provider needing torch is active
+    active_provider_env = os.getenv("EMBEDDING_ACTIVE_EMBEDDING_PROVIDER", "openai").lower()
+    if active_provider_env in ["sentence_transformer", "instructor"]:
         import torch
         _torch_imported = True
 except ImportError:
-    # This case should ideally not happen if the Docker image is built correctly
-    # for sentence_transformer provider, but good to have a fallback log.
     logging.getLogger("embedding_service.config.loader").warning(
-        "Torch import failed even though sentence_transformer might be active. Ensure torch is installed if using ST."
+        f"Torch import failed. If using '{active_provider_env}', ensure torch is installed."
     )
     _torch_imported = False
 # LLM_FLAG: CONDITIONAL_IMPORT_END
@@ -28,36 +36,42 @@ except ImportError:
 DEFAULT_PROJECT_NAME = "Atenex Embedding Service"
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_API_V1_STR = "/api/v1"
-DEFAULT_ACTIVE_EMBEDDING_PROVIDER = "openai" # "openai" or "sentence_transformer"
+DEFAULT_ACTIVE_EMBEDDING_PROVIDER = "openai" # "openai", "sentence_transformer", or "instructor"
 
 # OpenAI specific defaults
 DEFAULT_OPENAI_EMBEDDING_MODEL_NAME = "text-embedding-3-small"
-DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_SMALL = 1536 # for text-embedding-3-small
-DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_LARGE = 3072 # for text-embedding-3-large
+DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_SMALL = 1536
+DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_LARGE = 3072
 DEFAULT_OPENAI_TIMEOUT_SECONDS = 30
 DEFAULT_OPENAI_MAX_RETRIES = 3
 
 # SentenceTransformer (ST) specific defaults
-DEFAULT_ST_MODEL_NAME = "intfloat/multilingual-e5-base" # Updated default ST model
-DEFAULT_ST_EMBEDDING_DIMENSION_E5_BASE_V2 = 768 # For intfloat/e5-base-v2 (English)
-DEFAULT_ST_EMBEDDING_DIMENSION_MULTILINGUAL_E5_BASE = 768 # For intfloat/multilingual-e5-base
-DEFAULT_ST_EMBEDDING_DIMENSION_E5_LARGE_V2 = 1024 # For intfloat/e5-large-v2 (English)
-DEFAULT_ST_MODEL_DEVICE = "cpu" # "cpu" or "cuda"
+DEFAULT_ST_MODEL_NAME = "intfloat/multilingual-e5-base"
+DEFAULT_ST_EMBEDDING_DIMENSION_MULTILINGUAL_E5_BASE = 768
+DEFAULT_ST_MODEL_DEVICE = "cpu"
 DEFAULT_ST_BATCH_SIZE_CPU = 64
-DEFAULT_ST_BATCH_SIZE_CUDA = 128 # Can be higher on GPU
-DEFAULT_ST_NORMALIZE_EMBEDDINGS = True # E5 models recommend normalization
-DEFAULT_ST_USE_FP16 = True # Enable by default if CUDA supports it
+DEFAULT_ST_BATCH_SIZE_CUDA = 128
+DEFAULT_ST_NORMALIZE_EMBEDDINGS = True
+DEFAULT_ST_USE_FP16 = True
 
-# FastEmbed specific defaults (kept for potential future use, but not primary)
+# INSTRUCTOR specific defaults
+DEFAULT_INSTRUCTOR_MODEL_NAME = "hkunlp/instructor-large"
+DEFAULT_INSTRUCTOR_EMBEDDING_DIMENSION_LARGE = 768
+DEFAULT_INSTRUCTOR_MODEL_DEVICE = "cpu" # Matches ST_MODEL_DEVICE logic
+DEFAULT_INSTRUCTOR_BATCH_SIZE_CPU = 32 # Common default for INSTRUCTOR
+DEFAULT_INSTRUCTOR_BATCH_SIZE_CUDA = 64 # Can be higher on GPU for INSTRUCTOR
+DEFAULT_INSTRUCTOR_NORMALIZE_EMBEDDINGS = False # INSTRUCTOR often not normalized by default
+
+# FastEmbed specific defaults
 DEFAULT_FASTEMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-DEFAULT_FASTEMBED_EMBEDDING_DIMENSION = 384 # Default for all-MiniLM-L6-v2
+DEFAULT_FASTEMBED_EMBEDDING_DIMENSION = 384
 DEFAULT_FASTEMBED_MAX_LENGTH = 512
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file='.env',
-        env_prefix='EMBEDDING_', # Unique prefix for this service
+        env_prefix='EMBEDDING_',
         env_file_encoding='utf-8',
         case_sensitive=False,
         extra='ignore'
@@ -67,37 +81,41 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = Field(default=DEFAULT_PROJECT_NAME)
     API_V1_STR: str = Field(default=DEFAULT_API_V1_STR)
     LOG_LEVEL: str = Field(default=DEFAULT_LOG_LEVEL)
-    PORT: int = Field(default=8003, description="Port the service will listen on.")
-    WORKERS: int = Field(default=2, description="Number of Gunicorn workers.")
+    PORT: int = Field(default=8003)
+    WORKERS: int = Field(default=2)
 
 
     # --- Active Embedding Provider ---
-    ACTIVE_EMBEDDING_PROVIDER: str = Field(default=DEFAULT_ACTIVE_EMBEDDING_PROVIDER, description="Active embedding provider: 'openai' or 'sentence_transformer'.")
+    ACTIVE_EMBEDDING_PROVIDER: str = Field(default=DEFAULT_ACTIVE_EMBEDDING_PROVIDER, description="Active embedding provider: 'openai', 'sentence_transformer', or 'instructor'.")
 
     # --- OpenAI Embedding Model ---
-    OPENAI_API_KEY: Optional[SecretStr] = Field(default=None, description="OpenAI API Key. Required if using OpenAI.")
-    OPENAI_EMBEDDING_MODEL_NAME: str = Field(default=DEFAULT_OPENAI_EMBEDDING_MODEL_NAME, description="Name of the OpenAI embedding model to use.")
-    OPENAI_EMBEDDING_DIMENSIONS_OVERRIDE: Optional[int] = Field(default=None, gt=0, description="Optional: Override embedding dimensions for OpenAI. Supported by text-embedding-3 models.")
-    OPENAI_API_BASE: Optional[str] = Field(default=None, description="Optional: Base URL for OpenAI API, e.g., for Azure OpenAI.")
+    OPENAI_API_KEY: Optional[SecretStr] = Field(default=None)
+    OPENAI_EMBEDDING_MODEL_NAME: str = Field(default=DEFAULT_OPENAI_EMBEDDING_MODEL_NAME)
+    OPENAI_EMBEDDING_DIMENSIONS_OVERRIDE: Optional[int] = Field(default=None, gt=0)
+    OPENAI_API_BASE: Optional[str] = Field(default=None)
     OPENAI_TIMEOUT_SECONDS: int = Field(default=DEFAULT_OPENAI_TIMEOUT_SECONDS, gt=0)
     OPENAI_MAX_RETRIES: int = Field(default=DEFAULT_OPENAI_MAX_RETRIES, ge=0)
 
     # --- SentenceTransformer (ST) Model ---
     ST_MODEL_NAME: str = Field(default=DEFAULT_ST_MODEL_NAME)
-    ST_MODEL_DEVICE: str = Field(default=DEFAULT_ST_MODEL_DEVICE, description="Device for ST model: 'cpu', 'cuda', 'cuda:0', etc.")
-    ST_HF_CACHE_DIR: Optional[str] = Field(default=None, description="Cache directory for HuggingFace models for ST.")
+    ST_MODEL_DEVICE: str = Field(default=DEFAULT_ST_MODEL_DEVICE)
+    ST_HF_CACHE_DIR: Optional[str] = Field(default=None)
     ST_BATCH_SIZE: int = Field(default=DEFAULT_ST_BATCH_SIZE_CPU, gt=0)
     ST_NORMALIZE_EMBEDDINGS: bool = Field(default=DEFAULT_ST_NORMALIZE_EMBEDDINGS)
-    ST_USE_FP16: bool = Field(default=DEFAULT_ST_USE_FP16, description="Enable FP16 for ST models on CUDA if supported.")
+    ST_USE_FP16: bool = Field(default=DEFAULT_ST_USE_FP16)
 
+    # --- INSTRUCTOR Model ---
+    INSTRUCTOR_MODEL_NAME: str = Field(default=DEFAULT_INSTRUCTOR_MODEL_NAME)
+    INSTRUCTOR_MODEL_DEVICE: str = Field(default=DEFAULT_INSTRUCTOR_MODEL_DEVICE) # Shared logic with ST_MODEL_DEVICE for validation
+    INSTRUCTOR_HF_CACHE_DIR: Optional[str] = Field(default=None, description="Cache directory for HuggingFace models for INSTRUCTOR (if different from ST). Defaults to ST_HF_CACHE_DIR if not set.")
+    INSTRUCTOR_BATCH_SIZE: int = Field(default=DEFAULT_INSTRUCTOR_BATCH_SIZE_CPU, gt=0)
+    INSTRUCTOR_NORMALIZE_EMBEDDINGS: bool = Field(default=DEFAULT_INSTRUCTOR_NORMALIZE_EMBEDDINGS)
+    # INSTRUCTOR_USE_FP16 could be added if needed, similar to ST_USE_FP16. For now, assumed handled by model if on CUDA.
 
     # --- Embedding Dimension (Crucial, validated based on active provider) ---
-    EMBEDDING_DIMENSION: int = Field(
-        default=DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_SMALL, 
-        description="Actual dimension of the embeddings produced by the active provider."
-    )
+    EMBEDDING_DIMENSION: int = Field(default_factory=lambda: int(os.getenv("EMBEDDING_DIMENSION", DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_SMALL)))
 
-    # --- FastEmbed Model (Optional, for fallback or specific use cases if retained) ---
+    # --- FastEmbed Model ---
     FASTEMBED_MODEL_NAME: str = Field(default=DEFAULT_FASTEMBED_MODEL_NAME)
     FASTEMBED_CACHE_DIR: Optional[str] = Field(default=None)
     FASTEMBED_THREADS: Optional[int] = Field(default=None)
@@ -117,44 +135,51 @@ class Settings(BaseSettings):
     @field_validator('ACTIVE_EMBEDDING_PROVIDER')
     @classmethod
     def check_active_provider(cls, v: str) -> str:
-        valid_providers = ["openai", "sentence_transformer"]
+        valid_providers = ["openai", "sentence_transformer", "instructor"]
         if v.lower() not in valid_providers:
             raise ValueError(f"Invalid ACTIVE_EMBEDDING_PROVIDER '{v}'. Must be one of {valid_providers}")
         return v.lower()
 
-    @field_validator('ST_MODEL_DEVICE')
+    @field_validator('ST_MODEL_DEVICE', 'INSTRUCTOR_MODEL_DEVICE')
     @classmethod
-    def check_st_model_device(cls, v: str, info: ValidationInfo) -> str:
+    def check_torch_model_device(cls, v: str, info: ValidationInfo) -> str:
         # LLM_FLAG: CONDITIONAL_CUDA_CHECK_START
         active_provider = info.data.get('ACTIVE_EMBEDDING_PROVIDER', DEFAULT_ACTIVE_EMBEDDING_PROVIDER)
-        if active_provider != "sentence_transformer":
-            # If not using ST, this validation is less critical or can be skipped.
-            # However, we still validate the format if provided.
+        field_name = info.field_name # 'st_model_device' or 'instructor_model_device'
+        
+        is_relevant_provider = False
+        if field_name == 'st_model_device' and active_provider == "sentence_transformer":
+            is_relevant_provider = True
+        elif field_name == 'instructor_model_device' and active_provider == "instructor":
+            is_relevant_provider = True
+
+        if not is_relevant_provider:
+            # If not using the provider this device setting is for, validate format but it might be ignored.
             if v.lower() not in ["cpu", "cuda"] and not v.lower().startswith("cuda:"):
-                 logging.getLogger("embedding_service.config.validator").warning(f"ST_MODEL_DEVICE '{v}' provided but ST is not active. Value will be ignored.")
-            return v # Return as is, will be ignored by ST adapter if ST not active.
+                 logging.getLogger("embedding_service.config.validator").warning(f"{field_name.upper()} '{v}' provided but provider '{active_provider}' is not active for it. Value may be ignored.")
+            return v
 
         if not _torch_imported:
-            logging.getLogger("embedding_service.config.validator").warning("Torch not imported. Cannot perform CUDA checks for ST_MODEL_DEVICE. Assuming 'cpu'.")
+            logging.getLogger("embedding_service.config.validator").warning(f"Torch not imported. Cannot perform CUDA checks for {field_name.upper()}. Assuming 'cpu'.")
             return "cpu"
         # LLM_FLAG: CONDITIONAL_CUDA_CHECK_END
 
         device_str = v.lower()
         if device_str.startswith("cuda"):
             if not torch.cuda.is_available():
-                logging.warning(f"ST_MODEL_DEVICE set to '{v}' but CUDA is not available. Forcing to 'cpu'.")
+                logging.warning(f"{field_name.upper()} set to '{v}' but CUDA is not available. Forcing to 'cpu'.")
                 return "cpu"
             if ":" in device_str:
                 try:
                     idx = int(device_str.split(":")[1])
                     if idx >= torch.cuda.device_count():
-                        logging.warning(f"CUDA device index {idx} is invalid. Max available: {torch.cuda.device_count()-1}. Using default CUDA device.")
+                        logging.warning(f"CUDA device index {idx} for {field_name.upper()} is invalid. Max available: {torch.cuda.device_count()-1}. Using default CUDA device 'cuda'.")
                         return "cuda" 
                 except ValueError:
-                    logging.warning(f"Invalid CUDA device format '{device_str}'. Using default CUDA device 'cuda'.")
+                    logging.warning(f"Invalid CUDA device format '{device_str}' for {field_name.upper()}. Using default CUDA device 'cuda'.")
                     return "cuda"
-        elif device_str != "cpu" and device_str != "mps": 
-             logging.warning(f"Unsupported ST_MODEL_DEVICE '{v}'. Using 'cpu'. Supported: 'cpu', 'cuda', 'cuda:N', 'mps'.")
+        elif device_str != "cpu" and device_str != "mps": # MPS for Apple Silicon
+             logging.warning(f"Unsupported {field_name.upper()} '{v}'. Using 'cpu'. Supported: 'cpu', 'cuda', 'cuda:N', 'mps'.")
              return "cpu"
         return device_str
 
@@ -162,12 +187,16 @@ class Settings(BaseSettings):
     @classmethod
     def check_workers_gpu(cls, v: int, info: ValidationInfo) -> int:
         active_provider = info.data.get('ACTIVE_EMBEDDING_PROVIDER', DEFAULT_ACTIVE_EMBEDDING_PROVIDER)
-        st_device = info.data.get('ST_MODEL_DEVICE', DEFAULT_ST_MODEL_DEVICE)
+        device = "cpu" # Default
+        if active_provider == "sentence_transformer":
+            device = info.data.get('ST_MODEL_DEVICE', DEFAULT_ST_MODEL_DEVICE)
+        elif active_provider == "instructor":
+            device = info.data.get('INSTRUCTOR_MODEL_DEVICE', DEFAULT_INSTRUCTOR_MODEL_DEVICE)
         
-        if active_provider == "sentence_transformer" and st_device.startswith("cuda"):
+        if device.startswith("cuda"):
             if v > 1:
                 logging.warning(
-                    f"EMBEDDING_WORKERS set to {v} but using SentenceTransformer on CUDA. "
+                    f"EMBEDDING_WORKERS set to {v} but using provider '{active_provider}' on CUDA. "
                     "Forcing workers to 1 to prevent VRAM contention and ensure stability."
                 )
                 return 1
@@ -176,17 +205,36 @@ class Settings(BaseSettings):
     @field_validator('ST_BATCH_SIZE')
     @classmethod
     def set_st_batch_size_based_on_device(cls, v: int, info: ValidationInfo) -> int:
-        # LLM_FLAG: CONDITIONAL_CUDA_CHECK_START
         active_provider = info.data.get('ACTIVE_EMBEDDING_PROVIDER', DEFAULT_ACTIVE_EMBEDDING_PROVIDER)
         if active_provider != "sentence_transformer":
-            return v # No adjustment if ST is not active
-        # LLM_FLAG: CONDITIONAL_CUDA_CHECK_END
+            return v 
         
         st_device = info.data.get('ST_MODEL_DEVICE', DEFAULT_ST_MODEL_DEVICE)
-        if st_device.startswith("cuda") and v == DEFAULT_ST_BATCH_SIZE_CPU:
+        if st_device.startswith("cuda") and v == DEFAULT_ST_BATCH_SIZE_CPU: # If user left it as CPU default
             logging.info(f"ST_MODEL_DEVICE is CUDA, adjusting ST_BATCH_SIZE to default CUDA value: {DEFAULT_ST_BATCH_SIZE_CUDA}")
             return DEFAULT_ST_BATCH_SIZE_CUDA
         return v
+
+    @field_validator('INSTRUCTOR_BATCH_SIZE')
+    @classmethod
+    def set_instructor_batch_size_based_on_device(cls, v: int, info: ValidationInfo) -> int:
+        active_provider = info.data.get('ACTIVE_EMBEDDING_PROVIDER', DEFAULT_ACTIVE_EMBEDDING_PROVIDER)
+        if active_provider != "instructor":
+            return v
+        
+        instructor_device = info.data.get('INSTRUCTOR_MODEL_DEVICE', DEFAULT_INSTRUCTOR_MODEL_DEVICE)
+        if instructor_device.startswith("cuda") and v == DEFAULT_INSTRUCTOR_BATCH_SIZE_CPU: # If user left it as CPU default
+            logging.info(f"INSTRUCTOR_MODEL_DEVICE is CUDA, adjusting INSTRUCTOR_BATCH_SIZE to default CUDA value: {DEFAULT_INSTRUCTOR_BATCH_SIZE_CUDA}")
+            return DEFAULT_INSTRUCTOR_BATCH_SIZE_CUDA
+        return v
+    
+    @field_validator('INSTRUCTOR_HF_CACHE_DIR', mode='before')
+    @classmethod
+    def set_instructor_hf_cache_dir_default(cls, v: Optional[str], info: ValidationInfo) -> Optional[str]:
+        if v is None: # If not explicitly set for INSTRUCTOR
+            return info.data.get('ST_HF_CACHE_DIR') # Default to ST cache dir
+        return v
+
 
     @field_validator('EMBEDDING_DIMENSION', mode='after') 
     @classmethod
@@ -195,6 +243,7 @@ class Settings(BaseSettings):
             raise ValueError("EMBEDDING_DIMENSION must be a positive integer.")
 
         active_provider = info.data.get('ACTIVE_EMBEDDING_PROVIDER')
+        logger = logging.getLogger("embedding_service.config.validator")
 
         if active_provider == "openai":
             openai_model_name = info.data.get('OPENAI_EMBEDDING_MODEL_NAME', DEFAULT_OPENAI_EMBEDDING_MODEL_NAME)
@@ -204,6 +253,7 @@ class Settings(BaseSettings):
             if openai_model_name == "text-embedding-3-small": expected_dimension_openai = DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_SMALL
             elif openai_model_name == "text-embedding-3-large": expected_dimension_openai = DEFAULT_OPENAI_EMBEDDING_DIMENSIONS_LARGE
             elif openai_model_name == "text-embedding-ada-002": expected_dimension_openai = 1536
+            # Add other OpenAI models here if needed
 
             final_expected_dim = expected_dimension_openai
             if openai_dimensions_override is not None:
@@ -212,41 +262,57 @@ class Settings(BaseSettings):
             if final_expected_dim is not None and v != final_expected_dim:
                  raise ValueError(
                     f"EMBEDDING_DIMENSION ({v}) must match the effective dimension ({final_expected_dim}) "
-                    f"for OpenAI model '{openai_model_name}' (considering override: {openai_dimensions_override}). "
-                    "Update EMBEDDING_DIMENSION in your environment/ConfigMap to match."
+                    f"for OpenAI model '{openai_model_name}' (override: {openai_dimensions_override})."
                 )
             elif final_expected_dim is None: 
-                logging.warning(f"OpenAI model '{openai_model_name}' has no default dimension in config. EMBEDDING_DIMENSION is {v}. Ensure this is correct.")
+                logger.warning(f"OpenAI model '{openai_model_name}' has no default dimension in config. EMBEDDING_DIMENSION is {v}. Ensure this is correct.")
 
         elif active_provider == "sentence_transformer":
             st_model_name = info.data.get('ST_MODEL_NAME', DEFAULT_ST_MODEL_NAME)
             expected_dimension_st = None
-            if st_model_name == "intfloat/e5-base-v2": expected_dimension_st = DEFAULT_ST_EMBEDDING_DIMENSION_E5_BASE_V2
-            elif st_model_name == "intfloat/e5-large-v2": expected_dimension_st = DEFAULT_ST_EMBEDDING_DIMENSION_E5_LARGE_V2
-            elif st_model_name == "intfloat/multilingual-e5-base": expected_dimension_st = DEFAULT_ST_EMBEDDING_DIMENSION_MULTILINGUAL_E5_BASE
-            elif st_model_name == "sentence-transformers/all-MiniLM-L6-v2": expected_dimension_st = 384 
+            # Common ST models
+            if st_model_name == "intfloat/multilingual-e5-base": expected_dimension_st = DEFAULT_ST_EMBEDDING_DIMENSION_MULTILINGUAL_E5_BASE
+            elif st_model_name == "intfloat/e5-large-v2": expected_dimension_st = 1024
+            elif st_model_name == "sentence-transformers/all-MiniLM-L6-v2": expected_dimension_st = 384
+            # Add other ST models here
 
-            if expected_dimension_st is not None:
-                if v != expected_dimension_st:
-                    raise ValueError(
-                        f"EMBEDDING_DIMENSION ({v}) for 'sentence_transformer' provider does not match the expected dimension ({expected_dimension_st}) "
-                        f"for ST model '{st_model_name}'. Correct EMBEDDING_DIMENSION or ST_MODEL_NAME."
-                    )
-            else: 
-                logging.warning(f"ST model '{st_model_name}' has no default dimension in config. EMBEDDING_DIMENSION is {v}. Ensure this is correct.")
-        
+            if expected_dimension_st is not None and v != expected_dimension_st:
+                raise ValueError(
+                    f"EMBEDDING_DIMENSION ({v}) for 'sentence_transformer' provider does not match expected dimension ({expected_dimension_st}) "
+                    f"for ST model '{st_model_name}'. Correct EMBEDDING_DIMENSION or ST_MODEL_NAME."
+                )
+            elif expected_dimension_st is None:
+                logger.warning(f"ST model '{st_model_name}' has no default dimension mapping in config. EMBEDDING_DIMENSION is {v}. Ensure this is correct by checking the model's documentation.")
+
+        elif active_provider == "instructor":
+            instructor_model_name = info.data.get('INSTRUCTOR_MODEL_NAME', DEFAULT_INSTRUCTOR_MODEL_NAME)
+            expected_dimension_instructor = None
+            # Common INSTRUCTOR models
+            if instructor_model_name == "hkunlp/instructor-large": expected_dimension_instructor = DEFAULT_INSTRUCTOR_EMBEDDING_DIMENSION_LARGE
+            elif instructor_model_name == "hkunlp/instructor-base": expected_dimension_instructor = 768
+            elif instructor_model_name == "hkunlp/instructor-xl": expected_dimension_instructor = 1024
+            # Add other INSTRUCTOR models here
+
+            if expected_dimension_instructor is not None and v != expected_dimension_instructor:
+                raise ValueError(
+                    f"EMBEDDING_DIMENSION ({v}) for 'instructor' provider does not match expected dimension ({expected_dimension_instructor}) "
+                    f"for INSTRUCTOR model '{instructor_model_name}'. Correct EMBEDDING_DIMENSION or INSTRUCTOR_MODEL_NAME."
+                )
+            elif expected_dimension_instructor is None:
+                logger.warning(f"INSTRUCTOR model '{instructor_model_name}' has no default dimension mapping in config. EMBEDDING_DIMENSION is {v}. Ensure this is correct by checking the model's documentation.")
+
         return v
     
     @field_validator('OPENAI_API_KEY', mode='before')
     @classmethod
     def check_openai_api_key_if_provider(cls, v: Optional[str], info: ValidationInfo) -> Optional[SecretStr]:
-        current_active_provider = info.data.get('ACTIVE_EMBEDDING_PROVIDER', DEFAULT_ACTIVE_EMBEDDING_PROVIDER)
+        current_active_provider = info.data.get('ACTIVE_EMBEDDING_PROVIDER', os.getenv('EMBEDDING_ACTIVE_EMBEDDING_PROVIDER', DEFAULT_ACTIVE_EMBEDDING_PROVIDER))
         
         if current_active_provider == "openai":
             if v is None or (isinstance(v, str) and not v.strip()): 
                 raise ValueError("OPENAI_API_KEY (EMBEDDING_OPENAI_API_KEY) is required when ACTIVE_EMBEDDING_PROVIDER is 'openai'.")
             return SecretStr(v)
-        if v is not None and isinstance(v, str) and v.strip():
+        if v is not None and isinstance(v, str) and v.strip(): # If provided even when not active, still parse as SecretStr
             return SecretStr(v)
         return None
 
@@ -263,8 +329,15 @@ if not temp_log_config.handlers:
 try:
     temp_log_config.info("Loading Embedding Service settings...")
     settings = Settings()
+    # Log effective cache dir for INSTRUCTOR (after potential default from ST)
+    if settings.ACTIVE_EMBEDDING_PROVIDER == 'instructor':
+        settings_dump = settings.model_dump()
+        settings_dump['INSTRUCTOR_HF_CACHE_DIR'] = settings.INSTRUCTOR_HF_CACHE_DIR
+    else:
+        settings_dump = settings.model_dump()
+
     temp_log_config.info("--- Embedding Service Settings Loaded ---")
-    for key, value in settings.model_dump().items():
+    for key, value in settings_dump.items():
         display_value = "********" if isinstance(value, SecretStr) else value
         temp_log_config.info(f"  {key.upper()}: {display_value}")
     temp_log_config.info("------------------------------------")
