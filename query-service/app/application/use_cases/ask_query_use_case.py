@@ -302,6 +302,9 @@ class AskQueryUseCase:
         assistant_sources_for_db: List[Dict[str, Any]] = []
         log_id: Optional[uuid.UUID] = None
         
+        validation_json_err = None
+        json_decode_err = None
+
         try:
             structured_answer_obj = RespuestaEstructurada.model_validate_json(json_answer_str)
             answer_for_user = structured_answer_obj.respuesta_detallada
@@ -316,6 +319,9 @@ class AskQueryUseCase:
             map_chunk_id_to_original = {chunk.id: chunk for chunk in original_chunks_for_citation}
             
             processed_chunk_ids_for_response = set()
+
+            if not structured_answer_obj.fuentes_citadas:
+                 llm_handler_log.info("LLM response did not include any 'fuentes_citadas'.")
 
             for cited_source_by_llm in structured_answer_obj.fuentes_citadas:
                 if cited_source_by_llm.id_documento and cited_source_by_llm.id_documento in map_chunk_id_to_original:
@@ -349,14 +355,16 @@ class AskQueryUseCase:
 
 
         except ValidationError as pydantic_err:
-            llm_handler_log.error("LLM JSON response failed Pydantic validation", raw_response=truncate_text(json_answer_str, 500), errors=pydantic_err.errors())
+            validation_json_err = pydantic_err.errors()
+            llm_handler_log.error("LLM JSON response failed Pydantic validation", raw_response=truncate_text(json_answer_str, 500), errors=validation_json_err)
             answer_for_user = "La respuesta del asistente no tuvo el formato esperado. Por favor, intenta de nuevo."
-            assistant_sources_for_db = [{"error": "Pydantic validation failed", "details": pydantic_err.errors()}]
+            assistant_sources_for_db = [{"error": "Pydantic validation failed", "details": validation_json_err}]
             retrieved_chunks_for_response = original_chunks_for_citation[:self.settings.NUM_SOURCES_TO_SHOW] 
-        except json.JSONDecodeError as json_err:
-            llm_handler_log.error("Failed to parse JSON response from LLM", raw_response=truncate_text(json_answer_str, 500), error=str(json_err))
+        except json.JSONDecodeError as json_err_detail:
+            json_decode_err = str(json_err_detail)
+            llm_handler_log.error("Failed to parse JSON response from LLM", raw_response=truncate_text(json_answer_str, 500), error=json_decode_err)
             answer_for_user = f"Hubo un error al procesar la respuesta del asistente (JSON malformado): {truncate_text(json_answer_str,100)}. Por favor, intenta de nuevo."
-            assistant_sources_for_db = [{"error": "JSON decode error", "details": str(json_err)}]
+            assistant_sources_for_db = [{"error": "JSON decode error", "details": json_decode_err}]
             retrieved_chunks_for_response = original_chunks_for_citation[:self.settings.NUM_SOURCES_TO_SHOW] 
 
         await self.chat_repo.save_message(
@@ -364,7 +372,7 @@ class AskQueryUseCase:
             content=answer_for_user, 
             sources=assistant_sources_for_db[:self.settings.NUM_SOURCES_TO_SHOW] if assistant_sources_for_db else None
         )
-        llm_handler_log.info(f"Assistant message saved with up to {self.settings.NUM_SOURCES_TO_SHOW} sources.")
+        llm_handler_log.info(f"Assistant message saved with up to {self.settings.NUM_SOURCES_TO_SHOW} sources.", num_sources_saved_to_db=len(assistant_sources_for_db))
 
         try:
             docs_for_log_summary = [
@@ -385,11 +393,13 @@ class AskQueryUseCase:
                 "diversity_filter_enabled_in_settings": self.settings.DIVERSITY_FILTER_ENABLED,
                 "reranker_enabled_in_settings": self.settings.RERANKER_ENABLED,
                 "bm25_enabled_in_settings": self.settings.BM25_ENABLED,
+                "json_validation_error": validation_json_err,
+                "json_decode_error": json_decode_err,
             }
             log_id = await self.log_repo.log_query_interaction(
                 company_id=company_id, user_id=user_id, query=query, answer=answer_for_user,
                 retrieved_documents_data=docs_for_log_summary, 
-                chat_id=final_chat_id, metadata=log_metadata_details
+                chat_id=final_chat_id, metadata={k: v for k, v in log_metadata_details.items() if v is not None}
             )
             llm_handler_log.info("Interaction logged successfully", db_log_id=str(log_id))
         except Exception as log_err_final:
@@ -417,19 +427,21 @@ class AskQueryUseCase:
                 if not await self.chat_repo.check_chat_ownership(chat_id, user_id, company_id):
                     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Chat not found or access denied.")
                 final_chat_id = chat_id
-                if self.settings.MAX_CHAT_HISTORY_MESSAGES > 0:
-                    history_messages = await self.chat_repo.get_chat_messages(
-                        chat_id=final_chat_id, user_id=user_id, company_id=company_id,
-                        limit=self.settings.MAX_CHAT_HISTORY_MESSAGES, offset=0
-                    )
-                    chat_history_str = self._format_chat_history(history_messages)
-                    exec_log.info("Chat history retrieved", num_messages=len(history_messages))
+                history_messages = await self.chat_repo.get_chat_messages(
+                    chat_id=final_chat_id, user_id=user_id, company_id=company_id,
+                    limit=self.settings.MAX_CHAT_HISTORY_MESSAGES, offset=0
+                )
+                chat_history_str = self._format_chat_history(history_messages)
+                exec_log.info("Using existing chat. History retrieved.", num_messages=len(history_messages))
             else:
                 initial_title = f"Chat: {truncate_text(query, 40)}"
                 final_chat_id = await self.chat_repo.create_chat(user_id=user_id, company_id=company_id, title=initial_title)
-            exec_log = exec_log.bind(chat_id=str(final_chat_id))
+                exec_log.info("New chat created for this query.", new_chat_id=str(final_chat_id))
+
+            exec_log = exec_log.bind(chat_id=str(final_chat_id), is_new_chat=(not chat_id))
+
             await self.chat_repo.save_message(chat_id=final_chat_id, role='user', content=query)
-            exec_log.info("Chat state managed and user message saved", is_new_chat=(not chat_id))
+            exec_log.info("User message saved.")
 
             if GREETING_REGEX.match(query):
                 answer = "¡Hola! ¿En qué puedo ayudarte hoy con la información de tus documentos?"
@@ -770,7 +782,7 @@ class AskQueryUseCase:
                 json_answer_str = await self.llm.generate(reduce_prompt_str, response_pydantic_schema=RespuestaEstructurada)
 
             else: 
-                exec_log.info(f"Using Direct RAG strategy. Chunks: {len(final_chunks_for_processing)}", flow_type="DirectRAG")
+                exec_log.info(f"Using Direct RAG strategy. Chunks available: {len(final_chunks_for_processing)}", flow_type="DirectRAG")
                 pipeline_stages_used.append("direct_rag_flow")
                 
                 haystack_docs_for_prompt = [
@@ -785,6 +797,10 @@ class AskQueryUseCase:
                         score=c.score
                     ) for c in final_chunks_for_processing
                 ]
+                
+                exec_log.info("Chunks for Direct RAG after truncating to MAX_CONTEXT_CHUNKS: {len(haystack_docs_for_prompt)} (limit: {self.settings.MAX_CONTEXT_CHUNKS})")
+
+
                 direct_rag_prompt = await self._build_prompt(query, haystack_docs_for_prompt, chat_history_str, builder=self._prompt_builder_rag)
                 
                 exec_log.info("Sending direct RAG request to LLM for JSON response.")
