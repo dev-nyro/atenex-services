@@ -45,8 +45,8 @@ DEFAULT_REDUCE_PROMPT_TEMPLATE_PATH = str(PROMPT_DIR / "reduce_prompt_template_v
 
 # Models
 DEFAULT_EMBEDDING_DIMENSION = 1536
-DEFAULT_GEMINI_MODEL = "gemini-1.5-flash-latest" 
-DEFAULT_GEMINI_MAX_OUTPUT_TOKENS: Optional[int] = 8000 # Ajustado a un valor común para Flash, pero puede ser None
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-preview-04-17" 
+DEFAULT_GEMINI_MAX_OUTPUT_TOKENS = 16384
 
 # RAG Pipeline Parameters
 DEFAULT_RETRIEVER_TOP_K = 200 
@@ -137,7 +137,8 @@ class Settings(BaseSettings):
     # --- LLM (Google Gemini) ---
     GEMINI_API_KEY: SecretStr
     GEMINI_MODEL_NAME: str = Field(default=DEFAULT_GEMINI_MODEL)
-    GEMINI_MAX_OUTPUT_TOKENS: Optional[int] = Field(default=DEFAULT_GEMINI_MAX_OUTPUT_TOKENS, description="Optional: Maximum number of tokens to generate in the LLM response.")
+    GEMINI_MAX_OUTPUT_TOKENS: int = Field(default=DEFAULT_GEMINI_MAX_OUTPUT_TOKENS, gt=0)
+
 
     # --- Reranker Settings ---
     RERANKER_ENABLED: bool = Field(default=DEFAULT_RERANKER_ENABLED)

@@ -378,8 +378,8 @@ class AskQueryUseCase:
         assistant_sources_for_db: List[Dict[str, Any]] = []
         log_id: Optional[uuid.UUID] = None
         
-        # Log the raw JSON for debugging if parsing fails. Be careful with sensitive data in production.
-        raw_json_preview_on_error = truncate_text(json_answer_str, 1000)
+        validation_json_err = None
+        json_decode_err = None
 
         try:
             structured_answer_obj = RespuestaEstructurada.model_validate_json(json_answer_str)
@@ -395,59 +395,59 @@ class AskQueryUseCase:
             
             processed_chunk_ids_for_response = set()
 
-            if structured_answer_obj.fuentes_citadas:
-                for cited_source_from_llm in structured_answer_obj.fuentes_citadas:
-                    # The `id_documento` from LLM's FuenteCitada should be the `RetrievedChunk.id`
-                    chunk_id_from_llm = cited_source_from_llm.id_documento
-                    
-                    if chunk_id_from_llm and chunk_id_from_llm in map_id_to_original_chunk:
-                        original_chunk = map_id_to_original_chunk[chunk_id_from_llm]
-                        # Create a new RetrievedChunk instance for the API response, or modify a copy.
-                        # This ensures content and other details are from the original chunk,
-                        # and we add the cita_tag.
-                        api_chunk = RetrievedChunk(
-                            id=original_chunk.id,
-                            content=original_chunk.content, # Crucial: ensure full content is here
-                            score=cited_source_from_llm.score if cited_source_from_llm.score is not None else original_chunk.score,
-                            metadata=original_chunk.metadata, # Keep original metadata
-                            embedding=None, # Not needed for API response usually
-                            document_id=original_chunk.document_id,
-                            file_name=original_chunk.file_name,
-                            company_id=original_chunk.company_id,
-                            cita_tag=cited_source_from_llm.cita_tag # Add the cita_tag
-                        )
-                        retrieved_chunks_for_api_response.append(api_chunk)
-                        processed_chunk_ids_for_response.add(original_chunk.id)
-                    else:
-                        llm_handler_log.warning("LLM cited a source (id_documento) not found in original_chunks_for_citation or chunk has no content.",
-                                                cited_id=chunk_id_from_llm,
-                                                cited_tag=cited_source_from_llm.cita_tag,
-                                                available_ids=list(map_id_to_original_chunk.keys()))
-            else: # No fuentes_citadas from LLM
-                llm_handler_log.info("LLM response did not include any 'fuentes_citadas'.")
+            if not structured_answer_obj.fuentes_citadas:
+                 llm_handler_log.info("LLM response did not include any 'fuentes_citadas'.")
+
+            for cited_source_by_llm in structured_answer_obj.fuentes_citadas:
+                if cited_source_by_llm.id_documento and cited_source_by_llm.id_documento in map_chunk_id_to_original:
+                    original_chunk = map_chunk_id_to_original[cited_source_by_llm.id_documento]
+                    if original_chunk.id not in processed_chunk_ids_for_response:
+                       retrieved_chunks_for_response.append(original_chunk)
+                       processed_chunk_ids_for_response.add(original_chunk.id)
+
+            if not retrieved_chunks_for_response and structured_answer_obj.fuentes_citadas:
+                llm_handler_log.warning("LLM cited sources, but no direct match found by id_documento. Using filename as fallback or top N.")
+                for cited_source_by_llm in structured_answer_obj.fuentes_citadas:
+                    if len(retrieved_chunks_for_response) >= self.settings.NUM_SOURCES_TO_SHOW: break
+                    found_by_name = False
+                    for orig_chunk in original_chunks_for_citation:
+                        if orig_chunk.id not in processed_chunk_ids_for_response and \
+                           orig_chunk.file_name == cited_source_by_llm.nombre_archivo:
+                             retrieved_chunks_for_response.append(orig_chunk)
+                             processed_chunk_ids_for_response.add(orig_chunk.id)
+                             found_by_name = True
+                             break 
+                    if not found_by_name:
+                         llm_handler_log.info("LLM cited source not found by filename either", cited_source_name=cited_source_by_llm.nombre_archivo)
             
-            # Limitar el número de fuentes mostradas si es necesario, pero ahora basado en lo que el LLM citó.
-            retrieved_chunks_for_api_response = retrieved_chunks_for_api_response[:self.settings.NUM_SOURCES_TO_SHOW]
-            assistant_sources_for_db = [f.model_dump(exclude_none=True) for f in structured_answer_obj.fuentes_citadas][:self.settings.NUM_SOURCES_TO_SHOW]
+            if len(retrieved_chunks_for_response) < self.settings.NUM_SOURCES_TO_SHOW and original_chunks_for_citation:
+                llm_handler_log.debug("Filling remaining source slots with top original chunks provided to LLM/MapReduce.")
+                for chunk in original_chunks_for_citation:
+                    if len(retrieved_chunks_for_response) >= self.settings.NUM_SOURCES_TO_SHOW: break
+                    if chunk.id not in processed_chunk_ids_for_response:
+                        retrieved_chunks_for_response.append(chunk)
+                        processed_chunk_ids_for_response.add(chunk.id)
 
 
-        except (ValidationError, json.JSONDecodeError) as validation_json_err:
-            error_type = type(validation_json_err).__name__
-            llm_handler_log.error(f"LLM response failed parsing or validation ({error_type})",
-                                  raw_response_preview=raw_json_preview_on_error, 
-                                  error_details=str(validation_json_err))
-            answer_for_user = ("La respuesta del asistente no tuvo el formato esperado y no pudo ser procesada. "
-                               "Por favor, intenta simplificar tu pregunta o contacta a soporte si el problema persiste.")
-            assistant_sources_for_db = [{"error": f"{error_type} en respuesta del LLM", "details": str(validation_json_err)}]
-            retrieved_chunks_for_api_response = [] # No enviar fuentes si el parseo falló
+        except ValidationError as pydantic_err:
+            validation_json_err = pydantic_err.errors()
+            llm_handler_log.error("LLM JSON response failed Pydantic validation", raw_response=truncate_text(json_answer_str, 500), errors=validation_json_err)
+            answer_for_user = "La respuesta del asistente no tuvo el formato esperado. Por favor, intenta de nuevo."
+            assistant_sources_for_db = [{"error": "Pydantic validation failed", "details": validation_json_err}]
+            retrieved_chunks_for_response = original_chunks_for_citation[:self.settings.NUM_SOURCES_TO_SHOW] 
+        except json.JSONDecodeError as json_err_detail:
+            json_decode_err = str(json_err_detail)
+            llm_handler_log.error("Failed to parse JSON response from LLM", raw_response=truncate_text(json_answer_str, 500), error=json_decode_err)
+            answer_for_user = f"Hubo un error al procesar la respuesta del asistente (JSON malformado): {truncate_text(json_answer_str,100)}. Por favor, intenta de nuevo."
+            assistant_sources_for_db = [{"error": "JSON decode error", "details": json_decode_err}]
+            retrieved_chunks_for_response = original_chunks_for_citation[:self.settings.NUM_SOURCES_TO_SHOW] 
 
-        # Guardar el mensaje del asistente en el chat
         await self.chat_repo.save_message(
             chat_id=final_chat_id, role='assistant',
             content=answer_for_user, 
             sources=assistant_sources_for_db # Usar las fuentes procesadas
         )
-        llm_handler_log.info("Assistant message saved to DB.", num_sources_saved_to_db=len(assistant_sources_for_db))
+        llm_handler_log.info(f"Assistant message saved with up to {self.settings.NUM_SOURCES_TO_SHOW} sources.", num_sources_saved_to_db=len(assistant_sources_for_db))
 
         # Loguear la interacción
         try:
@@ -473,16 +473,16 @@ class AskQueryUseCase:
                 "num_sources_processed_from_llm_response": len(assistant_sources_for_db),
                 "num_retrieved_docs_in_api_response": len(retrieved_chunks_for_api_response),
                 "chat_history_messages_included_in_prompt": num_history_messages_effective,
-                "llm_json_parse_error": "ValidationError" if isinstance(validation_json_err, ValidationError) else "JSONDecodeError" if isinstance(validation_json_err, json.JSONDecodeError) else None if 'validation_json_err' not in locals() or validation_json_err is None else "UnknownParseError",
+                "diversity_filter_enabled_in_settings": self.settings.DIVERSITY_FILTER_ENABLED,
+                "reranker_enabled_in_settings": self.settings.RERANKER_ENABLED,
+                "bm25_enabled_in_settings": self.settings.BM25_ENABLED,
+                "json_validation_error": validation_json_err,
+                "json_decode_error": json_decode_err,
             }
             log_id = await self.log_repo.log_query_interaction(
-                user_id=user_id,
-                company_id=company_id,
-                query=query,
-                answer=answer_for_user,
-                retrieved_documents_data=docs_for_log_summary,
-                metadata=log_metadata_details,
-                chat_id=final_chat_id
+                company_id=company_id, user_id=user_id, query=query, answer=answer_for_user,
+                retrieved_documents_data=docs_for_log_summary, 
+                chat_id=final_chat_id, metadata={k: v for k, v in log_metadata_details.items() if v is not None}
             )
             llm_handler_log.info("Query interaction logged successfully.", log_id=str(log_id) if log_id else "None")
         except Exception as e_log:
@@ -559,21 +559,21 @@ class AskQueryUseCase:
                     exec_log.warning("Chat ownership check failed for existing chat.", provided_chat_id=str(chat_id))
                     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Chat not found or access denied.")
                 final_chat_id = chat_id
-                if self.settings.MAX_CHAT_HISTORY_MESSAGES > 0:
-                    history_messages = await self.chat_repo.get_chat_messages(
-                        chat_id=final_chat_id, user_id=user_id, company_id=company_id,
-                        limit=self.settings.MAX_CHAT_HISTORY_MESSAGES, offset=0
-                    )
-                    chat_history_str = self._format_chat_history(history_messages)
-                exec_log.info("Using existing chat. History retrieved.", num_messages=len(history_messages), chat_id=str(final_chat_id))
+                history_messages = await self.chat_repo.get_chat_messages(
+                    chat_id=final_chat_id, user_id=user_id, company_id=company_id,
+                    limit=self.settings.MAX_CHAT_HISTORY_MESSAGES, offset=0
+                )
+                chat_history_str = self._format_chat_history(history_messages)
+                exec_log.info("Using existing chat. History retrieved.", num_messages=len(history_messages))
             else:
                 initial_title = f"Chat: {truncate_text(query, 40)}"
                 final_chat_id = await self.chat_repo.create_chat(user_id=user_id, company_id=company_id, title=initial_title)
-                exec_log.info("New chat created.", new_chat_id=str(final_chat_id))
-            
-            exec_log = exec_log.bind(chat_id=str(final_chat_id))
+                exec_log.info("New chat created for this query.", new_chat_id=str(final_chat_id))
+
+            exec_log = exec_log.bind(chat_id=str(final_chat_id), is_new_chat=(not chat_id))
+
             await self.chat_repo.save_message(chat_id=final_chat_id, role='user', content=query)
-            exec_log.info("User message saved.", is_new_chat=(not chat_id)) 
+            exec_log.info("User message saved.")
 
             if GREETING_REGEX.match(query):
                 return await self._handle_greeting(query, company_id, user_id, final_chat_id, exec_log)
@@ -944,8 +944,8 @@ class AskQueryUseCase:
                 exec_log.info("Sending reduce request to LLM for final JSON response.")
                 json_answer_str = await self.llm.generate(reduce_prompt_str, response_pydantic_schema=RespuestaEstructurada)
 
-            else: # Direct RAG
-                exec_log.info(f"Using Direct RAG strategy. Chunks available: {num_final_chunks_for_llm_or_mapreduce}, Tokens: {total_tokens_for_llm}", flow_type="DirectRAG")
+            else: 
+                exec_log.info(f"Using Direct RAG strategy. Chunks available: {len(final_chunks_for_processing)}", flow_type="DirectRAG")
                 pipeline_stages_used.append("direct_rag_flow")
                 
                 chunks_to_send_to_llm = final_chunks_for_processing[:self.settings.MAX_CONTEXT_CHUNKS]
@@ -964,6 +964,10 @@ class AskQueryUseCase:
                         score=c.score
                     ) for c in chunks_to_send_to_llm
                 ]
+                
+                exec_log.info("Chunks for Direct RAG after truncating to MAX_CONTEXT_CHUNKS: {len(haystack_docs_for_prompt)} (limit: {self.settings.MAX_CONTEXT_CHUNKS})")
+
+
                 direct_rag_prompt = await self._build_prompt(query, haystack_docs_for_prompt, chat_history_str, builder=self._prompt_builder_rag)
                 
                 exec_log.info("Sending direct RAG request to LLM for JSON response.")
